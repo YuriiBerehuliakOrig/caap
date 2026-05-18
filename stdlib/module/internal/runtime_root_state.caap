@@ -1,0 +1,157 @@
+(ctfe-compiler-execute-bootstrap-file
+  compiler
+  "common.caap")
+
+(bind (
+  (module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.prelude-bindings"))
+  (common-keys
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.common-keys"))
+  (common-records
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.common-records"))
+  (module-events
+    (ctfe-compiler-lookup-value compiler "stdlib.module.events"))
+  (get-any (get module-helpers "get-any" null))
+  (is-null? (get-any module-helpers "is-null?" null))
+  (not-null? (get-any module-helpers "not-null?" null))
+  (get-or-null (get-any module-helpers "get-or-null" null))
+  (require-helper
+    (get-any module-helpers "require-helper" null))
+  (each (require-helper module-helpers "each"))
+  (public-module-name?
+    (require-helper module-helpers "public-module-name?"))
+  (summary-key (require-helper common-keys "summary-key"))
+  (interface-key
+    (require-helper common-keys "interface-key"))
+  (runtime-model-key
+    (require-helper common-keys "runtime-model-key"))
+  (state-version-key
+    (require-helper common-keys "state-version-key"))
+  (enabled-key (require-helper common-keys "enabled-key"))
+  (finalized-key
+    (require-helper common-keys "finalized-key"))
+  (summary-from-runtime-model
+    (require-helper common-records "summary-from-runtime-model"))
+  (annotation-get
+    (require-helper module-helpers "annotation-get"))
+  (annotation-set
+    (require-helper module-helpers "annotation-set"))
+  (set-pass-state
+    (require-helper module-helpers "set-pass-state"))
+  (clear-runtime-state
+    (require-helper module-helpers "clear-runtime-state"))
+  (module-state-names
+    (require-helper common-records "module-state-names"))
+  (begin-module-mutation
+    (require-helper common-records "begin-module-mutation"))
+  (module-mutation-put
+    (require-helper common-records "module-mutation-put"))
+  (commit-module-mutation
+    (require-helper common-records "commit-module-mutation"))
+  (define-internal-module
+    (require-helper module-helpers "define-internal-module"))
+  (module-event
+    (require-helper module-events "module-event"))
+)
+  (bind (
+    (make-list-modules
+      (lambda (state)
+        (bind (
+          (module-names (module-state-names state))
+        )
+          (lambda ()
+            (bind (
+              (names (list-of))
+            )
+              (do
+                (each module-names
+                  (lambda (module-name)
+                    (if (public-module-name? module-name)
+                      (append names module-name))))
+                names))))))
+    (make-prepare-root
+      (lambda ()
+        (lambda (root current-version)
+          (bind (
+            (existing-interface
+              (annotation-get root interface-key null))
+            (existing-runtime-model
+              (annotation-get root runtime-model-key null))
+            (existing-summary
+              (annotation-get root summary-key null))
+            (existing-version
+              (annotation-get root state-version-key null))
+            (existing-finalized
+              (annotation-get root finalized-key false))
+            (reuse-finalized-state
+              (and
+                existing-finalized
+                (not-null? existing-interface)
+                (not-null? existing-runtime-model)))
+            (reuse-state
+              (or
+                (and
+                  (eq existing-version current-version)
+                  (not-null? existing-interface)
+                  (not-null? existing-runtime-model))
+                reuse-finalized-state))
+          )
+            (do
+              (if (not reuse-state)
+                (clear-runtime-state root))
+              (if (and reuse-state (is-null? existing-summary))
+                (annotation-set
+                  root
+                  summary-key
+                  (summary-from-runtime-model existing-runtime-model)))
+              (set-pass-state root reuse-state current-version)
+              (bind (
+                (fields (map-of))
+              )
+                (do
+                  (assoc-many fields "current_version" current-version "reused_state" reuse-state)
+                  (module-event "prepare-root" "prepared module root" fields)))
+              root)))))
+    (make-register-root
+      (lambda (state)
+        (lambda (root)
+          (bind (
+            (interface
+              (annotation-get root interface-key null))
+            (runtime-model
+              (annotation-get root runtime-model-key null))
+            (module-name
+              (if (is-null? interface)
+                null
+                (get-or-null interface "module")))
+          )
+            (if (is-null? module-name)
+              null
+              (bind (
+                (mutation
+                  (begin-module-mutation state module-name))
+              )
+                (do
+                  (module-mutation-put mutation "interface" interface)
+                  (if (not-null? runtime-model)
+                    (module-mutation-put mutation "runtime_model" runtime-model))
+                  (commit-module-mutation mutation)
+                  (bind (
+                    (fields (map-of))
+                  )
+                    (do
+                      (assoc-many fields "module" module-name "has_runtime_model" (not-null? runtime-model))
+                      (module-event
+                        "register-root"
+                        "registered module root"
+                        fields)))
+                  module-name)))))))
+  )
+    (do
+      (define-internal-module
+        "stdlib.module.internal.runtime-root-state"
+        (list-of
+          (list-of "make-list-modules"  make-list-modules)
+          (list-of "make-prepare-root"  make-prepare-root)
+          (list-of "make-register-root" make-register-root)))
+      null)))

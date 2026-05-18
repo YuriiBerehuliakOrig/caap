@@ -1,0 +1,25 @@
+(module "sys.time")
+
+(module-capability "host_services")
+
+(import-namespace
+  "stdlib.internal.system-module-helpers"
+  "system-module-helpers")
+(import-namespace
+  "stdlib.module"
+  "module")
+
+;; Host-backed time module.
+;;
+;; Public exports are sourced from the host service catalog for "time" and
+;; published through stdlib.module. Time access is effectful host capability,
+;; not a pure core builtin.
+(bind (
+  (system-module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.internal.system-module-helpers"))
+  (bootstrap-system-modules
+    (get system-module-helpers "bootstrap-system-modules"))
+)
+  (bootstrap-system-modules
+    compiler
+    (list-of (list-of "sys.time" "time" "sys.time"))))

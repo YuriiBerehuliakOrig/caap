@@ -1,0 +1,16 @@
+(do
+  (ctfe-compiler-execute-bootstrap-file
+    compiler
+    "kits/compiler_kit/toolchain.caap")
+  (ctfe-compiler-execute-bootstrap-file
+    compiler
+    "module/bootstrap_plan.caap")
+  (ctfe-compiler-execute-bootstrap-file
+    compiler
+    "module/seed.caap")
+  (bind (
+    (seed-api
+      (ctfe-compiler-lookup-value compiler "stdlib.module.seed.api"))
+    (load-module (get seed-api "load-module" null))
+  )
+    (load-module "stdlib.module")))

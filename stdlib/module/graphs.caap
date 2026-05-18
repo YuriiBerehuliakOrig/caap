@@ -1,0 +1,156 @@
+(bind (
+  (sequence
+    (ctfe-compiler-lookup-value compiler "stdlib.sequence"))
+  (module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.common"))
+  (module-events
+    (ctfe-compiler-lookup-value compiler "stdlib.module.events"))
+  (module-summaries
+    (ctfe-compiler-lookup-value compiler "stdlib.module.summaries"))
+  (get-any (get module-helpers "get-any" null))
+  (is-null? (get-any module-helpers "is-null?" null))
+  (not-null? (get-any module-helpers "not-null?" null))
+  (get-or-null (get-any module-helpers "get-or-null" null))
+  (at (get sequence "at" null))
+  (length (get sequence "length" null))
+  (module-event (get module-events "module-event" null))
+  (summarize-root
+    (get module-summaries "summarize-root" null))
+  (each (get module-helpers "each" null))
+  (make-module-graph-node
+    (get module-helpers "make-module-graph-node" null))
+  (make-module-graph-edge
+    (get module-helpers "make-module-graph-edge" null))
+  (make-module-graph-error
+    (get module-helpers "make-module-graph-error" null))
+  (make-module-graph
+    (get module-helpers "make-module-graph" null))
+  (define-internal-module
+    (get module-helpers "define-internal-module" null))
+)
+  (bind (
+    (module-graph
+      (lambda (source)
+        (bind (
+          (summaries (list-of (summarize-root source)))
+          (nodes (list-of))
+          (edges (list-of))
+          (known-modules (map-of))
+          (missing-modules (map-of))
+          (seen-edges (map-of))
+          (errors (list-of))
+          (subject
+            (if (eq (length summaries) 1)
+              (get-or-null (at summaries 0) "module")
+              (assoc-many (map-of) "root_count" (length summaries))))
+        )
+          (do
+            (each summaries
+              (lambda (summary)
+                (bind (
+                  (module-name
+                    (get-or-null summary "module"))
+                  (error (get-or-null summary "error"))
+                )
+                  (if (or (not (value-is-string module-name)) (eq module-name ""))
+                    (append
+                      errors
+                      (make-module-graph-error
+                        summary
+                        "module graph expects each summary to contain a non-empty module name"))
+                    (bind (
+                      (node-id
+                        (string-concat-many "module:" module-name))
+                    )
+                      (do
+                        (if (not (contains known-modules module-name))
+                          (do
+                            (append
+                              nodes
+                              (make-module-graph-node node-id module-name summary))
+                            (assoc known-modules module-name node-id)))
+                        (if (not-null? error)
+                          (append errors (make-module-graph-error summary error)))))))))
+            (each summaries
+              (lambda (summary)
+                (bind (
+                  (module-name
+                    (get-or-null summary "module"))
+                  (imports
+                    (get-any summary "imports" (list-of)))
+                )
+                  (if
+                    (and
+                      (value-is-string module-name)
+                      (not (eq module-name "")))
+                    (bind (
+                      (from-id
+                        (get-or-null known-modules module-name))
+                    )
+                      (each imports
+                        (lambda (dependency)
+                          (if (and (value-is-string dependency) (not (eq dependency "")))
+                            (bind (
+                              (to-id
+                                (if (contains known-modules dependency)
+                                  (get-or-null known-modules dependency)
+                                  (bind (
+                                    (existing
+                                      (get-or-null missing-modules dependency))
+                                  )
+                                    (if (is-null? existing)
+                                      (bind (
+                                        (created-id
+                                          (string-concat-many "module:" dependency))
+                                        (created-data
+                                          (assoc-many (map-of) "module" dependency "missing_summary" true))
+                                      )
+                                        (do
+                                          (append
+                                            nodes
+                                            (make-module-graph-node created-id dependency created-data))
+                                          (assoc missing-modules dependency created-id)
+                                          created-id))
+                                      existing))))
+                            )
+                              (bind (
+                                (edge-key
+                                  (string-concat-many from-id "->" to-id))
+                                (edge-data
+                                  (assoc-many (map-of) "from_module" module-name "to_module" dependency))
+                              )
+                                (if (not (contains seen-edges edge-key))
+                                  (do
+                                    (assoc seen-edges edge-key true)
+                                    (append
+                                      edges
+                                      (make-module-graph-edge from-id to-id "imports" edge-data))))))))))))))
+            (bind (
+              (fields (map-of))
+            )
+              (do
+                (assoc-many
+                  fields
+                  "root_count" (length summaries)
+                  "module_count" (length nodes)
+                  "edge_count" (length edges)
+                  "error_count" (length errors))
+                (module-event
+                  "module-graph"
+                  "constructed module dependency graph"
+                  fields)
+                (make-module-graph
+                  subject
+                  (length summaries)
+                  nodes
+                  edges
+                  errors)))))))
+    (explain-module-graph
+      (lambda (source)
+        (module-graph source)))
+  )
+    (define-internal-module
+      "stdlib.module.graphs"
+      (list-of
+        (list-of "module-graph"         module-graph)
+        (list-of "explain-module-graph" explain-module-graph)))))

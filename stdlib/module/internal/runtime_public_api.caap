@@ -1,0 +1,111 @@
+(bind (
+  (bootstrap-entry
+    (ctfe-compiler-lookup-value compiler "stdlib.module.bootstrap-plan-entry"))
+  (order-bootstrap-plan
+    (ctfe-compiler-lookup-value compiler "stdlib.module.order-bootstrap-plan"))
+)
+  (ctfe-compiler-execute-bootstrap-files
+    compiler
+    (order-bootstrap-plan
+      (list-of
+        (bootstrap-entry "runtime_protocol.caap" (list-of))
+        (bootstrap-entry
+          "runtime_public_resolution.caap"
+          (list-of "runtime_protocol.caap"))
+        (bootstrap-entry
+          "runtime_public_explain.caap"
+          (list-of "runtime_public_resolution.caap"))))))
+
+(bind (
+  (module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.prelude-bindings"))
+  (common-keys
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.common-keys"))
+  (public-resolution
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.public-resolution"))
+  (public-explain
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.public-explain"))
+  (get-any (get module-helpers "get-any" null))
+  (is-null? (get-any module-helpers "is-null?" null))
+  (not-null? (get-any module-helpers "not-null?" null))
+  (get-or-null (get-any module-helpers "get-or-null" null))
+  (require-helper
+    (get-any module-helpers "require-helper" null))
+  (define-internal-module
+    (require-helper module-helpers "define-internal-module"))
+  (each (require-helper module-helpers "each"))
+  (manifest-key (require-helper common-keys "manifest-key"))
+  (scan-key (require-helper module-helpers "scan-key"))
+  (fact-get (require-helper module-helpers "fact-get"))
+  (manifest-for
+    (require-helper module-helpers "manifest-for"))
+  (manifest-imports
+    (require-helper module-helpers "manifest-imports"))
+  (scan-raw (require-helper module-helpers "scan-raw"))
+  (make-list-publics
+    (require-helper public-resolution "make-list-publics"))
+  (make-resolve-public-provider
+    (require-helper
+      public-resolution
+      "make-resolve-public-provider"))
+  (make-explain-public
+    (require-helper public-explain "make-explain-public"))
+  (make-explain-root-public
+    (require-helper public-explain "make-explain-root-public"))
+)
+  (bind (
+    (imported-symbol?
+      (lambda (ctx root module-path symbol-name)
+        (bind (
+          (manifest (manifest-for ctx root null))
+          (scan (fact-get ctx scan-key root null))
+          (found-state (map-of))
+        )
+          (do
+            (assoc found-state "value" false)
+            (if (value-is-map manifest)
+              (each (manifest-imports manifest)
+                (lambda (entry)
+                  (if (not (get-any found-state "value" false))
+                    (bind (
+                      (path (get-or-null entry "path"))
+                      (module (get-or-null entry "module"))
+                      (kind (get-or-null entry "kind"))
+                      (source (get-or-null entry "source"))
+                    )
+                      (if (or (eq path module-path) (eq module module-path))
+                        (if (and (eq kind "symbol") (eq source symbol-name))
+                          (assoc found-state "value" true))))))))
+            (if
+              (and
+                (not (get-any found-state "value" false))
+                (not-null? scan))
+              (each (scan-raw scan)
+                (lambda (entry)
+                  (if (not (get-any found-state "value" false))
+                    (bind (
+                      (kind (get-or-null entry "kind"))
+                      (path (get-or-null entry "path"))
+                    )
+                      (if (eq path module-path)
+                        (if (eq kind "import-symbols")
+                          (each
+                            (get-any entry "names" (list-of))
+                            (lambda (name)
+                              (if (eq name symbol-name)
+                                (assoc found-state "value" true))))
+                          (if (eq kind "import-as")
+                            (if (eq (get-or-null entry "source") symbol-name)
+                              (assoc found-state "value" true)))))))))
+              (get-any found-state "value" false))))))
+  )
+    (do
+      (define-internal-module
+        "stdlib.module.internal.public-runtime"
+        (list-of
+          (list-of "make-list-publics"            make-list-publics)
+          (list-of "make-resolve-public-provider" make-resolve-public-provider)
+          (list-of "make-explain-public"          make-explain-public)
+          (list-of "make-explain-root-public"     make-explain-root-public)
+          (list-of "imported-symbol?"             imported-symbol?)))
+      null)))

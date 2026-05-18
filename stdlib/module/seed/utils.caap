@@ -1,0 +1,521 @@
+(bind (
+  (existing-api
+    (ctfe-compiler-lookup-value compiler "stdlib.module.seed.api" null))
+)
+  (if (not (eq existing-api null))
+    existing-api
+    (do
+      (ctfe-compiler-register-value
+        compiler
+        "stdlib.module.seed.indexes"
+        (map-of))
+      (ctfe-compiler-register-value
+        compiler
+        "stdlib.module.seed.names"
+        (list-of))
+      (ctfe-compiler-register-value
+        compiler
+        "stdlib.module.seed.load-order-state"
+        (list-of))
+      (ctfe-compiler-register-value
+        compiler
+        "stdlib.module.seed.load-stack-state"
+        (assoc-many (map-of) "stack" (list-of))))))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.each"
+  (lambda (items fn)
+    (sequence-each items fn)))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.each-indexed"
+  (lambda (items start fn)
+    ; Seed loads before the public stdlib.sequence package, so this keeps the
+    ; seed API local while delegating the actual loop to kernel sequence
+    ; primitives. The start argument is an offset added to callback indexes.
+    (sequence-each-indexed
+      items
+      (lambda (item index)
+        (fn item (int-add start index))))))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.fold-indexed"
+  (lambda (items start initial fn)
+    (bind (
+      (count (size items))
+      (indexes (sequence-range start count))
+    )
+      (sequence-fold-left
+        indexes
+        initial
+        (lambda (acc index)
+          (fn acc (get items index null) index))))))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.path-dir"
+  (lambda (path)
+    (bind (
+      (tail (string-last-segment path "/"))
+    )
+      (string-slice
+        path
+        0
+        (int-sub (size path) (int-add (size tail) 1))))))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.source-filename-extension"
+  "caap")
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.error"
+  (lambda (code message context)
+    (runtime-error (string-concat-many code ": " message))))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.behaviors"
+  (map-of))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.register-behavior"
+  (lambda (name handler)
+    (bind (
+      (seed-error
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.error"))
+      (behaviors
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.behaviors"))
+    )
+      (if
+        (or
+          (not (value-is-string name))
+          (eq name "")
+          (not (value-is-callable handler)))
+        (seed-error
+          "stdlib.module.seed.behavior.invalid"
+          "seed behavior registration expects a non-empty name and callable handler"
+          (assoc-many (map-of) "name" name))
+        (do
+          (assoc behaviors name handler)
+          handler)))))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.behavior"
+  (lambda (name)
+    (bind (
+      (seed-error
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.error"))
+      (behaviors
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.behaviors"))
+      (handler (get behaviors name null))
+    )
+      (if (eq handler null)
+        (seed-error
+          "stdlib.module.seed.behavior.missing"
+          (string-concat-many "missing seed behavior " name)
+          (assoc-many (map-of) "name" name))
+        handler))))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.descriptor-states"
+  (assoc-many (map-of) "unloaded" true "loading" true "loaded" true "failed" true))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.descriptor-state?"
+  (lambda (state)
+    (bind (
+      (states
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.descriptor-states"))
+    )
+      (and (value-is-string state) (contains states state)))))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.transition-descriptor-state"
+  (lambda (descriptor expected next)
+    (bind (
+      (seed-error
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.error"))
+      (descriptor-state?
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.descriptor-state?"))
+      (current
+        (if (value-is-map descriptor)
+          (get descriptor "state" null)
+          null))
+    )
+      (if (not (value-is-map descriptor))
+        (seed-error
+          "stdlib.module.seed.descriptor.state_subject_invalid"
+          "descriptor state transition requires a descriptor map"
+          (assoc-many (map-of) "descriptor" descriptor))
+        (if (not (descriptor-state? expected))
+          (seed-error
+            "stdlib.module.seed.descriptor.state_expected_invalid"
+            "descriptor state transition expected state is not registered"
+            (assoc-many (map-of) "expected" expected))
+          (if (not (descriptor-state? next))
+            (seed-error
+              "stdlib.module.seed.descriptor.state_next_invalid"
+              "descriptor state transition target state is not registered"
+              (assoc-many (map-of) "next" next))
+            (if (not (eq current expected))
+              (seed-error
+                "stdlib.module.seed.descriptor.state_transition_invalid"
+                (string-concat-many
+                  "invalid descriptor state transition "
+                  (if (value-is-string current)
+                    current
+                    "null")
+                  " -> "
+                  next
+                  "; expected "
+                  expected)
+                (assoc-many
+                  (map-of)
+                  "current" current
+                  "expected" expected
+                  "next" next
+                  "descriptor" descriptor))
+              (do
+                (assoc descriptor "state" next)
+                descriptor))))))))
+
+(bind (
+  (source-filename-extension
+    (ctfe-compiler-lookup-value compiler "stdlib.module.seed.source-filename-extension"))
+)
+  (ctfe-compiler-register-value
+    compiler
+    "stdlib.module.seed.source-file?"
+    (lambda (path)
+      (and
+        (value-is-string path)
+        (not (eq path ""))
+        (eq
+          (string-last-segment path ".")
+          source-filename-extension)))))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.trim-trailing-separator"
+  (lambda (path)
+    (if
+      (and
+        (value-is-string path)
+        (value-lt 0 (size path))
+        (eq (string-slice path (int-sub (size path) 1) null) "/"))
+      (string-slice path 0 (int-sub (size path) 1))
+      path)))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.bootstrap-filename"
+  "bootstrap.caap")
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.bootstrap-file?"
+  (lambda (path)
+    (and
+      (value-is-string path)
+      (not (eq path ""))
+      (bind (
+        (bootstrap-filename
+          (ctfe-compiler-lookup-value compiler "stdlib.module.seed.bootstrap-filename"))
+        (trim-trailing-separator
+          (ctfe-compiler-lookup-value compiler "stdlib.module.seed.trim-trailing-separator"))
+        (clean-path (trim-trailing-separator path))
+      )
+        (eq (string-last-segment clean-path "/") bootstrap-filename)))))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.bootstrap-path"
+  (lambda (base-path)
+    (bind (
+      (trim-trailing-separator
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.trim-trailing-separator"))
+      (bootstrap-filename
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.bootstrap-filename"))
+    )
+      (string-concat-many
+        (trim-trailing-separator base-path)
+        "/"
+        bootstrap-filename))))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.module-bootstrap-path"
+  (lambda (stdlib-root module-fragment)
+    (bind (
+      (trim-trailing-separator
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.trim-trailing-separator"))
+      (bootstrap-path
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.bootstrap-path"))
+      (stdlib-root-clean
+        (trim-trailing-separator stdlib-root))
+      (module-root
+        (if (eq module-fragment "")
+          stdlib-root-clean
+          (string-concat-many stdlib-root-clean "/" module-fragment)))
+    )
+      (bootstrap-path module-root))))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.main-filename"
+  "main.caap")
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.resolve-entry-candidates"
+  (lambda (root entry-name)
+    (if
+      (and
+        (value-is-string root)
+        (value-is-string entry-name)
+        (not (eq root ""))
+        (not (eq entry-name "")))
+      (bind (
+        (trim-trailing-separator
+          (ctfe-compiler-lookup-value compiler "stdlib.module.seed.trim-trailing-separator"))
+        (bootstrap-filename
+          (ctfe-compiler-lookup-value compiler "stdlib.module.seed.bootstrap-filename"))
+        (main-filename
+          (ctfe-compiler-lookup-value compiler "stdlib.module.seed.main-filename"))
+        (source-file?
+          (ctfe-compiler-lookup-value compiler "stdlib.module.seed.source-file?"))
+        (source-filename-extension
+          (ctfe-compiler-lookup-value compiler "stdlib.module.seed.source-filename-extension"))
+        (base-path
+          (if (eq (string-find entry-name "/" 0) 0)
+            (trim-trailing-separator entry-name)
+            (string-concat-many
+              (trim-trailing-separator root)
+              "/"
+              entry-name)))
+        (candidate-source
+          (string-concat-many base-path "." source-filename-extension))
+        (candidate-bootstrap
+          (string-concat-many base-path "/" bootstrap-filename))
+        (candidate-main
+          (string-concat-many base-path "/" main-filename))
+      )
+        (if (source-file? base-path)
+          (list-of base-path)
+          (list-of base-path candidate-source candidate-bootstrap candidate-main)))
+      (
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.error")
+        "stdlib.module.seed.entry_input_invalid"
+        (string-concat-many
+          "invalid module entry resolution input: "
+          "root="
+          (if (value-is-string root)
+            root
+            "null")
+          ", entry-name="
+          (if (value-is-string entry-name)
+            entry-name
+            "null"))
+        (assoc-many (map-of) "root" root "entry" entry-name)))))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.try-stdlib-root-for-path"
+  (lambda (current-path)
+    (if
+      (and
+        (value-is-string current-path)
+        (not (eq current-path "")))
+      (bind (
+        (trim-trailing-separator
+          (ctfe-compiler-lookup-value compiler "stdlib.module.seed.trim-trailing-separator"))
+        (source-file?
+          (ctfe-compiler-lookup-value compiler "stdlib.module.seed.source-file?"))
+        (bootstrap-file?
+          (ctfe-compiler-lookup-value compiler "stdlib.module.seed.bootstrap-file?"))
+        (path-dir
+          (ctfe-compiler-lookup-value compiler "stdlib.module.seed.path-dir"))
+        (module-seed-marker "/module/seed/")
+        (stdlib-marker "/stdlib/")
+        (module-seed-index
+          (string-find current-path module-seed-marker 0))
+        (stdlib-index
+          (string-find current-path stdlib-marker 0))
+        (path-has-child?
+          (lambda (dir name kind)
+            (if (not (value-is-string dir))
+              false
+              (if (eq dir "")
+                false
+                (bind (
+                  (entries
+                    (ctfe-compiler-list-dir compiler dir))
+                  (found
+                    (sequence-find
+                      entries
+                      (lambda (entry)
+                        (and
+                          (eq (get entry "kind" null) kind)
+                          (eq (get entry "name" null) name)))))
+                )
+                  (not (eq found null)))))))
+        (path-has-seed-root?
+          (lambda (dir)
+            (if (not (value-is-string dir))
+              false
+              (if (eq dir "")
+                false
+                (bind (
+                  (trimmed-dir
+                    (trim-trailing-separator dir))
+                  (module-dir
+                    (string-concat-many trimmed-dir "/module"))
+                  (seed-dir
+                    (string-concat-many module-dir "/seed"))
+                )
+                  (if (not (path-has-child? trimmed-dir "module" "dir"))
+                    false
+                    (if (not (path-has-child? module-dir "seed" "dir"))
+                      false
+                      (path-has-child? seed-dir "seed.caap" "file"))))))))
+        (start-dir
+          (if (source-file? current-path)
+            (path-dir (trim-trailing-separator current-path))
+            (if (bootstrap-file? current-path)
+              (path-dir (trim-trailing-separator current-path))
+              (trim-trailing-separator current-path))))
+      )
+        (if (not (eq module-seed-index null))
+          (trim-trailing-separator
+            (string-slice current-path 0 module-seed-index))
+          (if (not (eq stdlib-index null))
+            (trim-trailing-separator
+              (string-slice
+                current-path
+                0
+                (int-add stdlib-index (size "/stdlib"))))
+            (if (path-has-seed-root? start-dir)
+              start-dir
+              null))))
+      null)))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.stdlib-root-for-current"
+  (lambda (current-path)
+    (bind (
+      (stdlib-root
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.try-stdlib-root-for-path"))
+      (resolved-root (stdlib-root current-path))
+    )
+      (if (eq resolved-root null)
+        (
+          (ctfe-compiler-lookup-value compiler "stdlib.module.seed.error")
+          "stdlib.module.seed.stdlib_root_missing"
+          (string-concat-many
+            "stdlib module loader is not inside stdlib: "
+            current-path)
+          (assoc-many (map-of) "path" current-path))
+        resolved-root))))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.call-shape"
+  (lambda (node)
+    (if (ctfe-node-is-call node)
+      (bind (
+        (callee (ctfe-node-call-callee node))
+      )
+        (if (ctfe-node-is-name callee)
+          (assoc-many
+            (map-of)
+            "head" (ctfe-node-name-identifier callee)
+            "args" (ctfe-node-call-args node))
+          null))
+      null)))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.call-head"
+  (lambda (node)
+    (bind (
+      (call-shape
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.call-shape"))
+      (shape (call-shape node))
+    )
+      (if (eq shape null)
+        null
+        (get shape "head" null)))))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.call-args"
+  (lambda (node default)
+    (bind (
+      (call-shape
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.call-shape"))
+      (shape (call-shape node))
+    )
+      (if (eq shape null)
+        default
+        (get shape "args" default)))))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.literal-string"
+  (lambda (node)
+    (if
+      (and
+        (ctfe-node-is-literal node)
+        (value-is-string (ctfe-node-literal-value node)))
+      (ctfe-node-literal-value node)
+      null)))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.first-string"
+  (lambda (nodes)
+    (bind (
+      (literal-string
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.literal-string"))
+    )
+      (literal-string (get nodes 0 null)))))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.nested-string"
+  (lambda (entry key default)
+    (bind (
+      (call-args
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.call-args"))
+      (call-head
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.call-head"))
+      (first-string
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.first-string"))
+      (args (call-args entry (list-of)))
+      (count (size args))
+      (match
+        (sequence-find
+          (sequence-range 1 count)
+          (lambda (index)
+            (bind (
+              (node (get args index null))
+              (head (call-head node))
+              (node-args (call-args node (list-of)))
+              (value (first-string node-args))
+            )
+              (and (eq head key) (not (eq value null)))))))
+    )
+      (if (eq match null)
+        default
+        (first-string (call-args (get args match null) (list-of)))))))

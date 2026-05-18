@@ -1,0 +1,44 @@
+(bind (
+  (bootstrap-entry
+    (ctfe-compiler-lookup-value compiler "stdlib.module.bootstrap-plan-entry"))
+  (order-bootstrap-plan
+    (ctfe-compiler-lookup-value compiler "stdlib.module.order-bootstrap-plan"))
+)
+  (ctfe-compiler-execute-bootstrap-files
+    compiler
+    (order-bootstrap-plan
+      (list-of
+        (bootstrap-entry
+          "runtime_public_explain_mod.caap"
+          (list-of))
+        (bootstrap-entry
+          "runtime_public_explain_root.caap"
+          (list-of "runtime_public_explain_mod.caap"))))))
+
+(bind (
+  (module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.prelude-bindings"))
+  (public-explain-module
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.public-explain-module"))
+  (public-explain-root
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.public-explain-root"))
+  (get-any (get module-helpers "get-any" null))
+  (get-or-null (get-any module-helpers "get-or-null" null))
+  (require-helper
+    (get-any module-helpers "require-helper" null))
+  (define-internal-module
+    (require-helper module-helpers "define-internal-module"))
+  (make-explain-public
+    (require-helper public-explain-module "make-explain-public"))
+  (make-explain-root-public
+    (require-helper
+      public-explain-root
+      "make-explain-root-public"))
+)
+  (do
+    (define-internal-module
+      "stdlib.module.internal.public-explain"
+      (list-of
+        (list-of "make-explain-public"      make-explain-public)
+        (list-of "make-explain-root-public" make-explain-root-public)))
+    null))

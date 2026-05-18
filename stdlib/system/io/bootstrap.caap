@@ -1,0 +1,27 @@
+(module "sys.io")
+
+(module-capability "host_services")
+
+(import-namespace
+  "stdlib.internal.system-module-helpers"
+  "system-module-helpers")
+(import-namespace
+  "stdlib.module"
+  "module")
+
+;; Host-backed IO module.
+;;
+;; Export groups:
+;; - default-capability
+;; - stdout/stderr: print, println, write, eprint, eprintln,
+;;   flush-stdout, flush-stderr
+;; - stdin: read-line, read-all
+(bind (
+  (system-module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.internal.system-module-helpers"))
+  (bootstrap-system-modules
+    (get system-module-helpers "bootstrap-system-modules"))
+)
+  (bootstrap-system-modules
+    compiler
+    (list-of (list-of "sys.io" "io" "sys.io"))))

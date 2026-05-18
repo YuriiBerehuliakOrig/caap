@@ -1,0 +1,60 @@
+(module "stdlib.list")
+
+(import-namespace "stdlib.sequence" "sequence")
+
+(export "stdlib.list")
+
+; List-focused facade over the canonical sequence helpers.
+(bind (
+  (each (get sequence "each" null))
+  (pick
+    (lambda (&names)
+      (bind (
+        (exports (map-of))
+      )
+        (do
+          (each names
+            (lambda (name)
+              (assoc exports name (get sequence name null))))
+          exports))))
+)
+  (pick
+    "empty?"
+    "length"
+    "range"
+    "at"
+    "map"
+    "copy"
+    "each"
+    "each-indexed"
+    "fold-left"
+    "filter"
+    "find"
+    "find-reverse"
+    "any?"
+    "all?"
+    "reverse"
+    "take"
+    "drop"
+    "slice"
+    "flat-map"
+    "flatten"
+    "zip"
+    "index-of"
+    "partition"
+    "count"
+    "distinct"
+    "group-by"
+    "sum"
+    "join"
+    "take-while"
+    "drop-while"
+    "interleave"
+    "sort-by"
+    "sort"
+    "sort-desc"
+    "unique-by"
+    "index-by"
+    "frequencies"
+    "chunks"
+    "windowed"))

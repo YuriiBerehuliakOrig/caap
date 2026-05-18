@@ -1,0 +1,121 @@
+(ctfe-compiler-execute-bootstrap-file
+  compiler
+  "common.caap")
+
+(ctfe-compiler-execute-bootstrap-file
+  compiler
+  "runtime_host_exports.caap")
+
+(bind (
+  (module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.prelude-bindings"))
+  (runtime-host-exports
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.runtime-host-exports"))
+  (get-any (get module-helpers "get-any" null))
+  (get-or-null (get-any module-helpers "get-or-null" null))
+  (require-helper
+    (get-any module-helpers "require-helper" null))
+  (length (require-helper module-helpers "length"))
+  (make-interface-record
+    (require-helper module-helpers "make-interface-record"))
+  (make-runtime-model-record
+    (require-helper module-helpers "make-runtime-model-record"))
+  (make-template-provider
+    (require-helper module-helpers "make-template-provider"))
+  (make-host-service-provider
+    (require-helper module-helpers "make-host-service-provider"))
+  (build-host-export-catalog
+    (require-helper
+      runtime-host-exports
+      "build-host-export-catalog"))
+  (begin-module-mutation
+    (require-helper module-helpers "begin-module-mutation"))
+  (module-mutation-put
+    (require-helper module-helpers "module-mutation-put"))
+  (commit-module-mutation
+    (require-helper module-helpers "commit-module-mutation"))
+  (define-internal-module
+    (require-helper module-helpers "define-internal-module"))
+)
+  (bind (
+    (make-bind-provider
+      (lambda (state)
+        (lambda (module-name template)
+          (bind (
+            (provider (make-template-provider template))
+            (mutation
+              (begin-module-mutation state module-name))
+          )
+            (do
+              (module-mutation-put mutation "provider" provider)
+              (module-mutation-put mutation "export_cache" (map-of))
+              (commit-module-mutation mutation)
+              module-name)))))
+    (make-register-host-module
+      (lambda (state module-event)
+        (lambda (module-name host-library public-exports)
+          (bind (
+            (catalog
+              (build-host-export-catalog host-library public-exports))
+            (exports-map
+              (get-any catalog "exports_map" (map-of)))
+            (provenance
+              (get-any catalog "provenance" (map-of)))
+            (public-list
+              (get-any catalog "public_list" (list-of)))
+            (provider-export-names
+              (get-any catalog "provider_export_names" (map-of)))
+            (runtime-values
+              (get-any catalog "runtime_values" (map-of)))
+            (compile-time-values
+              (get-any catalog "compile_time_values" (map-of)))
+            (mutation
+              (begin-module-mutation state module-name))
+          )
+            (do
+              (module-mutation-put
+                mutation
+                "interface"
+                (make-interface-record module-name exports-map provenance))
+              (module-mutation-put
+                mutation
+                "runtime_model"
+                (make-runtime-model-record
+                  module-name
+                  (list-of)
+                  provenance
+                  public-list))
+              (module-mutation-put
+                mutation
+                "provider"
+                (make-host-service-provider
+                  host-library
+                  provider-export-names
+                  runtime-values
+                  compile-time-values))
+              (module-mutation-put mutation "export_cache" (map-of))
+              (commit-module-mutation mutation)
+              (ctfe-compiler-register-value
+                compiler
+                module-name
+                compile-time-values)
+              (bind (
+                (fields (map-of))
+              )
+                (do
+                  (assoc-many
+                    fields
+                    "module" module-name
+                    "host_library" host-library
+                    "public_count" (length public-list))
+                  (module-event
+                    "register-host-module"
+                    "registered host-backed module"
+                    fields)))
+              module-name)))))
+  )
+    (define-internal-module
+      "stdlib.module.internal.runtime-registration"
+      (list-of
+        (list-of "make-bind-provider"        make-bind-provider)
+        (list-of "make-register-host-module" make-register-host-module)))))

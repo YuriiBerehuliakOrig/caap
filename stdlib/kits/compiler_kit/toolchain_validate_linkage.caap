@@ -1,0 +1,123 @@
+; stdlib/compiler_kit/toolchain_validate_linkage.caap
+; Linkage validation helpers for validate_graph.
+(bind (
+  (emit-graph-error
+    (lambda (ctx node message code)
+      (ctfe-compiler-error ctx node message code)))
+  (binding-for-local?
+    (lambda (bindings local-name)
+      (bind (
+        (state (map-of))
+      )
+        (do
+          (assoc state "found" false)
+          (sequence-each
+            bindings
+            (lambda (binding)
+              (if (eq (get binding "local_name" null) local-name)
+                (assoc state "found" true))))
+          (get state "found" false)))))
+  (symbol-public-name?
+    (lambda (symbol public-name)
+      (bind (
+        (names (get symbol "public_names" (list-of)))
+        (state (map-of))
+      )
+        (if (eq (get symbol "name" null) public-name)
+          true
+          (do
+            (assoc state "found" false)
+            (sequence-each
+              names
+              (lambda (name)
+                (if (eq name public-name)
+                  (assoc state "found" true))))
+            (get state "found" false))))))
+  (public-name-declared?
+    (lambda (symbols public-name)
+      (bind (
+        (state (map-of))
+      )
+        (do
+          (assoc state "found" false)
+          (sequence-each
+            symbols
+            (lambda (symbol)
+              (if (symbol-public-name? symbol public-name)
+                (assoc state "found" true))))
+          (get state "found" false)))))
+  (validate-link-bindings
+    (lambda (ctx node bindings)
+      (bind (
+        (seen (map-of))
+      )
+        (sequence-each
+          bindings
+          (lambda (binding)
+            (bind (
+              (local-name (get binding "local_name" null))
+            )
+              (if (get seen local-name false)
+                (emit-graph-error
+                  ctx
+                  node
+                  (string-concat-many
+                    "duplicate link binding local name '"
+                    local-name
+                    "'")
+                  "caap.validate.linkage.duplicate_local_name")
+                (assoc seen local-name true))))))))
+  (validate-external-symbols
+    (lambda (ctx node symbols bindings)
+      (sequence-each
+        symbols
+        (lambda (symbol)
+          (bind (
+            (name (get symbol "name" null))
+          )
+            (if
+              (and
+                (eq (get symbol "kind" null) "external")
+                (not (binding-for-local? bindings name)))
+              (emit-graph-error
+                ctx
+                node
+                (string-concat-many
+                  "external symbol '"
+                  name
+                  "' has no link binding")
+                "caap.validate.linkage.external_binding_missing")))))))
+  (validate-public-names
+    (lambda (ctx node public-names symbols)
+      (sequence-each
+        public-names
+        (lambda (public-name)
+          (if (not (public-name-declared? symbols public-name))
+            (emit-graph-error
+              ctx
+              node
+              (string-concat-many
+                "public name '"
+                public-name
+                "' does not refer to any declared or external symbol")
+              "caap.validate.linkage.public_name_missing"))))))
+  (validate-linkage
+    (lambda (ctx unit root)
+      (bind (
+        (bindings (ctfe-unit-link-bindings unit))
+        (symbols (ctfe-unit-symbols unit))
+        (public-names (ctfe-unit-public-names unit))
+      )
+        (do
+          (validate-link-bindings ctx root bindings)
+          (validate-external-symbols ctx root symbols bindings)
+          (validate-public-names ctx root public-names symbols)))))
+  (exports
+    (assoc-many (map-of) "validate-linkage" validate-linkage))
+)
+  (do
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.compiler-kit.validate.linkage"
+      exports)
+    exports))

@@ -1,0 +1,406 @@
+(module "stdlib.special-forms")
+
+(import-namespace "stdlib.builder" "builder")
+
+(import-namespace "stdlib.sequence" "sequence")
+
+(export "stdlib.special-forms")
+
+; stdlib/special_forms/bootstrap.caap
+; Opt-in ergonomic surface sugar implemented as ordinary compile-time functions.
+(bind (
+  (module-exports (map-of))
+  (module-semantics (map-of))
+  (pure-compile-time-semantics
+    (assoc-many (map-of) "phase" "compile_time" "effect" "pure" "pure" true))
+  (impure-compile-time-semantics
+    (assoc-many (map-of) "phase" "compile_time" "effect" "impure" "pure" false))
+  (is-null? (get sequence "is-null?" null))
+  (not-null? (get sequence "not-null?" null))
+  (get-or-null (get sequence "get-or-null" null))
+  (make-body (get builder "body" null))
+  (make-if (get builder "if" null))
+  (make-bind (get builder "bind" null))
+  (make-bind-entry (get builder "bind-entry" null))
+  (make-lambda (get builder "lambda" null))
+  (call-items (get builder "call-items" null))
+  (call-with (get builder "call-with" null))
+  (call-args (get builder "call-args" null))
+  (make-call (get builder "call" null))
+  (match-call (get builder "match-call" null))
+  (match-arg (get builder "match-arg" null))
+  (match-rest (get builder "match-rest" null))
+  (name-or-null (get builder "name-or-null" null))
+  (map (get sequence "map" null))
+  (each (get sequence "each" null))
+  (at (get sequence "at" null))
+  (length (get sequence "length" null))
+  (reverse (get sequence "reverse" null))
+  (extract-symbols
+    (lambda (node)
+      (bind (
+        (identifier (name-or-null node))
+      )
+        (if (not-null? identifier)
+          (list-of identifier)
+          (map
+            (call-items node (list-of))
+            (lambda (arg)
+              (name-or-null arg)))))))
+  (extract-bindings
+    (lambda (node)
+      (bind (
+        (pairs (call-items node))
+      )
+        (if (is-null? pairs)
+          (list-of)
+          (map
+            pairs
+            (lambda (pair-node)
+              (bind (
+                (match (match-call pair-node null 1 1 null))
+              )
+                (if (is-null? match)
+                  null
+                  (bind (
+                    (head (get-or-null match "head"))
+                    (binding-name head)
+                  )
+                    (if (is-null? binding-name)
+                      null
+                      (make-bind-entry binding-name (match-arg match 0 null))))))))))))
+  (extract-single-binding
+    (lambda (node)
+      (bind (
+        (match (match-call node null 1 1 null))
+      )
+        (if (is-null? match)
+          null
+          (bind (
+            (binding-name (get-or-null match "head"))
+          )
+            (if (is-null? binding-name)
+              null
+              (make-bind-entry binding-name (match-arg match 0 null))))))))
+  (lower-fn
+    (lambda (ctx node)
+      (bind (
+        (match (match-call node "fn" 1 null null))
+      )
+        (if (is-null? match)
+          node
+          (bind (
+            (params
+              (extract-symbols (match-arg match 0 null)))
+            (body (make-body (match-rest match 1) null))
+          )
+            (make-lambda params body null))))))
+  (lower-let
+    (lambda (ctx node)
+      (bind (
+        (match (match-call node "let" 2 null null))
+      )
+        (if (is-null? match)
+          node
+          (bind (
+            (binding-name (name-or-null (match-arg match 0 null)))
+            (value-expr (match-arg match 1 null))
+            (body (make-body (match-rest match 2) null))
+            (bindings (list-of))
+          )
+            (if (is-null? binding-name)
+              node
+              (do
+                (append bindings (make-bind-entry binding-name value-expr))
+                (make-bind bindings body null))))))))
+  (lower-when
+    (lambda (ctx node)
+      (bind (
+        (match (match-call node "when" 1 null null))
+      )
+        (if (is-null? match)
+          node
+          (make-if
+            (match-arg match 0 null)
+            (make-body (match-rest match 1) null)
+            null
+            null)))))
+  (lower-unless
+    (lambda (ctx node)
+      (bind (
+        (match (match-call node "unless" 1 null null))
+      )
+        (if (is-null? match)
+          node
+          (make-if
+            (match-arg match 0 null)
+            null
+            (make-body (match-rest match 1) null)
+            null)))))
+  (lower-let1
+    (lambda (ctx node)
+      (bind (
+        (match (match-call node "let1" 1 null null))
+      )
+        (if (is-null? match)
+          node
+          (bind (
+            (entry
+              (extract-single-binding (match-arg match 0 null)))
+            (bindings (list-of))
+            (body (make-body (match-rest match 1) null))
+          )
+            (if (is-null? entry)
+              node
+              (do
+                (append bindings entry)
+                (make-bind bindings body null))))))))
+  (lower-when-let
+    (lambda (ctx node)
+      (bind (
+        (match (match-call node "when-let" 1 null null))
+      )
+        (if (is-null? match)
+          node
+          (bind (
+            (entry
+              (extract-single-binding (match-arg match 0 null)))
+            (bindings (list-of))
+            (body (make-body (match-rest match 1) null))
+          )
+            (if (is-null? entry)
+              node
+              (bind (
+                (name (get-or-null entry "name"))
+              )
+                (do
+                  (append bindings entry)
+                  (make-bind bindings (make-if name body null null) null)))))))))
+  (lower-if-let
+    (lambda (ctx node)
+      (bind (
+        (match (match-call node "if-let" 3 3 null))
+      )
+        (if (is-null? match)
+          node
+          (bind (
+            (entry
+              (extract-single-binding (match-arg match 0 null)))
+            (bindings (list-of))
+            (then-branch (match-arg match 1 null))
+            (else-branch (match-arg match 2 null))
+          )
+            (if (is-null? entry)
+              node
+              (bind (
+                (name (get-or-null entry "name"))
+              )
+                (do
+                  (append bindings entry)
+                  (make-bind
+                    bindings
+                    (make-if name then-branch else-branch null)
+                    null)))))))))
+  (lower-cond
+    (lambda (ctx node)
+      (bind (
+        (match (match-call node "cond" 1 null null))
+      )
+        (if (is-null? match)
+          node
+          (bind (
+            (clauses (match-rest match 0))
+            (state (map-of))
+          )
+            (do
+              (set state "acc" null)
+              (each (reverse clauses)
+                (lambda (clause)
+                  (bind (
+                    (items (call-items clause (list-of)))
+                    (cond-node (at items 0))
+                    (result-node
+                      (if (value-lt 1 (length items))
+                        (at items 1)
+                        null))
+                    (cond-name (name-or-null cond-node))
+                    (cur-acc (get state "acc" null))
+                  )
+                    (if (eq cond-name "else")
+                      (set state "acc" result-node)
+                      (set
+                        state
+                        "acc"
+                        (make-if cond-node result-node cur-acc null))))))
+              (get state "acc" null)))))))
+  (lower-thread-first
+    (lambda (ctx node)
+      (bind (
+        (match (match-call node "->" 1 null null))
+      )
+        (if (is-null? match)
+          node
+          (bind (
+            (init (match-arg match 0 null))
+            (steps (match-rest match 1))
+            (state (map-of))
+          )
+            (do
+              (set state "acc" init)
+              (each steps
+                (lambda (step)
+                  (bind (
+                    (cur-acc (get state "acc" null))
+                    (old-args (call-args step (list-of)))
+                    (new-args (list-of cur-acc))
+                  )
+                    (do
+                      (each old-args
+                        (lambda (a)
+                          (append new-args a)))
+                      (set state "acc" (call-with step new-args null))))))
+              (get state "acc" null)))))))
+  (lower-thread-last
+    (lambda (ctx node)
+      (bind (
+        (match (match-call node "->>" 1 null null))
+      )
+        (if (is-null? match)
+          node
+          (bind (
+            (init (match-arg match 0 null))
+            (steps (match-rest match 1))
+            (state (map-of))
+          )
+            (do
+              (set state "acc" init)
+              (each steps
+                (lambda (step)
+                  (bind (
+                    (cur-acc (get state "acc" null))
+                    (old-args (call-args step (list-of)))
+                    (new-args (list-of))
+                  )
+                    (do
+                      (each old-args
+                        (lambda (a)
+                          (append new-args a)))
+                      (append new-args cur-acc)
+                      (set state "acc" (call-with step new-args null))))))
+              (get state "acc" null)))))))
+  (lower-with-map
+    (lambda (ctx node)
+      (bind (
+        (match (match-call node "with-map" 3 3 null))
+      )
+        (if (is-null? match)
+          node
+          (bind (
+            (map-expr (match-arg match 0 null))
+            (bindings-node (match-arg match 1 null))
+            (body-node (match-arg match 2 null))
+            (binding-items
+              (call-items bindings-node (list-of)))
+            (tmp-name (gensym "__wm_"))
+            (entries (list-of))
+          )
+            (do
+              (append entries (make-bind-entry tmp-name map-expr))
+              (each binding-items
+                (lambda (entry)
+                  (bind (
+                    (e-items (call-items entry (list-of)))
+                    (local-name
+                      (name-or-null (at e-items 0)))
+                    (key-node (at e-items 1))
+                    (get-args
+                      (if (value-lt 2 (length e-items))
+                        (list-of tmp-name key-node (at e-items 2))
+                        (list-of tmp-name key-node)))
+                  )
+                    (if (not-null? local-name)
+                      (append
+                        entries
+                        (make-bind-entry local-name (make-call "get" get-args null)))
+                      null))))
+              (make-bind entries body-node null)))))))
+  (lower-begin
+    (lambda (ctx node)
+      (bind (
+        (match (match-call node "begin" 0 null null))
+      )
+        (if (is-null? match)
+          node
+          (make-body (match-rest match 0) null)))))
+  (special-form-policy
+    (lambda (scope form)
+      (special-form-policy-with "pure" "plain" scope form)))
+  (special-form-policy-with
+    (lambda (effect control scope form)
+      (assoc-many
+        (map-of)
+        "phase" "compile_time"
+        "effect" effect
+        "eval" "special_form"
+        "control" control
+        "scope" scope
+        "form" form)))
+  (register-special-form
+    (lambda (name policy normalizer)
+      (ctfe-compiler-register-semantic-policy
+        compiler
+        name
+        policy
+        normalizer)))
+  (default-special-form-policy
+    (lambda ()
+      (special-form-policy "none" "none")))
+  (default-special-form-semantics
+    (lambda ()
+      (assoc-many (default-special-form-policy) "pure" true "has_normalizer" true)))
+  (form-entries
+    (list-of
+      (list-of "fn" lower-fn)
+      (list-of "let" lower-let)
+      (list-of "cond" lower-cond)
+      (list-of "when" lower-when)
+      (list-of "unless" lower-unless)
+      (list-of "let1" lower-let1)
+      (list-of "when-let" lower-when-let)
+      (list-of "if-let" lower-if-let)
+      (list-of "begin" lower-begin)
+      (list-of "->" lower-thread-first)
+      (list-of "->>" lower-thread-last)
+      (list-of "with-map" lower-with-map)))
+)
+  (do
+    (assoc-many
+      module-semantics
+      "special-form-policy"
+        pure-compile-time-semantics
+      "special-form-policy-with"
+        pure-compile-time-semantics
+      "register-special-form"
+        impure-compile-time-semantics)
+    (assoc-many
+      module-exports
+      "special-form-policy" special-form-policy
+      "special-form-policy-with" special-form-policy-with
+      "register-special-form" register-special-form)
+    (each form-entries
+      (lambda (entry)
+        (bind (
+          (name (at entry 0))
+          (normalizer (at entry 1))
+          (policy (default-special-form-policy))
+        )
+          (do
+            (assoc module-semantics name (default-special-form-semantics))
+            (assoc module-exports name normalizer)
+            (register-special-form name policy normalizer)))))
+    (assoc module-exports "__contract_semantics__" module-semantics)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.special-forms"
+      module-exports)
+    module-exports))

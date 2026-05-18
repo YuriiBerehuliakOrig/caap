@@ -1,0 +1,211 @@
+(ctfe-compiler-execute-bootstrap-file
+  compiler
+  "runtime_link_exports.caap")
+
+(bind (
+  (module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.prelude-bindings"))
+  (common-keys
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.common-keys"))
+  (common-records
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.common-records"))
+  (runtime-protocol
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.runtime-protocol"))
+  (runtime-link-exports
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.runtime-link-exports"))
+  (get-any (get module-helpers "get-any" null))
+  (is-null? (get-any module-helpers "is-null?" null))
+  (not-null? (get-any module-helpers "not-null?" null))
+  (get-or-null (get-any module-helpers "get-or-null" null))
+  (require-helper
+    (get-any module-helpers "require-helper" null))
+  (each (require-helper module-helpers "each"))
+  (runtime-model-key
+    (require-helper common-keys "runtime-model-key"))
+  (annotation-get
+    (require-helper module-helpers "annotation-get"))
+  (runtime-model-module-name
+    (require-helper common-records "runtime-model-module-name"))
+  (runtime-model-imports
+    (require-helper common-records "runtime-model-imports"))
+  (runtime-model-provenance
+    (require-helper common-records "runtime-model-provenance"))
+  (runtime-model-publics
+    (require-helper common-records "runtime-model-publics"))
+  (make-runtime-model-record
+    (require-helper common-records "make-runtime-model-record"))
+  (import-module-name
+    (require-helper common-records "import-module-name"))
+  (provider-kind
+    (require-helper common-records "provider-kind"))
+  (PROVIDER-HOST-SERVICE
+    (require-helper module-helpers "PROVIDER-HOST-SERVICE"))
+  (PROVIDER-TEMPLATE
+    (require-helper module-helpers "PROVIDER-TEMPLATE"))
+  (module-state-registry
+    (require-helper common-records "module-state-registry"))
+  (module-state-runtime-models
+    (require-helper
+      common-records
+      "module-state-runtime-models"))
+  (module-state-providers
+    (require-helper common-records "module-state-providers"))
+  (module-state-export-cache-for
+    (require-helper
+      common-records
+      "module-state-export-cache-for"))
+  (define-internal-module
+    (require-helper module-helpers "define-internal-module"))
+  (result-error
+    (require-helper runtime-protocol "result-error"))
+  (result-ok (require-helper runtime-protocol "result-ok"))
+  (result-ok?
+    (require-helper runtime-protocol "result-ok?"))
+  (result-value
+    (require-helper runtime-protocol "result-value"))
+  (result-bind
+    (require-helper runtime-protocol "result-bind"))
+  (result->public
+    (require-helper runtime-protocol "result->public"))
+  (lookup-interface-result
+    (require-helper runtime-protocol "lookup-interface-result"))
+  (lookup-runtime-model-result
+    (require-helper
+      runtime-protocol
+      "lookup-runtime-model-result"))
+  (lookup-provider-result
+    (require-helper runtime-protocol "lookup-provider-result"))
+  (stack-empty
+    (require-helper runtime-protocol "stack-empty"))
+  (stack-contains
+    (require-helper runtime-protocol "stack-contains"))
+  (stack-push
+    (require-helper runtime-protocol "stack-push"))
+  (host-service-module-exports
+    (require-helper
+      runtime-link-exports
+      "host-service-module-exports"))
+  (template-module-exports
+    (require-helper
+      runtime-link-exports
+      "template-module-exports"))
+)
+  (bind (
+    (make-link-root
+      (lambda (build-linked-env module-event state)
+        (bind (
+          (registry (module-state-registry state))
+          (runtime-models
+            (module-state-runtime-models state))
+          (providers (module-state-providers state))
+          (module-exports-for
+            (lambda (self compiler module-name phase stack)
+              (if (stack-contains stack module-name)
+                (result-error
+                  "stdlib.module.dependency_cycle"
+                  "module runtime detected a cyclic module dependency"
+                  (assoc-many (map-of) "module" module-name "stack" stack))
+                (bind (
+                  (module-cache
+                    (module-state-export-cache-for state module-name))
+                  (cached (get-or-null module-cache phase))
+                )
+                  (if (not-null? cached)
+                    (result-ok cached)
+                    (result-bind
+                      (lookup-interface-result registry module-name)
+                      (lambda (interface)
+                        (result-bind
+                          (lookup-runtime-model-result runtime-models module-name)
+                          (lambda (runtime-model)
+                            (result-bind
+                              (lookup-provider-result providers module-name)
+                              (lambda (provider)
+                                (bind (
+                                  (resolved-provider-kind
+                                    (provider-kind provider))
+                                )
+                                  (if (eq resolved-provider-kind PROVIDER-HOST-SERVICE)
+                                    (host-service-module-exports
+                                      provider
+                                      runtime-model
+                                      module-cache
+                                      phase)
+                                    (if (eq resolved-provider-kind PROVIDER-TEMPLATE)
+                                      (template-module-exports
+                                        self
+                                        build-linked-env
+                                        compiler
+                                        runtime-models
+                                        module-name
+                                        runtime-model
+                                        interface
+                                        provider
+                                        module-cache
+                                        phase
+                                        stack)
+                                      (result-error
+                                        "stdlib.module.provider_kind.unknown"
+                                        "module runtime found an unknown provider kind"
+                                        (assoc-many (map-of) "module" module-name "provider_kind" resolved-provider-kind))))))))))))))))
+          (runtime-link-model
+            (lambda (runtime-model)
+              (bind (
+                (module-name
+                  (runtime-model-module-name runtime-model))
+              )
+                (if (contains registry module-name)
+                  runtime-model
+                  (bind (
+                    (runtime-imports (list-of))
+                  )
+                    (do
+                      (each
+                        (runtime-model-imports runtime-model)
+                        (lambda (entry)
+                          (if (contains registry (import-module-name entry))
+                            (append runtime-imports entry))))
+                      (make-runtime-model-record
+                        module-name
+                        runtime-imports
+                        (runtime-model-provenance runtime-model)
+                        (runtime-model-publics runtime-model))))))))
+        )
+          (lambda (compiler root phase)
+            (bind (
+              (runtime-model
+                (annotation-get root runtime-model-key null))
+              (linked-runtime-model
+                (if (is-null? runtime-model)
+                  null
+                  (runtime-link-model runtime-model)))
+              (result
+                (if (is-null? runtime-model)
+                  (result-error
+                    "stdlib.module.runtime_model.missing_on_root"
+                    "module runtime model is missing on the consumer root"
+                    (assoc-many (map-of) "phase" phase))
+                  (build-linked-env
+                    module-exports-for
+                    compiler
+                    runtime-models
+                    linked-runtime-model
+                    phase
+                    (stack-empty))))
+              (fields (map-of))
+            )
+              (do
+                (assoc-many
+                  fields
+                  "module"
+                    (if (is-null? runtime-model)
+                      null
+                      (runtime-model-module-name runtime-model))
+                  "phase" phase
+                  "has_error" (not (result-ok? result)))
+                (module-event "link-root" "linked module root" fields)
+                (result->public result)))))))
+  )
+    (define-internal-module
+      "stdlib.module.internal.runtime-linker"
+      (list-of (list-of "make-link-root" make-link-root)))))

@@ -1,0 +1,22 @@
+[package]
+name = "caap-core-port"
+version = "0.1.0"
+edition = "2021"
+description = "Work-in-progress Rust port of CAAP core (IR + evaluator)."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+blake2 = "0.10"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "1.0"
+caap-peg-port = { path = "../peg" }
+
+[dev-dependencies]
+static_assertions = "1.1"
+
+[lib]
+name = "caap_core_port"
+path = "src/lib.rs"

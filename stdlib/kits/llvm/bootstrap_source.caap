@@ -1,0 +1,76 @@
+(bind (
+  (kit-root
+    (ctfe-compiler-lookup-value compiler "stdlib.llvm" null))
+  (sequence
+    (ctfe-compiler-lookup-value compiler "stdlib.sequence" null))
+  (kit-protocol
+    (ctfe-compiler-lookup-value compiler "stdlib.internal.kit-protocol" null))
+  (get-any (get sequence "get" null))
+  (get-or-null (get sequence "get-or-null" null))
+  (is-null? (get sequence "is-null?" null))
+  (at (get sequence "at" null))
+  (length (get sequence "length" null))
+  (each (get sequence "each" null))
+  (register-helper
+    (get kit-protocol "register-helper" null))
+)
+  (do
+    (register-helper
+      kit-root
+      "_placeholder-external-value-v1"
+      (lambda (params)
+        (lambda (&args)
+          (if (eq (length &args) 0)
+            0
+            (at &args 0))))
+      "pure"
+      true)
+    (register-helper
+      kit-root
+      "emit-source-ll"
+      (lambda (path contract)
+        (bind (
+          (emit-unit-ll (get kit-root "emit-unit-ll" null))
+          (placeholder-external-value-v1
+            (get kit-root "_placeholder-external-value-v1" null))
+          (externals (get contract "externals" (list-of)))
+          (template
+            (ctfe-compiler-load-surface-file-template compiler path))
+          (unit (ctfe-unit-template-instantiate template))
+        )
+          (do
+            (bind (
+              (initial-bindings (map-of))
+              (invalid (map-of))
+            )
+              (bind (
+                (resolved-initial-bindings
+                  (do
+                    (assoc invalid "value" false)
+                    (each externals
+                      (lambda (external)
+                        (bind (
+                          (placeholder
+                            (placeholder-external-value-v1
+                              (get external "params" (list-of))))
+                        )
+                          (if (is-null? placeholder)
+                            (assoc invalid "value" true)
+                            (assoc
+                              initial-bindings
+                              (get-or-null external "decl")
+                              placeholder)))))
+                    (if (get invalid "value" false)
+                      null
+                      initial-bindings)))
+              )
+                (do
+                  (ctfe-compiler-compile-unit
+                    compiler
+                    unit
+                    resolved-initial-bindings
+                    false)
+                  (emit-unit-ll unit contract)))))))
+      "impure"
+      false)
+    (get kit-root "emit-source-ll" null)))

@@ -1,0 +1,153 @@
+(bind (
+  (bootstrap-entry
+    (ctfe-compiler-lookup-value compiler "stdlib.module.bootstrap-plan-entry"))
+  (order-bootstrap-plan
+    (ctfe-compiler-lookup-value compiler "stdlib.module.order-bootstrap-plan"))
+)
+  (ctfe-compiler-execute-bootstrap-files
+    compiler
+    (order-bootstrap-plan
+      (list-of
+        (bootstrap-entry "common.caap" (list-of))
+        (bootstrap-entry
+          "runtime_protocol.caap"
+          (list-of "common.caap"))))))
+
+(bind (
+  (module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.prelude-bindings"))
+  (runtime-protocol
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.runtime-protocol"))
+  (runtime-host-exports-exports (map-of))
+  (get-any (get module-helpers "get-any" null))
+  (is-null? (get-any module-helpers "is-null?" null))
+  (not-null? (get-any module-helpers "not-null?" null))
+  (get-or-null (get-any module-helpers "get-or-null" null))
+  (require-helper
+    (get-any module-helpers "require-helper" null))
+  (sequence
+    (ctfe-compiler-lookup-value compiler "stdlib.sequence"))
+  (each (require-helper sequence "each"))
+  (make-host-service-provenance
+    (require-helper
+      module-helpers
+      "make-host-service-provenance"))
+  (result-ok (require-helper runtime-protocol "result-ok"))
+  (result-error
+    (require-helper runtime-protocol "result-error"))
+  (result-ok?
+    (require-helper runtime-protocol "result-ok?"))
+  (result-value
+    (require-helper runtime-protocol "result-value"))
+)
+  null)
+
+(bind (
+  (exports runtime-host-exports-exports)
+  (validate-host-public-export-entry
+    (lambda (entry)
+      (bind (
+        (public-name (get-or-null entry "public"))
+        (export-name (get-or-null entry "export"))
+        (runtime-value (get-or-null entry "runtime_value"))
+        (compile-time-value
+          (get-or-null entry "compile_time_value"))
+        (phase (get-or-null entry "phase"))
+        (effect (get-or-null entry "effect"))
+        (pure (get-or-null entry "pure"))
+        (policy (get-or-null entry "policy"))
+        (record (map-of))
+      )
+        (if
+          (and
+            (value-is-string public-name)
+            (not (eq public-name ""))
+            (value-is-string export-name)
+            (not (eq export-name ""))
+            (not-null? runtime-value)
+            (not-null? compile-time-value))
+          (do
+            (assoc-many
+              record
+              "public" public-name
+              "export" export-name
+              "runtime_value" runtime-value
+              "compile_time_value" compile-time-value
+              "phase" phase
+              "effect" effect
+              "pure" pure
+              "policy" policy)
+            (result-ok record))
+          (result-error
+            "stdlib.module.host_export.malformed"
+            "module runtime ignores malformed host public export entries"
+            (assoc-many (map-of) "entry" entry))))))
+  (build-host-export-catalog
+    (lambda (host-library public-exports)
+      (bind (
+        (exports-map (map-of))
+        (provenance (map-of))
+        (public-list (list-of))
+        (provider-export-names (map-of))
+        (runtime-values (map-of))
+        (compile-time-values (map-of))
+      )
+        (do
+          (each public-exports
+            (lambda (entry)
+              (bind (
+                (validated
+                  (validate-host-public-export-entry entry))
+              )
+                (if (result-ok? validated)
+                  (bind (
+                    (record (result-value validated))
+                    (public-name
+                      (get-or-null record "public"))
+                    (export-name
+                      (get-or-null record "export"))
+                    (host-record
+                      (make-host-service-provenance
+                        host-library
+                        export-name
+                        public-name
+                        (get-or-null record "phase")
+                        (get-or-null record "effect")
+                        (get-or-null record "pure")
+                        (get-or-null record "policy")))
+                  )
+                    (do
+                      (assoc exports-map public-name true)
+                      (append public-list public-name)
+                      (assoc provenance public-name host-record)
+                      (assoc provider-export-names public-name export-name)
+                      (assoc
+                        runtime-values
+                        public-name
+                        (get-or-null record "runtime_value"))
+                      (assoc
+                        compile-time-values
+                        public-name
+                        (get-or-null record "compile_time_value"))))))))
+          (bind (
+            (catalog (map-of))
+          )
+            (do
+              (assoc-many
+                catalog
+                "exports_map" exports-map
+                "provenance" provenance
+                "public_list" public-list
+                "provider_export_names"
+                  provider-export-names
+                "runtime_values" runtime-values
+                "compile_time_values" compile-time-values)
+              catalog))))))
+)
+  (do
+    (assoc-many exports "build-host-export-catalog" build-host-export-catalog)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.module.internal.runtime-host-exports"
+      exports)
+    exports))

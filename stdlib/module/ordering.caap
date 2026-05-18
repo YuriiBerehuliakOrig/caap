@@ -1,0 +1,238 @@
+(bind (
+  (sequence
+    (ctfe-compiler-lookup-value compiler "stdlib.sequence"))
+  (module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.common"))
+  (module-events
+    (ctfe-compiler-lookup-value compiler "stdlib.module.events"))
+  (get-any (get module-helpers "get-any" null))
+  (get-or-null (get-any module-helpers "get-or-null" null))
+  (is-null? (get-any module-helpers "is-null?" null))
+  (not-null? (get-any module-helpers "not-null?" null))
+  (each (get-or-null module-helpers "each"))
+  (length (get-or-null module-helpers "length"))
+  (at (get-or-null module-helpers "at"))
+  (slice (get sequence "slice" null))
+  (reverse (get sequence "reverse" null))
+  (copy (get sequence "copy" null))
+  (join (get sequence "join" null))
+  (make-error-record
+    (get-or-null module-helpers "make-error-record"))
+  (make-error-record-with-context
+    (get-or-null
+      module-helpers
+      "make-error-record-with-context"))
+  (error-message
+    (get-or-null module-helpers "error-message"))
+  (module-event (get-or-null module-events "module-event"))
+  (define-internal-module
+    (get-or-null module-helpers "define-internal-module"))
+)
+  (bind (
+    (order-cache (map-of))
+    (order-cache-key
+      (lambda (summaries)
+        (bind (
+          (parts (list-of))
+        )
+          (do
+            (each summaries
+              (lambda (summary)
+                (bind (
+                  (message (error-message summary))
+                )
+                  (append
+                    parts
+                    (string-concat-many
+                      (get-any summary "module" "<missing>")
+                      ":"
+                      (join (get-any summary "imports" (list-of)) ",")
+                      ":"
+                      (if (not-null? message) message ""))))))
+            (join parts "|")))))
+    (order-units
+      (lambda (summaries)
+        (bind (
+          (cache-key (order-cache-key summaries))
+          (cached-order (get-or-null order-cache cache-key))
+        )
+          (if (not-null? cached-order)
+            (bind (
+              (fields (map-of))
+            )
+              (do
+                (assoc-many fields "count" (length cached-order) "has_error" false "cache_hit" true)
+                (module-event
+                  "order-units"
+                  "resolved module registration order"
+                  fields)
+                (copy cached-order)))
+            (bind (
+              (modules-by-name (map-of))
+              (seed-order (list-of))
+              (ordered (list-of))
+              (active (map-of))
+              (visited (map-of))
+              (state (map-of))
+              (make-frame
+                (lambda (module-name expanded)
+                  (assoc-many (map-of) "module" module-name "expanded" expanded)))
+              (push-frame
+                (lambda (module-name expanded)
+                  (append
+                    (get-any state "stack" (list-of))
+                    (make-frame module-name expanded))))
+              (pop-frame
+                (lambda ()
+                  (bind (
+                    (stack
+                      (get-any state "stack" (list-of)))
+                    (count (length stack))
+                    (frame (at stack (int-sub count 1)))
+                  )
+                    (do
+                      (assoc state "stack" (slice stack 0 (int-sub count 1)))
+                      frame))))
+              (complete-visit
+                (lambda (current)
+                  (do
+                    (assoc active current false)
+                    (assoc visited current true)
+                    (append ordered current))))
+              (cycle-path
+                (lambda (current)
+                  (bind (
+                    (path (list-of))
+                  )
+                    (do
+                      (each
+                        (get-any state "stack" (list-of))
+                        (lambda (frame)
+                          (append path (get-or-null frame "module"))))
+                      (append path current)
+                      path))))
+              (set-order-error
+                (lambda (code message context)
+                  (do
+                    (assoc state "error" message)
+                    (assoc state "error_code" code)
+                    (assoc state "error_context" context))))
+              (detect-cycle
+                (lambda (current)
+                  (set-order-error
+                    "stdlib.module.order.cycle"
+                    "compiled mode detected a cyclic module initialization dependency"
+                    (assoc-many (map-of) "path" (cycle-path current)))))
+              (start-visit
+                (lambda (current summary)
+                  (do
+                    (assoc active current true)
+                    (push-frame current true)
+                    (each
+                      (reverse (get-any summary "imports" (list-of)))
+                      (lambda (dependency)
+                        (if
+                          (and
+                            (contains modules-by-name dependency)
+                            (not (get-any visited dependency false)))
+                          (push-frame dependency false)))))))
+              (visit-module
+                (lambda (module-name)
+                  (do
+                    (assoc state "stack" (list-of))
+                    (push-frame module-name false)
+                    (while
+                      (and
+                        (is-null? (get-or-null state "error"))
+                        (value-lt 0 (length (get-any state "stack" (list-of)))))
+                      (bind (
+                        (frame (pop-frame))
+                        (current
+                          (get-or-null frame "module"))
+                        (expanded
+                          (get-any frame "expanded" false))
+                      )
+                        (if (not (get-any visited current false))
+                          (if (get-any active current false)
+                            (if expanded
+                              (complete-visit current)
+                              (detect-cycle current))
+                            (bind (
+                              (summary
+                                (get-or-null modules-by-name current))
+                            )
+                              (if (is-null? summary)
+                                (set-order-error
+                                  "stdlib.module.order.summary_missing"
+                                  "module runtime could not find a planned module summary"
+                                  (assoc-many (map-of) "module" current))
+                                (start-visit current summary))))))))))
+            )
+              (do
+                (assoc state "error" null)
+                (each summaries
+                  (lambda (summary)
+                    (if (is-null? (get-or-null state "error"))
+                      (bind (
+                        (message (error-message summary))
+                        (module-name
+                          (get-or-null summary "module"))
+                      )
+                        (if (not-null? message)
+                          (set-order-error
+                            "stdlib.module.order.summary_error"
+                            message
+                            (assoc-many (map-of) "module" module-name))
+                          (if (or (not (value-is-string module-name)) (eq module-name ""))
+                            (set-order-error
+                              "stdlib.module.order.module_missing"
+                              "module summary is missing a non-empty module name"
+                              (assoc-many (map-of) "summary" summary))
+                            (if (contains modules-by-name module-name)
+                              (set-order-error
+                                "stdlib.module.order.duplicate_module"
+                                "build manifest registers duplicate modules"
+                                (assoc-many (map-of) "module" module-name))
+                              (do
+                                (assoc modules-by-name module-name summary)
+                                (append seed-order module-name)))))))))
+                (bind (
+                  (make-order-error
+                    (lambda ()
+                      (make-error-record-with-context
+                        (get-or-null state "error_code")
+                        (get-or-null state "error")
+                        (get-or-null state "error_context"))))
+                  (result
+                    (if (not-null? (get-or-null state "error"))
+                      (make-order-error)
+                      (do
+                        (each seed-order
+                          (lambda (module-name)
+                            (visit-module module-name)))
+                        (if (not-null? (get-or-null state "error"))
+                          (make-order-error)
+                          ordered))))
+                  (fields (map-of))
+                )
+                  (do
+                    (assoc-many
+                      fields
+                      "count"
+                        (if (value-is-map result)
+                          0
+                          (length result))
+                      "has_error"
+                        (and (value-is-map result) (contains result "error")))
+                    (if (not (and (value-is-map result) (contains result "error")))
+                      (assoc order-cache cache-key (copy result)))
+                    (assoc fields "cache_hit" false)
+                    (module-event
+                      "order-units"
+                      "resolved module registration order"
+                      fields)
+                    result))))))))
+  )
+    (define-internal-module
+      "stdlib.module.ordering"
+      (list-of (list-of "order-units" order-units)))))

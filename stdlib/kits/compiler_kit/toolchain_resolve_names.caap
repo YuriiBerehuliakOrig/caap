@@ -1,0 +1,318 @@
+; stdlib/compiler_kit/toolchain_resolve_names.caap
+; Name/block resolution and call classification providers.
+(do
+  (bind (
+    (mark-resolved-name
+      (lambda (ctx unit node scope state)
+        (if (ctfe-node-is-name node)
+          (if (eq (ctfe-node-resolved-name-entry node null) null)
+            (bind (
+              (entry
+                (ctfe-resolution-scope-lookup
+                  scope
+                  (ctfe-node-name-identifier node)
+                  null))
+            )
+              (if (eq entry null)
+                false
+                (do
+                  (ctfe-meta-fact-set-by-key
+                    node
+                    "caap.fact.resolved_name"
+                    (ctfe-resolved-name-new entry))
+                  (bind (
+                    (def-node
+                      (ctfe-semantic-entry-node entry unit null))
+                  )
+                    (if (not (eq def-node null))
+                      (ctfe-meta-fact-set-by-key
+                        node
+                        "caap.def.location"
+                        (ctfe-unit-node-location unit def-node))))
+                  (assoc state "changed" true)
+                  true)))
+            false)
+          false)))
+    (define-scope-bindings
+      (lambda (ctx call-node scope bindings)
+        (bind (
+          (loop-state (map-of))
+        )
+          (do
+            (assoc loop-state "valid" true)
+            (sequence-each
+              bindings
+              (lambda (binding)
+                (if (get loop-state "valid" true)
+                  (bind (
+                    (kind (get binding "kind" "local"))
+                    (name (get binding "name" null))
+                    (binding-node
+                      (if (eq kind "parameter")
+                        call-node
+                        (get binding "node" null)))
+                  )
+                    (if (not (eq name null))
+                      (ctfe-resolution-scope-define!
+                        scope
+                        (ctfe-provider-semantic-entry-new
+                          ctx
+                          name
+                          (if (eq kind "parameter")
+                            "parameter"
+                            "local")
+                          binding-node
+                          "runtime")))))))
+            null))))
+    (walk-name-sequence
+      (lambda (ctx unit nodes scope state)
+        (bind (
+          (loop-state (map-of))
+        )
+          (do
+            (assoc loop-state "valid" true)
+            (sequence-each
+              nodes
+              (lambda (node)
+                (if (get loop-state "valid" true)
+                  (resolve-name-node ctx unit node scope state))))
+            null))))
+    (resolve-name-node
+      (lambda (ctx unit node scope state)
+        (if (ctfe-node-is-name node)
+          (mark-resolved-name ctx unit node scope state)
+          (if (ctfe-node-is-call node)
+            (do
+              (mark-resolved-name
+                ctx
+                unit
+                (ctfe-node-call-callee node)
+                scope
+                state)
+              (bind (
+                (descriptor
+                  (ctfe-provider-node-call-scope-descriptor ctx node))
+              )
+                (if (not (eq descriptor null))
+                  (bind (
+                    (child-scope
+                      (ctfe-resolution-scope-fork scope))
+                  )
+                    (do
+                      (define-scope-bindings
+                        ctx
+                        node
+                        child-scope
+                        (get descriptor "bindings" (list-of)))
+                      (walk-name-sequence
+                        ctx
+                        unit
+                        (get descriptor "binding_values" (list-of))
+                        child-scope
+                        state)
+                      (walk-name-sequence
+                        ctx
+                        unit
+                        (get descriptor "bodies" (list-of))
+                        child-scope
+                        state)))
+                  (walk-name-sequence
+                    ctx
+                    unit
+                    (ctfe-node-children node)
+                    scope
+                    state))))
+            (walk-name-sequence
+              ctx
+              unit
+              (ctfe-node-children node)
+              scope
+              state)))))
+    (resolve-name-roots
+      (lambda (ctx root state)
+        (bind (
+          (unit (ctfe-provider-unit ctx))
+          (scope (ctfe-provider-base-resolution-scope ctx))
+          (forms (ctfe-unit-top-level-forms unit))
+          (loop-state (map-of))
+        )
+          (do
+            (assoc loop-state "valid" true)
+            (if (eq (size forms) 0)
+              (resolve-name-node ctx unit root scope state)
+              (sequence-each
+                forms
+                (lambda (form)
+                  (if (get loop-state "valid" true)
+                    (resolve-name-node ctx unit form scope state)))))
+            null))))
+    (resolve-names-provider
+      (lambda (ctx root)
+        (bind (
+          (state (map-of))
+        )
+          (do
+            (assoc state "changed" false)
+            (resolve-name-roots ctx root state)
+            (get state "changed" false)))))
+  )
+    (ctfe-compiler-provider-register
+      compiler
+      "resolve_names"
+      "resolve_names"
+      resolve-names-provider
+      (list-of)
+      (list-of "read-ir" "read-facts" "read-symbols" "write-facts")
+      (assoc-many
+        (map-of)
+        "family" "resolve_names"
+        "reads" (list-of "ir" "facts" "symbols")
+        "writes" (list-of "facts")
+        "cache_scope" "unit"
+        "resume_policy" "never"))
+    (ctfe-compiler-provider-register
+      compiler
+      "resolve_names.after_resolve"
+      "normalize_after_resolve"
+      resolve-names-provider
+      (list-of)
+      (list-of "read-ir" "read-facts" "read-symbols" "write-facts")
+      (assoc-many
+        (map-of)
+        "family" "semantic_normalization"
+        "reads" (list-of "ir" "facts" "symbols")
+        "writes" (list-of "facts")
+        "cache_scope" "unit"
+        "resume_policy" "never")))
+  (bind (
+    (walk-block-sequence
+      (lambda (ctx nodes scope state)
+        (bind (
+          (loop-state (map-of))
+        )
+          (do
+            (assoc loop-state "valid" true)
+            (sequence-each
+              nodes
+              (lambda (node)
+                (if (get loop-state "valid" true)
+                  (resolve-block-node ctx node scope state))))
+            null))))
+    (resolve-block-node
+      (lambda (ctx node scope state)
+        (if (ctfe-node-is-call node)
+          (bind (
+            (control
+              (ctfe-provider-node-call-control-descriptor ctx node))
+          )
+            (if
+              (and
+                (not (eq control null))
+                (eq (get control "kind" null) "block"))
+              (bind (
+                (child-scope (map-merge scope))
+                (label (get control "label" null))
+              )
+                (do
+                  (if (not (eq label null))
+                    (assoc child-scope label node))
+                  (walk-block-sequence
+                    ctx
+                    (get control "values" (list-of))
+                    child-scope
+                    state)))
+              (do
+                (if
+                  (and
+                    (not (eq control null))
+                    (eq (get control "kind" null) "leave"))
+                  (bind (
+                    (label (get control "label" null))
+                    (target
+                      (if (eq label null)
+                        null
+                        (get scope label null)))
+                  )
+                    (if
+                      (and
+                        (not (eq target null))
+                        (eq (ctfe-node-resolved-block node null) null))
+                      (do
+                        (ctfe-meta-fact-set-by-key
+                          node
+                          "caap.fact.resolved_block"
+                          (ctfe-resolved-block-new target))
+                        (assoc state "changed" true)))))
+                (bind (
+                  (descriptor
+                    (ctfe-provider-node-call-scope-descriptor ctx node))
+                )
+                  (if (not (eq descriptor null))
+                    (do
+                      (walk-block-sequence
+                        ctx
+                        (get descriptor "binding_values" (list-of))
+                        scope
+                        state)
+                      (walk-block-sequence
+                        ctx
+                        (get descriptor "bodies" (list-of))
+                        scope
+                        state))
+                    (if (not (eq control null))
+                      (walk-block-sequence
+                        ctx
+                        (get control "values" (list-of))
+                        scope
+                        state)
+                      (walk-block-sequence
+                        ctx
+                        (ctfe-node-children node)
+                        scope
+                        state)))))))
+          (walk-block-sequence
+            ctx
+            (ctfe-node-children node)
+            scope
+            state))))
+    (resolve-block-roots
+      (lambda (ctx root state)
+        (bind (
+          (unit (ctfe-provider-unit ctx))
+          (forms (ctfe-unit-top-level-forms unit))
+          (loop-state (map-of))
+        )
+          (do
+            (assoc loop-state "valid" true)
+            (if (eq (size forms) 0)
+              (resolve-block-node ctx root (map-of) state)
+              (sequence-each
+                forms
+                (lambda (form)
+                  (if (get loop-state "valid" true)
+                    (resolve-block-node ctx form (map-of) state)))))
+            null))))
+    (resolve-blocks-provider
+      (lambda (ctx root)
+        (bind (
+          (state (map-of))
+        )
+          (do
+            (assoc state "changed" false)
+            (resolve-block-roots ctx root state)
+            (get state "changed" false)))))
+  )
+    (ctfe-compiler-provider-register
+      compiler
+      "resolve_blocks"
+      "resolve_names"
+      resolve-blocks-provider
+      (list-of)
+      (list-of "read-ir" "read-facts" "read-symbols" "write-facts")
+      (assoc-many
+        (map-of)
+        "family" "resolve_names"
+        "reads" (list-of "ir" "facts" "symbols")
+        "writes" (list-of "facts")
+        "cache_scope" "unit"
+        "resume_policy" "never"))))

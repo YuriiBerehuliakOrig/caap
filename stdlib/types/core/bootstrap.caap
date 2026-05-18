@@ -1,0 +1,111 @@
+(module "stdlib.types.core")
+
+(import-namespace "stdlib.sequence" "sequence")
+
+(export "stdlib.types.core")
+
+(bind (
+  (exports (map-of))
+  (semantics (map-of))
+  (get-any (get sequence "get" null))
+  (get-or-null (get sequence "get-or-null" null))
+  (fold-left (get sequence "fold-left" null))
+  (pure-semantics
+    (assoc-many (map-of) "phase" "dual" "effect" "pure" "pure" true))
+  (impure-semantics
+    (assoc-many (map-of) "phase" "dual" "effect" "impure" "pure" false))
+  (make-type
+    (lambda (kind key)
+      (assoc-many (map-of) "kind" kind "key" key)))
+  (type-kind
+    (lambda (type)
+      (get-or-null type "kind")))
+  (type-name
+    (lambda (type)
+      (get-or-null type "name")))
+  (type-key
+    (lambda (type)
+      (get-or-null type "key")))
+  (primitive-key
+    (lambda (name)
+      (string-concat-many "primitive:" name)))
+  (struct-key
+    (lambda (name)
+      (string-concat-many "struct:" name)))
+  (enum-key
+    (lambda (name)
+      (string-concat-many "enum:" name)))
+  (alias-key
+    (lambda (name)
+      (string-concat-many "alias:" name)))
+  (newtype-key
+    (lambda (name)
+      (string-concat-many "newtype:" name)))
+  (array-key
+    (lambda (element length)
+      (string-concat-many
+        "array:"
+        (int-to-string length)
+        ":"
+        (get-any element "key" ""))))
+  (type-param-key
+    (lambda (name)
+      (string-concat-many "type-param:" name)))
+  (generic-args-key
+    (lambda (args)
+      (fold-left
+        args
+        ""
+        (lambda (acc arg)
+          (bind (
+            (piece (type-key arg))
+          )
+            (if (eq acc "")
+              piece
+              (string-concat-many acc "," piece)))))))
+  (generic-key
+    (lambda (base args)
+      (string-concat-many
+        "generic:"
+        (type-key base)
+        "<"
+        (generic-args-key args)
+        ">")))
+)
+  (do
+    (assoc-many
+      semantics
+      "make-type" pure-semantics
+      "type-kind" pure-semantics
+      "type-name" pure-semantics
+      "type-key" pure-semantics
+      "primitive-key" pure-semantics
+      "struct-key" pure-semantics
+      "enum-key" pure-semantics
+      "alias-key" pure-semantics
+      "newtype-key" pure-semantics
+      "array-key" pure-semantics
+      "type-param-key" pure-semantics
+      "generic-key" pure-semantics)
+    (assoc-many
+      exports
+      "pure-semantics" pure-semantics
+      "impure-semantics" impure-semantics
+      "make-type" make-type
+      "type-kind" type-kind
+      "type-name" type-name
+      "type-key" type-key
+      "primitive-key" primitive-key
+      "struct-key" struct-key
+      "enum-key" enum-key
+      "alias-key" alias-key
+      "newtype-key" newtype-key
+      "array-key" array-key
+      "type-param-key" type-param-key
+      "generic-key" generic-key
+      "__contract_semantics__" semantics)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.types.core"
+      exports)
+    exports))

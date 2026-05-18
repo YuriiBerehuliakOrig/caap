@@ -1,0 +1,5 @@
+(module "stdlib.internal.kit-protocol")
+(export "stdlib.internal.kit-protocol")
+(do
+  (ctfe-compiler-execute-bootstrap-file compiler "impl.caap")
+  (ctfe-compiler-lookup-value compiler "stdlib.internal.kit-protocol"))

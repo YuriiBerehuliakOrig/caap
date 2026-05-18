@@ -1,0 +1,467 @@
+(module "stdlib.module")
+
+(import-namespace "stdlib.sequence" "sequence")
+
+(import-namespace "stdlib.builder" "builder")
+
+(import-namespace "stdlib.pass-kit" "pass-kit")
+
+(import-namespace "stdlib.build-events" "build-events")
+
+(export "stdlib.module")
+
+(export "stdlib.module.api")
+
+(export-as "register-root" "stdlib.module.register-root")
+
+(export-as
+  "publish-public-facade-module"
+  "stdlib.module.publish-public-facade-module")
+
+(export-as
+  "publish-host-module-from-contract"
+  "stdlib.module.publish-host-module-from-contract")
+
+(export-as "list-modules" "stdlib.module.list-modules")
+
+(export-as "summarize-root" "stdlib.module.summarize-root")
+
+(export-as "module-graph" "stdlib.module.module-graph")
+
+(export-as
+  "explain-module-graph"
+  "stdlib.module.explain-module-graph")
+
+(export-as "order-units" "stdlib.module.order-units")
+
+(export-as "prepare-root" "stdlib.module.prepare-root")
+
+(export-as "bind-provider" "stdlib.module.bind-provider")
+
+(export-as
+  "register-host-module"
+  "stdlib.module.register-host-module")
+
+(export-as "link-root" "stdlib.module.link-root")
+
+(export-as "check-root" "stdlib.module.check-root")
+
+(export-as "emit-root-llvm" "stdlib.module.emit-root-llvm")
+
+(export-as "run-source" "stdlib.module.run-source")
+
+(export-as "check-source" "stdlib.module.check-source")
+
+(export-as
+  "emit-source-llvm"
+  "stdlib.module.emit-source-llvm")
+
+(export-as "list-publics" "stdlib.module.list-publics")
+
+(export-as "explain-public" "stdlib.module.explain-public")
+
+(export-as
+  "explain-root-public"
+  "stdlib.module.explain-root-public")
+
+(export-as
+  "resolve-public-provider"
+  "stdlib.module.resolve-public-provider")
+
+(export-as
+  "imported-symbol?"
+  "stdlib.module.imported-symbol?")
+
+;; --- Implementation note: internal/ sub-files ---
+;;
+;; Files under stdlib/module/internal/ and the .caap files below are NOT
+;; independent modules. They are loaded sequentially by this bootstrap via
+;; ctfe-compiler-execute-bootstrap-file and share the same CTFE compiler
+;; registry state. Each sub-file reads stdlib.sequence, stdlib.pass-kit,
+;; stdlib.codegen-kit, etc. directly from the registry — those modules are
+;; guaranteed to be present because this module's top-level import declarations
+;; declare them, so the loader ensures they are registered before this file runs.
+;;
+;; Load order is declared as a small dependency graph. The graph validator lives
+;; in stdlib/module/bootstrap_plan.caap and keeps stdlib boot order explicit
+;; without moving package semantics into Python core.
+(bind (
+  (bootstrap-entry
+    (ctfe-compiler-lookup-value compiler "stdlib.module.bootstrap-plan-entry"))
+  (order-bootstrap-plan
+    (ctfe-compiler-lookup-value compiler "stdlib.module.order-bootstrap-plan"))
+)
+  (ctfe-compiler-execute-bootstrap-files
+    compiler
+    (order-bootstrap-plan
+      (list-of
+        (bootstrap-entry "internal/common_constants.caap" (list-of))
+        (bootstrap-entry
+          "internal/common.caap"
+          (list-of "internal/common_constants.caap"))
+        (bootstrap-entry
+          "internal/passes.caap"
+          (list-of "internal/common.caap"))
+        (bootstrap-entry "events.caap" (list-of))
+        (bootstrap-entry
+          "ordering.caap"
+          (list-of "internal/common.caap" "events.caap"))
+        (bootstrap-entry
+          "internal/runtime_registration.caap"
+          (list-of "internal/common.caap"))
+        (bootstrap-entry
+          "runtime_support.caap"
+          (list-of "internal/common.caap" "events.caap" "internal/runtime_registration.caap"))
+        (bootstrap-entry
+          "publics.caap"
+          (list-of "runtime_support.caap"))
+        (bootstrap-entry
+          "summaries.caap"
+          (list-of "runtime_support.caap"))
+        (bootstrap-entry
+          "graphs.caap"
+          (list-of "summaries.caap" "events.caap"))))))
+
+(bind (
+  ;; --- internal module bundles ---
+  (module-passes
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.passes"))
+  (module-runtime-support
+    (ctfe-compiler-lookup-value compiler "stdlib.module.runtime_support"))
+  (module-publics
+    (ctfe-compiler-lookup-value compiler "stdlib.module.publics"))
+  (module-summaries
+    (ctfe-compiler-lookup-value compiler "stdlib.module.summaries"))
+  (module-ordering
+    (ctfe-compiler-lookup-value compiler "stdlib.module.ordering"))
+  (module-graphs
+    (ctfe-compiler-lookup-value compiler "stdlib.module.graphs"))
+  (module-root-loading
+    (ctfe-compiler-lookup-value compiler "stdlib.module.root_loading"))
+  (stdlib-modules-api
+    (ctfe-compiler-lookup-value compiler "stdlib.module.seed.api"))
+  (module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.prelude-bindings"))
+  ;; --- shared helpers ---
+  (get-any (get sequence "get" null))
+  (each (get sequence "each" null))
+  (export-entry
+    (get-any module-helpers "export-entry" null))
+  (build-export-table
+    (get-any module-helpers "build-export-table" null))
+  (register-provider
+    (get pass-kit "register-provider" null))
+  (bootstrap-entry
+    (ctfe-compiler-lookup-value compiler "stdlib.module.bootstrap-plan-entry"))
+  (order-bootstrap-plan
+    (ctfe-compiler-lookup-value compiler "stdlib.module.order-bootstrap-plan"))
+  ;; --- module state and normalization passes ---
+  (module-state
+    (get-any module-runtime-support "state" null))
+  (registry (get-any module-state "registry" null))
+  (project-pass (get-any module-passes "project-pass" null))
+  (make-validate-pass
+    (get-any module-passes "make-validate-pass" null))
+  (strip-pass (get-any module-passes "strip-pass" null))
+  (validate-pass (make-validate-pass module-state))
+  ;; --- runtime root API ---
+  (prepare-root
+    (get-any module-runtime-support "prepare-root" null))
+  (register-root
+    (get-any module-runtime-support "register-root" null))
+  (bind-provider
+    (get-any module-runtime-support "bind-provider" null))
+  (register-host-module
+    (get-any module-runtime-support "register-host-module" null))
+  (publish-public-facade-module
+    (get-any
+      module-runtime-support
+      "publish-public-facade-module"
+      null))
+  (publish-host-module-from-contract
+    (get-any
+      module-runtime-support
+      "publish-host-module-from-contract"
+      null))
+  (link-root
+    (get-any module-runtime-support "link-root" null))
+  (scan-roots
+    (get-any module-runtime-support "scan-roots" null))
+  (make-runtime-root-commands
+    (get-any
+      module-root-loading
+      "make-runtime-root-commands"
+      null))
+  ;; --- public/query API ---
+  (list-modules
+    (get-any module-runtime-support "list-modules" null))
+  (list-publics
+    (get-any module-publics "list-publics" null))
+  (explain-public
+    (get-any module-publics "explain-public" null))
+  (explain-root-public
+    (get-any module-publics "explain-root-public" null))
+  (resolve-public-provider
+    (get-any module-publics "resolve-public-provider" null))
+  (imported-symbol?
+    (get-any module-publics "imported-symbol?" null))
+  (summarize-root
+    (get-any module-summaries "summarize-root" null))
+  (root-commands
+    (make-runtime-root-commands
+      scan-roots
+      prepare-root
+      summarize-root
+      register-root
+      bind-provider
+      link-root
+      (get-any stdlib-modules-api "load-module" null)
+      (get-any stdlib-modules-api "module-record" null)))
+  (module-run-from-root
+    (get-any root-commands "run-from-root" null))
+  (check-root (get-any root-commands "check-root" null))
+  (emit-root-llvm
+    (get-any root-commands "emit-root-llvm" null))
+  (module-run-source
+    (get-any root-commands "run-source" null))
+  (check-source (get-any root-commands "check-source" null))
+  (emit-source-llvm
+    (get-any root-commands "emit-source-llvm" null))
+  (module-graph (get-any module-graphs "module-graph" null))
+  (explain-module-graph
+    (get-any module-graphs "explain-module-graph" null))
+  (order-units (get-any module-ordering "order-units" null))
+  ;; --- API contract semantics ---
+  (impure-helper-semantics
+    (assoc-many
+      (map-of)
+      "phase" "compile_time"
+      "effect" "impure"
+      "pure" false
+      "truth_kind" "helper"))
+  (pure-helper-semantics
+    (assoc-many
+      (map-of)
+      "phase" "compile_time"
+      "effect" "pure"
+      "pure" true
+      "truth_kind" "helper"))
+  ;; --- exported module API table ---
+  (api-entries
+    (list-of
+      (export-entry
+        "prepare-root"
+        prepare-root
+        impure-helper-semantics)
+      (export-entry
+        "register-root"
+        register-root
+        impure-helper-semantics)
+      (export-entry
+        "bind-provider"
+        bind-provider
+        impure-helper-semantics)
+      (export-entry
+        "register-host-module"
+        register-host-module
+        impure-helper-semantics)
+      (export-entry
+        "publish-public-facade-module"
+        publish-public-facade-module
+        impure-helper-semantics)
+      (export-entry
+        "publish-host-module-from-contract"
+        publish-host-module-from-contract
+        impure-helper-semantics)
+      (export-entry "link-root" link-root impure-helper-semantics)
+      (export-entry
+        "scan-roots"
+        scan-roots
+        impure-helper-semantics)
+      (export-entry
+        "run-from-root"
+        module-run-from-root
+        impure-helper-semantics)
+      (export-entry
+        "check-root"
+        check-root
+        impure-helper-semantics)
+      (export-entry
+        "emit-root-llvm"
+        emit-root-llvm
+        impure-helper-semantics)
+      (export-entry
+        "run-source"
+        module-run-source
+        impure-helper-semantics)
+      (export-entry
+        "check-source"
+        check-source
+        impure-helper-semantics)
+      (export-entry
+        "emit-source-llvm"
+        emit-source-llvm
+        impure-helper-semantics)
+      (export-entry
+        "list-modules"
+        list-modules
+        pure-helper-semantics)
+      (export-entry
+        "list-publics"
+        list-publics
+        pure-helper-semantics)
+      (export-entry
+        "explain-public"
+        explain-public
+        pure-helper-semantics)
+      (export-entry
+        "explain-root-public"
+        explain-root-public
+        pure-helper-semantics)
+      (export-entry
+        "resolve-public-provider"
+        resolve-public-provider
+        pure-helper-semantics)
+      (export-entry
+        "imported-symbol?"
+        imported-symbol?
+        pure-helper-semantics)
+      (export-entry
+        "summarize-root"
+        summarize-root
+        pure-helper-semantics)
+      (export-entry
+        "module-graph"
+        module-graph
+        pure-helper-semantics)
+      (export-entry
+        "explain-module-graph"
+        explain-module-graph
+        pure-helper-semantics)
+      (export-entry
+        "order-units"
+        order-units
+        pure-helper-semantics)))
+  (module-api (build-export-table api-entries))
+  (provider-entry
+    (lambda
+      (name
+        callback
+        requires
+        effects
+        reads
+        writes
+        required-facts
+        produced-facts)
+      (assoc-many
+        (map-of)
+        "name" name
+        "stage" "normalize_before_resolve"
+        "callback" callback
+        "requires" requires
+        "effects" effects
+        "required_facts" required-facts
+        "produced_facts" produced-facts
+        "spec"
+          (assoc-many
+            (map-of)
+            "family" "semantic_normalization"
+            "reads" reads
+            "writes" writes
+            "required_facts" required-facts
+            "produced_facts" produced-facts
+            "cache_scope" "unit"
+            "resume_policy" "safe"))))
+  (register-provider-pipeline
+    (lambda (entries)
+      (bind (
+        (provider-index (map-of))
+        (plan (list-of))
+      )
+        (do
+          (each entries
+            (lambda (entry)
+              (bind (
+                (name (get-any entry "name" null))
+                (requires
+                  (get-any entry "requires" (list-of)))
+              )
+                (do
+                  (assoc provider-index name entry)
+                  (append plan (bootstrap-entry name requires))))))
+          (each (order-bootstrap-plan plan)
+            (lambda (name)
+              (bind (
+                (entry (get-any provider-index name null))
+              )
+                (register-provider
+                  name
+                  (get-any entry "stage" null)
+                  (get-any entry "callback" null)
+                  (get-any entry "requires" (list-of))
+                  (get-any entry "effects" (list-of))
+                  (get-any entry "spec" (map-of))))))
+          null))))
+)
+  (do
+    (each api-entries
+      (lambda (entry)
+        (bind (
+          (name (get-any entry "name" null))
+          (implementation (get-any entry "value" null))
+        )
+          (ctfe-compiler-register-value
+            compiler
+            (string-concat-many "stdlib.module." name)
+            implementation))))
+    (register-provider-pipeline
+      (list-of
+        (provider-entry
+          "stdlib.module.project"
+          project-pass
+          (list-of)
+          (list-of
+            "read-ir"
+            "read-facts"
+            "read-attributes"
+            "read-symbols"
+            "write-ir"
+            "write-facts"
+            "write-attributes"
+            "write-symbols"
+            "emit-diagnostics")
+          (list-of "ir" "facts" "attributes" "symbols")
+          (list-of "ir" "facts" "attributes" "symbols" "diagnostics")
+          (list-of "stdlib.module.manifest")
+          (list-of "stdlib.module.interface" "stdlib.module.runtime-model"))
+        (provider-entry
+          "stdlib.module.validate"
+          validate-pass
+          (list-of "stdlib.module.project")
+          (list-of "read-ir" "read-facts" "read-attributes" "write-facts" "emit-diagnostics")
+          (list-of "ir" "facts" "attributes")
+          (list-of "facts" "diagnostics")
+          (list-of "stdlib.module.interface" "stdlib.module.runtime-model")
+          (list-of "stdlib.module.valid"))
+        (provider-entry
+          "stdlib.module.strip"
+          strip-pass
+          (list-of "stdlib.module.validate")
+          (list-of "read-ir" "read-facts" "read-attributes" "write-ir" "write-attributes")
+          (list-of "ir" "facts" "attributes")
+          (list-of "ir" "attributes")
+          (list-of "stdlib.module.valid")
+          (list-of "stdlib.module.cleaned-ir"))))
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.module.api"
+      module-api)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.module.internal.state"
+      module-state)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.module.internal.imported-symbol?"
+      imported-symbol?)
+    null))

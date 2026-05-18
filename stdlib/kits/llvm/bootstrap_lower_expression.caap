@@ -1,0 +1,22 @@
+; Lowering helpers are intentionally split by expression category.
+; Keep this file as the ordering boundary for LLVM lowering registration.
+(do
+  (ctfe-compiler-execute-bootstrap-file
+    compiler
+    "bootstrap_lower_context.caap")
+  (ctfe-compiler-execute-bootstrap-file
+    compiler
+    "bootstrap_lower_bind.caap")
+  (ctfe-compiler-execute-bootstrap-file
+    compiler
+    "bootstrap_lower_scalar_calls.caap")
+  (ctfe-compiler-execute-bootstrap-file
+    compiler
+    "bootstrap_lower_aggregates.caap")
+  (ctfe-compiler-execute-bootstrap-file
+    compiler
+    "bootstrap_lower_control.caap")
+  (get
+    (ctfe-compiler-lookup-value compiler "stdlib.llvm" null)
+    "_lower-expression-v1"
+    null))

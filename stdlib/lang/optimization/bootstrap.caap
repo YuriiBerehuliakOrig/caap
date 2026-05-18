@@ -1,0 +1,319 @@
+(module "stdlib.optimization")
+
+(import-namespace "stdlib.pass-kit" "pass-kit")
+
+(import-namespace "stdlib.sequence" "sequence")
+
+(import-namespace "stdlib.builder" "builder")
+
+(export "stdlib.optimization")
+
+; stdlib/optimization/bootstrap.caap
+; CAAP-owned semantic-normalization orchestration over the shared Python evaluator substrate.
+(bind (
+  (module-exports (map-of))
+  (module-semantics (map-of))
+  (is-null? (get sequence "is-null?" null))
+  (not-null? (get sequence "not-null?" null))
+  (registered-rewrite-rules (list-of))
+  (each (get sequence "each" null))
+  (each-indexed (get sequence "each-indexed" null))
+  (find-reverse (get sequence "find-reverse" null))
+  (length (get sequence "length" null))
+  (at (get sequence "at" null))
+  (call-with-head? (get builder "call-with-head?" null))
+  (replace-one (get pass-kit "replace-one" null))
+  (rewrite-result (get pass-kit "rewrite-result" null))
+  (unchanged-summary
+    (get pass-kit "unchanged-summary" null))
+  (summary-empty (get pass-kit "summary-empty" null))
+  (summary-merge (get pass-kit "summary-merge" null))
+  (summary-changed? (get pass-kit "summary-changed?" null))
+  (summary-relabel (get pass-kit "summary-relabel" null))
+  (fold-compile-time-call
+    (get pass-kit "fold-compile-time-call" null))
+  (top-level-forms (get pass-kit "top-level-forms" null))
+  (walk-postorder (get pass-kit "walk-postorder" null))
+  (rule-entry
+    (lambda (name handler)
+      (assoc-many (map-of) "name" name "handler" handler)))
+  (register-rewrite-rule
+    (lambda (name handler)
+      (bind (
+        (entry (rule-entry name handler))
+      )
+        (do
+          (append registered-rewrite-rules entry)
+          entry))))
+  (rewrite-rules
+    (lambda ()
+      registered-rewrite-rules))
+  (rule-name
+    (lambda (rule)
+      (get rule "name" "anonymous-rewrite-rule")))
+  (rule-handler
+    (lambda (rule)
+      (get rule "handler" null)))
+  (ir-name
+    (lambda (identifier)
+      (ctfe-ir-instantiate
+        "name"
+        (assoc-many (map-of) "identifier" identifier))))
+  (ir-literal
+    (lambda (value)
+      (ctfe-ir-instantiate
+        "literal"
+        (assoc-many (map-of) "value" value))))
+  (ir-call
+    (lambda (callee args)
+      (ctfe-ir-instantiate
+        "call"
+        (assoc-many (map-of) "callee" (ir-name callee) "args" args))))
+  (node-spec
+    (lambda (node)
+      (ctfe-node-to-spec node)))
+  (literal-null?
+    (lambda (node)
+      (and
+        (ctfe-node-is-literal node)
+        (is-null? (ctfe-node-literal-value node)))))
+  (flatten-do-args
+    (lambda (args state)
+      (bind (
+        (out (list-of))
+      )
+        (do
+          (each args
+            (lambda (arg)
+              (if (call-with-head? arg "do")
+                (do
+                  (assoc state "nested_do" true)
+                  (each (ctfe-node-call-args arg)
+                    (lambda (child)
+                      (append out (node-spec child)))))
+                (append out (node-spec arg)))))
+          out))))
+  (filter-non-terminal-nulls
+    (lambda (items state)
+      (bind (
+        (out (list-of))
+        (count (length items))
+        (last-index (int-sub count 1))
+      )
+        (do
+          (each-indexed
+            items
+            (lambda (item index)
+              (if (and (value-lt index last-index) (literal-null? item))
+                (assoc state "removed_null" true)
+                (append out item))))
+          out))))
+  (canonical-bind-rule
+    (lambda (ctx node)
+      (if (not (call-with-head? node "bind"))
+        false
+        (bind (
+          (args (ctfe-node-call-args node))
+          (count (length args))
+        )
+          (if (eq count 1)
+            (node-spec (at args 0))
+            false)))))
+  (canonical-do-rule
+    (lambda (ctx node)
+      (if (not (call-with-head? node "do"))
+        false
+        (bind (
+          (state (map-of))
+          (args (ctfe-node-call-args node))
+          (flattened (flatten-do-args args state))
+          (filtered
+            (filter-non-terminal-nulls flattened state))
+          (count (length filtered))
+        )
+          (if (eq count 0)
+            (ir-literal null)
+            (if (eq count 1)
+              (at filtered 0)
+              (if
+                (or
+                  (get state "nested_do" false)
+                  (get state "removed_null" false))
+                (ir-call "do" filtered)
+                false)))))))
+  (canonical-if-rule
+    (lambda (ctx node)
+      (if (not (call-with-head? node "if"))
+        false
+        (bind (
+          (args (ctfe-node-call-args node))
+          (count (length args))
+        )
+          (if (value-lt count 1)
+            false
+            (bind (
+              (condition (at args 0))
+            )
+              (if (ctfe-node-is-literal condition)
+                (if (ctfe-node-literal-value condition)
+                  (if (value-lt 1 count)
+                    (node-spec (at args 1))
+                    (ir-literal null))
+                  (if (value-lt 2 count)
+                    (node-spec (at args 2))
+                    (ir-literal null)))
+                (if (value-lt 2 count)
+                  (bind (
+                    (then-spec (node-spec (at args 1)))
+                    (else-spec (node-spec (at args 2)))
+                  )
+                    (if (eq then-spec else-spec)
+                      (ir-call "do" (list-of (node-spec condition) then-spec))
+                      false))
+                  false))))))))
+  (normalize-rule-summary
+    (lambda (name node value)
+      (if (value-is-map value)
+        (summary-relabel name value)
+        (if (or (is-null? value) (eq value false))
+          (unchanged-summary name node)
+          null))))
+  (apply-rule-result
+    (lambda (ctx node name value)
+      (bind (
+        (summary (normalize-rule-summary name node value))
+      )
+        (if (not-null? summary)
+          summary
+          (summary-relabel name (replace-one ctx node value))))))
+  (apply-registered-rules-to-node
+    (lambda (ctx node)
+      (bind (
+        (state (map-of))
+        (apply-rule
+          (lambda (rule)
+            (bind (
+              (name (rule-name rule))
+              (handler (rule-handler rule))
+            )
+              (if (is-null? handler)
+                false
+                (bind (
+                  (result
+                    (ctfe-provider-invoke-callback ctx handler ctx node))
+                  (step
+                    (apply-rule-result ctx node name result))
+                )
+                  (if (summary-changed? step)
+                    (do
+                      (assoc state "result" step)
+                      true)
+                    false))))))
+      )
+        (do
+          (assoc state "result" null)
+          (find-reverse registered-rewrite-rules apply-rule)
+          (if (is-null? (get state "result" null))
+            (unchanged-summary "registered_rewrites" node)
+            (get state "result" null))))))
+  (fold-node
+    (lambda (ctx node)
+      (bind (
+        (result-node (fold-compile-time-call ctx node))
+      )
+        (if (eq result-node node)
+          (unchanged-summary "fold_compile_time_call" node)
+          (rewrite-result
+            "fold_compile_time_call"
+            true
+            result-node
+            1
+            0
+            null)))))
+  (rewrite-node
+    (lambda (ctx node)
+      (bind (
+        (rewrite-step
+          (apply-registered-rules-to-node ctx node))
+      )
+        (if (summary-changed? rewrite-step)
+          rewrite-step
+          (fold-node ctx node)))))
+  (run-postorder-pass
+    (lambda (ctx root)
+      (bind (
+        (steps (list-of))
+        (forms (top-level-forms ctx))
+      )
+        (do
+          (if (eq (length forms) 0)
+            (walk-postorder
+              ctx
+              root
+              (lambda (node)
+                (append steps (rewrite-node ctx node))))
+            (each forms
+              (lambda (form)
+                (walk-postorder
+                  ctx
+                  form
+                  (lambda (node)
+                    (append steps (rewrite-node ctx node)))))))
+          (summary-merge "semantic_normalization" steps root)))))
+  (workflow
+    (lambda (ctx root)
+      (if (eq (length registered-rewrite-rules) 0)
+        (run-postorder-pass ctx root)
+        (bind (
+          (first-pass (run-postorder-pass ctx root))
+        )
+          (if (summary-changed? first-pass)
+            (bind (
+              (second-root
+                (ctfe-unit-root (ctfe-provider-unit ctx)))
+            )
+              (summary-merge
+                "semantic_normalization"
+                (list-of first-pass (run-postorder-pass ctx second-root))
+                second-root))
+            first-pass)))))
+)
+  (do
+    (register-rewrite-rule
+      "stdlib.optimization.canonical-bind"
+      canonical-bind-rule)
+    (register-rewrite-rule
+      "stdlib.optimization.canonical-do"
+      canonical-do-rule)
+    (register-rewrite-rule
+      "stdlib.optimization.canonical-if"
+      canonical-if-rule)
+    (assoc-many
+      module-semantics
+      "semantic-normalization"
+        (assoc-many (map-of) "phase" "compile_time" "effect" "mutates_ir")
+      "semantic-normalization-workflow"
+        (assoc-many (map-of) "phase" "compile_time" "effect" "mutates_ir")
+      "register-rewrite-rule"
+        (assoc-many (map-of) "phase" "compile_time" "effect" "mutates_ir")
+      "rewrite-rules"
+        (assoc-many (map-of) "phase" "compile_time" "effect" "pure"))
+    (assoc-many
+      module-exports
+      "semantic-normalization-workflow" workflow
+      "register-rewrite-rule" register-rewrite-rule
+      "rewrite-rules" rewrite-rules
+      "semantic-normalization"
+        (lambda (ctx root)
+          (summary-changed? (workflow ctx root)))
+      "__contract_semantics__" module-semantics)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.optimization"
+      module-exports)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.optimization.semantic-normalization"
+      (lambda (ctx root)
+        (summary-changed? (workflow ctx root))))
+    module-exports))

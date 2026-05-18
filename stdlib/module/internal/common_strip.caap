@@ -1,0 +1,52 @@
+(bind (
+  (sequence
+    (ctfe-compiler-lookup-value compiler "stdlib.sequence"))
+  (builder
+    (ctfe-compiler-lookup-value compiler "stdlib.builder"))
+  (pass-kit
+    (ctfe-compiler-lookup-value compiler "stdlib.pass-kit"))
+  (get-or-null (get sequence "get-or-null" null))
+  (not-null? (get sequence "not-null?" null))
+  (literal (get builder "literal" null))
+  (top-level-form? (get builder "top-level-form?" null))
+  (replace-one (get pass-kit "replace-one" null))
+  (erase-node (get pass-kit "erase-node" null))
+  (strip-one
+    (lambda (ctx root node changed-state root-replaced-state)
+      (bind (
+        (parent (ctfe-node-parent node))
+      )
+        (if (top-level-form? node root)
+          (do
+            (erase-node ctx node)
+            (assoc changed-state "value" true))
+          (if
+            (and
+              (not-null? parent)
+              (eq (ctfe-node-id parent) (ctfe-node-id root)))
+            (do
+              (erase-node ctx node)
+              (assoc changed-state "value" true))
+            (do
+              (replace-one ctx node (literal null null))
+              (assoc changed-state "value" true)))))))
+  (strip-one-summary
+    (lambda (ctx root node)
+      (bind (
+        (parent (ctfe-node-parent node))
+      )
+        (if (top-level-form? node root)
+          (erase-node ctx node)
+          (if
+            (and
+              (not-null? parent)
+              (eq (ctfe-node-id parent) (ctfe-node-id root)))
+            (erase-node ctx node)
+            (replace-one ctx node (literal null null)))))))
+  (exports
+    (assoc-many (map-of) "strip-one" strip-one "strip-one-summary" strip-one-summary))
+)
+  (ctfe-compiler-register-value
+    compiler
+    "stdlib.module.internal.common-strip"
+    exports))

@@ -1,0 +1,323 @@
+;;; ====================================================================
+;;; Приклад: Самодостатній пас перевірки чистоти (Purity Pass)
+;;; Демонструє реєстрацію кастомного пасу компілятора в тому ж файлі,
+;;; що й код, який перевіряється.
+;;; ====================================================================
+
+(module "example.purity-pass-demo")
+
+(import-symbols "sys.io" "println")
+(import-symbols "stdlib.pass-kit" "stdlib.pass-kit")
+(import-symbols "stdlib.builder" "stdlib.builder")
+
+;;; --------------------------------------------------------------------
+;;; РЕАЛІЗАЦІЯ ТА РЕЄСТРАЦІЯ ПАСУ (Compile-Time)
+;;; --------------------------------------------------------------------
+
+(stdlib.pass-kit.register-compile-time-function
+  "example.purity-pass.check-now"
+  (bind (
+    ; Provider registration
+    (invocation-message
+      "pipeline invocation: example.purity-pass.check")
+    (manual-invocation-message
+      "manual invocation: example.purity-pass.check-now")
+    (seen-diagnostics (map-of))
+    (purity-pass-implementation
+      (lambda (ctx root-or-node invocation-label)
+        (bind (
+          ; Config
+          (config
+            (assoc-many
+              (map-of)
+              "impure_call_severity" "warning"
+              "unknown_effect_severity" "warning"
+              "strict_unknown_effects" false
+              "check_main" false))
+          (impure-suggestion
+            "mark callee as pure, remove the side effect, or refactor the function")
+          (unknown-suggestion
+            "ensure the callee is resolved and has effect metadata before this pass runs")
+          (invocation-suggestion
+            "same CAAP pass function was invoked from the compiler pipeline and from main")
+          (emit-error (get stdlib.pass-kit "emit-error" null))
+          (emit-warning (get stdlib.pass-kit "emit-warning" null))
+          (emit-note (get stdlib.pass-kit "emit-note" null))
+          (top-level-forms (get stdlib.pass-kit "top-level-forms" null))
+          (call-effect-policy (get stdlib.pass-kit "call-effect-policy" null))
+          (cfg
+            (lambda (key default)
+              (get config key default)))
+          (strict-unknown?
+            (cfg "strict_unknown_effects" false))
+          (impure-severity
+            (cfg "impure_call_severity" "warning"))
+          (unknown-severity
+            (if strict-unknown?
+              "error"
+              (cfg "unknown_effect_severity" "warning")))
+          (transparent-forms
+            (assoc-many (map-of) "bind" true "do" true "if" true "and" true "or" true "lambda" true))
+          ; Diagnostics
+          (diagnostic-key
+            (lambda (code node)
+              (string-concat-many
+                code
+                ":"
+                (int-to-string (get node "id" 0)))))
+          (emit-once
+            (lambda (severity node message code suggestion)
+              (bind (
+                (key (diagnostic-key code node))
+              )
+                (if (not (contains seen-diagnostics key))
+                  (do
+                    (assoc seen-diagnostics key true)
+                    (if (eq severity "error")
+                      (emit-error ctx node message code)
+                      (if (eq severity "warning")
+                        (emit-warning ctx node message code)
+                        (emit-note ctx node message code))))))))
+          (emit-invocation-note
+            (lambda ()
+              (emit-once
+                "note"
+                root-or-node
+                (string-concat-many "example.purity.invocation: " invocation-label)
+                "example.purity.invocation"
+                invocation-suggestion)))
+          ; Call inspection
+          (manual-invocation?
+            (lambda ()
+              (eq
+                (stdlib.builder.call-head-name root-or-node "")
+                "example.purity-pass.check-now")))
+          (callee
+            (lambda (node)
+              (stdlib.builder.call-head-name node "<unknown>")))
+          (transparent?
+            (lambda (name)
+              (contains transparent-forms name)))
+          (effect-of
+            (lambda (node)
+              (call-effect-policy node null)))
+          (report-unknown
+            (lambda (fn node callee)
+              (emit-once
+                unknown-severity
+                node
+                (string-concat-many
+                  "example.purity.unknown_effect: function '"
+                  fn
+                  "' purity is unknown: call to '"
+                  callee
+                  "' is missing effect metadata")
+                "example.purity.unknown_effect"
+                unknown-suggestion)))
+          (report-impure
+            (lambda (fn node callee effect)
+              (emit-once
+                impure-severity
+                node
+                (string-concat-many
+                  "example.purity.impure_call_in_function: function '"
+                  fn
+                  "' is not pure: call to '"
+                  callee
+                  "' has effect '"
+                  effect
+                  "'")
+                "example.purity.impure_call_in_function"
+                impure-suggestion)))
+          
+          ;;; ПЕРЕВІРКА ОДИНИЧНОГО ВИКЛИКУ
+          ; Перевіряє ефект виклику (чистий/нечистий) та генерує діагностику
+          (inspect-call
+            (lambda (fn node)
+              (if (not (eq (stdlib.builder.call-shape node null) null))
+                (bind (
+                  (name (callee node))
+                  (effect (effect-of node))
+                )
+                  (if (not (transparent? name))
+                    (if (eq effect null)
+                      (report-unknown fn node name)
+                      (if (not (eq effect "pure"))
+                        (report-impure fn node name effect))))))))
+          ; Function body traversal
+          (nested-lambda?
+            (lambda (body-root node)
+              (and
+                (not (eq (get body-root "id" null) (get node "id" null)))
+                (not (eq (stdlib.builder.lambda-shape node null) null)))))
+          
+          ;;; ОБХІД ТІЛА ФУНКЦІЇ
+          ; Рекурсивно обходить AST тіла функції та шукає нечисті виклики
+          (walk-body
+            (lambda (self fn body-root node)
+              (if (not (nested-lambda? body-root node))
+                (bind (
+                  (shape (stdlib.builder.call-shape node null))
+                  (children
+                    (if (eq shape null)
+                      (list-of)
+                      (get shape "args" (list-of))))
+                  (child-count (size children))
+                  (walk-child
+                    (lambda (walk-self index)
+                      (if (value-lt index child-count)
+                        (do
+                          (self self fn body-root (get children index null))
+                          (walk-self walk-self (int-add index 1))))))
+                )
+                  (do
+                    (inspect-call fn node)
+                    (walk-child walk-child 0))))))
+          (summary-effect
+            (lambda (value-node)
+              (bind (
+                (summary
+                  (stdlib.pass-kit.annotation-get
+                    value-node
+                    "caap.decl.function_attribute_inference"
+                    null))
+              )
+                (if (eq summary null)
+                  null
+                  (get (get summary "inferred" (map-of)) "effect" null)))))
+          (check-body
+            (lambda (fn value-node body)
+              (bind (
+                (effect (summary-effect value-node))
+              )
+                (if (eq effect null)
+                  (walk-body walk-body fn body body)
+                  (if (not (eq effect "pure"))
+                    (emit-once
+                      impure-severity
+                      value-node
+                      (string-concat-many
+                        "example.purity.impure_call_in_function: function '"
+                        fn
+                        "' is not pure: inferred function effect '"
+                        effect
+                        "'")
+                      "example.purity.impure_call_in_function"
+                      impure-suggestion))))))
+          ; Binding/form traversal
+          (checked?
+            (lambda (fn)
+              (or (not (eq fn "main")) (cfg "check_main" false))))
+          (check-binding
+            (lambda (binding)
+              (bind (
+                (fn (get binding "name" null))
+                (value-node (get binding "value" null))
+                (lambda-shape
+                  (stdlib.builder.lambda-shape value-node null))
+              )
+                (if
+                  (and
+                    (not (eq fn null))
+                    (checked? fn)
+                    (not (eq lambda-shape null)))
+                  (check-body fn value-node (get lambda-shape "body" null))))))
+          (check-bindings
+            (lambda (bindings index count)
+              (if (value-lt index count)
+                (do
+                  (check-binding (get bindings index null))
+                  (check-bindings bindings (int-add index 1) count)))))
+          (check-form
+            (lambda (form)
+              (bind (
+                (shape
+                  (stdlib.builder.bind-shape form null))
+                (bindings
+                  (if (eq shape null)
+                    (list-of)
+                    (get shape "bindings" (list-of))))
+              )
+                (if (not (eq shape null))
+                  (check-bindings bindings 0 (size bindings))))))
+          (walk-forms
+            (lambda (self index)
+              (bind (
+                (forms
+                  (top-level-forms ctx))
+                (count (size forms))
+              )
+                (if (value-lt index count)
+                  (do
+                    (check-form (get forms index null))
+                    (self self (int-add index 1)))))))
+        )
+          (do
+            (emit-invocation-note)
+            (if (not (manual-invocation?))
+              (walk-forms walk-forms 0))
+            false))))
+    (purity-provider
+      (lambda (ctx root)
+        (purity-pass-implementation ctx root invocation-message)))
+    (purity-check-now
+      (lambda (ctx node)
+        (purity-pass-implementation ctx node manual-invocation-message)))
+  )
+    (do
+      (stdlib.pass-kit.register-provider
+        "example.purity-pass.check"
+        "validate_graph"
+        purity-provider
+        (list-of "validate_graph")
+        (list-of "read-ir" "read-facts" "read-attributes" "emit-diagnostics")
+        (stdlib.pass-kit.provider-spec
+          "validate_graph"
+          (list-of "ir" "facts" "attributes")
+          (list-of "diagnostics")
+          "none"
+          "safe"
+          null))
+      purity-check-now)))
+
+;;; ====================================================================
+;;; ТЕСТОВИЙ КОД (Код, який перевіряється пасом)
+;;; ====================================================================
+
+(bind (
+  (pure-add
+    (lambda (left right)
+      (int-add left right)))
+  (pure-control
+    (lambda (value)
+      (if (value-lt value 0)
+        (do
+          (pure-add value 1))
+        (pure-add value 2))))
+  (pure-with-nested-lambda
+    (lambda (value)
+      (bind (
+        (unused-impure-closure
+          (lambda (inner)
+            (println 0)))
+      )
+        (pure-add value 3))))
+  (pure-recursive
+    (lambda (n)
+      (if (value-lt n 1)
+        0
+        (pure-recursive (int-sub n 1)))))
+  (impure-print
+    (lambda (value)
+      (do
+        (println 41)
+        value)))
+  (main
+    (lambda ()
+      (do
+        (example.purity-pass.check-now)
+        (impure-print (pure-control 40))
+        (println (pure-add (pure-with-nested-lambda 1) (pure-recursive 2)))
+        0)))
+)
+  (main))

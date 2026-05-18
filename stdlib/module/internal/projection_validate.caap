@@ -1,0 +1,369 @@
+(ctfe-compiler-execute-bootstrap-file
+  compiler
+  "common.caap")
+
+(bind (
+  (module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.prelude-bindings"))
+  (common-keys
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.common-keys"))
+  (common-records
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.common-records"))
+  (get-any (get module-helpers "get-any" null))
+  (is-null? (get-any module-helpers "is-null?" null))
+  (get-or-null (get-any module-helpers "get-or-null" null))
+  (require-helper
+    (get-any module-helpers "require-helper" null))
+  (sequence
+    (ctfe-compiler-lookup-value compiler "stdlib.sequence"))
+  (define-internal-module
+    (require-helper module-helpers "define-internal-module"))
+  (module-state-registry
+    (require-helper common-records "module-state-registry"))
+  (each (require-helper sequence "each"))
+  (length (require-helper sequence "length"))
+  (pass-enabled?
+    (require-helper module-helpers "pass-enabled?"))
+  (pass-finalized?
+    (require-helper module-helpers "pass-finalized?"))
+  (manifest-key (require-helper common-keys "manifest-key"))
+  (valid-key (require-helper common-keys "valid-key"))
+  (set-runtime-state
+    (require-helper module-helpers "set-runtime-state"))
+  (fact-get (require-helper module-helpers "fact-get"))
+  (fact-set (require-helper module-helpers "fact-set"))
+  (summary-empty
+    (require-helper module-helpers "summary-empty"))
+  (summary-merge
+    (require-helper module-helpers "summary-merge"))
+  (emit-pass-error
+    (require-helper module-helpers "emit-pass-error"))
+  (manifest-imports
+    (require-helper common-records "manifest-imports"))
+  (manifest-exports
+    (require-helper common-records "manifest-exports"))
+  (manifest-modules
+    (require-helper common-records "manifest-modules"))
+  (manifest-errors
+    (require-helper common-records "manifest-errors"))
+  (manifest-active-module
+    (require-helper common-records "manifest-active-module"))
+  (import-module-name
+    (require-helper common-records "import-module-name"))
+  (import-source-name
+    (require-helper common-records "import-source-name"))
+  (import-local-name
+    (require-helper common-records "import-local-name"))
+  (import-kind
+    (require-helper common-records "import-kind"))
+  (import-node
+    (require-helper common-records "import-node"))
+  (import-synthetic?
+    (require-helper common-records "import-synthetic?"))
+  (import-syntax?
+    (require-helper common-records "import-syntax?"))
+  (export-local-name
+    (require-helper common-records "export-local-name"))
+  (export-public-name
+    (require-helper common-records "export-public-name"))
+  (export-node
+    (require-helper common-records "export-node"))
+  (make-top-level-provenance
+    (require-helper common-records "make-top-level-provenance"))
+  (make-imported-provenance
+    (require-helper common-records "make-imported-provenance"))
+  (make-interface-record
+    (require-helper common-records "make-interface-record"))
+  (make-runtime-model-record
+    (require-helper common-records "make-runtime-model-record"))
+  (interface-exports
+    (require-helper common-records "interface-exports"))
+  (top-level-symbol-names
+    (require-helper module-helpers "top-level-symbol-names"))
+)
+  (bind (
+    (record-error
+      (lambda (ctx node message code steps)
+        (append steps (emit-pass-error ctx node message code))))
+    (populate-runtime-publics
+      (lambda
+        (exports-list
+          imports-by-local
+          publics
+          provenance
+          public-list)
+        (each exports-list
+          (lambda (entry)
+            (bind (
+              (local (export-local-name entry))
+              (public-name (export-public-name entry))
+              (import-entry
+                (get-or-null imports-by-local local))
+              (record-state (map-of))
+            )
+              (do
+                (if (is-null? import-entry)
+                  (assoc
+                    record-state
+                    "value"
+                    (make-top-level-provenance local))
+                  (assoc
+                    record-state
+                    "value"
+                    (make-imported-provenance
+                      local
+                      (import-module-name import-entry)
+                      (import-source-name import-entry))))
+                (assoc publics public-name true)
+                (append public-list public-name)
+                (assoc
+                  provenance
+                  public-name
+                  (get-or-null record-state "value"))))))))
+    (build-runtime-state
+      (lambda (exports-list imports imports-by-local own-module)
+        (bind (
+          (publics (map-of))
+          (provenance (map-of))
+          (public-list (list-of))
+        )
+          (do
+            (populate-runtime-publics
+              exports-list
+              imports-by-local
+              publics
+              provenance
+              public-list)
+            (assoc-many
+              (map-of)
+              "interface"
+                (make-interface-record own-module publics provenance)
+              "runtime_model"
+                (make-runtime-model-record
+                  own-module
+                  imports
+                  provenance
+                  public-list))))))
+    (validate-import
+      (lambda
+        (ctx
+          entry
+          registry
+          own-module
+          top-levels
+          available-locals
+          imports-by-local
+          seen-imports
+          steps)
+        (bind (
+          (local (import-local-name entry))
+          (module-path (import-module-name entry))
+          (kind (import-kind entry))
+          (source (import-source-name entry))
+          (synthetic (import-synthetic? entry))
+          (module-registered
+            (or
+              (contains registry module-path)
+              (not
+                (is-null?
+                  (ctfe-compiler-lookup-value compiler module-path null)))))
+        )
+          (do
+            (if (contains seen-imports local)
+              (record-error
+                ctx
+                (import-node entry)
+                "duplicate import alias"
+                "stdlib.module.duplicate_import"
+                steps)
+              (assoc seen-imports local true))
+            (if (contains top-levels local)
+              (record-error
+                ctx
+                (import-node entry)
+                "import alias conflicts with top-level symbol"
+                "stdlib.module.alias_conflict"
+                steps))
+            (assoc available-locals local true)
+            (assoc imports-by-local local entry)
+            (if (eq module-path own-module)
+              (record-error
+                ctx
+                (import-node entry)
+                "module cannot import itself"
+                "stdlib.module.self_import"
+                steps))
+            (if (and (not (import-syntax? entry)) (not module-registered))
+              (record-error
+                ctx
+                (import-node entry)
+                "referenced module is not registered"
+                "stdlib.module.unresolved_module"
+                steps))
+            (if
+              (and
+                synthetic
+                (eq kind "symbol")
+                (contains registry module-path))
+              (bind (
+                (publics
+                  (interface-exports (get-or-null registry module-path)))
+              )
+                (if (not (contains publics source))
+                  (record-error
+                    ctx
+                    (import-node entry)
+                    "reexported symbol is not public in target module"
+                    "stdlib.module.reexport_missing"
+                    steps))))))))
+    (validate-export
+      (lambda (ctx entry available-locals seen-exports steps)
+        (bind (
+          (local (export-local-name entry))
+          (public-name (export-public-name entry))
+        )
+          (do
+            (if (contains seen-exports public-name)
+              (record-error
+                ctx
+                (export-node entry)
+                "duplicate public export"
+                "stdlib.module.duplicate_export"
+                steps)
+              (assoc seen-exports public-name true))
+            (if (not (contains available-locals local))
+              (record-error
+                ctx
+                (export-node entry)
+                "export references an unresolved local or imported symbol"
+                "stdlib.module.export_missing"
+                steps))))))
+    (finish-validation
+      (lambda
+        (ctx
+          root
+          manifest
+          imports
+          exports-list
+          imports-by-local
+          own-module
+          steps)
+        (bind (
+          (summary
+            (summary-merge "validate-pass" steps root))
+          (has-errors
+            (or
+              (manifest-errors manifest)
+              (value-lt 0 (get-any summary "error_count" 0))))
+        )
+          (do
+            (fact-set ctx valid-key root (not has-errors))
+            (if (not has-errors)
+              (bind (
+                (runtime-state
+                  (build-runtime-state
+                    exports-list
+                    imports
+                    imports-by-local
+                    own-module))
+              )
+                (set-runtime-state
+                  root
+                  (get-or-null runtime-state "interface")
+                  (get-or-null runtime-state "runtime_model"))))
+            (assoc summary "changed" false)
+            (assoc summary "pass_name" "validate-pass")
+            (assoc
+              summary
+              "status"
+              (if has-errors
+                "diagnostics_error"
+                (get-any summary "status" "ok")))
+            (assoc
+              summary
+              "meta"
+              (assoc-many (map-of) "valid" (not has-errors) "module" own-module))
+            summary))))
+    (validate-manifest
+      (lambda (ctx root registry manifest)
+        (bind (
+          (modules (manifest-modules manifest))
+          (imports (manifest-imports manifest))
+          (exports-list (manifest-exports manifest))
+          (top-levels (map-of))
+          (available-locals (map-of))
+          (imports-by-local (map-of))
+          (seen-imports (map-of))
+          (seen-exports (map-of))
+          (steps (list-of))
+          (own-module (manifest-active-module manifest))
+        )
+          (do
+            (set-runtime-state root null null)
+            (each (top-level-symbol-names ctx)
+              (lambda (name)
+                (do
+                  (assoc top-levels name true)
+                  (assoc available-locals name true))))
+            (if (eq (length modules) 0)
+              (record-error
+                ctx
+                root
+                "module declaration is required"
+                "stdlib.module.missing"
+                steps))
+            (if (value-lt 1 (length modules))
+              (record-error
+                ctx
+                root
+                "multiple module declarations are not allowed"
+                "stdlib.module.multiple"
+                steps))
+            (each imports
+              (lambda (entry)
+                (validate-import
+                  ctx
+                  entry
+                  registry
+                  own-module
+                  top-levels
+                  available-locals
+                  imports-by-local
+                  seen-imports
+                  steps)))
+            (each exports-list
+              (lambda (entry)
+                (validate-export
+                  ctx
+                  entry
+                  available-locals
+                  seen-exports
+                  steps)))
+            (finish-validation
+              ctx
+              root
+              manifest
+              imports
+              exports-list
+              imports-by-local
+              own-module
+              steps)))))
+    (make-validate-pass
+      (lambda (state)
+        (bind (
+          (registry (module-state-registry state))
+        )
+          (lambda (ctx root)
+            (if (and (pass-enabled? root) (not (pass-finalized? root)))
+              (bind (
+                (manifest
+                  (fact-get ctx manifest-key root null))
+              )
+                (if (is-null? manifest)
+                  (summary-empty "validate-pass" root null)
+                  (validate-manifest ctx root registry manifest)))
+              (summary-empty "validate-pass" root null))))))
+  )
+    (define-internal-module
+      "stdlib.module.internal.projection-validate"
+      (list-of (list-of "make-validate-pass" make-validate-pass)))))

@@ -1,0 +1,8 @@
+.DS_Store
+*:Zone.Identifier
+.agents/
+.codex/
+.caap_build/
+target/
+*/target/
+*.log

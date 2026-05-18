@@ -1,0 +1,62 @@
+(ctfe-compiler-execute-bootstrap-file
+  compiler
+  "internal/common.caap")
+
+(bind (
+  (module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.common"))
+  (module-events
+    (ctfe-compiler-lookup-value compiler "stdlib.module.events"))
+  (get-any (get module-helpers "get-any" null))
+  (each (get-any module-helpers "each" null))
+  (length (get-any module-helpers "length" null))
+  (module-event (get-any module-events "module-event" null))
+  (seed-source-file?
+    (ctfe-compiler-lookup-value compiler "stdlib.module.seed.source-file?"))
+  (source-path?
+    (lambda (path kind)
+      (and (eq kind "file") (seed-source-file? path))))
+  (make-scan-roots
+    (lambda ()
+      (bind (
+        (scan-path
+          (lambda (self path list-dir results visited-dirs)
+            (each (list-dir path)
+              (lambda (entry)
+                (bind (
+                  (child-path (get-any entry "path" null))
+                  (kind (get-any entry "kind" null))
+                )
+                  (if (and (value-is-string child-path) (not (eq child-path "")))
+                    (if (eq kind "dir")
+                      (if (not (contains visited-dirs child-path))
+                        (do
+                          (assoc visited-dirs child-path true)
+                          (self self child-path list-dir results visited-dirs)))
+                      (if (source-path? child-path kind)
+                        (append results child-path)))))))))
+      )
+        (lambda (root list-dir)
+          (bind (
+            (results (list-of))
+            (fields (map-of))
+            (visited-dirs (map-of))
+          )
+            (do
+              (assoc visited-dirs root true)
+              (scan-path scan-path root list-dir results visited-dirs)
+              (assoc-many fields "root" root "count" (length results))
+              (module-event
+                "scan-roots"
+                "scanned source roots for module loading"
+                fields)
+              results))))))
+  (exports
+    (assoc-many (map-of) "make-scan-roots" make-scan-roots))
+)
+  (do
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.module.root_loading.scan"
+      exports)
+    exports))

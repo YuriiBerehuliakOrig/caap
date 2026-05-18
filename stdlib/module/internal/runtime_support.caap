@@ -1,0 +1,107 @@
+(bind (
+  (bootstrap-entry
+    (ctfe-compiler-lookup-value compiler "stdlib.module.bootstrap-plan-entry"))
+  (order-bootstrap-plan
+    (ctfe-compiler-lookup-value compiler "stdlib.module.order-bootstrap-plan"))
+)
+  (ctfe-compiler-execute-bootstrap-files
+    compiler
+    (order-bootstrap-plan
+      (list-of
+        (bootstrap-entry "runtime_protocol.caap" (list-of))
+        (bootstrap-entry
+          "runtime_public_bridge.caap"
+          (list-of "runtime_protocol.caap"))
+        (bootstrap-entry
+          "runtime_imports.caap"
+          (list-of "runtime_protocol.caap"))
+        (bootstrap-entry
+          "runtime_linker.caap"
+          (list-of "runtime_protocol.caap" "runtime_imports.caap"))
+        (bootstrap-entry
+          "runtime_registration.caap"
+          (list-of "runtime_protocol.caap"))))))
+
+(bind (
+  (module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.prelude-bindings"))
+  (runtime-protocol
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.runtime-protocol"))
+  (runtime-public-bridge
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.runtime-public-bridge"))
+  (runtime-linker
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.runtime-linker"))
+  (runtime-imports
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.runtime-imports"))
+  (runtime-registration
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.runtime-registration"))
+  (get-any (get module-helpers "get-any" null))
+  (is-null? (get-any module-helpers "is-null?" null))
+  (get-or-null (get-any module-helpers "get-or-null" null))
+  (require-helper
+    (get-any module-helpers "require-helper" null))
+  (each (require-helper module-helpers "each"))
+  (define-internal-module
+    (require-helper module-helpers "define-internal-module"))
+  (module-runtime-error
+    (require-helper module-helpers "module-runtime-error"))
+  (make-list-publics
+    (require-helper runtime-public-bridge "make-list-publics"))
+  (make-resolve-public-provider
+    (require-helper
+      runtime-public-bridge
+      "make-resolve-public-provider"))
+  (make-explain-public
+    (require-helper runtime-public-bridge "make-explain-public"))
+  (make-explain-root-public
+    (require-helper
+      runtime-public-bridge
+      "make-explain-root-public"))
+  (make-link-root
+    (require-helper runtime-linker "make-link-root"))
+  (build-linked-env
+    (require-helper runtime-imports "build-linked-env"))
+  (make-bind-provider
+    (require-helper runtime-registration "make-bind-provider"))
+  (make-register-host-module
+    (require-helper
+      runtime-registration
+      "make-register-host-module"))
+  (build-events-root
+    (ctfe-compiler-lookup-value compiler "stdlib.build-events" null))
+  (diagnostics-emit-raw
+    (if (value-is-map build-events-root)
+      (get-or-null build-events-root "emit")
+      null))
+  (diagnostics-emit
+    (if (is-null? diagnostics-emit-raw)
+      (lambda (component action message fields)
+        (module-runtime-error
+          "stdlib.module.build_events.emit_missing"
+          "stdlib.build-events emit is required"
+          (assoc-many (map-of) "component" component "action" action)))
+      diagnostics-emit-raw))
+  (module-event
+    (lambda (action message fields)
+      (diagnostics-emit "module" action message fields)))
+)
+  (do
+    (define-internal-module
+      "stdlib.module.runtime"
+      (list-of
+        (list-of "make-bind-provider" make-bind-provider)
+        (list-of
+          "make-register-host-module"
+          (lambda (state)
+            (make-register-host-module state module-event)))
+        (list-of "make-list-publics" make-list-publics)
+        (list-of "make-resolve-public-provider" make-resolve-public-provider)
+        (list-of "make-explain-public" make-explain-public)
+        (list-of "make-explain-root-public" make-explain-root-public)
+        (list-of
+          "make-link-root"
+          (lambda (state)
+            (make-link-root build-linked-env module-event state)))
+        (list-of "build-linked-env" build-linked-env)
+        (list-of "module-event" module-event)))
+    null))

@@ -1,0 +1,860 @@
+(module "stdlib.explain-kit.summary")
+
+(import-namespace "stdlib.sequence" "sequence")
+
+(export "stdlib.explain-kit.summary")
+
+; Stable explain payload and diagnostic summary helpers.
+(bind (
+  (seq sequence)
+  (get-any (get seq "get" null))
+  (is-null? (get seq "is-null?" null))
+  (not-null? (get seq "not-null?" null))
+  (get-or-null (get seq "get-or-null" null))
+  (each (get-or-null seq "each"))
+  (map (get-or-null seq "map"))
+  (copy (get-or-null seq "copy"))
+  (filter (get-or-null seq "filter"))
+  (any? (get-or-null seq "any?"))
+  (length (get-or-null seq "length"))
+  (get-path (get-or-null seq "get-path"))
+  (compile-time-target-record
+    (lambda (target)
+      (assoc-many (map-of) "target" target "phase" "compile_time")))
+  (compile-time-summary
+    (lambda (target field-name value)
+      (assoc (compile-time-target-record target) field-name value)))
+  (simple-query-summary
+    (lambda (target)
+      (compile-time-summary target "result" null)))
+  (simple-invalidation-summary
+    (lambda (target)
+      (compile-time-summary target "steps" (list-of))))
+  (simple-provider-schedule
+    (lambda (target)
+      (compile-time-summary target "stages" (list-of))))
+  (simple-execution-summary
+    (lambda (target)
+      (compile-time-summary target "executed" (list-of))))
+  (node-id-record
+    (lambda (node)
+      (assoc-many (map-of) "node_id" (ctfe-node-id node))))
+  (append-diagnostic-code
+    (lambda (state code)
+      (if (not-null? code)
+        (do
+          (if (not (contains (get-or-null state "by_code") code))
+            (append (get-or-null state "codes") code))
+          (assoc
+            (get-or-null state "by_code")
+            code
+            (int-add (get-path state (list-of "by_code" code) 0) 1))
+          (assoc state "count" (int-add (get-any state "count" 0) 1))))))
+  (collect-diagnostic-codes-from-items
+    (lambda (items state)
+      (each items
+        (lambda (item)
+          (append-diagnostic-code state (get-or-null item "code"))))))
+  (collect-diagnostic-codes-from-bundle
+    (lambda (bundle state)
+      (bind (
+        (query (get-or-null bundle "query"))
+        (query-result
+          (if (is-null? query)
+            null
+            (get-or-null query "result")))
+        (declaration (get-or-null bundle "declaration"))
+        (targets (get-any bundle "targets" (list-of)))
+      )
+        (do
+          (collect-diagnostic-codes-from-items
+            (get-any bundle "diagnostics" (list-of))
+            state)
+          (if (not-null? declaration)
+            (collect-diagnostic-codes-from-items
+              (get-any declaration "advisories" (list-of))
+              state))
+          (if (not-null? query-result)
+            (collect-diagnostic-codes-from-items
+              (get-any query-result "diagnostics" (list-of))
+              state))
+          (each targets
+            (lambda (target)
+              (collect-diagnostic-codes-from-items
+                (get-any target "diagnostics" (list-of))
+                state)))))))
+  (diagnostic-codes-summary
+    (lambda (bundle)
+      (bind (
+        (state (map-of))
+        (codes (list-of))
+        (by-code (map-of))
+        (summary (map-of))
+      )
+        (do
+          (assoc-many state "count" 0 "codes" codes "by_code" by-code)
+          (collect-diagnostic-codes-from-bundle bundle state)
+          (assoc-many summary "count" (get-any state "count" 0) "codes" codes "by_code" by-code)
+          summary))))
+  (with-diagnostic-codes
+    (lambda (bundle)
+      (do
+        (assoc
+          bundle
+          "diagnostic_codes"
+          (diagnostic-codes-summary bundle))
+        bundle)))
+  (bundle-field
+    (lambda (bundle path default)
+      (get-path bundle path default)))
+  (stable-diagnostics
+    (lambda (items)
+      (map
+        items
+        (lambda (item)
+          (assoc-many
+            (map-of)
+            "code" (get-or-null item "code")
+            "severity" (get-or-null item "severity")
+            "message" (get-or-null item "message"))))))
+  (stable-rewrite-records
+    (lambda (items)
+      (map
+        items
+        (lambda (item)
+          (assoc-many
+            (map-of)
+            "provider_name"
+              (get-or-null item "provider_name")
+            "stage" (get-or-null item "stage")
+            "kind" (get-or-null item "kind")
+            "operation" (get-or-null item "operation")
+            "sources" (get-any item "sources" (list-of))
+            "generation" (get-or-null item "generation"))))))
+  (stable-sequence
+    (lambda (items)
+      (if (is-null? items)
+        (list-of)
+        (copy items))))
+  (stable-provider-effects
+    (lambda (effects)
+      (if (is-null? effects)
+        null
+        (assoc-many
+          (map-of)
+          "reads"
+            (stable-sequence (get-any effects "reads" (list-of)))
+          "writes"
+            (stable-sequence (get-any effects "writes" (list-of)))
+          "emits"
+            (stable-sequence (get-any effects "emits" (list-of)))
+          "uses"
+            (stable-sequence (get-any effects "uses" (list-of)))))))
+  (stable-provider-contract
+    (lambda (contract)
+      (if (is-null? contract)
+        null
+        (assoc-many
+          (map-of)
+          "phase_policy"
+            (get-or-null contract "phase_policy")
+          "internal" (get-any contract "internal" false)
+          "effects"
+            (stable-provider-effects (get-or-null contract "effects"))
+          "requires"
+            (stable-sequence (get-any contract "requires" (list-of)))
+          "reads"
+            (stable-sequence (get-any contract "reads" (list-of)))
+          "writes"
+            (stable-sequence (get-any contract "writes" (list-of)))
+          "cache_scope" (get-or-null contract "cache_scope")
+          "resume_policy"
+            (get-or-null contract "resume_policy")))))
+  (stable-executed-records
+    (lambda (items)
+      (map
+        items
+        (lambda (item)
+          (assoc-many
+            (map-of)
+            "provider_name"
+              (get-or-null item "provider_name")
+            "stage" (get-or-null item "stage")
+            "kind" (get-or-null item "kind")
+            "provider_contract"
+              (stable-provider-contract
+                (get-or-null item "provider_contract"))
+            "changed" (get-any item "changed" false)
+            "outcome_kind" (get-or-null item "outcome_kind")
+            "rewrite_count"
+              (get-or-null item "rewrite_count")
+            "erased_count" (get-or-null item "erased_count")
+            "diagnostic_codes"
+              (stable-sequence
+                (get-any item "diagnostic_codes" (list-of)))
+            "touched_node_kinds"
+              (stable-sequence
+                (get-any item "touched_node_kinds" (list-of))))))))
+  (stable-invalidation-steps
+    (lambda (items)
+      (map
+        items
+        (lambda (item)
+          (bind (
+            (entry
+              (assoc-many
+                (map-of)
+                "stage" (get-or-null item "stage")
+                "cached" (get-any item "cached" true)))
+            (invalidation (get-or-null item "invalidation"))
+          )
+            (do
+              (if (not-null? invalidation)
+                (assoc
+                  entry
+                  "invalidation"
+                  (assoc-many
+                    (map-of)
+                    "reason_kind"
+                      (get-or-null invalidation "reason_kind")
+                    "lineage_kind"
+                      (get-or-null invalidation "lineage_kind")
+                    "changed_inputs"
+                      (get-any invalidation "changed_inputs" (list-of)))))
+              entry))))))
+  (stable-pass-groups
+    (lambda (groups)
+      (map
+        groups
+        (lambda (group)
+          (assoc-many
+            (map-of)
+            "index" (get-or-null group "index")
+            "passes"
+              (map
+                (get-any group "passes" (list-of))
+                (lambda (item)
+                  (assoc-many
+                    (map-of)
+                    "name" (get-or-null item "name")
+                    "stage" (get-or-null item "stage")
+                    "kind" (get-or-null item "kind")
+                    "phase_policy"
+                      (get-or-null item "phase_policy")
+                    "internal"
+                      (get-any item "internal" false)
+                    "effects"
+                      (stable-provider-effects (get-or-null item "effects"))
+                    "requires"
+                      (stable-sequence (get-any item "requires" (list-of)))
+                    "reads"
+                      (stable-sequence (get-any item "reads" (list-of)))
+                    "writes"
+                      (stable-sequence (get-any item "writes" (list-of)))
+                    "cache_scope"
+                      (get-or-null item "cache_scope")
+                    "resume_policy"
+                      (get-or-null item "resume_policy"))))
+            "barrier_after"
+              (get-or-null group "barrier_after"))))))
+  (stable-pass-schedule
+    (lambda (bundle)
+      (bind (
+        (schedule (get-or-null bundle "provider_schedule"))
+      )
+        (if (is-null? schedule)
+          null
+          (assoc-many
+            (map-of)
+            "target" (get-or-null schedule "target")
+            "phase" (get-or-null schedule "phase")
+            "stages"
+              (map
+                (get-any schedule "stages" (list-of))
+                (lambda (stage)
+                  (assoc-many
+                    (map-of)
+                    "stage" (get-or-null stage "stage")
+                    "groups"
+                      (stable-pass-groups (get-any stage "groups" (list-of)))))))))))
+  (stable-semantic-provenance
+    (lambda (items)
+      (map
+        items
+        (lambda (item)
+          (assoc-many
+            (map-of)
+            "module" (get-or-null item "module")
+            "public" (get-or-null item "public")
+            "record_kind" (get-or-null item "record_kind")
+            "phase" (get-or-null item "phase")
+            "effect" (get-or-null item "effect")
+            "pure" (get-or-null item "pure")
+            "truth_kind" (get-or-null item "truth_kind")
+            "semantic_source"
+              (get-or-null item "semantic_source")
+            "semantic_mode"
+              (get-or-null item "semantic_mode")
+            "final_truth" (get-or-null item "final_truth")
+            "semantic_step_kind"
+              (get-or-null item "semantic_step_kind")
+            "propagated_from_module"
+              (get-or-null item "propagated_from_module")
+            "propagated_from_public"
+              (get-or-null item "propagated_from_public")
+            "semantic_fields_present"
+              (get-any item "semantic_fields_present" (list-of))
+            "matches_final_truth"
+              (get-or-null item "matches_final_truth"))))))
+  (stable-query-result
+    (lambda (result)
+      (if (is-null? result)
+        null
+        (assoc-many
+          (map-of)
+          "stage" (get-or-null result "stage")
+          "cached" (get-any result "cached" false)
+          "diagnostics"
+            (stable-diagnostics
+              (get-any result "diagnostics" (list-of)))))))
+  (stable-query
+    (lambda (query)
+      (if (is-null? query)
+        null
+        (assoc-many
+          (map-of)
+          "target" (get-or-null query "target")
+          "phase" (get-or-null query "phase")
+          "steps"
+            (stable-invalidation-steps
+              (get-any query "steps" (list-of)))
+          "result"
+            (stable-query-result (get-or-null query "result"))))))
+  (stable-invalidation
+    (lambda (invalidation)
+      (if (is-null? invalidation)
+        null
+        (assoc-many
+          (map-of)
+          "target" (get-or-null invalidation "target")
+          "phase" (get-or-null invalidation "phase")
+          "steps"
+            (stable-invalidation-steps
+              (get-any invalidation "steps" (list-of)))))))
+  (stable-execution
+    (lambda (execution)
+      (if (is-null? execution)
+        null
+        (assoc-many
+          (map-of)
+          "target" (get-or-null execution "target")
+          "phase" (get-or-null execution "phase")
+          "executed"
+            (stable-executed-records
+              (get-any execution "executed" (list-of)))))))
+  (stable-rewrite
+    (lambda (rewrite)
+      (if (is-null? rewrite)
+        null
+        (assoc-many
+          (map-of)
+          "rewritten" (get-any rewrite "rewritten" false)
+          "erased" (get-any rewrite "erased" false)
+          "origin_stage"
+            (get-or-null rewrite "origin_stage")
+          "stable_id" (get-or-null rewrite "stable_id")
+          "latest" (get-or-null rewrite "latest")
+          "chain"
+            (stable-rewrite-records (get-any rewrite "chain" (list-of)))
+          "query" (get-or-null rewrite "query")))))
+  (stable-type
+    (lambda (summary)
+      (if (is-null? summary)
+        null
+        (assoc-many
+          (map-of)
+          "node_id" (get-or-null summary "node_id")
+          "resolved_type"
+            (get-or-null summary "resolved_type")
+          "declared_type"
+            (get-or-null summary "declared_type")
+          "inferred_type"
+            (get-or-null summary "inferred_type")
+          "type_signature"
+            (get-or-null summary "type_signature")
+          "query" (get-or-null summary "query")))))
+  (stable-typecheck
+    (lambda (summary)
+      (if (is-null? summary)
+        null
+        (assoc-many
+          (map-of)
+          "status" (get-or-null summary "status")
+          "subset" (get-or-null summary "subset")
+          "declared_type"
+            (get-or-null summary "declared_type")
+          "actual_type" (get-or-null summary "actual_type")
+          "compatible" (get-any summary "compatible" false)
+          "value_summary"
+            (get-or-null summary "value_summary")))))
+  (stable-bootstrap-context
+    (lambda (context)
+      (bind (
+        (path
+          (if (is-null? context)
+            null
+            (get-or-null context "path")))
+        (capabilities
+          (if (is-null? context)
+            (list-of)
+            (stable-sequence (get-any context "capabilities" (list-of)))))
+      )
+        (assoc-many
+          (map-of)
+          "path" path
+          "capabilities" capabilities
+          "has_active_bootstrap" (not-null? path)
+          "capability_count" (length capabilities)))))
+  (current-bootstrap-context
+    (lambda ()
+      (stable-bootstrap-context
+        (assoc-many
+          (map-of)
+          "path"
+            (ctfe-compiler-current-bootstrap-path compiler)
+          "capabilities"
+            (ctfe-compiler-current-bootstrap-capabilities compiler)))))
+  (current-bootstrap-record
+    (lambda ()
+      (assoc-many
+        (map-of)
+        "path"
+          (ctfe-compiler-current-bootstrap-path compiler)
+        "capabilities"
+          (stable-sequence
+            (ctfe-compiler-current-bootstrap-capabilities compiler)))))
+  (stable-semantic-policy
+    (lambda (policy)
+      (if (is-null? policy)
+        null
+        (assoc-many
+          (map-of)
+          "name" (get-or-null policy "name")
+          "source" (get-or-null policy "source")
+          "phase" (get-or-null policy "phase")
+          "effect" (get-or-null policy "effect")
+          "eval" (get-or-null policy "eval")
+          "control" (get-or-null policy "control")
+          "scope" (get-or-null policy "scope")
+          "form" (get-or-null policy "form")
+          "has_normalizer"
+            (get-any policy "has_normalizer" false)
+          "unit_id" (get-or-null policy "unit_id")
+          "stable_id" (get-or-null policy "stable_id")))))
+  (stable-semantic-policy-list
+    (lambda (items)
+      (map items stable-semantic-policy)))
+  (stable-llvm-functions
+    (lambda (items)
+      (map
+        items
+        (lambda (item)
+          (assoc-many
+            (map-of)
+            "symbol" (get-or-null item "symbol")
+            "result_type" (get-or-null item "result_type")
+            "params"
+              (stable-sequence (get-any item "params" (list-of))))))))
+  (stable-llvm-codegen
+    (lambda (result)
+      (assoc-many
+        (map-of)
+        "module_name"
+          (bind (
+            (module
+              (if (is-null? result)
+                null
+                (get-or-null result "module")))
+          )
+            (if (is-null? module)
+              null
+              (get-or-null module "name")))
+        "decl"
+          (if (is-null? result)
+            null
+            (get-or-null result "decl"))
+        "symbol"
+          (if (is-null? result)
+            null
+            (get-or-null result "symbol"))
+        "result_llvm_type"
+          (if (is-null? result)
+            null
+            (get-or-null result "result_llvm_type"))
+        "text"
+          (if (is-null? result)
+            ""
+            (get-any result "text" ""))
+        "supported_subset"
+          (if (is-null? result)
+            (list-of)
+            (stable-sequence
+              (get-any result "supported_subset" (list-of))))
+        "diagnostics"
+          (if (is-null? result)
+            (list-of)
+            (stable-diagnostics
+              (get-any result "diagnostics" (list-of))))
+        "functions"
+          (if (is-null? result)
+            (list-of)
+            (stable-llvm-functions
+              (get-any result "functions" (list-of)))))))
+  (stable-declaration
+    (lambda (summary)
+      (if (is-null? summary)
+        null
+        (assoc-many
+          (map-of)
+          "kind" (get-or-null summary "kind")
+          "name" (get-or-null summary "name")
+          "meta" (get-any summary "meta" (list-of))
+          "type" (get-or-null summary "type")
+          "type_item" (get-or-null summary "type_item")
+          "type_meta" (get-or-null summary "type_meta")
+          "type_ref_name"
+            (get-or-null summary "type_ref_name")
+          "value_summary"
+            (get-or-null summary "value_summary")
+          "attribute_symbols"
+            (get-any summary "attribute_symbols" (list-of))
+          "attributes"
+            (get-any summary "attributes" (list-of))
+          "advisories"
+            (stable-diagnostics
+              (get-any summary "advisories" (list-of)))))))
+  (stable-alignment
+    (lambda (alignment)
+      (if (is-null? alignment)
+        null
+        (assoc-many
+          (map-of)
+          "aligned" (get-any alignment "aligned" false)
+          "mismatches"
+            (map
+              (get-any alignment "mismatches" (list-of))
+              (lambda (mismatch)
+                (bind (
+                  (explain (get-or-null mismatch "explain"))
+                )
+                  (assoc-many
+                    (map-of)
+                    "code" (get-or-null mismatch "code")
+                    "module" (get-or-null mismatch "module")
+                    "public" (get-or-null mismatch "public")
+                    "function"
+                      (get-or-null mismatch "function")
+                    "field" (get-or-null mismatch "field")
+                    "message"
+                      (get-or-null mismatch "message")
+                    "grounding"
+                      (if (is-null? explain)
+                        null
+                        (get-or-null explain "grounding"))
+                    "grounding_candidates"
+                      (if (is-null? explain)
+                        (list-of)
+                        (get-any explain "grounding_candidates" (list-of)))
+                    "semantic_provenance"
+                      (if (is-null? explain)
+                        (list-of)
+                        (stable-semantic-provenance
+                          (get-any explain "semantic_provenance" (list-of))))))))))))
+  (stable-targets
+    (lambda (targets)
+      (map
+        targets
+        (lambda (target)
+          (assoc-many
+            (map-of)
+            "target_kind" (get-or-null target "target_kind")
+            "target" (get-or-null target "target")
+            "source" (get-or-null target "source")
+            "source_path" (get-or-null target "source_path")
+            "error" (get-or-null target "error")
+            "diagnostics"
+              (stable-diagnostics
+                (get-any target "diagnostics" (list-of)))
+            "query"
+              (stable-query (get-or-null target "query"))
+            "invalidation"
+              (stable-invalidation (get-or-null target "invalidation"))
+            "execution"
+              (stable-execution (get-or-null target "execution")))))))
+  (target-was-rebuilt?
+    (lambda (target)
+      (bind (
+        (steps
+          (get-any
+            (get-any target "invalidation" (map-of))
+            "steps"
+            (list-of)))
+      )
+        (any?
+          steps
+          (lambda (step)
+            (not (get-any step "cached" true)))))))
+  (collect-rebuild-targets
+    (lambda (refresh)
+      (map
+        (filter
+          (get-any refresh "targets" (list-of))
+          (lambda (target)
+            (and
+              (target-was-rebuilt? target)
+              (not-null? (get-or-null target "target")))))
+        (lambda (target)
+          (get-or-null target "target")))))
+  (collect-rebuild-stages
+    (lambda (refresh)
+      (bind (
+        (items (list-of))
+        (seen (map-of))
+      )
+        (do
+          (each (get-any refresh "targets" (list-of))
+            (lambda (target)
+              (each
+                (get-any
+                  (get-any target "invalidation" (map-of))
+                  "steps"
+                  (list-of))
+                (lambda (step)
+                  (bind (
+                    (stage (get-or-null step "stage"))
+                  )
+                    (if
+                      (and
+                        (not-null? stage)
+                        (not (get-any step "cached" true))
+                        (not (contains seen stage)))
+                      (do
+                        (assoc seen stage true)
+                        (append items stage))))))))
+          items))))
+  (workspace-refresh-base-bundle
+    (lambda (refresh)
+      (bind (
+        (bundle (map-of))
+        (changed-paths
+          (get-any refresh "changed_paths" (list-of)))
+        (targets (get-any refresh "targets" (list-of)))
+      )
+        (do
+          (assoc-many
+            bundle
+            "changed"
+              (if (contains refresh "changed")
+                (get-any refresh "changed" false)
+                (if (value-lt 0 (length changed-paths))
+                  true
+                  (if (value-lt 0 (length targets))
+                    true
+                    false)))
+            "changed_paths" changed-paths
+            "target_count"
+              (if (contains refresh "target_count")
+                (get-any refresh "target_count" 0)
+                (length targets))
+            "targets" targets
+            "refresh" refresh)
+          bundle))))
+  (explain-diagnostic-codes
+    (lambda (bundle)
+      (diagnostic-codes-summary bundle)))
+  (explain-diagnostic-summary
+    (lambda (bundle)
+      (diagnostic-codes-summary bundle)))
+  (explain-golden-bundle
+    (lambda (bundle)
+      (bind (
+        (stable (map-of))
+      )
+        (do
+          (assoc
+            stable
+            "diagnostic_codes"
+            (diagnostic-codes-summary bundle))
+          (if (contains bundle "changed")
+            (assoc stable "changed" (get-any bundle "changed" false)))
+          (if (contains bundle "changed_paths")
+            (assoc
+              stable
+              "changed_paths"
+              (get-any bundle "changed_paths" (list-of))))
+          (if (contains bundle "rebuild_targets")
+            (assoc
+              stable
+              "rebuild_targets"
+              (get-any bundle "rebuild_targets" (list-of))))
+          (if (contains bundle "rebuilt_families")
+            (assoc
+              stable
+              "rebuilt_families"
+              (get-any bundle "rebuilt_families" (list-of))))
+          (if (contains bundle "targets")
+            (assoc
+              stable
+              "targets"
+              (stable-targets (get-any bundle "targets" (list-of)))))
+          (if (contains bundle "query")
+            (assoc
+              stable
+              "query"
+              (stable-query (get-or-null bundle "query"))))
+          (if (contains bundle "invalidation")
+            (assoc
+              stable
+              "invalidation"
+              (stable-invalidation (get-or-null bundle "invalidation"))))
+          (if (contains bundle "execution")
+            (assoc
+              stable
+              "execution"
+              (stable-execution (get-or-null bundle "execution"))))
+          (if (contains bundle "provider_schedule")
+            (assoc
+              stable
+              "provider_schedule"
+              (stable-pass-schedule bundle)))
+          (if (contains bundle "rewrite")
+            (assoc
+              stable
+              "rewrite"
+              (stable-rewrite (get-or-null bundle "rewrite"))))
+          (if (contains bundle "type")
+            (assoc
+              stable
+              "type"
+              (stable-type (get-or-null bundle "type"))))
+          (if (contains bundle "typecheck")
+            (assoc
+              stable
+              "typecheck"
+              (stable-typecheck (get-or-null bundle "typecheck"))))
+          (if (contains bundle "declaration")
+            (assoc
+              stable
+              "declaration"
+              (stable-declaration (get-or-null bundle "declaration"))))
+          (if (contains bundle "alignment")
+            (assoc
+              stable
+              "alignment"
+              (stable-alignment (get-or-null bundle "alignment"))))
+          (if (contains bundle "bootstrap")
+            (assoc
+              stable
+              "bootstrap"
+              (stable-bootstrap-context (get-or-null bundle "bootstrap"))))
+          (if (contains bundle "policy")
+            (assoc
+              stable
+              "policy"
+              (stable-semantic-policy (get-or-null bundle "policy"))))
+          (if (contains bundle "policies")
+            (assoc
+              stable
+              "policies"
+              (stable-semantic-policy-list
+                (get-any bundle "policies" (list-of)))))
+          (if (contains bundle "public")
+            (assoc
+              stable
+              "public"
+              (bind (
+                (public-map (get-or-null bundle "public"))
+              )
+                (assoc-many
+                  (map-of)
+                  "module"
+                    (if (is-null? public-map)
+                      null
+                      (get-or-null public-map "module"))
+                  "public"
+                    (if (is-null? public-map)
+                      null
+                      (get-or-null public-map "public"))
+                  "available"
+                    (if (is-null? public-map)
+                      false
+                      (get-any public-map "available" false))
+                  "provider"
+                    (if (is-null? public-map)
+                      null
+                      (get-or-null public-map "provider"))
+                  "semantics"
+                    (if (is-null? public-map)
+                      null
+                      (get-or-null public-map "semantics"))
+                  "semantic_provenance"
+                    (if (is-null? public-map)
+                      (list-of)
+                      (stable-semantic-provenance
+                        (get-any public-map "semantic_provenance" (list-of)))))))
+            stable)))))
+)
+  (assoc-many
+    (map-of)
+    "compile-time-target-record" compile-time-target-record
+    "compile-time-summary" compile-time-summary
+    "simple-query-summary" simple-query-summary
+    "simple-invalidation-summary"
+      simple-invalidation-summary
+    "simple-provider-schedule" simple-provider-schedule
+    "simple-execution-summary" simple-execution-summary
+    "node-id-record" node-id-record
+    "append-diagnostic-code" append-diagnostic-code
+    "collect-diagnostic-codes-from-items"
+      collect-diagnostic-codes-from-items
+    "collect-diagnostic-codes-from-bundle"
+      collect-diagnostic-codes-from-bundle
+    "diagnostic-codes-summary" diagnostic-codes-summary
+    "with-diagnostic-codes" with-diagnostic-codes
+    "bundle-field" bundle-field
+    "stable-diagnostics" stable-diagnostics
+    "stable-rewrite-records" stable-rewrite-records
+    "stable-sequence" stable-sequence
+    "stable-provider-effects" stable-provider-effects
+    "stable-provider-contract" stable-provider-contract
+    "stable-executed-records" stable-executed-records
+    "stable-invalidation-steps" stable-invalidation-steps
+    "stable-pass-groups" stable-pass-groups
+    "stable-pass-schedule" stable-pass-schedule
+    "stable-semantic-provenance" stable-semantic-provenance
+    "stable-query-result" stable-query-result
+    "stable-query" stable-query
+    "stable-invalidation" stable-invalidation
+    "stable-execution" stable-execution
+    "stable-rewrite" stable-rewrite
+    "stable-type" stable-type
+    "stable-typecheck" stable-typecheck
+    "stable-bootstrap-context" stable-bootstrap-context
+    "current-bootstrap-context" current-bootstrap-context
+    "current-bootstrap-record" current-bootstrap-record
+    "stable-semantic-policy" stable-semantic-policy
+    "stable-semantic-policy-list"
+      stable-semantic-policy-list
+    "stable-llvm-functions" stable-llvm-functions
+    "stable-llvm-codegen" stable-llvm-codegen
+    "stable-declaration" stable-declaration
+    "stable-alignment" stable-alignment
+    "stable-targets" stable-targets
+    "target-was-rebuilt?" target-was-rebuilt?
+    "collect-rebuild-targets" collect-rebuild-targets
+    "collect-rebuild-stages" collect-rebuild-stages
+    "workspace-refresh-base-bundle"
+      workspace-refresh-base-bundle
+    "explain-diagnostic-codes" explain-diagnostic-codes
+    "explain-diagnostic-summary" explain-diagnostic-summary
+    "explain-golden-bundle" explain-golden-bundle))

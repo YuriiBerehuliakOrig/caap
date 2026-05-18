@@ -1,0 +1,153 @@
+(bind (
+  (module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.prelude-bindings"))
+  (runtime-protocol
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.runtime-protocol"))
+  (get-any (get module-helpers "get-any" null))
+  (is-null? (get-any module-helpers "is-null?" null))
+  (get-or-null (get-any module-helpers "get-or-null" null))
+  (require-helper
+    (get-any module-helpers "require-helper" null))
+  (module-state-registry
+    (require-helper module-helpers "module-state-registry"))
+  (module-state-runtime-models
+    (require-helper
+      module-helpers
+      "module-state-runtime-models"))
+  (each (require-helper module-helpers "each"))
+  (runtime-model-publics
+    (require-helper module-helpers "runtime-model-publics"))
+  (interface-provenance
+    (require-helper module-helpers "interface-provenance"))
+  (provenance-kind
+    (require-helper module-helpers "provenance-kind"))
+  (provenance-local-name
+    (require-helper module-helpers "provenance-local-name"))
+  (provenance-source-module
+    (require-helper module-helpers "provenance-source-module"))
+  (provenance-source-name
+    (require-helper module-helpers "provenance-source-name"))
+  (define-internal-module
+    (require-helper module-helpers "define-internal-module"))
+  (result-ok (require-helper runtime-protocol "result-ok"))
+  (result-error
+    (require-helper runtime-protocol "result-error"))
+  (result-bind
+    (require-helper runtime-protocol "result-bind"))
+  (result->public
+    (require-helper runtime-protocol "result->public"))
+  (require-public-module-result
+    (require-helper
+      runtime-protocol
+      "require-public-module-result"))
+  (lookup-runtime-model-result
+    (require-helper
+      runtime-protocol
+      "lookup-runtime-model-result"))
+  (lookup-interface-result
+    (require-helper runtime-protocol "lookup-interface-result"))
+  (provider-stack-empty
+    (require-helper runtime-protocol "provider-stack-empty"))
+  (provider-stack-contains
+    (require-helper runtime-protocol "provider-stack-contains"))
+  (provider-stack-push
+    (require-helper runtime-protocol "provider-stack-push"))
+  (provider-from-host-record
+    (require-helper
+      runtime-protocol
+      "provider-from-host-record"))
+  (provider-from-template-binding
+    (require-helper
+      runtime-protocol
+      "provider-from-template-binding"))
+)
+  (bind (
+    (make-list-publics
+      (lambda (state)
+        (bind (
+          (runtime-models
+            (module-state-runtime-models state))
+        )
+          (lambda (module-name)
+            (result->public
+              (result-bind
+                (require-public-module-result module-name)
+                (lambda (name)
+                  (result-bind
+                    (lookup-runtime-model-result runtime-models name)
+                    (lambda (runtime-model)
+                      (bind (
+                        (names (list-of))
+                      )
+                        (do
+                          (each
+                            (runtime-model-publics runtime-model)
+                            (lambda (public-name)
+                              (append names public-name)))
+                          (result-ok names))))))))))))
+    (make-resolve-public-provider
+      (lambda (state)
+        (bind (
+          (registry (module-state-registry state))
+          (resolve-record-provider
+            (lambda (resolve-provider module-name public-name record stack)
+              (bind (
+                (kind (provenance-kind record))
+                (local-name (provenance-local-name record))
+                (source-name
+                  (provenance-source-name record))
+              )
+                (if (eq kind "host_service")
+                  (provider-from-host-record record)
+                  (if (or (eq kind "top_level") (eq source-name "*"))
+                    (provider-from-template-binding
+                      module-name
+                      local-name
+                      record)
+                    (resolve-provider
+                      resolve-provider
+                      (provenance-source-module record)
+                      source-name
+                      (provider-stack-push stack module-name public-name)))))))
+          (resolve-provider
+            (lambda (self module-name public-name stack)
+              (if (provider-stack-contains stack module-name public-name)
+                (result-error
+                  "stdlib.module.public_provider_cycle"
+                  "module runtime detected a cyclic public provider dependency"
+                  (assoc-many (map-of) "module" module-name "public" public-name "stack" stack))
+                (result-bind
+                  (lookup-interface-result registry module-name)
+                  (lambda (interface)
+                    (bind (
+                      (record
+                        (get-or-null (interface-provenance interface) public-name))
+                    )
+                      (if (is-null? record)
+                        (result-error
+                          "stdlib.module.export_provenance.unresolved"
+                          "module runtime could not resolve exported provenance"
+                          (assoc-many (map-of) "module" module-name "public" public-name))
+                        (resolve-record-provider
+                          self
+                          module-name
+                          public-name
+                          record
+                          stack))))))))
+        )
+          (lambda (module-name public-name)
+            (result->public
+              (result-bind
+                (require-public-module-result module-name)
+                (lambda (name)
+                  (resolve-provider
+                    resolve-provider
+                    name
+                    public-name
+                    (provider-stack-empty)))))))))
+  )
+    (define-internal-module
+      "stdlib.module.internal.public-resolution"
+      (list-of
+        (list-of "make-list-publics"            make-list-publics)
+        (list-of "make-resolve-public-provider" make-resolve-public-provider)))))

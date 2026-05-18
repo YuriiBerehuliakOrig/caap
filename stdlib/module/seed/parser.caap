@@ -1,0 +1,429 @@
+(ctfe-compiler-execute-bootstrap-file
+  compiler
+  "../module_form_grammar.caap")
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.export-registry-name"
+  (lambda (module-name public-name)
+    (if
+      (or
+        (eq public-name module-name)
+        (eq (string-find public-name "stdlib." 0) 0)
+        (eq (string-find public-name "sys." 0) 0)
+        (eq (string-find public-name "example." 0) 0))
+      public-name
+      (string-concat-many module-name "." public-name))))
+
+(bind (
+  (descriptor-field-string?
+    (lambda (entry key)
+      (and
+        (contains entry key)
+        (value-is-string (get entry key null)))))
+  (descriptor-field-list?
+    (lambda (entry key)
+      (and
+        (contains entry key)
+        (value-is-list (get entry key null)))))
+  (descriptor-field-int?
+    (lambda (entry key)
+      (and
+        (contains entry key)
+        (value-is-int (get entry key null)))))
+  (package-descriptor?
+    (lambda (entry)
+      (bind (
+        (descriptor-state?
+          (ctfe-compiler-lookup-value compiler "stdlib.module.seed.descriptor-state?"))
+      )
+        (and
+          (value-is-map entry)
+          (descriptor-field-string? entry "name")
+          (descriptor-field-string? entry "index_path")
+          (descriptor-field-string? entry "base_dir")
+          (descriptor-field-list? entry "imports")
+          (descriptor-field-list? entry "syntax_imports")
+          (descriptor-field-list? entry "exports")
+          (descriptor-field-list? entry "capabilities")
+          (descriptor-field-int? entry "declaration_count")
+          (descriptor-state? (get entry "state" null))))))
+  (seed-error
+    (ctfe-compiler-lookup-value compiler "stdlib.module.seed.error"))
+  (assert-package-descriptor
+    (lambda (entry)
+      (if (package-descriptor? entry)
+        entry
+        (seed-error
+          "stdlib.module.seed.descriptor.invalid"
+          "invalid package descriptor"
+          (assoc-many (map-of) "descriptor" entry)))))
+  (each-indexed
+    (ctfe-compiler-lookup-value compiler "stdlib.module.seed.each-indexed"))
+  (path-dir
+    (ctfe-compiler-lookup-value compiler "stdlib.module.seed.path-dir"))
+  (export-registry-name
+    (ctfe-compiler-lookup-value compiler "stdlib.module.seed.export-registry-name"))
+  (atom-string
+    (lambda (node)
+      (if
+        (and
+          (value-is-map node)
+          (eq (get node "kind" null) "string"))
+        (get node "value" null)
+        null)))
+  (string-at
+    (lambda (nodes index)
+      (atom-string (get nodes index null))))
+  (append-import-symbols
+    (lambda (ctx module-name args start)
+      (bind (
+        (imports (get ctx "imports" (list-of)))
+        (symbols (list-of))
+        (count (size args))
+      )
+        (do
+          (sequence-each
+            (sequence-range start count)
+            (lambda (index)
+              (bind (
+                (symbol-name (string-at args index))
+              )
+                (if
+                  (and
+                    (value-is-string symbol-name)
+                    (not (eq symbol-name "")))
+                  (append
+                    symbols
+                    (assoc-many (map-of) "name" symbol-name "as" symbol-name))))))
+          (append
+            imports
+            (assoc-many (map-of) "module" module-name "as" module-name "symbols" symbols))))))
+  (declaration-handlers
+    (assoc-many
+      (map-of)
+      "module"
+        (lambda (ctx args)
+          (bind (
+            (path (get ctx "path" null))
+            (descriptor (get ctx "descriptor" (map-of)))
+            (module-name (string-at args 0))
+          )
+            (if
+              (and
+                (value-is-string module-name)
+                (not (eq module-name "")))
+              (assoc descriptor "name" module-name)
+              (seed-error
+                "stdlib.module.seed.declaration.module_name_required"
+                (string-concat-many
+                  path
+                  " module declaration requires a name")
+                (assoc-many (map-of) "path" path)))))
+      "module-capability"
+        (lambda (ctx args)
+          (bind (
+            (path (get ctx "path" null))
+            (capabilities
+              (get ctx "capabilities" (list-of)))
+            (capability (string-at args 0))
+          )
+            (if (and (value-is-string capability) (not (eq capability "")))
+              (append capabilities capability)
+              (seed-error
+                "stdlib.module.seed.declaration.capability_required"
+                (string-concat-many
+                  path
+                  " module-capability declaration requires a capability")
+                (assoc-many (map-of) "path" path)))))
+      "import-namespace"
+        (lambda (ctx args)
+          (bind (
+            (path (get ctx "path" null))
+            (imports (get ctx "imports" (list-of)))
+            (module-name (string-at args 0))
+            (alias (string-at args 1))
+          )
+            (if
+              (and
+                (value-is-string module-name)
+                (not (eq module-name ""))
+                (value-is-string alias)
+                (not (eq alias "")))
+              (append
+                imports
+                (assoc-many (map-of) "module" module-name "as" alias "symbols" (list-of)))
+              (seed-error
+                "stdlib.module.seed.declaration.import_namespace_invalid"
+                (string-concat-many
+                  path
+                  " import-namespace requires module and alias")
+                (assoc-many (map-of) "path" path)))))
+      "syntax-import"
+        (lambda (ctx args)
+          (bind (
+            (path (get ctx "path" null))
+            (imports (get ctx "imports" (list-of)))
+            (syntax-imports
+              (get ctx "syntax_imports" (list-of)))
+            (module-name (string-at args 0))
+          )
+            (if
+              (and
+                (value-is-string module-name)
+                (not (eq module-name "")))
+              (bind (
+                (entry
+                  (assoc-many
+                    (map-of)
+                    "module" module-name
+                    "as" module-name
+                    "symbols" (list-of)
+                    "syntax" true))
+              )
+                (do
+                  (append imports entry)
+                  (append syntax-imports entry)))
+              (seed-error
+                "stdlib.module.seed.declaration.syntax_import_invalid"
+                (string-concat-many path " syntax-import requires a module")
+                (assoc-many (map-of) "path" path)))))
+      "import-symbols"
+        (lambda (ctx args)
+          (bind (
+            (path (get ctx "path" null))
+            (module-name (string-at args 0))
+          )
+            (if
+              (and
+                (value-is-string module-name)
+                (not (eq module-name "")))
+              (append-import-symbols ctx module-name args 1)
+              (seed-error
+                "stdlib.module.seed.declaration.import_symbols_invalid"
+                (string-concat-many
+                  path
+                  " import-symbols requires a module")
+                (assoc-many (map-of) "path" path)))))
+      "import-as"
+        (lambda (ctx args)
+          (bind (
+            (path (get ctx "path" null))
+            (imports (get ctx "imports" (list-of)))
+            (module-name (string-at args 0))
+            (source-name (string-at args 1))
+            (alias (string-at args 2))
+          )
+            (if
+              (and
+                (value-is-string module-name)
+                (not (eq module-name ""))
+                (value-is-string source-name)
+                (not (eq source-name ""))
+                (value-is-string alias)
+                (not (eq alias "")))
+              (append
+                imports
+                (assoc-many
+                  (map-of)
+                  "module" module-name
+                  "as" module-name
+                  "symbols"
+                    (list-of (assoc-many (map-of) "name" source-name "as" alias))))
+              (seed-error
+                "stdlib.module.seed.declaration.import_as_invalid"
+                (string-concat-many
+                  path
+                  " import-as requires module, source, and alias")
+                (assoc-many (map-of) "path" path)))))
+      "export"
+        (lambda (ctx args)
+          (bind (
+            (path (get ctx "path" null))
+            (descriptor (get ctx "descriptor" (map-of)))
+            (exports (get ctx "exports" (list-of)))
+          )
+            (each-indexed
+              args
+              0
+              (lambda (entry _export-index)
+                (bind (
+                  (public-name (atom-string entry))
+                  (module-name (get descriptor "name" null))
+                )
+                  (if
+                    (and
+                      (value-is-string public-name)
+                      (not (eq public-name ""))
+                      (value-is-string module-name)
+                      (not (eq module-name "")))
+                    (append
+                      exports
+                      (assoc-many
+                        (map-of)
+                        "name" public-name
+                        "path" null
+                        "registry"
+                          (export-registry-name module-name public-name)))
+                    (seed-error
+                      "stdlib.module.seed.declaration.export_invalid"
+                      (string-concat-many
+                        path
+                        " export declarations require module first and string names")
+                      (assoc-many (map-of) "path" path))))))))
+      "export-as"
+        (lambda (ctx args)
+          (bind (
+            (path (get ctx "path" null))
+            (descriptor (get ctx "descriptor" (map-of)))
+            (exports (get ctx "exports" (list-of)))
+            (local-name (string-at args 0))
+            (public-name (string-at args 1))
+            (module-name (get descriptor "name" null))
+          )
+            (if
+              (and
+                (value-is-string local-name)
+                (not (eq local-name ""))
+                (value-is-string public-name)
+                (not (eq public-name ""))
+                (value-is-string module-name)
+                (not (eq module-name "")))
+              (append
+                exports
+                (assoc-many
+                  (map-of)
+                  "name" public-name
+                  "path" local-name
+                  "registry"
+                    (export-registry-name module-name public-name)))
+              (seed-error
+                "stdlib.module.seed.declaration.export_as_invalid"
+                (string-concat-many
+                  path
+                  " export-as declarations require module first, local, and public")
+                (assoc-many (map-of) "path" path)))))))
+)
+  (do
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.module.seed.package-descriptor?"
+      package-descriptor?)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.module.seed.assert-package-descriptor"
+      assert-package-descriptor)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.module.seed.declaration-handlers"
+      declaration-handlers)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.module.seed.parse-package-declaration-forms"
+      (lambda (path forms)
+        (bind (
+          (imports (list-of))
+          (syntax-imports (list-of))
+          (exports (list-of))
+          (capabilities (list-of))
+          (descriptor (map-of))
+          (state
+            (assoc-many (map-of) "declaration_count" 0 "implementation_seen" false))
+          (ctx
+            (assoc-many
+              (map-of)
+              "path" path
+              "imports" imports
+              "syntax_imports" syntax-imports
+              "exports" exports
+              "capabilities" capabilities
+              "descriptor" descriptor
+              "state" state))
+          (parse-declaration
+            (lambda (node _index)
+              (bind (
+                (head (get node "head" null))
+                (args (get node "args" (list-of)))
+                (handler
+                  (get declaration-handlers head null))
+              )
+                (if (not (eq handler null))
+                  (if (get state "implementation_seen" false)
+                    (seed-error
+                      "stdlib.module.seed.declaration.after_body"
+                      (string-concat-many
+                        path
+                        " package declaration after implementation body")
+                      (assoc-many (map-of) "path" path "head" head))
+                    (do
+                      (assoc
+                        state
+                        "declaration_count"
+                        (int-add (get state "declaration_count" 0) 1))
+                      (handler ctx args)))
+                  (assoc state "implementation_seen" true)))))
+        )
+          (do
+            (each-indexed forms 0 parse-declaration)
+            (if (not (contains descriptor "name"))
+              (seed-error
+                "stdlib.module.seed.declaration.module_missing"
+                (string-concat-many path " is missing module declaration")
+                (assoc-many (map-of) "path" path)))
+            (assoc descriptor "index_path" path)
+            (assoc descriptor "base_dir" (path-dir path))
+            (assoc descriptor "imports" imports)
+            (assoc descriptor "syntax_imports" syntax-imports)
+            (assoc descriptor "exports" exports)
+            (assoc descriptor "capabilities" capabilities)
+            (assoc
+              descriptor
+              "declaration_count"
+              (get state "declaration_count" 0))
+            (assoc descriptor "state" "unloaded")
+            (assert-package-descriptor descriptor)))))))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.parse-package-declarations"
+  (lambda (path)
+    (bind (
+      (parse-package-declaration-forms
+        (ctfe-compiler-lookup-value
+          compiler
+          "stdlib.module.seed.parse-package-declaration-forms"))
+      (forms
+        (ctfe-compiler-parse-surface-file-forms compiler path))
+    )
+      (parse-package-declaration-forms path forms))))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.parse-package-declarations-or-null"
+  (lambda (path)
+    (bind (
+      (form-grammar
+        (ctfe-compiler-lookup-value compiler "stdlib.module.form-grammar"))
+      (declaration-head?
+        (get form-grammar "declaration-head?" null))
+      (parse-package-declaration-forms
+        (ctfe-compiler-lookup-value
+          compiler
+          "stdlib.module.seed.parse-package-declaration-forms"))
+      (forms
+        (ctfe-compiler-parse-surface-file-forms
+          compiler
+          path
+          (get form-grammar "declaration-heads" (list-of))))
+      (first-form (get forms 0 null))
+      (first-head
+        (if (value-is-map first-form)
+          (get first-form "head" null)
+          null))
+    )
+      (if
+        (and
+          (not (eq declaration-head? null))
+          (declaration-head? first-head))
+        (parse-package-declaration-forms path forms)
+        null))))

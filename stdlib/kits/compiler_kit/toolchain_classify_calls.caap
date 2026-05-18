@@ -1,0 +1,81 @@
+; stdlib/compiler_kit/toolchain_classify_calls.caap
+; Call classification providers. Depends on resolve_names providers.
+(do
+  (bind (
+    (classify-call-node
+      (lambda (ctx state node)
+        (bind (
+          (entry
+            (ctfe-node-resolved-name-entry
+              (ctfe-node-call-callee node)
+              null))
+          (existing (ctfe-node-call-semantics node))
+        )
+          (if (not (eq entry null))
+            (bind (
+              (next
+                (ctfe-call-semantics-from-entry entry ctx))
+            )
+              (if (not (eq existing next))
+                (do
+                  (ctfe-meta-fact-set-by-key
+                    node
+                    "caap.fact.call_semantics"
+                    next)
+                  (assoc state "changed" true))))))))
+    (classify-form
+      (lambda (ctx state form)
+        (ctfe-provider-traversal-walk
+          ctx
+          form
+          (lambda (node)
+            (classify-call-node ctx state node))
+          (assoc-many (map-of) "kind" "Call"))))
+    (classify-calls-provider
+      (lambda (ctx root)
+        (bind (
+          (state (map-of))
+          (forms
+            (ctfe-unit-top-level-forms (ctfe-provider-unit ctx)))
+          (loop-state (map-of))
+        )
+          (do
+            (assoc state "changed" false)
+            (assoc loop-state "valid" true)
+            (if (eq (size forms) 0)
+              (classify-form ctx state root)
+              (sequence-each
+                forms
+                (lambda (form)
+                  (if (get loop-state "valid" true)
+                    (classify-form ctx state form)))))
+            (get state "changed" false)))))
+  )
+    (ctfe-compiler-provider-register
+      compiler
+      "classify_calls"
+      "resolve_names"
+      classify-calls-provider
+      (list-of "resolve_names")
+      (list-of "read-ir" "read-facts" "write-facts")
+      (assoc-many
+        (map-of)
+        "family" "resolve_names"
+        "reads" (list-of "ir" "facts")
+        "writes" (list-of "facts")
+        "cache_scope" "unit"
+        "resume_policy" "never"))
+    (ctfe-compiler-provider-register
+      compiler
+      "classify_calls.after_resolve"
+      "normalize_after_resolve"
+      classify-calls-provider
+      (list-of "resolve_names.after_resolve")
+      (list-of "read-ir" "read-facts" "write-facts")
+      (assoc-many
+        (map-of)
+        "family" "semantic_normalization"
+        "reads" (list-of "ir" "facts")
+        "writes" (list-of "facts")
+        "cache_scope" "unit"
+        "resume_policy" "never"))))

@@ -1,0 +1,139 @@
+(module "stdlib.explain-kit")
+
+(import-namespace
+  "stdlib.explain-kit.summary"
+  "summary-module")
+
+(import-namespace
+  "stdlib.explain-kit.bundles"
+  "bundles-module")
+
+(import-namespace
+  "stdlib.internal.kit-protocol"
+  "kit-protocol")
+
+(export "stdlib.explain-kit")
+
+; Root explain kit assembly. Summary and bundle construction live in focused submodules.
+(bind (
+  (new-kit (get kit-protocol "new-kit" null))
+  (register-bundle
+    (get kit-protocol "register-bundle" null))
+  (register-helper
+    (get kit-protocol "register-helper" null))
+  (kit-root
+    (new-kit
+      "stdlib.explain-kit"
+      "Compiler and workspace explain bundle helpers."
+      (list-of)))
+  (register-impure-bundle
+    (lambda (name implementation)
+      (register-bundle
+        kit-root
+        name
+        implementation
+        "impure"
+        false)))
+  (register-pure-bundle
+    (lambda (name implementation)
+      (register-bundle kit-root name implementation "pure" true)))
+  (register-pure-helper
+    (lambda (name implementation)
+      (register-helper kit-root name implementation "pure" true)))
+)
+  (do
+    (register-impure-bundle
+      "explain-query-bundle"
+      (get bundles-module "explain-query-bundle" null))
+    (register-impure-bundle
+      "explain-execution-bundle"
+      (get bundles-module "explain-execution-bundle" null))
+    (register-impure-bundle
+      "explain-pass-bundle"
+      (get bundles-module "explain-pass-bundle" null))
+    (register-impure-bundle
+      "explain-cache-bundle"
+      (get bundles-module "explain-cache-bundle" null))
+    (register-impure-bundle
+      "explain-rebuild-bundle"
+      (get bundles-module "explain-rebuild-bundle" null))
+    (register-impure-bundle
+      "explain-diagnostics-bundle"
+      (get bundles-module "explain-diagnostics-bundle" null))
+    (register-impure-bundle
+      "explain-pass-workflow-bundle"
+      (get bundles-module "explain-pass-workflow-bundle" null))
+    (register-impure-bundle
+      "explain-pass-trace-bundle"
+      (get bundles-module "explain-pass-trace-bundle" null))
+    (register-impure-bundle
+      "explain-name-bundle"
+      (get bundles-module "explain-name-bundle" null))
+    (register-impure-bundle
+      "explain-rewrite-bundle"
+      (get bundles-module "explain-rewrite-bundle" null))
+    (register-impure-bundle
+      "explain-module-surface-bundle"
+      (get bundles-module "explain-module-surface-bundle" null))
+    (register-impure-bundle
+      "explain-module-bundle"
+      (get bundles-module "explain-module-bundle" null))
+    (register-impure-bundle
+      "explain-module-truth-bundle"
+      (get bundles-module "explain-module-truth-bundle" null))
+    (register-impure-bundle
+      "explain-query-graph-bundle"
+      (get bundles-module "explain-query-graph-bundle" null))
+    (register-impure-bundle
+      "explain-lineage-graph-bundle"
+      (get bundles-module "explain-lineage-graph-bundle" null))
+    (register-impure-bundle
+      "explain-module-graph-bundle"
+      (get bundles-module "explain-module-graph-bundle" null))
+    (register-pure-bundle
+      "explain-workspace-refresh-bundle"
+      (get bundles-module "explain-workspace-refresh-bundle" null))
+    (register-pure-bundle
+      "explain-workspace-diff-bundle"
+      (get bundles-module "explain-workspace-diff-bundle" null))
+    (register-pure-bundle
+      "explain-pass-refresh-bundle"
+      (get bundles-module "explain-pass-refresh-bundle" null))
+    (register-pure-bundle
+      "explain-bootstrap-context-bundle"
+      (get bundles-module "explain-bootstrap-context-bundle" null))
+    (register-pure-bundle
+      "explain-semantic-policy-bundle"
+      (get bundles-module "explain-semantic-policy-bundle" null))
+    (register-pure-bundle
+      "explain-semantic-policy-registry-bundle"
+      (get
+        bundles-module
+        "explain-semantic-policy-registry-bundle"
+        null))
+    (register-pure-helper
+      "explain-diagnostic-codes"
+      (get summary-module "explain-diagnostic-codes" null))
+    (register-pure-helper
+      "explain-diagnostic-summary"
+      (get summary-module "explain-diagnostic-summary" null))
+    (register-pure-helper
+      "bundle-field"
+      (get summary-module "bundle-field" null))
+    (register-pure-helper
+      "stable-bootstrap-context"
+      (get summary-module "stable-bootstrap-context" null))
+    (register-pure-helper
+      "stable-semantic-policy"
+      (get summary-module "stable-semantic-policy" null))
+    (register-pure-helper
+      "stable-llvm-codegen"
+      (get summary-module "stable-llvm-codegen" null))
+    (register-pure-helper
+      "explain-golden-bundle"
+      (get summary-module "explain-golden-bundle" null))
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.explain-kit"
+      kit-root)
+    kit-root))

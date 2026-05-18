@@ -1,0 +1,25 @@
+(module "sys.net")
+
+(module-capability "host_services")
+
+(import-namespace
+  "stdlib.internal.system-module-helpers"
+  "system-module-helpers")
+(import-namespace
+  "stdlib.module"
+  "module")
+
+;; Host-backed networking module.
+;;
+;; Public exports are sourced from the host service catalog for "net" and
+;; published through stdlib.module. Network capability remains explicit; this
+;; file must not create ambient socket/network builtins.
+(bind (
+  (system-module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.internal.system-module-helpers"))
+  (bootstrap-system-modules
+    (get system-module-helpers "bootstrap-system-modules"))
+)
+  (bootstrap-system-modules
+    compiler
+    (list-of (list-of "sys.net" "net" "sys.net"))))

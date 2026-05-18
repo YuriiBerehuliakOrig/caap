@@ -1,0 +1,105 @@
+(module "stdlib.types.metadata")
+
+(import-namespace "stdlib.sequence" "sequence")
+
+(import-namespace "stdlib.types.core" "core")
+
+(import-namespace "stdlib.types.structs" "structs")
+
+(import-namespace "stdlib.types.enums" "enums")
+
+(export "stdlib.types.metadata")
+
+(bind (
+  (exports (map-of))
+  (semantics (map-of))
+  (get-any (get sequence "get" null))
+  (get-or-null (get sequence "get-or-null" null))
+  (map (get sequence "map" null))
+  (pure-semantics (get core "pure-semantics" null))
+  (type-name (get core "type-name" null))
+  (enum-type-variants (get enums "enum-type-variants" null))
+  (enum-type-variant (get enums "enum-type-variant" null))
+  (struct-type-fields
+    (get structs "struct-type-fields" null))
+  (struct-type-field (get structs "struct-type-field" null))
+  (struct-type-field-index
+    (get structs "struct-type-field-index" null))
+  (enum-variant-constant
+    (lambda (enum-type variant-name)
+      (bind (
+        (variant (enum-type-variant enum-type variant-name))
+      )
+        (if (eq variant null)
+          null
+          (assoc-many
+            (map-of)
+            "kind" "enum_variant_constant"
+            "name" (get-any variant "name" null)
+            "value" (get-any variant "value" null)
+            "type" enum-type)))))
+  (enum-variant-constants
+    (lambda (enum-type)
+      (map
+        (enum-type-variants enum-type)
+        (lambda (variant)
+          (enum-variant-constant
+            enum-type
+            (get-any variant "name" null))))))
+  (struct-field-metadata
+    (lambda (struct-type field-name)
+      (bind (
+        (field-type
+          (struct-type-field struct-type field-name))
+        (field-index
+          (struct-type-field-index struct-type field-name))
+      )
+        (if (eq field-type null)
+          null
+          (assoc-many
+            (map-of)
+            "kind" "struct_field"
+            "struct" struct-type
+            "struct_name" (type-name struct-type)
+            "name" field-name
+            "index" field-index
+            "type" field-type)))))
+  (struct-fields-metadata
+    (lambda (struct-type)
+      (map
+        (struct-type-fields struct-type)
+        (lambda (field)
+          (struct-field-metadata
+            struct-type
+            (get-any field "name" null))))))
+  (struct-constructor-metadata
+    (lambda (struct-type)
+      (assoc-many
+        (map-of)
+        "kind" "struct_constructor"
+        "name" (type-name struct-type)
+        "params" (struct-type-fields struct-type)
+        "result" struct-type)))
+)
+  (do
+    (assoc-many
+      semantics
+      "enum-variant-constant" pure-semantics
+      "enum-variant-constants" pure-semantics
+      "struct-field-metadata" pure-semantics
+      "struct-fields-metadata" pure-semantics
+      "struct-constructor-metadata" pure-semantics)
+    (assoc-many
+      exports
+      "enum-variant-constant" enum-variant-constant
+      "enum-variant-constants" enum-variant-constants
+      "struct-field-metadata" struct-field-metadata
+      "struct-fields-metadata" struct-fields-metadata
+      "struct-constructor-metadata"
+        struct-constructor-metadata
+      "__contract_semantics__" semantics)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.types.metadata"
+      exports)
+    exports))

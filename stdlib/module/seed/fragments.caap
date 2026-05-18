@@ -1,0 +1,106 @@
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.path-fragments"
+  (map-of))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.declare-stdlib-fragment"
+  (lambda (module-name path-fragment)
+    (bind (
+      (seed-error
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.error"))
+      (fragments
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.path-fragments"))
+      (existing (get fragments module-name null))
+    )
+      (if (not (eq existing null))
+        (seed-error
+          "stdlib.module.seed.fragment_duplicate"
+          (string-concat-many
+            "duplicate stdlib module fragment declaration for "
+            module-name)
+          (assoc-many (map-of) "module" module-name "existing" existing))
+        (do
+          (assoc fragments module-name path-fragment)
+          path-fragment)))))
+
+(bind (
+  (declare
+    (ctfe-compiler-lookup-value compiler "stdlib.module.seed.declare-stdlib-fragment"))
+)
+  (do
+    (declare "stdlib.module" "module")
+    (declare "stdlib.build-events" "build_events")
+    (declare
+      "stdlib.internal.kit-protocol"
+      "internal/kit_protocol")
+    (declare
+      "stdlib.internal.system-module-helpers"
+      "internal/system_module_helpers")
+    (declare "stdlib.codegen-kit" "kits/codegen_kit")
+    (declare
+      "stdlib.codegen-kit.root-contract"
+      "kits/codegen_kit/root_contract")
+    (declare "stdlib.compiler-kit" "kits/compiler_kit")
+    (declare "stdlib.contract-kit" "kits/contract_kit")
+    (declare "stdlib.explain-kit" "kits/explain_kit")
+    (declare
+      "stdlib.explain-kit.bundles"
+      "kits/explain_kit/bundles")
+    (declare
+      "stdlib.explain-kit.summary"
+      "kits/explain_kit/summary")
+    (declare "stdlib.llvm" "kits/llvm")
+    (declare "stdlib.pass-kit" "kits/pass_kit")
+    (declare
+      "stdlib.pass-kit.authoring"
+      "kits/pass_kit/authoring")
+    (declare
+      "stdlib.pass-kit.diagnostics"
+      "kits/pass_kit/diagnostics")
+    (declare
+      "stdlib.pass-kit.mutation"
+      "kits/pass_kit/mutation")
+    (declare
+      "stdlib.pass-kit.provider"
+      "kits/pass_kit/provider")
+    (declare "stdlib.pass-kit.state" "kits/pass_kit/state")
+    (declare "stdlib.pass-kit.summary" "kits/pass_kit/summary")
+    (declare
+      "stdlib.pass-kit.traversal"
+      "kits/pass_kit/traversal")
+    (declare "stdlib.visualize-kit" "kits/visualize_kit")
+    (declare "stdlib.builder" "lang/builder")
+    (declare "stdlib.lang.effects" "lang/effects")
+    (declare "stdlib.list" "lang/list")
+    (declare "stdlib.map" "lang/map")
+    (declare "stdlib.numbers" "lang/numbers")
+    (declare "stdlib.optimization" "lang/optimization")
+    (declare "stdlib.predicates" "lang/predicates")
+    (declare "stdlib.sequence" "lang/sequence")
+    (declare "stdlib.special-forms" "lang/special_forms")
+    (declare "stdlib.string" "lang/string")
+    (declare "stdlib.surface-builder" "lang/surface_builder")
+    (declare "sys.fmt" "system/format")
+    (declare "sys.fs" "system/fs")
+    (declare "sys.io" "system/io")
+    (declare "sys.net" "system/net")
+    (declare "sys.os" "system/os")
+    (declare "sys.proc" "system/process")
+    (declare "sys.time" "system/time")
+    (declare "stdlib.types" "types/bootstrap")
+    (declare "stdlib.types.aliases" "types/aliases")
+    (declare "stdlib.types.arrays" "types/arrays")
+    (declare "stdlib.types.checker" "types/checker")
+    (declare "stdlib.types.core" "types/core")
+    (declare "stdlib.types.enums" "types/enums")
+    (declare "stdlib.types.equality" "types/equality")
+    (declare "stdlib.types.functions" "types/functions")
+    (declare "stdlib.types.generics" "types/generics")
+    (declare "stdlib.types.inspect" "types/inspect")
+    (declare "stdlib.types.metadata" "types/metadata")
+    (declare "stdlib.types.primitives" "types/primitives")
+    (declare "stdlib.types.registry" "types/registry")
+    (declare "stdlib.types.structs" "types/structs")
+    (declare "stdlib.types.validation" "types/validation")))

@@ -1,0 +1,105 @@
+(module "stdlib.types.structs")
+
+(import-namespace "stdlib.types.core" "core")
+
+(import-namespace "stdlib.types.validation" "validation")
+
+(import-namespace "stdlib.sequence" "sequence")
+
+(export "stdlib.types.structs")
+
+(bind (
+  (exports (map-of))
+  (semantics (map-of))
+  (not-null? (get sequence "not-null?" null))
+  (is-null? (get sequence "is-null?" null))
+  (get-or-null (get sequence "get-or-null" null))
+  (pure-semantics (get core "pure-semantics" null))
+  (each (get sequence "each" null))
+  (make-type (get core "make-type" null))
+  (struct-key (get core "struct-key" null))
+  (validate-type (get validation "validate-type" null))
+  (expect-struct
+    (lambda (type)
+      (bind (
+        (validated (validate-type type))
+      )
+        (if (not (eq (get-or-null validated "kind") "struct"))
+          (runtime-error "expected a struct type")
+          validated))))
+  (index-struct-fields
+    (lambda (fields)
+      (bind (
+        (index (map-of))
+        (state (assoc (map-of) "position" 0))
+      )
+        (do
+          (each fields
+            (lambda (field)
+              (bind (
+                (name (get-or-null field "name"))
+                (position (get-or-null state "position"))
+              )
+                (do
+                  (if (not-null? name)
+                    (assoc
+                      index
+                      name
+                      (assoc-many (map-of) "field" field "index" position)))
+                  (assoc state "position" (int-add position 1))))))
+          index))))
+  (make-struct-type
+    (lambda (name fields)
+      (bind (
+        (type (make-type "struct" (struct-key name)))
+      )
+        (do
+          (assoc-many type "name" name "fields" fields "field_index" (index-struct-fields fields))
+          (validate-type type)))))
+  (struct-type-fields
+    (lambda (type)
+      (get-or-null (expect-struct type) "fields")))
+  (struct-type-field
+    (lambda (type field-name)
+      (bind (
+        (field-entry
+          (get-or-null
+            (get-or-null (expect-struct type) "field_index")
+            field-name))
+        (field (get-or-null field-entry "field"))
+      )
+        (if (is-null? field)
+          null
+          (get-or-null field "type")))))
+  (struct-type-field-index
+    (lambda (type field-name)
+      (get-or-null
+        (get-or-null
+          (get-or-null (expect-struct type) "field_index")
+          field-name)
+        "index")))
+  (struct-has-field
+    (lambda (type field-name)
+      (not-null? (struct-type-field type field-name))))
+)
+  (do
+    (assoc-many
+      semantics
+      "make-struct-type" pure-semantics
+      "struct-type-fields" pure-semantics
+      "struct-type-field" pure-semantics
+      "struct-type-field-index" pure-semantics
+      "struct-has-field" pure-semantics)
+    (assoc-many
+      exports
+      "make-struct-type" make-struct-type
+      "struct-type-fields" struct-type-fields
+      "struct-type-field" struct-type-field
+      "struct-type-field-index" struct-type-field-index
+      "struct-has-field" struct-has-field
+      "__contract_semantics__" semantics)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.types.structs"
+      exports)
+    exports))

@@ -1,0 +1,59 @@
+(module "stdlib.types.arrays")
+
+(import-namespace "stdlib.types.core" "core")
+
+(import-namespace "stdlib.types.validation" "validation")
+
+(import-namespace "stdlib.sequence" "sequence")
+
+(export "stdlib.types.arrays")
+
+(bind (
+  (exports (map-of))
+  (semantics (map-of))
+  (get-or-null (get sequence "get-or-null" null))
+  (pure-semantics (get core "pure-semantics" null))
+  (make-type (get core "make-type" null))
+  (array-key (get core "array-key" null))
+  (validate-type (get validation "validate-type" null))
+  (expect-array
+    (lambda (type)
+      (bind (
+        (validated (validate-type type))
+      )
+        (if (not (eq (get-or-null validated "kind") "array"))
+          (runtime-error "expected an array type")
+          validated))))
+  (make-array-type
+    (lambda (element length)
+      (bind (
+        (type
+          (make-type "array" (array-key element length)))
+      )
+        (do
+          (assoc-many type "element" element "length" length)
+          (validate-type type)))))
+  (array-element-type
+    (lambda (type)
+      (get-or-null (expect-array type) "element")))
+  (array-length
+    (lambda (type)
+      (get-or-null (expect-array type) "length")))
+)
+  (do
+    (assoc-many
+      semantics
+      "make-array-type" pure-semantics
+      "array-element-type" pure-semantics
+      "array-length" pure-semantics)
+    (assoc-many
+      exports
+      "make-array-type" make-array-type
+      "array-element-type" array-element-type
+      "array-length" array-length
+      "__contract_semantics__" semantics)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.types.arrays"
+      exports)
+    exports))

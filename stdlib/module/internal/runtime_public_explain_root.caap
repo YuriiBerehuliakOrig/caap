@@ -1,0 +1,72 @@
+(ctfe-compiler-execute-bootstrap-file
+  compiler
+  "runtime_public_payloads.caap")
+
+(ctfe-compiler-execute-bootstrap-file
+  compiler
+  "runtime_public_state.caap")
+
+(bind (
+  (module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.prelude-bindings"))
+  (public-payloads
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.public-payloads"))
+  (public-state
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.public-state"))
+  (exports (map-of))
+  (get-any (get module-helpers "get-any" null))
+  (is-null? (get-any module-helpers "is-null?" null))
+  (get-or-null (get-any module-helpers "get-or-null" null))
+  (require-helper
+    (get-any module-helpers "require-helper" null))
+  (module-state-registry
+    (require-helper module-helpers "module-state-registry"))
+  (resolve-root-public-state
+    (require-helper public-state "resolve-root-public-state"))
+  (explain-summary
+    (require-helper public-payloads "explain-summary"))
+  (explain-chain-result
+    (require-helper public-payloads "explain-chain-result"))
+)
+  null)
+
+(bind (
+  (make-explain-root-public
+    (lambda (state)
+      (bind (
+        (registry (module-state-registry state))
+      )
+        (lambda (root public-name)
+          (bind (
+            (public-state
+              (resolve-root-public-state registry root public-name))
+          )
+            (bind (
+              (chain-thunk
+                (get-or-null public-state "chain_thunk"))
+            )
+              (if (is-null? chain-thunk)
+                (explain-summary
+                  (get-or-null public-state "module")
+                  (get-or-null public-state "public")
+                  false
+                  (get-or-null public-state "module_kind")
+                  (get-any public-state "publics" (list-of))
+                  null
+                  null
+                  (list-of)
+                  (get-or-null public-state "error"))
+                (explain-chain-result
+                  (get-or-null public-state "module")
+                  (get-or-null public-state "public")
+                  (get-or-null public-state "module_kind")
+                  (get-any public-state "publics" (list-of))
+                  (chain-thunk)))))))))
+)
+  (do
+    (assoc-many exports "make-explain-root-public" make-explain-root-public)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.module.internal.public-explain-root"
+      exports)
+    exports))

@@ -1,0 +1,114 @@
+(module "stdlib.pass-kit.provider")
+
+(import-namespace "stdlib.sequence" "sequence")
+
+(export "exports")
+
+(bind (
+  (_sequence-loaded sequence)
+  (is-null? (get sequence "is-null?"))
+  (each (get sequence "each"))
+  (range (get sequence "range"))
+  (provider-spec
+    (lambda (family reads writes cache-scope resume-policy input-schema)
+      (assoc-many
+        (map-of)
+        "family" family
+        "reads"
+          (if (is-null? reads)
+            (list-of)
+            reads)
+        "writes"
+          (if (is-null? writes)
+            (list-of)
+            writes)
+        "cache_scope" cache-scope
+        "resume_policy" resume-policy
+        "input_schema" input-schema)))
+  (register-provider
+    (lambda (name stage implementation requires effects spec)
+      (ctfe-compiler-provider-register
+        compiler
+        name
+        stage
+        implementation
+        requires
+        effects
+        spec)))
+  (register-compile-time-function
+    (lambda (name implementation)
+      (do
+        (ctfe-compiler-register-compile-time-function
+          compiler
+          name
+          implementation)
+        null)))
+  (source-setup
+    (lambda (value)
+      null))
+  (source-define
+    (lambda (name value)
+      null))
+  (annotation-get
+    (lambda (node key default)
+      (ctfe-meta-annotation-get node key default)))
+  (annotation-set
+    (lambda (node key value)
+      (do
+        (ctfe-meta-annotation-set node key value)
+        node)))
+  (annotation-set-many
+    (lambda (node &items)
+      (bind (
+        (count (size &items))
+        (pair-count (int-div count 2))
+      )
+        (do
+          (if (not (eq (int-rem count 2) 0))
+            (runtime-error
+              "pass-kit annotation-set-many expects alternating key/value items"))
+          (each (range 0 pair-count)
+            (lambda (pair-idx)
+              (bind (
+                (index (int-mul pair-idx 2))
+              )
+                (ctfe-meta-annotation-set
+                  node
+                  (get &items index null)
+                  (get &items (int-add index 1) null)))))
+          node))))
+  (fact-get
+    (lambda (ctx key node default)
+      (ctfe-provider-fact-get ctx key node default)))
+  (fact-set
+    (lambda (ctx key node value)
+      (ctfe-provider-fact-set ctx key node value)))
+  (fold-compile-time-call
+    (lambda (ctx node)
+      (ctfe-provider-fold-compile-time-call ctx node)))
+  (fold-safe?
+    (lambda (ctx node)
+      (ctfe-provider-fold-safe? ctx node)))
+  (exports
+    (assoc-many
+      (map-of)
+      "provider-spec" provider-spec
+      "register-provider" register-provider
+      "register-compile-time-function"
+        register-compile-time-function
+      "source-setup" source-setup
+      "source-define" source-define
+      "annotation-get" annotation-get
+      "annotation-set" annotation-set
+      "annotation-set-many" annotation-set-many
+      "fact-get" fact-get
+      "fact-set" fact-set
+      "fold-compile-time-call" fold-compile-time-call
+      "fold-safe?" fold-safe?))
+)
+  (do
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.pass-kit.provider"
+      exports)
+    exports))

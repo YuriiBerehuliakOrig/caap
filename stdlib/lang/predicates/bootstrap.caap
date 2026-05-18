@@ -1,0 +1,30 @@
+(module "stdlib.predicates")
+
+(import-namespace "stdlib.sequence" "sequence")
+
+(export "stdlib.predicates")
+
+; Predicate-focused facade over common stdlib truth helpers.
+(bind (
+  (each (get sequence "each" null))
+  (pick
+    (lambda (&names)
+      (bind (
+        (exports (map-of))
+      )
+        (do
+          (each names
+            (lambda (name)
+              (assoc exports name (get sequence name null))))
+          exports))))
+)
+  (pick
+    "empty?"
+    "is-null?"
+    "not-null?"
+    "contains"
+    "any?"
+    "all?"
+    "map-entry?"
+    "has-key?"
+    "nonempty-str?"))

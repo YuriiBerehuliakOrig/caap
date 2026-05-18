@@ -1,0 +1,209 @@
+(ctfe-compiler-execute-bootstrap-file
+  compiler
+  "common.caap")
+
+(bind (
+  (module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.prelude-bindings"))
+  (get-any (get module-helpers "get-any" null))
+  (is-null? (get-any module-helpers "is-null?" null))
+  (not-null? (get-any module-helpers "not-null?" null))
+  (get-or-null (get-any module-helpers "get-or-null" null))
+  (require-helper
+    (get-any module-helpers "require-helper" null))
+  (each (require-helper module-helpers "each"))
+  (provider-kind
+    (require-helper module-helpers "provider-kind"))
+  (provider-library
+    (require-helper module-helpers "provider-library"))
+  (define-internal-module
+    (require-helper module-helpers "define-internal-module"))
+)
+  (bind (
+    (provider-summary
+      (lambda (provider)
+        (if (or (is-null? provider) (not (value-is-map provider)))
+          null
+          (bind (
+            (summary (map-of))
+          )
+            (do
+              (assoc-many
+                summary
+                "provider_kind" (provider-kind provider)
+                "module" (get-or-null provider "module")
+                "local" (get-or-null provider "local")
+                "library" (provider-library provider)
+                "export" (get-or-null provider "export")
+                "policy" (get-or-null provider "policy"))
+              summary)))))
+    (semantics-summary
+      (lambda (entry truth-kind)
+        (if (or (is-null? entry) (not (value-is-map entry)))
+          null
+          (bind (
+            (summary (map-of))
+          )
+            (do
+              (assoc-many
+                summary
+                "phase" (get-or-null entry "phase")
+                "effect" (get-or-null entry "effect")
+                "pure" (get-or-null entry "pure")
+                "truth_kind" truth-kind)
+              summary)))))
+    (provider-semantics-summary
+      (lambda (provider)
+        (if (or (is-null? provider) (not (value-is-map provider)))
+          null
+          (semantics-summary provider (provider-kind provider)))))
+    (semantic-source-for-record-kind
+      (lambda (record-kind)
+        (if (eq record-kind "top_level")
+          "declared-local"
+          (if (eq record-kind "imported")
+            "propagated-import"
+            (if (eq record-kind "host_service")
+              "host-catalog"
+              null)))))
+    (semantic-truth-kind-for-record
+      (lambda (record-kind semantics)
+        (if (eq record-kind "top_level")
+          "template"
+          (if (eq record-kind "host_service")
+            "host-service"
+            (if (is-null? semantics)
+              null
+              (get-or-null semantics "truth_kind"))))))
+    (semantic-mode-for-record-kind
+      (lambda (record-kind)
+        (if (eq record-kind "top_level")
+          "local"
+          (if (eq record-kind "imported")
+            "propagated"
+            (if (eq record-kind "host_service")
+              "terminal"
+              null)))))
+    (semantic-final-truth-for-record-kind
+      (lambda (record-kind)
+        (if (eq record-kind "imported")
+          false
+          (if
+            (or
+              (eq record-kind "top_level")
+              (eq record-kind "host_service"))
+            true
+            false))))
+    (semantic-step-kind-for-record-kind
+      (lambda (record-kind)
+        (if (eq record-kind "top_level")
+          "local_truth"
+          (if (eq record-kind "imported")
+            "propagated_truth"
+            (if (eq record-kind "host_service")
+              "terminal_truth"
+              null)))))
+    (semantic-fields-present
+      (lambda (phase effect pure)
+        (bind (
+          (fields (list-of))
+        )
+          (do
+            (if (not-null? phase)
+              (append fields "phase"))
+            (if (not-null? effect)
+              (append fields "effect"))
+            (if (not-null? pure)
+              (append fields "pure"))
+            fields))))
+    (semantic-matches-final-truth
+      (lambda (record-kind phase effect pure semantics)
+        (if (is-null? semantics)
+          null
+          (if (eq record-kind "imported")
+            (and
+              (eq phase (get-or-null semantics "phase"))
+              (eq effect (get-or-null semantics "effect"))
+              (eq pure (get-or-null semantics "pure")))
+            true))))
+    (semantic-provenance-entry
+      (lambda (entry semantics)
+        (bind (
+          (record-kind (get-or-null entry "record_kind"))
+          (summary (map-of))
+          (propagated? (eq record-kind "imported"))
+          (phase
+            (if propagated?
+              (if (is-null? semantics)
+                null
+                (get-or-null semantics "phase"))
+              (get-or-null entry "phase")))
+          (effect
+            (if propagated?
+              (if (is-null? semantics)
+                null
+                (get-or-null semantics "effect"))
+              (get-or-null entry "effect")))
+          (pure
+            (if propagated?
+              (if (is-null? semantics)
+                null
+                (get-or-null semantics "pure"))
+              (get-or-null entry "pure")))
+        )
+          (do
+            (assoc-many
+              summary
+              "module" (get-or-null entry "module")
+              "public" (get-or-null entry "public")
+              "record_kind" record-kind
+              "phase" phase
+              "effect" effect
+              "pure" pure
+              "truth_kind"
+                (semantic-truth-kind-for-record record-kind semantics)
+              "semantic_source"
+                (semantic-source-for-record-kind record-kind)
+              "semantic_mode"
+                (semantic-mode-for-record-kind record-kind)
+              "final_truth"
+                (semantic-final-truth-for-record-kind record-kind)
+              "semantic_step_kind"
+                (semantic-step-kind-for-record-kind record-kind)
+              "propagated_from_module"
+                (if propagated?
+                  (get-or-null entry "source_module")
+                  null)
+              "propagated_from_public"
+                (if propagated?
+                  (get-or-null entry "source_public")
+                  null)
+              "semantic_fields_present"
+                (semantic-fields-present phase effect pure)
+              "matches_final_truth"
+                (semantic-matches-final-truth
+                  record-kind
+                  phase
+                  effect
+                  pure
+                  semantics))
+            summary))))
+    (semantic-provenance-summary
+      (lambda (provenance-chain semantics)
+        (bind (
+          (items (list-of))
+        )
+          (do
+            (each provenance-chain
+              (lambda (entry)
+                (append items (semantic-provenance-entry entry semantics))))
+            items))))
+  )
+    (do
+      (define-internal-module
+        "stdlib.module.internal.public-summaries"
+        (list-of
+          (list-of "provider-summary"            provider-summary)
+          (list-of "provider-semantics-summary"  provider-semantics-summary)
+          (list-of "semantic-provenance-summary" semantic-provenance-summary)))
+      null)))

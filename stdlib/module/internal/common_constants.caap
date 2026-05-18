@@ -1,0 +1,65 @@
+(bind (
+  (exports (map-of))
+  ;; --- Provenance Kinds ---
+  (PROVENANCE-TOP-LEVEL "top_level")
+  (PROVENANCE-IMPORTED "imported")
+  (PROVENANCE-HOST-SERVICE "host_service")
+  ;; --- Provider Kinds ---
+  (PROVIDER-TEMPLATE "template")
+  (PROVIDER-HOST-SERVICE "host-service")
+  ;; --- Phases ---
+  (PHASE-RUNTIME "runtime")
+  (PHASE-COMPILE-TIME "compile_time")
+  ;; --- Import Kinds ---
+  (IMPORT-SYMBOL "symbol")
+  (IMPORT-NAMESPACE "namespace")
+  ;; --- Error Codes ---
+  (ERR-STATE-INVALID "stdlib.module.state.invalid")
+  (ERR-RECORD-INVALID "stdlib.module.record.invalid")
+  (ERR-CYCLIC-DEP "stdlib.module.cyclic_dependency")
+  (ERR-UNRESOLVED "stdlib.module.unresolved")
+  ;; --- Module State Keys (formerly common_keys.caap) ---
+  (enabled-key "stdlib.module.enabled")
+  (finalized-key "stdlib.module.finalized")
+  (summary-key "stdlib.module.summary")
+  (scan-key "stdlib.module.scan")
+  (manifest-key "stdlib.module.manifest")
+  (valid-key "stdlib.module.valid")
+  (interface-key "stdlib.module.interface")
+  (runtime-model-key "stdlib.module.runtime-model")
+  (state-version-key "stdlib.module.state-version")
+)
+  (do
+    (assoc-many
+      exports
+      "PROVENANCE-TOP-LEVEL" PROVENANCE-TOP-LEVEL
+      "PROVENANCE-IMPORTED" PROVENANCE-IMPORTED
+      "PROVENANCE-HOST-SERVICE" PROVENANCE-HOST-SERVICE
+      "PROVIDER-TEMPLATE" PROVIDER-TEMPLATE
+      "PROVIDER-HOST-SERVICE" PROVIDER-HOST-SERVICE
+      "PHASE-RUNTIME" PHASE-RUNTIME
+      "PHASE-COMPILE-TIME" PHASE-COMPILE-TIME
+      "IMPORT-SYMBOL" IMPORT-SYMBOL
+      "IMPORT-NAMESPACE" IMPORT-NAMESPACE
+      "ERR-STATE-INVALID" ERR-STATE-INVALID
+      "ERR-RECORD-INVALID" ERR-RECORD-INVALID
+      "ERR-CYCLIC-DEP" ERR-CYCLIC-DEP
+      "ERR-UNRESOLVED" ERR-UNRESOLVED
+      "enabled-key" enabled-key
+      "finalized-key" finalized-key
+      "summary-key" summary-key
+      "scan-key" scan-key
+      "manifest-key" manifest-key
+      "valid-key" valid-key
+      "interface-key" interface-key
+      "runtime-model-key" runtime-model-key
+      "state-version-key" state-version-key)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.module.internal.common-constants"
+      exports)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.module.internal.common-keys"
+      exports)
+    exports))

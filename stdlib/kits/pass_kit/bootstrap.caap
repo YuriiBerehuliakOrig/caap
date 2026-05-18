@@ -1,0 +1,373 @@
+(module "stdlib.pass-kit")
+
+(import-namespace "stdlib.sequence" "sequence")
+
+(import-namespace "stdlib.lang.effects" "effects")
+
+(import-namespace
+  "stdlib.pass-kit.summary"
+  "summary-module")
+
+(import-namespace
+  "stdlib.pass-kit.diagnostics"
+  "diagnostics-module")
+
+(import-namespace
+  "stdlib.pass-kit.mutation"
+  "mutation-module")
+
+(import-namespace
+  "stdlib.pass-kit.traversal"
+  "traversal-module")
+
+(import-namespace "stdlib.pass-kit.state" "state-module")
+
+(import-namespace
+  "stdlib.pass-kit.provider"
+  "provider-module")
+
+(import-namespace
+  "stdlib.pass-kit.authoring"
+  "authoring-module")
+
+(import-namespace
+  "stdlib.internal.kit-protocol"
+  "kit-protocol")
+
+(export "stdlib.pass-kit")
+
+; stdlib/pass_kit/bootstrap.caap
+; Canonical pass-authoring workflow helpers over existing graph-pass builtins.
+(bind (
+  (new-kit (get kit-protocol "new-kit" null))
+  (register-pure-helper
+    (get kit-protocol "register-pure-helper" null))
+  (register-impure-helper
+    (get kit-protocol "register-impure-helper" null))
+  (register-diagnostic-helper
+    (get kit-protocol "register-diagnostic-helper" null))
+  (register-pass (get kit-protocol "register-pass" null))
+  (get-any (get sequence "get" null))
+  (is-null? (get sequence "is-null?" null))
+  (not-null? (get sequence "not-null?" null))
+  (each (get sequence "each" null))
+  (range (get sequence "range" null))
+  (length (get sequence "length" null))
+  (at (get sequence "at" null))
+  (has-key? (get sequence "has-key?" null))
+  (merge-fields (get sequence "merge-fields" null))
+  (effect-io (get effects "EFFECT-IO" "io"))
+  (effect-ir-write
+    (get effects "EFFECT-IR-WRITE" "write-ir"))
+  (kit-root
+    (new-kit
+      "stdlib.pass-kit"
+      "Canonical pass-authoring workflow helpers over compiler graph-pass builtins."
+      (list-of)))
+  (register-local-pure-helper
+    (lambda (name implementation)
+      (register-pure-helper kit-root name implementation)))
+  (register-local-impure-helper
+    (lambda (name implementation)
+      (register-impure-helper kit-root name implementation)))
+  (register-local-diagnostic-helper
+    (lambda (name implementation)
+      (register-diagnostic-helper kit-root name implementation)))
+  (register-mutating-pass
+    (lambda (name implementation)
+      (register-pass
+        kit-root
+        name
+        implementation
+        effect-ir-write
+        false)))
+  (register-impure-pass
+    (lambda (name implementation)
+      (register-pass kit-root name implementation effect-io false)))
+  ;;; Shared summary and golden-fixture helpers
+  (_summary-module-loaded summary-module)
+  (summary-kit
+    (ctfe-compiler-lookup-value compiler "stdlib.pass-kit.summary" null))
+  (meta-get (get summary-kit "meta-get" null))
+  (node-id-or-null (get summary-kit "node-id-or-null" null))
+  (node-stable-id-or-null
+    (get summary-kit "node-stable-id-or-null" null))
+  (fixture-node (get summary-kit "fixture-node" null))
+  (fixture-stable-id
+    (get summary-kit "fixture-stable-id" null))
+  (diagnostic-count-for-severity
+    (get summary-kit "diagnostic-count-for-severity" null))
+  (diagnostic-status
+    (get summary-kit "diagnostic-status" null))
+  (rewrite-result-ids
+    (get summary-kit "rewrite-result-ids" null))
+  (fixture-result (get summary-kit "fixture-result" null))
+  (rewrite-result (get summary-kit "rewrite-result" null))
+  (rewrite-summary (get summary-kit "rewrite-summary" null))
+  (unchanged-summary
+    (get summary-kit "unchanged-summary" null))
+  (summary-empty (get summary-kit "summary-empty" null))
+  (summary-changed?
+    (get summary-kit "summary-changed?" null))
+  (summary-relabel (get summary-kit "summary-relabel" null))
+  (summary-merge (get summary-kit "summary-merge" null))
+  (normalize-step-result
+    (get summary-kit "normalize-step-result" null))
+  (fixture-summary (get summary-kit "fixture-summary" null))
+  (execution-records-for-golden
+    (get summary-kit "execution-records-for-golden" null))
+  (rewrite-record-for-golden
+    (get summary-kit "rewrite-record-for-golden" null))
+  (rewrite-fixture (get summary-kit "rewrite-fixture" null))
+  (rewrite-golden (get summary-kit "rewrite-golden" null))
+  (_diagnostics-module-loaded diagnostics-module)
+  (_mutation-module-loaded mutation-module)
+  (_traversal-module-loaded traversal-module)
+  (_state-module-loaded state-module)
+  (_provider-module-loaded provider-module)
+  (_authoring-module-loaded authoring-module)
+  (diagnostics-kit
+    (ctfe-compiler-lookup-value compiler "stdlib.pass-kit.diagnostics" null))
+  (mutation-kit
+    (ctfe-compiler-lookup-value compiler "stdlib.pass-kit.mutation" null))
+  (traversal-kit
+    (ctfe-compiler-lookup-value compiler "stdlib.pass-kit.traversal" null))
+  (state-kit
+    (ctfe-compiler-lookup-value compiler "stdlib.pass-kit.state" null))
+  (provider-kit
+    (ctfe-compiler-lookup-value compiler "stdlib.pass-kit.provider" null))
+  (authoring-kit
+    (ctfe-compiler-lookup-value compiler "stdlib.pass-kit.authoring" null))
+  (emit-diagnostic (get diagnostics-kit "emit-diagnostic"))
+  (emit-warning (get diagnostics-kit "emit-warning"))
+  (emit-error (get diagnostics-kit "emit-error"))
+  (emit-note (get diagnostics-kit "emit-note"))
+  (diagnostic-step (get diagnostics-kit "diagnostic-step"))
+  (replace-one (get mutation-kit "replace-one"))
+  (replace-node (get mutation-kit "replace-node"))
+  (replace-many (get mutation-kit "replace-many"))
+  (erase-node (get mutation-kit "erase-node"))
+  (walk-preorder (get traversal-kit "walk-preorder"))
+  (walk-postorder (get traversal-kit "walk-postorder"))
+  (walk-stateful (get traversal-kit "walk-stateful"))
+  (walk-kind (get traversal-kit "walk-kind"))
+  (walk-calls (get traversal-kit "walk-calls"))
+  (walk-names (get traversal-kit "walk-names"))
+  (first-match (get traversal-kit "first-match"))
+  (collect-matches (get traversal-kit "collect-matches"))
+  (collect-first (get traversal-kit "collect-first"))
+  (collect-one (get traversal-kit "collect-one"))
+  (collect-node-kinds
+    (get traversal-kit "collect-node-kinds"))
+  (merged-step-summary
+    (get traversal-kit "merged-step-summary"))
+  (apply-when (get traversal-kit "apply-when"))
+  (apply-first-match
+    (get traversal-kit "apply-first-match"))
+  (lookup-binding (get state-kit "lookup-binding"))
+  (explain-binding (get state-kit "explain-binding"))
+  (declare-symbol (get state-kit "declare-symbol"))
+  (set-symbol-semantics
+    (get state-kit "set-symbol-semantics"))
+  (link-binding (get state-kit "link-binding"))
+  (set-unit-id (get state-kit "set-unit-id"))
+  (add-link-binding (get state-kit "add-link-binding"))
+  (add-public-name (get state-kit "add-public-name"))
+  (unit-version (get state-kit "unit-version"))
+  (unit-root (get state-kit "unit-root"))
+  (top-level-forms (get state-kit "top-level-forms"))
+  (top-level-symbol-names
+    (get state-kit "top-level-symbol-names"))
+  (top-level-symbols (get state-kit "top-level-symbols"))
+  (call-head-name (get state-kit "call-head-name"))
+  (call-args (get state-kit "call-args"))
+  (lambda-body (get state-kit "lambda-body"))
+  (flat-bind-bindings (get state-kit "flat-bind-bindings"))
+  (call-effect-policy (get state-kit "call-effect-policy"))
+  (provider-spec (get provider-kit "provider-spec"))
+  (register-provider (get provider-kit "register-provider"))
+  (register-compile-time-function
+    (get provider-kit "register-compile-time-function"))
+  (source-setup (get provider-kit "source-setup"))
+  (source-define (get provider-kit "source-define"))
+  (annotation-get (get provider-kit "annotation-get"))
+  (annotation-set (get provider-kit "annotation-set"))
+  (annotation-set-many
+    (get provider-kit "annotation-set-many"))
+  (fact-get (get provider-kit "fact-get"))
+  (fact-set (get provider-kit "fact-set"))
+  (fold-compile-time-call
+    (get provider-kit "fold-compile-time-call"))
+  (fold-safe? (get provider-kit "fold-safe?"))
+  (visit-each-match (get authoring-kit "visit-each-match"))
+  (replace-first-match
+    (get authoring-kit "replace-first-match"))
+  (replace-when (get authoring-kit "replace-when"))
+  (warn-when (get authoring-kit "warn-when"))
+  (emit-diagnostic-if
+    (get authoring-kit "emit-diagnostic-if"))
+  (erase-when (get authoring-kit "erase-when"))
+  (erase-first-match
+    (get authoring-kit "erase-first-match"))
+  (replace-all-matches
+    (get authoring-kit "replace-all-matches"))
+  (replace-each-match
+    (get authoring-kit "replace-each-match"))
+  (erase-all-matches
+    (get authoring-kit "erase-all-matches"))
+  (rewrite-step (get authoring-kit "rewrite-step"))
+  (rewrite-first-success
+    (get authoring-kit "rewrite-first-success"))
+  (rewrite-pipeline (get authoring-kit "rewrite-pipeline"))
+  (rewrite-while-internal
+    (get authoring-kit "rewrite-while-internal"))
+  (rewrite-while (get authoring-kit "rewrite-while"))
+  (rewrite-until-stable
+    (get authoring-kit "rewrite-until-stable"))
+  (diagnostic-summary
+    (get authoring-kit "diagnostic-summary"))
+  ;;; Capability registration tables
+  (register-helper-entry
+    (lambda (entry)
+      (bind (
+        (kind (at entry 0))
+        (name (at entry 1))
+        (implementation (at entry 2))
+      )
+        (if (eq kind "pure-helper")
+          (register-local-pure-helper name implementation)
+          (if (eq kind "impure-helper")
+            (register-local-impure-helper name implementation)
+            (if (eq kind "diagnostic-helper")
+              (register-local-diagnostic-helper name implementation)
+              (if (eq kind "mutating-pass")
+                (register-mutating-pass name implementation)
+                (if (eq kind "impure-pass")
+                  (register-impure-pass name implementation)
+                  (runtime-error
+                    "pass-kit registration entry has unknown kind")))))))))
+  (register-helper-entries
+    (lambda (&entry-lists)
+      (each &entry-lists
+        (lambda (entries)
+          (each entries
+            (lambda (entry)
+              (register-helper-entry entry)))))))
+  (diagnostic-helper-entries
+    (list-of
+      (list-of "diagnostic-helper" "emit-error"         emit-error)
+      (list-of "diagnostic-helper" "emit-warning"       emit-warning)
+      (list-of "diagnostic-helper" "emit-note"          emit-note)
+      (list-of "diagnostic-helper" "warn-when"          warn-when)
+      (list-of "diagnostic-helper" "emit-diagnostic-if" emit-diagnostic-if)))
+  (graph-mutation-entries
+    (list-of
+      (list-of "mutating-pass" "replace-one"    replace-one)
+      (list-of "mutating-pass" "replace-node"   replace-node)
+      (list-of "mutating-pass" "replace-many"   replace-many)
+      (list-of "mutating-pass" "erase-node"     erase-node)
+      (list-of "mutating-pass" "walk-preorder"  walk-preorder)
+      (list-of "mutating-pass" "walk-postorder" walk-postorder)
+      (list-of "mutating-pass" "walk-stateful"  walk-stateful)
+      (list-of "mutating-pass" "walk-kind"      walk-kind)
+      (list-of "mutating-pass" "walk-calls"     walk-calls)
+      (list-of "mutating-pass" "walk-names"     walk-names)))
+  (traversal-entries
+    (list-of
+      (list-of "pure-helper" "first-match"        first-match)
+      (list-of "pure-helper" "collect-matches"    collect-matches)
+      (list-of "pure-helper" "collect-first"      collect-first)
+      (list-of "pure-helper" "collect-one"        collect-one)
+      (list-of "pure-helper" "collect-node-kinds" collect-node-kinds)))
+  (semantic-state-entries
+    (list-of
+      (list-of "pure-helper" "lookup-binding"         lookup-binding)
+      (list-of "pure-helper" "explain-binding"        explain-binding)
+      (list-of "impure-pass" "declare-symbol"         declare-symbol)
+      (list-of "impure-pass" "set-symbol-semantics"   set-symbol-semantics)
+      (list-of "pure-helper" "link-binding"           link-binding)
+      (list-of "impure-pass" "set-unit-id"            set-unit-id)
+      (list-of "impure-pass" "add-link-binding"       add-link-binding)
+      (list-of "impure-pass" "add-public-name"        add-public-name)
+      (list-of "pure-helper" "unit-version"           unit-version)
+      (list-of "pure-helper" "unit-root"              unit-root)
+      (list-of "pure-helper" "top-level-forms"        top-level-forms)
+      (list-of "pure-helper" "top-level-symbol-names" top-level-symbol-names)
+      (list-of "pure-helper" "top-level-symbols"      top-level-symbols)
+      (list-of "pure-helper" "call-head-name"         call-head-name)
+      (list-of "pure-helper" "call-args"              call-args)
+      (list-of "pure-helper" "lambda-body"            lambda-body)
+      (list-of "pure-helper" "flat-bind-bindings"     flat-bind-bindings)
+      (list-of "pure-helper" "call-effect-policy"     call-effect-policy)))
+  (provider-registration-entries
+    (list-of
+      (list-of "pure-helper" "provider-spec" provider-spec)
+      (list-of "impure-helper" "register-provider" register-provider)
+      (list-of
+        "impure-helper"
+        "register-compile-time-function"
+        register-compile-time-function)
+      (list-of "impure-helper" "source-setup" source-setup)
+      (list-of "impure-helper" "source-define" source-define)
+      (list-of "pure-helper" "annotation-get" annotation-get)
+      (list-of "impure-pass" "annotation-set" annotation-set)
+      (list-of "impure-pass" "annotation-set-many" annotation-set-many)
+      (list-of "pure-helper" "fact-get" fact-get)
+      (list-of "impure-pass" "fact-set" fact-set)
+      (list-of "mutating-pass" "fold-compile-time-call" fold-compile-time-call)
+      (list-of "pure-helper" "fold-safe?" fold-safe?)))
+  (rewrite-result-entries
+    (list-of
+      (list-of "pure-helper" "fixture-node"      fixture-node)
+      (list-of "pure-helper" "fixture-stable-id" fixture-stable-id)
+      (list-of "pure-helper" "fixture-summary"   fixture-summary)
+      (list-of "pure-helper" "fixture-result"    fixture-result)
+      (list-of "pure-helper" "rewrite-result"    rewrite-result)
+      (list-of "pure-helper" "rewrite-summary"   rewrite-summary)
+      (list-of "pure-helper" "unchanged-summary" unchanged-summary)
+      (list-of "pure-helper" "summary-empty"     summary-empty)
+      (list-of "pure-helper" "summary-relabel"   summary-relabel)
+      (list-of "pure-helper" "summary-merge"     summary-merge)
+      (list-of "pure-helper" "summary-changed?"  summary-changed?)
+      (list-of "pure-helper" "rewrite-fixture"   rewrite-fixture)
+      (list-of "pure-helper" "rewrite-golden"    rewrite-golden)))
+  (rewrite-workflow-entries
+    (list-of
+      (list-of "mutating-pass" "replace-first-match"   replace-first-match)
+      (list-of "mutating-pass" "replace-when"          replace-when)
+      (list-of "mutating-pass" "erase-when"            erase-when)
+      (list-of "mutating-pass" "erase-first-match"     erase-first-match)
+      (list-of "mutating-pass" "replace-all-matches"   replace-all-matches)
+      (list-of "mutating-pass" "replace-each-match"    replace-each-match)
+      (list-of "mutating-pass" "erase-all-matches"     erase-all-matches)
+      (list-of "mutating-pass" "visit-each-match"      visit-each-match)
+      (list-of "mutating-pass" "rewrite-step"          rewrite-step)
+      (list-of "mutating-pass" "rewrite-first-success" rewrite-first-success)
+      (list-of "mutating-pass" "rewrite-pipeline"      rewrite-pipeline)
+      (list-of "mutating-pass" "rewrite-while"         rewrite-while)
+      (list-of "mutating-pass" "rewrite-until-stable"  rewrite-until-stable)
+      (list-of "pure-helper"   "diagnostic-summary"    diagnostic-summary)))
+)
+  (do
+    (assoc
+      kit-root
+      "__roles__"
+      (list-of
+        "diagnostics"
+        "graph-mutation"
+        "semantic-state"
+        "provider-registration"
+        "rewrite-workflows"))
+    (register-helper-entries
+      diagnostic-helper-entries
+      graph-mutation-entries
+      traversal-entries
+      semantic-state-entries
+      provider-registration-entries
+      rewrite-result-entries
+      rewrite-workflow-entries)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.pass-kit"
+      kit-root)
+    kit-root))

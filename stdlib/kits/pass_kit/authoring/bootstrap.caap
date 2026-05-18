@@ -1,0 +1,319 @@
+(module "stdlib.pass-kit.authoring")
+
+(import-namespace "stdlib.sequence" "sequence")
+
+(import-namespace
+  "stdlib.pass-kit.summary"
+  "summary-module")
+
+(import-namespace
+  "stdlib.pass-kit.diagnostics"
+  "diagnostics-module")
+
+(import-namespace
+  "stdlib.pass-kit.mutation"
+  "mutation-module")
+
+(import-namespace
+  "stdlib.pass-kit.traversal"
+  "traversal-module")
+
+(import-namespace "stdlib.pass-kit.state" "state-module")
+
+(export "exports")
+
+(bind (
+  (_sequence-loaded sequence)
+  (_summary-loaded summary-module)
+  (_diagnostics-loaded diagnostics-module)
+  (_mutation-loaded mutation-module)
+  (_traversal-loaded traversal-module)
+  (_state-loaded state-module)
+  (is-null? (get sequence "is-null?"))
+  (each (get sequence "each"))
+  (range (get sequence "range"))
+  (length (get sequence "length"))
+  (summary-kit
+    (ctfe-compiler-lookup-value compiler "stdlib.pass-kit.summary" null))
+  (diagnostics-kit
+    (ctfe-compiler-lookup-value compiler "stdlib.pass-kit.diagnostics" null))
+  (mutation-kit
+    (ctfe-compiler-lookup-value compiler "stdlib.pass-kit.mutation" null))
+  (traversal-kit
+    (ctfe-compiler-lookup-value compiler "stdlib.pass-kit.traversal" null))
+  (state-kit
+    (ctfe-compiler-lookup-value compiler "stdlib.pass-kit.state" null))
+  (summary-merge (get summary-kit "summary-merge"))
+  (summary-empty (get summary-kit "summary-empty"))
+  (summary-changed? (get summary-kit "summary-changed?"))
+  (summary-relabel (get summary-kit "summary-relabel"))
+  (normalize-step-result
+    (get summary-kit "normalize-step-result"))
+  (unchanged-summary (get summary-kit "unchanged-summary"))
+  (rewrite-result-ids
+    (get summary-kit "rewrite-result-ids"))
+  (diagnostic-step (get diagnostics-kit "diagnostic-step"))
+  (replace-one (get mutation-kit "replace-one"))
+  (erase-node (get mutation-kit "erase-node"))
+  (collect-matches (get traversal-kit "collect-matches"))
+  (apply-first-match
+    (get traversal-kit "apply-first-match"))
+  (apply-when (get traversal-kit "apply-when"))
+  (merged-step-summary
+    (get traversal-kit "merged-step-summary"))
+  (unit-root (get state-kit "unit-root"))
+  (visit-each-match
+    (lambda (ctx root predicate callback action)
+      (bind (
+        (matches (collect-matches ctx root predicate))
+        (steps (list-of))
+      )
+        (do
+          (each matches
+            (lambda (node)
+              (append
+                steps
+                (normalize-step-result action node (callback ctx node)))))
+          (merged-step-summary action steps root)))))
+  (replace-first-match
+    (lambda (ctx root predicate replacement)
+      (apply-first-match
+        "replace_first_match"
+        ctx
+        root
+        predicate
+        (lambda (inner-ctx node)
+          (replace-one inner-ctx node replacement)))))
+  (replace-when
+    (lambda (ctx node predicate replacement)
+      (apply-when
+        "replace_when"
+        ctx
+        node
+        predicate
+        (lambda (inner-ctx current-node)
+          (replace-one inner-ctx current-node replacement)))))
+  (warn-when
+    (lambda (ctx node predicate message code)
+      (if (predicate node)
+        (diagnostic-step
+          "warn_when"
+          "warning"
+          ctx
+          node
+          message
+          code)
+        (unchanged-summary "warn_when" node))))
+  (emit-diagnostic-if
+    (lambda (ctx node predicate severity message code)
+      (if (predicate node)
+        (diagnostic-step
+          "emit_diagnostic_if"
+          severity
+          ctx
+          node
+          message
+          code)
+        (unchanged-summary "emit_diagnostic_if" node))))
+  (erase-when
+    (lambda (ctx node predicate)
+      (apply-when
+        "erase_when"
+        ctx
+        node
+        predicate
+        (lambda (inner-ctx current-node)
+          (erase-node inner-ctx current-node)))))
+  (erase-first-match
+    (lambda (ctx root predicate)
+      (apply-first-match
+        "erase_first_match"
+        ctx
+        root
+        predicate
+        (lambda (inner-ctx node)
+          (erase-node inner-ctx node)))))
+  (replace-all-matches
+    (lambda (ctx root predicate replacement)
+      (visit-each-match
+        ctx
+        root
+        predicate
+        (lambda (inner-ctx node)
+          (replace-one inner-ctx node replacement))
+        "replace_all_matches")))
+  (replace-each-match
+    (lambda (ctx root predicate replacer)
+      (visit-each-match
+        ctx
+        root
+        predicate
+        (lambda (inner-ctx node)
+          (replace-one inner-ctx node (replacer node)))
+        "replace_each_match")))
+  (erase-all-matches
+    (lambda (ctx root predicate)
+      (visit-each-match
+        ctx
+        root
+        predicate
+        (lambda (inner-ctx node)
+          (erase-node inner-ctx node))
+        "erase_all_matches")))
+  (rewrite-step
+    (lambda (ctx node action callback)
+      (normalize-step-result action node (callback ctx node))))
+  (rewrite-first-success
+    (lambda (ctx root callbacks action)
+      (bind (
+        (count (length callbacks))
+        (state (map-of))
+      )
+        (do
+          (assoc state "result" null)
+          (assoc state "running" true)
+          (each (range 0 count)
+            (lambda (index)
+              (if (get state "running" true)
+                (bind (
+                  (step
+                    (normalize-step-result
+                      action
+                      root
+                      (ctfe-provider-invoke-callback
+                        ctx
+                        (at callbacks index)
+                        ctx
+                        root)))
+                )
+                  (if (summary-changed? step)
+                    (do
+                      (assoc state "result" (summary-relabel action step))
+                      (assoc state "running" false)))))))
+          (if (is-null? (get state "result" null))
+            (summary-empty action root null)
+            (get state "result" null))))))
+  (rewrite-pipeline
+    (lambda (ctx root callbacks)
+      (bind (
+        (steps (list-of))
+        (state (map-of))
+      )
+        (do
+          (assoc state "root" root)
+          (each callbacks
+            (lambda (cb)
+              (bind (
+                (current-root (get state "root" root))
+                (step
+                  (normalize-step-result
+                    "rewrite_step"
+                    current-root
+                    (ctfe-provider-invoke-callback ctx cb ctx current-root)))
+              )
+                (do
+                  (append steps step)
+                  (assoc state "root" (unit-root ctx))))))
+          (merged-step-summary
+            "rewrite_pipeline"
+            steps
+            (get state "root" root))))))
+  (rewrite-while-internal
+    (lambda (ctx root callback continue-predicate max-iterations action)
+      (bind (
+        (steps (list-of))
+        (state (map-of))
+        (iterations (map-of))
+      )
+        (do
+          (assoc state "stable" false)
+          (assoc state "running" true)
+          (assoc iterations "value" 0)
+          (each (range 0 max-iterations)
+            (lambda (iteration)
+              (if (get state "running" true)
+                (bind (
+                  (step
+                    (normalize-step-result action root (callback ctx root)))
+                )
+                  (do
+                    (append steps step)
+                    (assoc iterations "value" (int-add iteration 1))
+                    (if (summary-changed? step)
+                      (if
+                        (or
+                          (is-null? continue-predicate)
+                          (continue-predicate step iteration))
+                        null
+                        (do
+                          (assoc state "stable" true)
+                          (assoc state "running" false)))
+                      (do
+                        (assoc state "stable" true)
+                        (assoc state "running" false))))))))
+          (bind (
+            (summary
+              (merged-step-summary action steps root))
+          )
+            (do
+              (assoc summary "stable" (get state "stable" false))
+              (assoc summary "iterations" (get iterations "value" 0))
+              summary))))))
+  (rewrite-while
+    (lambda (ctx root callback continue-predicate max-iterations)
+      (rewrite-while-internal
+        ctx
+        root
+        callback
+        continue-predicate
+        max-iterations
+        "rewrite_while")))
+  (rewrite-until-stable
+    (lambda (ctx root callback max-iterations)
+      (rewrite-while-internal
+        ctx
+        root
+        callback
+        (lambda (step iteration)
+          true)
+        max-iterations
+        "rewrite_until_stable")))
+  (diagnostic-summary
+    (lambda (severity code emitted count)
+      (rewrite-result-ids
+        "diagnostic_summary"
+        emitted
+        null
+        null
+        count
+        (if emitted
+          count
+          0)
+        (assoc-many (map-of) "severity" severity "code" code))))
+  (exports
+    (assoc-many
+      (map-of)
+      "visit-each-match" visit-each-match
+      "replace-first-match" replace-first-match
+      "replace-when" replace-when
+      "warn-when" warn-when
+      "emit-diagnostic-if" emit-diagnostic-if
+      "erase-when" erase-when
+      "erase-first-match" erase-first-match
+      "replace-all-matches" replace-all-matches
+      "replace-each-match" replace-each-match
+      "erase-all-matches" erase-all-matches
+      "rewrite-step" rewrite-step
+      "rewrite-first-success" rewrite-first-success
+      "rewrite-pipeline" rewrite-pipeline
+      "rewrite-while-internal" rewrite-while-internal
+      "rewrite-while" rewrite-while
+      "rewrite-until-stable" rewrite-until-stable
+      "diagnostic-summary" diagnostic-summary))
+)
+  (do
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.pass-kit.authoring"
+      exports)
+    exports))

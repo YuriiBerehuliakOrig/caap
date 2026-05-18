@@ -1,0 +1,124 @@
+; stdlib/compiler_kit/toolchain_foundation.caap
+; Stage graph, fact schemas, diagnostic explanations, and Python language bridges.
+(do
+  (ctfe-compiler-stage-register
+    compiler
+    "parse_surface"
+    (list-of)
+    null
+    (list-of "lower_surface" "parse_surface")
+    null
+    (list-of "surface"))
+  (ctfe-compiler-stage-register
+    compiler
+    "unit_input"
+    (list-of)
+    null
+    (list-of)
+    null
+    (list-of "unit"))
+  (ctfe-compiler-stage-register
+    compiler
+    "normalize_before_resolve"
+    (list-of "parse_surface" "unit_input")
+    "semantic_normalization"
+    (list-of "semantic_normalization")
+    "normalize_before_resolve")
+  (ctfe-compiler-stage-register
+    compiler
+    "resolve_names"
+    (list-of "normalize_before_resolve")
+    "resolve_names"
+    (list-of "resolve_names")
+    "normalize_before_resolve")
+  (ctfe-compiler-stage-register
+    compiler
+    "normalize_after_resolve"
+    (list-of "resolve_names")
+    "semantic_normalization"
+    (list-of)
+    "normalize_after_resolve")
+  (ctfe-compiler-stage-register
+    compiler
+    "validate_graph"
+    (list-of "normalize_after_resolve")
+    "validate_graph"
+    (list-of "validate_graph")
+    "normalize_after_resolve")
+  (ctfe-compiler-stage-register
+    compiler
+    "compile_unit"
+    (list-of "validate_graph")
+    null
+    (list-of "compile_unit")
+    null)
+  (ctfe-compiler-fact-schema-type-bridge-register
+    compiler
+    "resolved-name"
+    "resolved-name")
+  (ctfe-compiler-fact-schema-type-bridge-register
+    compiler
+    "resolved-block"
+    "resolved-block")
+  (ctfe-compiler-fact-schema-type-bridge-register
+    compiler
+    "call-semantics"
+    "call-semantics")
+  (ctfe-compiler-fact-schema-register
+    compiler
+    "caap.fact.resolved_name"
+    "resolved-name")
+  (ctfe-compiler-fact-schema-register
+    compiler
+    "caap.fact.resolved_block"
+    "resolved-block")
+  (ctfe-compiler-fact-schema-register
+    compiler
+    "caap.fact.call_semantics"
+    "call-semantics")
+  (ctfe-compiler-diagnostic-explanation-register
+    compiler
+    "caap.resolve.name"
+    (assoc-many
+      (map-of)
+      "summary"
+        "Name resolution could not find a matching local, imported, or registered symbol."
+      "help"
+        "Check spelling, imports, exports, and whether stdlib bootstrap has loaded the package that owns the symbol."))
+  (ctfe-compiler-diagnostic-explanation-register
+    compiler
+    "caap.validate.call.arity"
+    (assoc-many
+      (map-of)
+      "summary"
+        "A call does not match the callee arity contract."
+      "help"
+        "Check the callee signature and the number of arguments passed at this call site."))
+  (ctfe-compiler-register-value
+    compiler
+    "caap.lsp.explain_diagnostic"
+    (lambda (ctx)
+      (bind (
+        (diagnostic (get ctx "diagnostic" null))
+        (code
+          (if (eq diagnostic null)
+            null
+            (get diagnostic "code" null)))
+        (explanations
+          (ctfe-compiler-lookup-value compiler "caap.diagnostics.explanations" null))
+      )
+        (if (or (eq code null) (eq explanations null))
+          null
+          (get explanations code null)))))
+  (ctfe-compiler-register-python-language-builtin-bridge
+    compiler
+    "core-special")
+  (ctfe-compiler-register-python-language-builtin-bridge
+    compiler
+    "core-value")
+  (ctfe-compiler-register-python-language-builtin-bridge
+    compiler
+    "data")
+  (ctfe-compiler-register-python-language-builtin-bridge
+    compiler
+    "mutable-data"))

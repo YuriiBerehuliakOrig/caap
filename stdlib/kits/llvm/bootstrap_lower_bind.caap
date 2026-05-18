@@ -1,0 +1,152 @@
+(bind (
+  (kit-root
+    (ctfe-compiler-lookup-value compiler "stdlib.llvm" null))
+  (kit-protocol
+    (ctfe-compiler-lookup-value compiler "stdlib.internal.kit-protocol" null))
+  (sequence
+    (ctfe-compiler-lookup-value compiler "stdlib.sequence" null))
+  (get-any (get sequence "get" null))
+  (get-or-null (get sequence "get-or-null" null))
+  (is-null? (get sequence "is-null?" null))
+  (not-null? (get sequence "not-null?" null))
+  (list-of (get sequence "list-of" null))
+  (find (get sequence "find" null))
+  (at (get sequence "at" null))
+  (length (get sequence "length" null))
+  (each (get sequence "each" null))
+  (range (get sequence "range" null))
+  (register-helper
+    (get kit-protocol "register-helper" null))
+  (builder-root
+    (ctfe-compiler-lookup-value compiler "stdlib.builder" null))
+  (bind-shape (get builder-root "bind-shape" null))
+  (call-shape (get builder-root "call-shape" null))
+  (name-or-null (get builder-root "name-or-null" null))
+  (pass-kit
+    (ctfe-compiler-lookup-value compiler "stdlib.pass-kit" null))
+  (annotation-get (get pass-kit "annotation-get" null))
+  (types-root
+    (ctfe-compiler-lookup-value compiler "stdlib.types" null))
+  (resolve-type-ref
+    (get types-root "resolve-type-ref" null))
+  (type-kind (get types-root "type-kind" null))
+  (struct-type-fields
+    (get types-root "struct-type-fields" null))
+  (enum-type-variant
+    (get types-root "enum-type-variant" null))
+  (array-element-type
+    (get types-root "array-element-type" null))
+  (make-array-type (get types-root "make-array-type" null))
+  (make-diagnostic
+    (get
+      (ctfe-compiler-lookup-value compiler "stdlib.llvm" null)
+      "_make-diagnostic"
+      null))
+  (copy (get kit-root "_copy" null))
+)
+  (do
+    (register-helper
+      kit-root
+      "_lower-bind-v1"
+      (lambda
+        (bind-entry
+          env-now
+          externals
+          path-now
+          decl-name
+          diagnostics)
+        (bind (
+          (lower-expression-v1
+            (get kit-root "_lower-expression-v1" null))
+          (node-references-name-v1
+            (get kit-root "_node-references-name-v1" null))
+          (lambda-call-v1?
+            (get kit-root "_lambda-call-v1?" null))
+          (bindings (get bind-entry "bindings" (list-of)))
+          (body-node (get bind-entry "body" null))
+        )
+          (if (not (eq (length bindings) 1))
+            (do
+              (append
+                diagnostics
+                (make-diagnostic
+                  decl-name
+                  "caap.llvm.error.unsupported_bind_shape"
+                  "llvm codegen supports only single-entry bind expressions"
+                  path-now))
+              null)
+            (bind (
+              (binding (at bindings 0))
+              (binding-name (get-or-null binding "name"))
+              (value-node (get-or-null binding "value"))
+              (unused-lambda?
+                (and
+                  (lambda-call-v1? value-node)
+                  (not
+                    (node-references-name-v1
+                      node-references-name-v1
+                      body-node
+                      binding-name))))
+            )
+              (if (is-null? binding-name)
+                null
+                (if unused-lambda?
+                  (lower-expression-v1
+                    body-node
+                    env-now
+                    externals
+                    path-now
+                    decl-name
+                    diagnostics)
+                  (bind (
+                    (lowered-value
+                      (lower-expression-v1
+                        value-node
+                        env-now
+                        externals
+                        path-now
+                        decl-name
+                        diagnostics))
+                  )
+                    (if (is-null? lowered-value)
+                      null
+                      (bind (
+                        (extended-env (copy env-now))
+                      )
+                        (do
+                          (append
+                            extended-env
+                            (assoc-many (map-of) "name" binding-name "type" (get-or-null lowered-value "type")))
+                          (bind (
+                            (lowered-body
+                              (lower-expression-v1
+                                body-node
+                                extended-env
+                                externals
+                                path-now
+                                decl-name
+                                diagnostics))
+                            (lowered-bindings (list-of))
+                          )
+                            (if (is-null? lowered-body)
+                              null
+                              (do
+                                (append
+                                  lowered-bindings
+                                  (assoc-many
+                                    (map-of)
+                                    "name" binding-name
+                                    "type"
+                                      (get-or-null lowered-value "type")
+                                    "value" lowered-value))
+                                (assoc-many
+                                  (map-of)
+                                  "kind" "bind"
+                                  "bindings"
+                                    lowered-bindings
+                                  "body" lowered-body
+                                  "type"
+                                    (get-or-null lowered-body "type")))))))))))))))
+      "pure"
+      true)
+    (get kit-root "_lower-bind-v1" null)))

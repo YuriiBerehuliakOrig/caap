@@ -1,0 +1,218 @@
+(ctfe-compiler-execute-bootstrap-file
+  compiler
+  "common.caap")
+
+(bind (
+  (module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.prelude-bindings"))
+  (get-any (get module-helpers "get-any" null))
+  (is-null? (get-any module-helpers "is-null?" null))
+  (get-or-null (get-any module-helpers "get-or-null" null))
+  (require-helper
+    (get-any module-helpers "require-helper" null))
+  (define-internal-module
+    (require-helper module-helpers "define-internal-module"))
+  (module-runtime-error
+    (require-helper module-helpers "module-runtime-error"))
+  (each (require-helper module-helpers "each"))
+  (internal-module-name?
+    (require-helper module-helpers "internal-module-name?"))
+  (public-module-name?
+    (require-helper module-helpers "public-module-name?"))
+  (publication-module-kind
+    (require-helper module-helpers "publication-module-kind"))
+  (load-surface-template
+    (require-helper module-helpers "load-surface-template"))
+  (instantiate-template
+    (require-helper module-helpers "instantiate-template"))
+  (compile-unit
+    (require-helper module-helpers "compile-unit"))
+  (unit-template
+    (require-helper module-helpers "unit-template"))
+)
+  (bind (
+    (make-publish-public-facade-module
+      (lambda
+        (prepare-root
+          register-root
+          bind-provider
+          register-host-module
+          module-event)
+        (lambda
+          (public-module-name
+            carrier-module-name
+            host-library
+            public-exports
+            facade-path)
+          (do
+            (if (not (public-module-name? public-module-name))
+              (module-runtime-error
+                "stdlib.module.publication.public_name_required"
+                "module publication facade requires a public module name"
+                (assoc-many (map-of) "module" public-module-name)))
+            (if (not (internal-module-name? carrier-module-name))
+              (module-runtime-error
+                "stdlib.module.publication.carrier_name_required"
+                "module publication facade requires an internal carrier module name"
+                (assoc-many (map-of) "carrier" carrier-module-name)))
+            (register-host-module
+              carrier-module-name
+              host-library
+              public-exports)
+            (bind (
+              (template (load-surface-template facade-path))
+              (unit (instantiate-template template))
+              (root (ctfe-unit-root unit))
+              (fields (map-of))
+            )
+              (do
+                (assoc-many
+                  fields
+                  "module" public-module-name
+                  "carrier" carrier-module-name
+                  "host_library" host-library)
+                (prepare-root root (ctfe-unit-version unit))
+                (compile-unit unit)
+                (bind (
+                  (registered-module (register-root root))
+                )
+                  (do
+                    (if (is-null? registered-module)
+                      (module-runtime-error
+                        "stdlib.module.publication.registration_missing"
+                        "module publication facade did not register a public module"
+                        fields))
+                    (if (not (eq registered-module public-module-name))
+                      (module-runtime-error
+                        "stdlib.module.publication.registration_mismatch"
+                        "module publication facade registered an unexpected public module"
+                        (assoc-many (map-of) "expected" public-module-name "actual" registered-module)))
+                    (bind-provider registered-module (unit-template unit))
+                    (module-event
+                      "publish-public-facade-module"
+                      "published source-backed facade module"
+                      fields)
+                    registered-module))))))))
+    (make-publish-host-module-from-contract
+      (lambda (register-host-module module-event)
+        (lambda (module-name host-library contract-entries export-fn)
+          (bind (
+            (public-exports (list-of))
+            (state (map-of))
+            (pair-label
+              (lambda (public-name export-name)
+                (string-concat-many public-name " -> " export-name)))
+          )
+            (do
+              (if (not (public-module-name? module-name))
+                (module-runtime-error
+                  "stdlib.module.publication.public_name_required"
+                  "host-backed publication requires a public module name"
+                  (assoc-many (map-of) "module" module-name)))
+              (if (is-null? contract-entries)
+                (module-runtime-error
+                  "stdlib.module.publication.contract_missing"
+                  "host service contract did not describe a public module surface"
+                  (assoc-many (map-of) "module" module-name)))
+              (assoc state "contract-count" 0)
+              (each contract-entries
+                (lambda (entry)
+                  (if (not (value-is-map entry))
+                    (module-runtime-error
+                      "stdlib.module.publication.contract_entry_invalid"
+                      "host service contract entries must be maps"
+                      (assoc-many (map-of) "module" module-name "entry" entry))
+                    (bind (
+                      (public-name
+                        (get-or-null entry "public"))
+                      (export-name
+                        (get-or-null entry "export"))
+                    )
+                      (do
+                        (if
+                          (or
+                            (not (value-is-string public-name))
+                            (eq public-name "")
+                            (not (value-is-string export-name))
+                            (eq export-name ""))
+                          (module-runtime-error
+                            "stdlib.module.publication.contract_entry_invalid"
+                            "host service contract entries require non-empty public/export strings"
+                            (assoc-many (map-of) "module" module-name "public" public-name "export" export-name)))
+                        (if
+                          (get-any
+                            state
+                            (string-concat-many "seen:" public-name)
+                            false)
+                          (module-runtime-error
+                            "stdlib.module.publication.contract_duplicate"
+                            (string-concat-many
+                              "host service contract contains duplicate public export "
+                              (pair-label public-name export-name))
+                            (assoc-many (map-of) "module" module-name "public" public-name "export" export-name)))
+                        (assoc state (string-concat-many "seen:" public-name) true)
+                        (assoc
+                          state
+                          "contract-count"
+                          (int-add (get-any state "contract-count" 0) 1)))))))
+              (if (eq (get-any state "contract-count" 0) 0)
+                (module-runtime-error
+                  "stdlib.module.publication.contract_empty"
+                  "host service contract did not describe a public module surface"
+                  (assoc-many (map-of) "module" module-name)))
+              (each contract-entries
+                (lambda (entry)
+                  (bind (
+                    (public-name
+                      (get-or-null entry "public"))
+                    (export-name
+                      (get-or-null entry "export"))
+                    (record (map-of))
+                  )
+                    (do
+                      (assoc-many
+                        record
+                        "public" public-name
+                        "export" export-name
+                        "phase"
+                          (get-or-null entry "phase_policy")
+                        "effect"
+                          (get-or-null entry "effect_policy")
+                        "pure" (get-or-null entry "pure")
+                        "policy"
+                          (get-or-null entry "policy")
+                        "runtime_value"
+                          (export-fn host-library export-name "runtime")
+                        "compile_time_value"
+                          (export-fn host-library export-name "compile_time"))
+                      (append public-exports record)))))
+              (bind (
+                (registered-module
+                  (register-host-module
+                    module-name
+                    host-library
+                    public-exports))
+                (fields (map-of))
+              )
+                (do
+                  (assoc-many
+                    fields
+                    "module" module-name
+                    "module_kind"
+                      (publication-module-kind module-name)
+                    "host_library" host-library
+                    "export_count"
+                      (get-any state "contract-count" 0))
+                  (module-event
+                    "publish-host-module-from-contract"
+                    "published host-backed public module from explicit contract"
+                    fields)
+                  registered-module)))))))
+  )
+    (define-internal-module
+      "stdlib.module.internal.runtime-publication"
+      (list-of
+        (list-of "make-publish-public-facade-module" make-publish-public-facade-module)
+        (list-of
+          "make-publish-host-module-from-contract"
+          make-publish-host-module-from-contract)))))

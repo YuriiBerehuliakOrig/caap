@@ -1,0 +1,114 @@
+(module "stdlib.types.primitives")
+
+(import-namespace "stdlib.types.core" "core")
+
+(import-namespace "stdlib.types.validation" "validation")
+
+(import-namespace "stdlib.types.registry" "registry")
+
+(import-namespace "stdlib.sequence" "sequence")
+
+(export "stdlib.types.primitives")
+
+(bind (
+  (exports (map-of))
+  (semantics (map-of))
+  (registry-lib registry)
+  (not-null? (get sequence "not-null?" null))
+  (is-null? (get sequence "is-null?" null))
+  (pure-semantics (get core "pure-semantics" null))
+  (impure-semantics (get core "impure-semantics" null))
+  (at (get sequence "at" null))
+  (make-type (get core "make-type" null))
+  (primitive-key (get core "primitive-key" null))
+  (validate-type (get validation "validate-type" null))
+  (register-type (get registry-lib "register-type" null))
+  (make-primitive-type
+    (lambda (name category bits signed)
+      (bind (
+        (type (make-type "primitive" (primitive-key name)))
+      )
+        (do
+          (assoc-many type "name" name "category" category)
+          (if (not-null? bits)
+            (assoc type "bits" bits))
+          (if (not-null? signed)
+            (assoc type "signed" signed))
+          (validate-type type)))))
+  (register-primitive-types
+    (lambda (registry)
+      (do
+        (register-type
+          registry
+          (make-primitive-type "u8" "integer" 8 false))
+        (register-type
+          registry
+          (make-primitive-type "i8" "integer" 8 true))
+        (register-type
+          registry
+          (make-primitive-type "u16" "integer" 16 false))
+        (register-type
+          registry
+          (make-primitive-type "i16" "integer" 16 true))
+        (register-type
+          registry
+          (make-primitive-type "u32" "integer" 32 false))
+        (register-type
+          registry
+          (make-primitive-type "i32" "integer" 32 true))
+        (register-type
+          registry
+          (make-primitive-type "i64" "integer" 64 true))
+        (register-type
+          registry
+          (make-primitive-type "f32" "float" 32 null))
+        (register-type
+          registry
+          (make-primitive-type "f64" "float" 64 null))
+        (register-type
+          registry
+          (make-primitive-type "bool" "boolean" null null))
+        (register-type
+          registry
+          (make-primitive-type "string" "string" null null))
+        (register-type
+          registry
+          (make-primitive-type "ptr" "pointer" null null))
+        (register-type
+          registry
+          (make-primitive-type "void" "void" null null))
+        registry)))
+)
+  (do
+    (assoc-many
+      semantics
+      "make-primitive-type" pure-semantics
+      "register-primitive-types" impure-semantics)
+    (assoc-many
+      exports
+      "make-primitive-type" make-primitive-type
+      "register-primitive-types" register-primitive-types
+      "value-is-string"
+        (lambda (v)
+          (eq (host-value-kind v) "string"))
+      "value-is-bool"
+        (lambda (v)
+          (eq (host-value-kind v) "bool"))
+      "value-is-int"
+        (lambda (v)
+          (eq (host-value-kind v) "int"))
+      "value-is-float"
+        (lambda (v)
+          (eq (host-value-kind v) "float"))
+      "value-is-map"
+        (lambda (v)
+          (eq (host-value-kind v) "map"))
+      "value-is-callable"
+        (lambda (v)
+          (eq (host-value-kind v) "closure"))
+      "__contract_semantics__" semantics)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.types.primitives"
+      exports)
+    exports))

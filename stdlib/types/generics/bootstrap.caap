@@ -1,0 +1,74 @@
+(module "stdlib.types.generics")
+
+(import-namespace "stdlib.types.core" "core")
+
+(import-namespace "stdlib.types.validation" "validation")
+
+(import-namespace "stdlib.sequence" "sequence")
+
+(export "stdlib.types.generics")
+
+(bind (
+  (exports (map-of))
+  (semantics (map-of))
+  (get-or-null (get sequence "get-or-null" null))
+  (pure-semantics (get core "pure-semantics" null))
+  (make-type (get core "make-type" null))
+  (type-param-key (get core "type-param-key" null))
+  (generic-key (get core "generic-key" null))
+  (validate-type (get validation "validate-type" null))
+  (make-type-parameter
+    (lambda (name)
+      (bind (
+        (type
+          (make-type "type_parameter" (type-param-key name)))
+      )
+        (do
+          (assoc type "name" name)
+          (validate-type type)))))
+  (make-generic-type
+    (lambda (base args)
+      (bind (
+        (validated-base (validate-type base))
+        (type
+          (make-type "generic" (generic-key validated-base args)))
+      )
+        (do
+          (assoc-many type "base" validated-base "args" args)
+          (validate-type type)))))
+  (generic-base
+    (lambda (type)
+      (bind (
+        (validated (validate-type type))
+      )
+        (if (not (eq (get-or-null validated "kind") "generic"))
+          (runtime-error "expected a generic type")
+          (get-or-null validated "base")))))
+  (generic-args
+    (lambda (type)
+      (bind (
+        (validated (validate-type type))
+      )
+        (if (not (eq (get-or-null validated "kind") "generic"))
+          (runtime-error "expected a generic type")
+          (get-or-null validated "args")))))
+)
+  (do
+    (assoc-many
+      semantics
+      "make-type-parameter" pure-semantics
+      "make-generic-type" pure-semantics
+      "generic-base" pure-semantics
+      "generic-args" pure-semantics)
+    (assoc-many
+      exports
+      "make-type-parameter" make-type-parameter
+      "make-generic-type" make-generic-type
+      "generic-base" generic-base
+      "generic-args" generic-args
+      "__contract_semantics__" semantics)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.types.generics"
+      exports)
+    exports))

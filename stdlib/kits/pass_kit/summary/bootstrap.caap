@@ -1,0 +1,525 @@
+(module "stdlib.pass-kit.summary")
+
+(import-namespace "stdlib.sequence" "sequence")
+
+(export "stdlib.pass-kit.summary")
+
+(bind (
+  (get-any (get sequence "get" null))
+  (is-null? (get sequence "is-null?" null))
+  (not-null? (get sequence "not-null?" null))
+  (each (get sequence "each" null))
+  (length (get sequence "length" null))
+  (has-key? (get sequence "has-key?" null))
+  (merge-fields (get sequence "merge-fields" null))
+  ;;; Shared metadata helpers
+  (meta-get
+    (lambda (meta key default)
+      (if (has-key? meta key)
+        (get meta key default)
+        default)))
+  (node-id-or-null
+    (lambda (node)
+      (if (is-null? node)
+        null
+        (get node "id" null))))
+  (node-stable-id-or-null
+    (lambda (node)
+      (if (is-null? node)
+        null
+        (get node "stable_id" null))))
+  (fixture-node
+    (lambda (node)
+      (assoc-many
+        (map-of)
+        "node_id" (node-id-or-null node)
+        "stable_id" (node-stable-id-or-null node)
+        "kind"
+          (if (is-null? node)
+            null
+            (ctfe-node-kind node)))))
+  (fixture-stable-id
+    (lambda (node)
+      (node-stable-id-or-null node)))
+  (diagnostic-count-for-severity
+    (lambda (meta severity diagnostics-emitted)
+      (meta-get
+        meta
+        (if (eq severity "error")
+          "error_count"
+          (if (eq severity "warning")
+            "warning_count"
+            "note_count"))
+        (if (eq (meta-get meta "severity" null) severity)
+          diagnostics-emitted
+          0))))
+  (diagnostic-status
+    (lambda (status error-count)
+      (if (eq status "ok")
+        (if (value-lt 0 error-count)
+          "diagnostics_error"
+          "ok")
+        status)))
+  ;;; Rewrite result and golden-fixture helpers
+  (rewrite-result-ids
+    (lambda
+      (action
+        changed
+        node-id
+        stable-id
+        count
+        diagnostics-emitted
+        meta)
+      (bind (
+        (summary (map-of))
+        (error-count
+          (diagnostic-count-for-severity
+            meta
+            "error"
+            diagnostics-emitted))
+        (warning-count
+          (diagnostic-count-for-severity
+            meta
+            "warning"
+            diagnostics-emitted))
+        (note-count
+          (diagnostic-count-for-severity
+            meta
+            "note"
+            diagnostics-emitted))
+        (status
+          (diagnostic-status
+            (meta-get meta "status" "ok")
+            error-count))
+        (steps (meta-get meta "steps" null))
+      )
+        (do
+          (assoc-many
+            summary
+            "action" action
+            "pass_name" (meta-get meta "pass_name" action)
+            "changed" changed
+            "count" count
+            "node_id" node-id
+            "stable_id" stable-id
+            "diagnostics_emitted" diagnostics-emitted
+            "error_count" error-count
+            "warning_count" warning-count
+            "note_count" note-count
+            "status" status
+            "steps" steps
+            "meta" meta)
+          summary))))
+  (fixture-result
+    (lambda (action changed node count diagnostics-emitted meta)
+      (rewrite-result-ids
+        action
+        changed
+        (node-id-or-null node)
+        (node-stable-id-or-null node)
+        count
+        diagnostics-emitted
+        meta)))
+  (rewrite-result
+    (lambda (action changed node count diagnostics-emitted meta)
+      (fixture-result
+        action
+        changed
+        node
+        count
+        diagnostics-emitted
+        meta)))
+  (rewrite-summary
+    (lambda (action changed node count)
+      (fixture-result action changed node count 0 null)))
+  (unchanged-summary
+    (lambda (action node)
+      (fixture-result action false node 0 0 null)))
+  (summary-empty
+    (lambda (action node meta)
+      (fixture-result action false node 0 0 meta)))
+  (summary-changed?
+    (lambda (summary)
+      (and (value-is-map summary) (get summary "changed" false))))
+  (summary-relabel
+    (lambda (action summary)
+      (bind (
+        (result
+          (rewrite-result-ids
+            action
+            (get summary "changed" false)
+            (get summary "node_id" null)
+            (get summary "stable_id" null)
+            (get summary "count" 0)
+            (get summary "diagnostics_emitted" 0)
+            (get summary "meta" null)))
+      )
+        (do
+          (merge-fields
+            result
+            summary
+            (list-of
+              (list-of "pass_name"     action)
+              (list-of "error_count"   0)
+              (list-of "warning_count" 0)
+              (list-of "note_count"    0)
+              (list-of "status"        "ok")))
+          (assoc
+            result
+            "steps"
+            (if (contains summary "steps")
+              (get summary "steps" null)
+              (get result "steps" null)))
+          result))))
+  (summary-merge
+    (lambda (action summaries fallback-node)
+      (bind (
+        (state (map-of))
+        (summary-count (length summaries))
+      )
+        (do
+          (assoc-many
+            state
+            "changed" false
+            "count" 0
+            "diagnostics_emitted" 0
+            "error_count" 0
+            "warning_count" 0
+            "note_count" 0
+            "status" "ok"
+            "node_id" null
+            "stable_id" null)
+          (each summaries
+            (lambda (summary)
+              (do
+                (if
+                  (and
+                    (is-null? (get state "node_id" null))
+                    (not-null? (get summary "node_id" null)))
+                  (assoc state "node_id" (get summary "node_id" null)))
+                (if
+                  (and
+                    (is-null? (get state "stable_id" null))
+                    (not-null? (get summary "stable_id" null)))
+                  (assoc state "stable_id" (get summary "stable_id" null)))
+                (assoc
+                  state
+                  "changed"
+                  (or
+                    (get state "changed" false)
+                    (get summary "changed" false)))
+                (assoc
+                  state
+                  "count"
+                  (int-add (get state "count" 0) (get summary "count" 0)))
+                (assoc
+                  state
+                  "diagnostics_emitted"
+                  (int-add
+                    (get state "diagnostics_emitted" 0)
+                    (get summary "diagnostics_emitted" 0)))
+                (assoc
+                  state
+                  "error_count"
+                  (int-add
+                    (get state "error_count" 0)
+                    (get summary "error_count" 0)))
+                (assoc
+                  state
+                  "warning_count"
+                  (int-add
+                    (get state "warning_count" 0)
+                    (get summary "warning_count" 0)))
+                (assoc
+                  state
+                  "note_count"
+                  (int-add
+                    (get state "note_count" 0)
+                    (get summary "note_count" 0)))
+                (if (eq (get summary "status" "ok") "internal_error")
+                  (assoc state "status" "internal_error")
+                  (if
+                    (and
+                      (not (eq (get state "status" "ok") "internal_error"))
+                      (or
+                        (eq (get summary "status" "ok") "diagnostics_error")
+                        (value-lt 0 (get summary "error_count" 0))))
+                    (assoc state "status" "diagnostics_error"))))))
+          (bind (
+            (meta
+              (if (eq summary-count 0)
+                null
+                (bind (
+                  (summary-meta (map-of))
+                )
+                  (do
+                    (assoc-many
+                      summary-meta
+                      "items" summaries
+                      "steps" summaries
+                      "status"
+                        (diagnostic-status
+                          (get state "status" "ok")
+                          (get state "error_count" 0)))
+                    summary-meta))))
+            (summary
+              (rewrite-result-ids
+                action
+                (get state "changed" false)
+                (if (is-null? (get state "node_id" null))
+                  (node-id-or-null fallback-node)
+                  (get state "node_id" null))
+                (if (is-null? (get state "stable_id" null))
+                  (node-stable-id-or-null fallback-node)
+                  (get state "stable_id" null))
+                (get state "count" 0)
+                (get state "diagnostics_emitted" 0)
+                meta))
+          )
+            (do
+              (assoc summary "error_count" (get state "error_count" 0))
+              (assoc
+                summary
+                "warning_count"
+                (get state "warning_count" 0))
+              (assoc summary "note_count" (get state "note_count" 0))
+              (assoc
+                summary
+                "status"
+                (diagnostic-status
+                  (get state "status" "ok")
+                  (get state "error_count" 0)))
+              (assoc
+                summary
+                "steps"
+                (if (eq summary-count 0)
+                  null
+                  summaries))
+              summary))))))
+  (normalize-step-result
+    (lambda (action node value)
+      (if (value-is-map value)
+        (bind (
+          (summary
+            (rewrite-result-ids
+              (get value "action" action)
+              (get value "changed" false)
+              (if (contains value "node_id")
+                (get value "node_id" null)
+                (node-id-or-null node))
+              (if (contains value "stable_id")
+                (get value "stable_id" null)
+                (node-stable-id-or-null node))
+              (get value "count" 0)
+              (get value "diagnostics_emitted" 0)
+              (get value "meta" value)))
+        )
+          (do
+            (assoc
+              summary
+              "pass_name"
+              (get
+                value
+                "pass_name"
+                (get summary "pass_name" (get value "action" action))))
+            (assoc
+              summary
+              "error_count"
+              (get value "error_count" (get summary "error_count" 0)))
+            (assoc
+              summary
+              "warning_count"
+              (get value "warning_count" (get summary "warning_count" 0)))
+            (assoc
+              summary
+              "note_count"
+              (get value "note_count" (get summary "note_count" 0)))
+            (assoc
+              summary
+              "status"
+              (get value "status" (get summary "status" "ok")))
+            (assoc
+              summary
+              "steps"
+              (if (contains value "steps")
+                (get value "steps" null)
+                (get summary "steps" null)))
+            summary))
+        (if (or (is-null? value) (eq value false))
+          (fixture-result action false node 0 0 null)
+          (fixture-result action true node 1 0 null)))))
+  (fixture-summary
+    (lambda (action node value)
+      (normalize-step-result action node value)))
+  (execution-records-for-golden
+    (lambda (execution)
+      (bind (
+        (source
+          (if (has-key? execution "executed")
+            execution
+            (if (has-key? execution "execution")
+              (get execution "execution" null)
+              null)))
+        (records
+          (if (is-null? source)
+            (list-of)
+            (get source "executed" (list-of))))
+        (stable (list-of))
+      )
+        (do
+          (each records
+            (lambda (record)
+              (append
+                stable
+                (assoc-many
+                  (map-of)
+                  "provider_name"
+                    (get record "provider_name" null)
+                  "stage" (get record "stage" null)
+                  "kind" (get record "kind" null)
+                  "changed" (get record "changed" false)
+                  "outcome_kind"
+                    (get record "outcome_kind" null)
+                  "rewrite_count"
+                    (get record "rewrite_count" null)
+                  "erased_count"
+                    (get record "erased_count" null)
+                  "diagnostic_codes"
+                    (get record "diagnostic_codes" (list-of))
+                  "touched_node_kinds"
+                    (get record "touched_node_kinds" (list-of)))))
+            stable)))))
+  (rewrite-record-for-golden
+    (lambda (rewrite)
+      (bind (
+        (source
+          (if (has-key? rewrite "rewrite")
+            (get rewrite "rewrite" null)
+            rewrite))
+        (latest
+          (if (is-null? source)
+            null
+            (get source "latest" null)))
+        (chain
+          (if (is-null? source)
+            (list-of)
+            (get source "chain" (list-of))))
+        (stable-chain (list-of))
+      )
+        (do
+          (each chain
+            (lambda (item)
+              (append
+                stable-chain
+                (assoc-many
+                  (map-of)
+                  "provider_name"
+                    (get item "provider_name" null)
+                  "stage" (get item "stage" null)
+                  "kind" (get item "kind" null)
+                  "operation" (get item "operation" null)
+                  "sources" (get item "sources" (list-of))
+                  "generation" (get item "generation" null)))))
+          (assoc-many
+            (map-of)
+            "rewritten"
+              (if (is-null? source)
+                false
+                (get source "rewritten" false))
+            "erased"
+              (if (is-null? source)
+                false
+                (get source "erased" false))
+            "stable_id"
+              (if (is-null? source)
+                null
+                (get source "stable_id" null))
+            "latest"
+              (if (is-null? latest)
+                null
+                (assoc-many
+                  (map-of)
+                  "provider_name"
+                    (get latest "provider_name" null)
+                  "stage" (get latest "stage" null)
+                  "kind" (get latest "kind" null)
+                  "operation" (get latest "operation" null)
+                  "sources" (get latest "sources" (list-of))
+                  "generation"
+                    (get latest "generation" null)))
+            "chain" stable-chain
+            "origin_stage"
+              (if (is-null? source)
+                null
+                (get source "origin_stage" null)))))))
+  (rewrite-fixture
+    (lambda (summary rewrite execution diagnostic-codes)
+      (assoc-many
+        (map-of)
+        "summary" summary
+        "rewrite" rewrite
+        "execution" execution
+        "diagnostic_codes" diagnostic-codes)))
+  (rewrite-golden
+    (lambda (summary rewrite execution diagnostic-codes)
+      (bind (
+        (fixture
+          (rewrite-fixture summary rewrite execution diagnostic-codes))
+        (s (get fixture "summary" (map-of)))
+      )
+        (assoc-many
+          (map-of)
+          "summary"
+            (assoc-many
+              (map-of)
+              "action" (get s "action" null)
+              "pass_name" (get s "pass_name" null)
+              "changed" (get s "changed" false)
+              "count" (get s "count" 0)
+              "node_id" (get s "node_id" null)
+              "stable_id" (get s "stable_id" null)
+              "diagnostics_emitted"
+                (get s "diagnostics_emitted" 0)
+              "error_count" (get s "error_count" 0)
+              "warning_count" (get s "warning_count" 0)
+              "note_count" (get s "note_count" 0)
+              "status" (get s "status" "ok")
+              "steps" (get s "steps" null)
+              "meta" (get s "meta" null))
+          "rewrite"
+            (rewrite-record-for-golden (get fixture "rewrite" null))
+          "execution"
+            (assoc-many
+              (map-of)
+              "executed"
+                (execution-records-for-golden
+                  (get fixture "execution" null)))
+          "diagnostic_codes"
+            (get fixture "diagnostic_codes" (map-of))))))
+)
+  (assoc-many
+    (map-of)
+    "meta-get" meta-get
+    "node-id-or-null" node-id-or-null
+    "node-stable-id-or-null" node-stable-id-or-null
+    "fixture-node" fixture-node
+    "fixture-stable-id" fixture-stable-id
+    "diagnostic-count-for-severity"
+      diagnostic-count-for-severity
+    "diagnostic-status" diagnostic-status
+    "rewrite-result-ids" rewrite-result-ids
+    "fixture-result" fixture-result
+    "rewrite-result" rewrite-result
+    "rewrite-summary" rewrite-summary
+    "unchanged-summary" unchanged-summary
+    "summary-empty" summary-empty
+    "summary-changed?" summary-changed?
+    "summary-relabel" summary-relabel
+    "summary-merge" summary-merge
+    "normalize-step-result" normalize-step-result
+    "fixture-summary" fixture-summary
+    "execution-records-for-golden"
+      execution-records-for-golden
+    "rewrite-record-for-golden" rewrite-record-for-golden
+    "rewrite-fixture" rewrite-fixture
+    "rewrite-golden" rewrite-golden))

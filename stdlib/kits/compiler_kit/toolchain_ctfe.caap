@@ -1,0 +1,163 @@
+; stdlib/compiler_kit/toolchain_ctfe.caap
+; Compile-time evaluation and optimization providers.
+(bind (
+  (bootstrap-active?
+    (lambda ()
+      (not
+        (eq (ctfe-compiler-current-bootstrap-path compiler) null))))
+  (run-optimization
+    (lambda (ctx root)
+      (bind (
+        (pipeline
+          (ctfe-compiler-lookup-value compiler "stdlib.optimization.semantic-normalization" null))
+        (load-optimization
+          (lambda ()
+            (bind (
+              (seed-api
+                (ctfe-compiler-lookup-value compiler "stdlib.module.seed.api" null))
+              (load-module
+                (if (eq seed-api null)
+                  null
+                  (get seed-api "load-module" null)))
+            )
+              (if (eq load-module null)
+                null
+                (do
+                  (load-module "stdlib.optimization")
+                  (ctfe-compiler-lookup-value compiler "stdlib.optimization.semantic-normalization" null))))))
+      )
+        (bind (
+          (active-pipeline
+            (if (eq pipeline null)
+              (load-optimization)
+              pipeline))
+        )
+          (if (eq active-pipeline null)
+            false
+            (active-pipeline ctx root))))))
+  (binding-node-for-name
+    (lambda (bindings name)
+      (bind (
+        (binding
+          (sequence-find
+            bindings
+            (lambda (entry)
+              (eq (get entry "name" null) name))))
+      )
+        (if (eq binding null)
+          null
+          (get binding "node" null)))))
+  (emit-unfoldable-decl-diagnostic
+    (lambda (ctx form)
+      (if
+        (and
+          (ctfe-node-is-call form)
+          (eq
+            (ctfe-meta-annotation-get
+              form
+              "caap.surface.decl.kind"
+              null)
+            "decl"))
+        (bind (
+          (attributes
+            (ctfe-meta-annotation-get
+              form
+              "caap.surface.decl.attribute_symbols"
+              (list-of)))
+          (name
+            (ctfe-meta-annotation-get
+              form
+              "caap.surface.decl.name"
+              null))
+        )
+          (if
+            (and
+              (not (eq name null))
+              (contains attributes "compile_time"))
+            (bind (
+              (scope (ctfe-node-call-scope-descriptor form))
+              (bindings (get scope "bindings" (list-of)))
+              (value-node
+                (binding-node-for-name bindings name))
+            )
+              (if
+                (and
+                  (not (eq value-node null))
+                  (not (ctfe-provider-fold-safe? ctx value-node)))
+                (ctfe-compiler-error
+                  ctx
+                  form
+                  "compile_time function is not fold-safe"
+                  "caap.ctfe.unfoldable"))))))))
+  (emit-unfoldable-decl-diagnostics
+    (lambda (ctx)
+      (sequence-each
+        (ctfe-unit-top-level-forms (ctfe-provider-unit ctx))
+        (lambda (form)
+          (emit-unfoldable-decl-diagnostic ctx form)))))
+  (compile-time-evaluation-provider
+    (lambda (ctx root)
+      (if (bootstrap-active?)
+        false
+        (run-optimization ctx root))))
+  (compile-time-evaluation-after-resolve-provider
+    (lambda (ctx root)
+      (if (bootstrap-active?)
+        false
+        (do
+          (emit-unfoldable-decl-diagnostics ctx)
+          (run-optimization ctx root)))))
+)
+  (do
+    (ctfe-compiler-provider-register
+      compiler
+      "compile_time_evaluation_provider"
+      "normalize_before_resolve"
+      compile-time-evaluation-provider
+      (list-of)
+      (list-of
+        "read-ir"
+        "read-facts"
+        "read-symbols"
+        "read-cache"
+        "write-ir"
+        "write-facts"
+        "write-attributes"
+        "write-cache"
+        "use-host-services")
+      (assoc-many
+        (map-of)
+        "family" "semantic_normalization"
+        "reads" (list-of "ir" "facts" "symbols" "cache")
+        "writes" (list-of "ir" "facts" "attributes" "cache")
+        "provides_data" (list-of "fact:caap.fact.ctfe_rule")
+        "cache_scope" "unit"
+        "resume_policy" "safe"))
+    (ctfe-compiler-provider-register
+      compiler
+      "compile_time_evaluation_provider.after_resolve"
+      "normalize_after_resolve"
+      compile-time-evaluation-after-resolve-provider
+      (list-of "classify_calls.after_resolve")
+      (list-of
+        "read-ir"
+        "read-facts"
+        "read-symbols"
+        "read-attributes"
+        "read-cache"
+        "write-ir"
+        "write-facts"
+        "write-attributes"
+        "write-cache"
+        "emit-diagnostics"
+        "use-host-services")
+      (assoc-many
+        (map-of)
+        "family" "semantic_normalization"
+        "reads"
+          (list-of "ir" "facts" "symbols" "attributes" "cache")
+        "writes"
+          (list-of "ir" "facts" "attributes" "cache" "diagnostics")
+        "provides_data" (list-of "fact:caap.fact.ctfe_rule")
+        "cache_scope" "unit"
+        "resume_policy" "safe"))))

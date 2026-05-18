@@ -1,0 +1,97 @@
+; stdlib/compiler_kit/toolchain_normalize.caap
+; Core-form normalization providers before and after name resolution.
+(bind (
+  (normalize-node
+    (lambda (ctx state node)
+      (bind (
+        (entry (ctfe-provider-call-callee-entry ctx node))
+      )
+        (if (eq entry null)
+          false
+          (if (not (ctfe-provider-normalizable-entry? entry))
+            false
+            (bind (
+              (result
+                (ctfe-provider-execute-ctfe-entry ctx node entry))
+              (replacement
+                (ctfe-provider-materialize-ctfe-result
+                  ctx
+                  node
+                  entry
+                  result))
+            )
+              (if (eq replacement null)
+                false
+                (do
+                  (ctfe-provider-node-replace ctx node replacement)
+                  (assoc state "changed" true)
+                  true))))))))
+  (normalize-core-forms-provider
+    (lambda (ctx root)
+      (bind (
+        (state (map-of))
+      )
+        (do
+          (ctfe-provider-traversal-walk
+            ctx
+            root
+            (lambda (node)
+              (normalize-node ctx state node))
+            (assoc-many (map-of) "order" "postorder"))
+          (get state "changed" false)))))
+)
+  (do
+    (ctfe-compiler-provider-register
+      compiler
+      "normalize_core_forms"
+      "normalize_before_resolve"
+      normalize-core-forms-provider
+      (list-of)
+      (list-of
+        "read-ir"
+        "read-attributes"
+        "read-facts"
+        "read-symbols"
+        "write-ir"
+        "write-attributes"
+        "write-facts"
+        "emit-diagnostics"
+        "use-host-services")
+      (assoc-many
+        (map-of)
+        "family" "semantic_normalization"
+        "reads"
+          (list-of "ir" "attributes" "facts" "symbols")
+        "writes"
+          (list-of "ir" "attributes" "facts" "diagnostics")
+        "provides_data"
+          (list-of "fact:caap.fact.call_semantics")
+        "cache_scope" "unit"
+        "resume_policy" "safe"))
+    (ctfe-compiler-provider-register
+      compiler
+      "normalize_core_forms.after_resolve"
+      "normalize_after_resolve"
+      normalize-core-forms-provider
+      (list-of)
+      (list-of
+        "read-ir"
+        "read-attributes"
+        "read-facts"
+        "read-symbols"
+        "write-ir"
+        "write-attributes"
+        "write-facts"
+        "emit-diagnostics"
+        "use-host-services")
+      (assoc-many
+        (map-of)
+        "family" "semantic_normalization"
+        "reads"
+          (list-of "ir" "attributes" "facts" "symbols")
+        "writes"
+          (list-of "ir" "attributes" "facts" "diagnostics")
+        "provides_data"
+          (list-of "fact:caap.fact.call_semantics")
+        "cache_scope" "unit"
+        "resume_policy" "safe"))))

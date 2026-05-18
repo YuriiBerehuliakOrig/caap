@@ -1,0 +1,118 @@
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.system-module-name?"
+  (lambda (module-name)
+    (or
+      (eq module-name "stdlib.internal.system-module-helpers")
+      (and
+        (value-is-string module-name)
+        (eq (string-find module-name "sys." 0) 0)))))
+
+(bind (
+  (register-behavior
+    (ctfe-compiler-lookup-value compiler "stdlib.module.seed.register-behavior"))
+  (behavior
+    (ctfe-compiler-lookup-value compiler "stdlib.module.seed.behavior"))
+  (system-module-name?
+    (ctfe-compiler-lookup-value compiler "stdlib.module.seed.system-module-name?"))
+)
+  (do
+    (register-behavior
+      "stdlib.module.seed.fragment-resolver"
+      (lambda (module-name)
+        (bind (
+          (fragments
+            (ctfe-compiler-lookup-value compiler "stdlib.module.seed.path-fragments"))
+        )
+          (get fragments module-name null))))
+    (register-behavior
+      "stdlib.module.seed.host-services-capability-policy"
+      system-module-name?)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.module.seed.module-fragment-candidate"
+      (lambda (module-name)
+        (bind (
+          (handler
+            (behavior "stdlib.module.seed.fragment-resolver"))
+        )
+          (handler module-name))))
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.module.seed.host-services-capability-allowed?"
+      (lambda (module-name)
+        (bind (
+          (handler
+            (behavior
+              "stdlib.module.seed.host-services-capability-policy"))
+        )
+          (handler module-name))))))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.index-fragment"
+  (lambda (module-name)
+    (bind (
+      (seed-error
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.error"))
+      (fragments
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.path-fragments"))
+      (known (get fragments module-name null))
+      (candidate-fragment
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.module-fragment-candidate"))
+      (candidate (candidate-fragment module-name))
+    )
+      (if (not (eq known null))
+        known
+        (if (not (eq candidate null))
+          (do
+            (assoc fragments module-name candidate)
+            candidate)
+          (seed-error
+            "stdlib.module.seed.module_missing"
+            (string-concat-many "missing stdlib module " module-name)
+            (assoc-many (map-of) "module" module-name)))))))
+
+(ctfe-compiler-register-value
+  compiler
+  "stdlib.module.seed.discover-module"
+  (lambda (stdlib-root module-name)
+    (bind (
+      (seed-error
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.error"))
+      (indexes
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.indexes"))
+      (module-names
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.names"))
+      (parse-package-declarations
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.parse-package-declarations"))
+      (index-fragment
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.index-fragment"))
+      (module-bootstrap-path
+        (ctfe-compiler-lookup-value compiler "stdlib.module.seed.module-bootstrap-path"))
+      (existing (get indexes module-name null))
+    )
+      (if (not (eq existing null))
+        existing
+        (bind (
+          (path
+            (module-bootstrap-path
+              stdlib-root
+              (index-fragment module-name)))
+          (descriptor (parse-package-declarations path))
+          (descriptor-name (get descriptor "name" null))
+        )
+          (if (not (eq descriptor-name module-name))
+            (seed-error
+              "stdlib.module.seed.module_name_mismatch"
+              (string-concat-many
+                path
+                " declares "
+                descriptor-name
+                " but loader expected "
+                module-name)
+              (assoc-many (map-of) "path" path "declared" descriptor-name "expected" module-name))
+            (do
+              (assoc indexes module-name descriptor)
+              (append module-names module-name)
+              descriptor)))))))

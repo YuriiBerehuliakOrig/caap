@@ -1,0 +1,20 @@
+(module "stdlib.build-events")
+(export "stdlib.build-events")
+(bind (
+  (exports (map-of))
+  (emit
+    (lambda (component action message fields)
+      (ctfe-compiler-emit-event
+        compiler
+        component
+        action
+        message
+        fields)))
+)
+  (do
+    (assoc exports "emit" emit)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.build-events"
+      exports)
+    exports))

@@ -1,0 +1,109 @@
+(module "stdlib.surface-builder")
+(export "stdlib.surface-builder")
+(export-as "symbol" "surface-symbol")
+(export-as "integer" "surface-integer")
+(export-as "null" "surface-null")
+(export-as "list" "surface-list")
+(export-as "prepend" "surface-prepend")
+(export-as "call" "surface-call")
+(export-as "binding" "surface-binding")
+(export-as "lambda" "surface-lambda")
+(export-as "bind" "surface-bind")
+(export-as "do" "surface-do")
+(export-as "body" "surface-body")
+(export-as "field" "surface-field")
+(export-as "field-or" "surface-field-or")
+(export-as "collect" "surface-collect")
+(export-as "unwrap" "surface-unwrap")
+; stdlib/lang/surface_builder/bootstrap.caap
+; Surface ParsedForm construction helpers for syntax grammar lowering hooks.
+; This is intentionally separate from stdlib.builder, which builds core IR.
+(bind (
+  (module-exports (map-of))
+  (surface-symbol
+    (lambda (name span)
+      (ctfe-surface-form-symbol name span)))
+  (surface-integer
+    (lambda (value span)
+      (ctfe-surface-form-integer value span)))
+  (surface-null
+    (lambda (span)
+      (ctfe-surface-form-null span)))
+  (surface-list
+    (lambda (children span)
+      (ctfe-surface-form-list children span)))
+  (surface-prepend
+    (lambda (head tail span)
+      (ctfe-surface-form-list-prepend head tail span)))
+  (surface-call
+    (lambda (name args span)
+      (surface-prepend (surface-symbol name span) args span)))
+  (surface-binding
+    (lambda (name value span)
+      (surface-list (list-of (surface-symbol name span) value) span)))
+  (surface-lambda
+    (lambda (params body span)
+      (surface-list
+        (list-of
+          (surface-symbol "lambda" span)
+          (surface-list params span)
+          body)
+        span)))
+  (surface-bind
+    (lambda (bindings body span)
+      (surface-list
+        (list-of
+          (surface-symbol "bind" span)
+          (surface-list bindings span)
+          body)
+        span)))
+  (surface-do
+    (lambda (forms span)
+      (surface-prepend (surface-symbol "do" span) forms span)))
+  (surface-body
+    (lambda (forms span)
+      (bind (
+        (n (size forms))
+      )
+        (if (eq n 0)
+          (surface-null span)
+          (if (eq n 1)
+            (get forms 0)
+            (surface-do forms span))))))
+  (surface-field
+    (lambda (value key)
+      (ctfe-surface-binding-get value key)))
+  (surface-field-or
+    (lambda (value key default)
+      (ctfe-surface-binding-get value key default)))
+  (surface-collect
+    (lambda (group item-key)
+      (ctfe-surface-binding-group-collect group item-key)))
+  (surface-unwrap
+    (lambda (value)
+      (ctfe-surface-unwrap value)))
+)
+  (do
+    (assoc-many
+      module-exports
+      "__roles__" (list-of "surface-constructors" "peg-capture")
+      "symbol" surface-symbol
+      "integer" surface-integer
+      "null" surface-null
+      "list" surface-list
+      "prepend" surface-prepend
+      "call" surface-call
+      "binding" surface-binding
+      "lambda" surface-lambda
+      "bind" surface-bind
+      "do" surface-do
+      "body" surface-body
+      "field" surface-field
+      "field-or" surface-field-or
+      "collect" surface-collect
+      "unwrap" surface-unwrap)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.surface-builder"
+      module-exports)
+    module-exports))

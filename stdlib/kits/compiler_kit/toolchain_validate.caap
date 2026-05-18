@@ -1,0 +1,212 @@
+; stdlib/compiler_kit/toolchain_validate.caap
+; Graph, call, control-flow, and top-level initialization validation provider.
+(bind (
+  (emit-graph-error
+    (lambda (ctx node message code)
+      (ctfe-compiler-error ctx node message code)))
+  (validate-top-level
+    (lambda (ctx node)
+      (if (not (eq (ctfe-node-parent node) null))
+        (emit-graph-error
+          ctx
+          node
+          "root node must not have a parent"
+          "caap.validate.graph.root_parent"))))
+  (validate-child-parent
+    (lambda (ctx node child)
+      (bind (
+        (parent (ctfe-node-parent child))
+      )
+        (if
+          (or
+            (eq parent null)
+            (not (ctfe-node-live? parent))
+            (not (eq (ctfe-node-id parent) (ctfe-node-id node))))
+          (emit-graph-error
+            ctx
+            child
+            "child parent link is inconsistent"
+            "caap.validate.graph.parent")))))
+  (validate-scope-bindings
+    (lambda (ctx node)
+      (bind (
+        (descriptor (ctfe-node-call-scope-descriptor node))
+      )
+        (if (not (eq descriptor null))
+          (bind (
+            (bindings (get descriptor "bindings" (list-of)))
+            (seen (map-of))
+          )
+            (sequence-each
+              bindings
+              (lambda (binding)
+                (bind (
+                  (name (get binding "name" null))
+                )
+                  (if (contains seen name)
+                    (emit-graph-error
+                      ctx
+                      node
+                      (string-concat-many
+                        "duplicate scoped binding name '"
+                        name
+                        "'")
+                      "caap.validate.call.scope_bindings")
+                    (assoc seen name true))))))))))
+  (validate-leave-target
+    (lambda (ctx node)
+      (bind (
+        (control (ctfe-node-call-control-descriptor node))
+      )
+        (if
+          (and
+            (not (eq control null))
+            (eq (get control "kind" null) "leave"))
+          (bind (
+            (target (ctfe-node-resolved-block node null))
+          )
+            (if (eq target null)
+              (emit-graph-error
+                ctx
+                node
+                "leave target does not resolve to an enclosing block"
+                "caap.validate.leave.target")
+              (if (not (ctfe-node-ancestor? node target))
+                (emit-graph-error
+                  ctx
+                  node
+                  "leave target must be an enclosing block"
+                  "caap.validate.leave.enclosing")
+                (bind (
+                  (target-control
+                    (ctfe-node-call-control-descriptor target))
+                )
+                  (if
+                    (or
+                      (eq target-control null)
+                      (not (eq (get target-control "kind" null) "block")))
+                    (emit-graph-error
+                      ctx
+                      node
+                      "leave target must resolve to a block node"
+                      "caap.validate.leave.block_kind"))))))))))
+  (initialization-validators
+    (ctfe-compiler-lookup-value compiler "stdlib.compiler-kit.validate.initialization" null))
+  (validate-top-level-initialization
+    (get
+      initialization-validators
+      "validate-top-level-initialization"))
+  (validate-node
+    (lambda (ctx node)
+      (bind (
+        (children (ctfe-node-children node))
+      )
+        (do
+          (if
+            (and
+              (ctfe-node-is-name node)
+              (eq (ctfe-node-resolved-name-entry node null) null))
+            (emit-graph-error
+              ctx
+              node
+              (string-concat-many
+                "unresolved name '"
+                (ctfe-node-name-identifier node)
+                "'")
+              "caap.resolve.name"))
+          (if
+            (and
+              (ctfe-node-is-call node)
+              (not (ctfe-node-call-has-semantics node)))
+            (emit-graph-error
+              ctx
+              node
+              "call is missing semantic classification"
+              "caap.validate.call.classification"))
+          (if (ctfe-node-is-call node)
+            (bind (
+              (builtin-name
+                (ctfe-node-call-builtin-name node null))
+              (arity (size (ctfe-node-call-args node)))
+              (min-arity
+                (ctfe-node-call-min-arity node null))
+              (max-arity
+                (ctfe-node-call-max-arity node null))
+              (callee (ctfe-node-call-callee node))
+              (callee-entry
+                (ctfe-node-resolved-name-entry callee null))
+              (callee-source
+                (if (eq callee-entry null)
+                  null
+                  (ctfe-semantic-entry-source callee-entry)))
+            )
+              (do
+                (if
+                  (and
+                    (not (eq builtin-name null))
+                    (not (eq callee-source "builtin")))
+                  (emit-graph-error
+                    ctx
+                    node
+                    "builtin call classification is inconsistent with name resolution"
+                    "caap.validate.call.builtin_consistency"))
+                (if
+                  (and
+                    (not (eq builtin-name null))
+                    (or
+                      (value-lt arity min-arity)
+                      (and (not (eq max-arity null)) (value-lt max-arity arity))))
+                  (emit-graph-error
+                    ctx
+                    node
+                    (string-concat-many
+                      "builtin "
+                      builtin-name
+                      " rejects arity "
+                      (int-to-string arity))
+                    "caap.validate.call.arity")))))
+          (if (ctfe-node-is-call node)
+            (validate-scope-bindings ctx node))
+          (if (ctfe-node-is-call node)
+            (validate-leave-target ctx node))
+          (sequence-each
+            children
+            (lambda (child)
+              (validate-child-parent ctx node child)))))))
+  (linkage-validators
+    (ctfe-compiler-lookup-value compiler "stdlib.compiler-kit.validate.linkage" null))
+  (validate-linkage
+    (get linkage-validators "validate-linkage"))
+  (validate-forms
+    (lambda (ctx unit)
+      (sequence-each
+        (ctfe-unit-top-level-forms unit)
+        (lambda (form)
+          (validate-top-level ctx form)))))
+  (validate-graph-provider
+    (lambda (ctx root)
+      (do
+        (validate-forms ctx (ctfe-provider-unit ctx))
+        (ctfe-provider-traversal-walk
+          ctx
+          root
+          (lambda (node)
+            (validate-node ctx node)))
+        (validate-top-level-initialization ctx)
+        (validate-linkage ctx (ctfe-provider-unit ctx) root)
+        false)))
+)
+  (ctfe-compiler-provider-register
+    compiler
+    "validate_graph"
+    "validate_graph"
+    validate-graph-provider
+    (list-of)
+    (list-of "read-ir" "emit-diagnostics")
+    (assoc-many
+      (map-of)
+      "family" "validate_graph"
+      "reads" (list-of "ir")
+      "writes" (list-of "diagnostics")
+      "cache_scope" "unit"
+      "resume_policy" "safe")))

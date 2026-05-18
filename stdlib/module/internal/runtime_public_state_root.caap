@@ -1,0 +1,119 @@
+(ctfe-compiler-execute-bootstrap-file
+  compiler
+  "runtime_public_provenance.caap")
+
+(bind (
+  (module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.prelude-bindings"))
+  (runtime-protocol
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.runtime-protocol"))
+  (public-provenance
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.public-provenance"))
+  (public-state-module
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.public-state-module"))
+  (get-any (get module-helpers "get-any" null))
+  (is-null? (get-any module-helpers "is-null?" null))
+  (get-or-null (get-any module-helpers "get-or-null" null))
+  (require-helper
+    (get-any module-helpers "require-helper" null))
+  (define-internal-module
+    (require-helper module-helpers "define-internal-module"))
+  (interface-key
+    (require-helper module-helpers "interface-key"))
+  (runtime-model-key
+    (require-helper module-helpers "runtime-model-key"))
+  (annotation-get
+    (require-helper module-helpers "annotation-get"))
+  (interface-module-name
+    (require-helper module-helpers "interface-module-name"))
+  (interface-provenance
+    (require-helper module-helpers "interface-provenance"))
+  (runtime-model-module-name
+    (require-helper module-helpers "runtime-model-module-name"))
+  (runtime-model-publics
+    (require-helper module-helpers "runtime-model-publics"))
+  (publication-module-kind
+    (require-helper module-helpers "publication-module-kind"))
+  (resolve-public-chain-result
+    (require-helper
+      public-provenance
+      "resolve-public-chain-result"))
+  (provider-stack-empty
+    (require-helper runtime-protocol "provider-stack-empty"))
+  (copy (require-helper runtime-protocol "copy"))
+  (state-with-error
+    (require-helper public-state-module "state-with-error"))
+  (state-with-chain
+    (require-helper public-state-module "state-with-chain"))
+)
+  (bind (
+    (resolve-root-public-state
+      (lambda (registry root public-name)
+        (bind (
+          (interface
+            (annotation-get root interface-key null))
+          (runtime-model
+            (annotation-get root runtime-model-key null))
+          (module-name
+            (if (is-null? interface)
+              (if (is-null? runtime-model)
+                null
+                (runtime-model-module-name runtime-model))
+              (interface-module-name interface)))
+          (module-kind
+            (if (value-is-string module-name)
+              (publication-module-kind module-name)
+              null))
+        )
+          (if (is-null? interface)
+            (state-with-error
+              module-name
+              public-name
+              module-kind
+              (list-of)
+              "module runtime could not find an interface")
+            (if (is-null? runtime-model)
+              (state-with-error
+                module-name
+                public-name
+                module-kind
+                (list-of)
+                "module runtime could not find a runtime model")
+              (bind (
+                (publics
+                  (copy (runtime-model-publics runtime-model)))
+                (provenance
+                  (interface-provenance interface))
+                (record
+                  (get-or-null provenance public-name))
+              )
+                (if (is-null? record)
+                  (state-with-error
+                    module-name
+                    public-name
+                    module-kind
+                    publics
+                    "module runtime could not resolve exported provenance")
+                  (bind (
+                    (chain-thunk
+                      (lambda ()
+                        (resolve-public-chain-result
+                          resolve-public-chain-result
+                          registry
+                          module-name
+                          public-name
+                          (provider-stack-empty)
+                          record)))
+                  )
+                    (state-with-chain
+                      module-name
+                      public-name
+                      module-kind
+                      publics
+                      chain-thunk)))))))))
+  )
+    (do
+      (define-internal-module
+        "stdlib.module.internal.public-state-root"
+        (list-of (list-of "resolve-root-public-state" resolve-root-public-state)))
+      null)))

@@ -1,0 +1,13 @@
+(module "stdlib.types.checker")
+
+(import-namespace "stdlib.sequence" "sequence")
+
+(import-namespace "stdlib.builder" "builder")
+
+(import-namespace "stdlib.pass-kit" "pass-kit")
+
+(import-namespace "stdlib.types" "types")
+
+(export "stdlib.types.checker")
+
+(ctfe-compiler-execute-bootstrap-file compiler "impl.caap")

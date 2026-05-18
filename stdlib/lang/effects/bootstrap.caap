@@ -1,0 +1,35 @@
+(module "stdlib.lang.effects")
+(export "stdlib.lang.effects")
+(export-as "EFFECT-PURE" "EFFECT-PURE")
+(export-as "EFFECT-IO" "EFFECT-IO")
+(export-as "EFFECT-MUTABLE" "EFFECT-MUTABLE")
+(export-as "EFFECT-DIAGNOSTICS" "EFFECT-DIAGNOSTICS")
+(export-as "EFFECT-EVENTS" "EFFECT-EVENTS")
+(export-as "EFFECT-IR-WRITE" "EFFECT-IR-WRITE")
+(export-as "EFFECT-FACTS-WRITE" "EFFECT-FACTS-WRITE")
+(export-as "FACT-EFFECT-POLICY" "FACT-EFFECT-POLICY")
+; stdlib/lang/effects/bootstrap.caap
+; Standard effect tokens and fact keys for CAAP semantic analysis.
+(bind (
+  (exports (map-of))
+  (EFFECT-PURE "pure")
+  (EFFECT-IO "io")
+  (EFFECT-MUTABLE "mutable-state")
+  (EFFECT-DIAGNOSTICS "emit-diagnostics")
+  (EFFECT-EVENTS "emit-events")
+  (EFFECT-IR-WRITE "write-ir")
+  (EFFECT-FACTS-WRITE "write-facts")
+  (FACT-EFFECT-POLICY "caap.fact.effect_policy")
+)
+  (do
+    (assoc-many
+      exports
+      "EFFECT-PURE" EFFECT-PURE
+      "EFFECT-IO" EFFECT-IO
+      "EFFECT-MUTABLE" EFFECT-MUTABLE
+      "EFFECT-DIAGNOSTICS" EFFECT-DIAGNOSTICS
+      "EFFECT-EVENTS" EFFECT-EVENTS
+      "EFFECT-IR-WRITE" EFFECT-IR-WRITE
+      "EFFECT-FACTS-WRITE" EFFECT-FACTS-WRITE
+      "FACT-EFFECT-POLICY" FACT-EFFECT-POLICY)
+    exports))

@@ -1,0 +1,204 @@
+(ctfe-compiler-execute-bootstrap-file
+  compiler
+  "common.caap")
+
+(bind (
+  (module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.prelude-bindings"))
+  (common-records
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.common-records"))
+  (common-keys
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.common-keys"))
+  (pass-kit
+    (ctfe-compiler-lookup-value compiler "stdlib.pass-kit"))
+  (module-transforms
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.passes"))
+  (get-any (get module-helpers "get-any" null))
+  (is-null? (get-any module-helpers "is-null?" null))
+  (not-null? (get-any module-helpers "not-null?" null))
+  (get-or-null (get-any module-helpers "get-or-null" null))
+  (require-helper
+    (get-any module-helpers "require-helper" null))
+  (sequence
+    (ctfe-compiler-lookup-value compiler "stdlib.sequence"))
+  (define-internal-module
+    (require-helper module-helpers "define-internal-module"))
+  (each (require-helper sequence "each"))
+  (length (require-helper sequence "length"))
+  (pass-enabled?
+    (require-helper module-helpers "pass-enabled?"))
+  (pass-finalized?
+    (require-helper module-helpers "pass-finalized?"))
+  (set-pass-state
+    (require-helper module-helpers "set-pass-state"))
+  (add-link-binding
+    (require-helper module-helpers "add-link-binding"))
+  (add-public-name
+    (require-helper module-helpers "add-public-name"))
+  (set-symbol-semantics
+    (require-helper module-helpers "set-symbol-semantics"))
+  (set-unit-id
+    (require-helper module-helpers "set-unit-id"))
+  (unit-version
+    (require-helper module-helpers "unit-version"))
+  (summary-key
+    (require-helper module-helpers "summary-key"))
+  (manifest-key (require-helper common-keys "manifest-key"))
+  (annotation-get
+    (require-helper module-helpers "annotation-get"))
+  (fact-get (require-helper module-helpers "fact-get"))
+  (rewrite-summary
+    (require-helper pass-kit "rewrite-summary"))
+  (rewrite-pipeline
+    (require-helper pass-kit "rewrite-pipeline"))
+  (summary-empty (require-helper pass-kit "summary-empty"))
+  (normalize-pass
+    (require-helper module-transforms "normalize-pass"))
+  (manifest-imports
+    (require-helper common-records "manifest-imports"))
+  (manifest-exports
+    (require-helper common-records "manifest-exports"))
+  (manifest-modules
+    (require-helper common-records "manifest-modules"))
+  (summary-module-name
+    (require-helper common-records "summary-module-name"))
+  (manifest-with-active-module
+    (require-helper
+      common-records
+      "manifest-with-active-module"))
+  (import-module-name
+    (require-helper common-records "import-module-name"))
+  (import-source-name
+    (require-helper common-records "import-source-name"))
+  (import-local-name
+    (require-helper common-records "import-local-name"))
+  (import-syntax?
+    (require-helper common-records "import-syntax?"))
+  (export-public-name
+    (require-helper common-records "export-public-name"))
+  (export-local-name
+    (require-helper common-records "export-local-name"))
+  (link-binding-new
+    (lambda (module-name source-name local-name syntax)
+      (ctfe-unit-link-binding-new
+        module-name
+        source-name
+        local-name
+        syntax)))
+)
+  (bind (
+    (provider-semantics
+      (lambda (provider)
+        (if (is-null? provider)
+          null
+          (bind (
+            (phase (get-or-null provider "phase"))
+            (effect (get-or-null provider "effect"))
+            (pure (get-or-null provider "pure"))
+            (semantics (map-of))
+          )
+            (if (or (is-null? phase) (is-null? effect) (is-null? pure))
+              null
+              (do
+                (assoc-many
+                  semantics
+                  "phase" phase
+                  "effect" effect
+                  "pure" pure
+                  "truth_kind" "module-public-provider")
+                semantics))))))
+    (project-import-symbol
+      (lambda (ctx entry resolve-public-provider)
+        (bind (
+          (source-module (import-module-name entry))
+          (source-name (import-source-name entry))
+          (local-name (import-local-name entry))
+          (provider
+            (if (is-null? resolve-public-provider)
+              null
+              (resolve-public-provider source-module source-name)))
+          (semantics (provider-semantics provider))
+        )
+          (if (not-null? semantics)
+            (do
+              (ctfe-unit-declare-symbol!
+                (ctfe-provider-unit ctx)
+                local-name
+                (get-any semantics "phase" "dual")
+                null
+                "external")
+              (set-symbol-semantics ctx local-name semantics null))))))
+    (project-pass-core
+      (lambda (ctx root)
+        (bind (
+          (manifest (fact-get ctx manifest-key root null))
+        )
+          (if (is-null? manifest)
+            (summary-empty "project-pass" root null)
+            (bind (
+              (imports-list (list-of))
+              (exports-list (manifest-exports manifest))
+              (modules (manifest-modules manifest))
+              (summary
+                (annotation-get root summary-key (map-of)))
+              (active-module
+                (if (is-null? (summary-module-name summary))
+                  "main"
+                  (summary-module-name summary)))
+              (resolve-public-provider
+                (ctfe-compiler-lookup-value compiler "stdlib.module.resolve-public-provider" null))
+            )
+              (do
+                (manifest-with-active-module manifest active-module)
+                (each (manifest-imports manifest)
+                  (lambda (entry)
+                    (append
+                      imports-list
+                      (link-binding-new
+                        (import-module-name entry)
+                        (import-source-name entry)
+                        (import-local-name entry)
+                        (import-syntax? entry)))))
+                (set-unit-id ctx active-module)
+                (each imports-list
+                  (lambda (binding)
+                    (add-link-binding ctx binding)))
+                (each (manifest-imports manifest)
+                  (lambda (entry)
+                    (project-import-symbol ctx entry resolve-public-provider)))
+                (each exports-list
+                  (lambda (entry)
+                    (add-public-name ctx (export-local-name entry))))
+                (set-pass-state root false (unit-version ctx))
+                (bind (
+                  (summary-result
+                    (rewrite-summary
+                      "project-pass"
+                      true
+                      root
+                      (int-add (length imports-list) (length exports-list))))
+                )
+                  (do
+                    (assoc summary-result "pass_name" "project-pass")
+                    (assoc
+                      summary-result
+                      "meta"
+                      (assoc-many (map-of) "module" active-module "modules" modules))
+                    summary-result))))))))
+    (project-pass
+      (lambda (ctx root)
+        (if (not (pass-finalized? root))
+          (bind (
+            (callbacks (list-of))
+          )
+            (do
+              (append callbacks normalize-pass)
+              (append callbacks project-pass-core)
+              (rewrite-pipeline ctx root callbacks)))
+          (summary-empty "project-pass" root null))))
+  )
+    (do
+      (define-internal-module
+        "stdlib.module.internal.projection-project"
+        (list-of (list-of "project-pass" project-pass)))
+      null)))

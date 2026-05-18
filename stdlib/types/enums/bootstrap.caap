@@ -1,0 +1,85 @@
+(module "stdlib.types.enums")
+
+(import-namespace "stdlib.types.core" "core")
+
+(import-namespace "stdlib.types.validation" "validation")
+
+(import-namespace "stdlib.sequence" "sequence")
+
+(export "stdlib.types.enums")
+
+(bind (
+  (exports (map-of))
+  (semantics (map-of))
+  (get-or-null (get sequence "get-or-null" null))
+  (pure-semantics (get core "pure-semantics" null))
+  (each (get sequence "each" null))
+  (make-type (get core "make-type" null))
+  (enum-key (get core "enum-key" null))
+  (validate-type (get validation "validate-type" null))
+  (expect-enum
+    (lambda (type)
+      (bind (
+        (validated (validate-type type))
+      )
+        (if (not (eq (get-or-null validated "kind") "enum"))
+          (runtime-error "expected an enum type")
+          validated))))
+  (index-enum-variants
+    (lambda (variants)
+      (bind (
+        (index (map-of))
+      )
+        (do
+          (each variants
+            (lambda (variant)
+              (bind (
+                (name (get-or-null variant "name"))
+              )
+                (if (not (eq name null))
+                  (assoc index name variant)))))
+          index))))
+  (make-enum-type
+    (lambda (name variants underlying)
+      (bind (
+        (type (make-type "enum" (enum-key name)))
+      )
+        (do
+          (assoc-many
+            type
+            "name" name
+            "variants" variants
+            "variant_index" (index-enum-variants variants)
+            "underlying" underlying)
+          (validate-type type)))))
+  (enum-type-variants
+    (lambda (type)
+      (get-or-null (expect-enum type) "variants")))
+  (enum-type-variant
+    (lambda (type variant-name)
+      (get-or-null
+        (get-or-null (expect-enum type) "variant_index")
+        variant-name)))
+  (enum-type-underlying
+    (lambda (type)
+      (get-or-null (expect-enum type) "underlying")))
+)
+  (do
+    (assoc-many
+      semantics
+      "make-enum-type" pure-semantics
+      "enum-type-variants" pure-semantics
+      "enum-type-variant" pure-semantics
+      "enum-type-underlying" pure-semantics)
+    (assoc-many
+      exports
+      "make-enum-type" make-enum-type
+      "enum-type-variants" enum-type-variants
+      "enum-type-variant" enum-type-variant
+      "enum-type-underlying" enum-type-underlying
+      "__contract_semantics__" semantics)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.types.enums"
+      exports)
+    exports))

@@ -1,0 +1,142 @@
+(bind (
+  (module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.prelude-bindings"))
+  (sequence
+    (ctfe-compiler-lookup-value compiler "stdlib.sequence"))
+  (get-any (get module-helpers "get-any" null))
+  (get-or-null (get-any module-helpers "get-or-null" null))
+  (require-helper
+    (get-any module-helpers "require-helper" null))
+  (each (require-helper module-helpers "each"))
+  (any? (require-helper module-helpers "any?"))
+  (at (require-helper module-helpers "at"))
+  (length (require-helper module-helpers "length"))
+  (keys (require-helper sequence "keys"))
+  (provenance-kind
+    (require-helper module-helpers "provenance-kind"))
+  (provenance-local-name
+    (require-helper module-helpers "provenance-local-name"))
+  (provenance-library
+    (require-helper module-helpers "provenance-library"))
+  (provenance-export-name
+    (require-helper module-helpers "provenance-export-name"))
+  (provenance-phase
+    (require-helper module-helpers "provenance-phase"))
+  (provenance-effect
+    (require-helper module-helpers "provenance-effect"))
+  (provenance-pure?
+    (require-helper module-helpers "provenance-pure?"))
+  (provenance-policy
+    (require-helper module-helpers "provenance-policy"))
+  (define-internal-module
+    (require-helper module-helpers "define-internal-module"))
+  (result-ok
+    (lambda (value)
+      (bind (
+        (entry (map-of))
+      )
+        (do
+          (assoc-many entry "ok" true "value" value)
+          entry))))
+)
+  (bind (
+    (provider-stack-entry-matches
+      (lambda (entry module-name public-name)
+        (and
+          (eq (get-or-null entry "module") module-name)
+          (eq (get-or-null entry "public") public-name))))
+    (provider-stack-key
+      (lambda (module-name public-name)
+        (string-concat-many module-name "::" public-name)))
+    (copy-map
+      (lambda (items)
+        (bind (
+          (copy-value (map-of))
+        )
+          (do
+            (each (keys items)
+              (lambda (key)
+                (assoc copy-value key (get-or-null items key))))
+            copy-value))))
+    (provider-stack-empty
+      (lambda ()
+        (assoc-many (map-of) "items" (list-of) "index" (map-of))))
+    (provider-stack-contains
+      (lambda (stack module-name public-name)
+        (get-any
+          (get-or-null stack "index")
+          (provider-stack-key module-name public-name)
+          false)))
+    (provider-stack-push
+      (lambda (stack module-name public-name)
+        (bind (
+          (next (list-of))
+          (next-index
+            (copy-map (get-or-null stack "index")))
+          (entry (map-of))
+        )
+          (do
+            (each (get-or-null stack "items")
+              (lambda (item)
+                (append next item)))
+            (assoc-many entry "module" module-name "public" public-name)
+            (append next entry)
+            (assoc
+              next-index
+              (provider-stack-key module-name public-name)
+              true)
+            (assoc-many (map-of) "items" next "index" next-index)))))
+    (provider-from-host-record
+      (lambda (record)
+        (bind (
+          (entry (map-of))
+        )
+          (do
+            (assoc-many
+              entry
+              "provider_kind" "host-service"
+              "module" null
+              "local" (provenance-local-name record)
+              "library" (provenance-library record)
+              "export" (provenance-export-name record)
+              "phase" (provenance-phase record)
+              "effect" (provenance-effect record)
+              "pure" (provenance-pure? record)
+              "policy" (provenance-policy record))
+            (result-ok entry)))))
+    (provider-from-template-binding
+      (lambda (module-name local-name record)
+        (bind (
+          (entry (map-of))
+        )
+          (do
+            (assoc-many
+              entry
+              "provider_kind" "template"
+              "module" module-name
+              "local" local-name
+              "library" null
+              "export" null
+              "phase"
+                (if (eq (provenance-kind record) "top_level")
+                  null
+                  (provenance-phase record))
+              "effect"
+                (if (eq (provenance-kind record) "top_level")
+                  null
+                  (provenance-effect record))
+              "pure"
+                (if (eq (provenance-kind record) "top_level")
+                  null
+                  (provenance-pure? record))
+              "policy" null)
+            (result-ok entry)))))
+  )
+    (define-internal-module
+      "stdlib.module.internal.runtime-provider-protocol"
+      (list-of
+        (list-of "provider-stack-empty"           provider-stack-empty)
+        (list-of "provider-stack-contains"        provider-stack-contains)
+        (list-of "provider-stack-push"            provider-stack-push)
+        (list-of "provider-from-host-record"      provider-from-host-record)
+        (list-of "provider-from-template-binding" provider-from-template-binding)))))

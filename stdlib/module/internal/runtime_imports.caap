@@ -1,0 +1,141 @@
+(ctfe-compiler-execute-bootstrap-file
+  compiler
+  "common.caap")
+
+(ctfe-compiler-execute-bootstrap-file
+  compiler
+  "runtime_protocol.caap")
+
+(bind (
+  (module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.prelude-bindings"))
+  (runtime-protocol
+    (ctfe-compiler-lookup-value compiler "stdlib.module.internal.runtime-protocol"))
+  (get-any (get module-helpers "get-any" null))
+  (get-or-null (get-any module-helpers "get-or-null" null))
+  (require-helper
+    (get-any module-helpers "require-helper" null))
+  (each (require-helper module-helpers "each"))
+  (any? (require-helper module-helpers "any?"))
+  (at (require-helper module-helpers "at"))
+  (length (require-helper module-helpers "length"))
+  (define-internal-module
+    (require-helper module-helpers "define-internal-module"))
+  (result-ok (require-helper runtime-protocol "result-ok"))
+  (result-error
+    (require-helper runtime-protocol "result-error"))
+  (result-ok?
+    (require-helper runtime-protocol "result-ok?"))
+  (result-value
+    (require-helper runtime-protocol "result-value"))
+  (lookup-runtime-model-result
+    (require-helper
+      runtime-protocol
+      "lookup-runtime-model-result"))
+)
+  (bind (
+    (clone-public-exports
+      (lambda (runtime-model exports)
+        (bind (
+          (copy (map-of))
+        )
+          (do
+            (each
+              (get-any runtime-model "publics" (list-of))
+              (lambda (public-name)
+                (assoc copy public-name (get-or-null exports public-name))))
+            copy))))
+    (resolve-import-entry
+      (lambda
+        (resolve-exports
+          compiler
+          runtime-models
+          phase
+          stack
+          linked
+          entry)
+        (bind (
+          (module-name (get-or-null entry "module"))
+          (source-name (get-or-null entry "source"))
+          (local-name (get-or-null entry "local"))
+          (exports-result
+            (resolve-exports
+              resolve-exports
+              compiler
+              module-name
+              phase
+              stack))
+        )
+          (if (not (result-ok? exports-result))
+            exports-result
+            (bind (
+              (exports (result-value exports-result))
+            )
+              (if (eq source-name "*")
+                (bind (
+                  (runtime-model-result
+                    (lookup-runtime-model-result runtime-models module-name))
+                )
+                  (if (not (result-ok? runtime-model-result))
+                    runtime-model-result
+                    (do
+                      (assoc
+                        linked
+                        local-name
+                        (clone-public-exports
+                          (result-value runtime-model-result)
+                          exports))
+                      (result-ok linked))))
+                (if (contains exports source-name)
+                  (do
+                    (assoc linked local-name (get-or-null exports source-name))
+                    (result-ok linked))
+                  (result-error
+                    "stdlib.module.import_symbol.unresolved"
+                    "module runtime could not resolve an imported symbol"
+                    (assoc-many (map-of) "module" module-name "source" source-name "local" local-name)))))))))
+    (build-linked-env
+      (lambda
+        (resolve-exports
+          compiler
+          runtime-models
+          runtime-model
+          phase
+          stack)
+        (bind (
+          (linked (map-of))
+          (imports
+            (get-any runtime-model "imports" (list-of)))
+          (state (map-of))
+          (process-import
+            (lambda (entry)
+              (bind (
+                (entry-result
+                  (resolve-import-entry
+                    resolve-exports
+                    compiler
+                    runtime-models
+                    phase
+                    stack
+                    linked
+                    entry))
+              )
+                (if (result-ok? entry-result)
+                  false
+                  (do
+                    (assoc state "result" entry-result)
+                    true)))))
+        )
+          (do
+            (assoc state "result" null)
+            (any? imports process-import)
+            (bind (
+              (result (get-or-null state "result"))
+            )
+              (if (eq result null)
+                (result-ok linked)
+                result))))))
+  )
+    (define-internal-module
+      "stdlib.module.internal.runtime-imports"
+      (list-of (list-of "build-linked-env" build-linked-env)))))

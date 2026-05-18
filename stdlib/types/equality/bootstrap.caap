@@ -1,0 +1,119 @@
+(module "stdlib.types.equality")
+
+(import-namespace "stdlib.types.core" "core")
+
+(import-namespace "stdlib.types.validation" "validation")
+
+(import-namespace "stdlib.types.inspect" "inspect")
+
+(import-namespace "stdlib.sequence" "sequence")
+
+(export "stdlib.types.equality")
+
+(bind (
+  (exports (map-of))
+  (semantics (map-of))
+  (get-any (get sequence "get" null))
+  (fold-left (get sequence "fold-left" null))
+  (copy (get sequence "copy" null))
+  (pure-semantics (get core "pure-semantics" null))
+  (at (get sequence "at" null))
+  (type-key (get core "type-key" null))
+  (validate-type (get validation "validate-type" null))
+  (type->string (get inspect "type->string" null))
+  (path-contains?
+    (lambda (path key)
+      (fold-left
+        path
+        false
+        (lambda (found entry)
+          (or found (eq entry key))))))
+  (path-with
+    (lambda (path key)
+      (bind (
+        (next-path (copy path))
+      )
+        (do
+          (append next-path key)
+          next-path))))
+  (canonical-compatible-type
+    (lambda (self type path)
+      (bind (
+        (validated (validate-type type))
+        (key (type-key validated))
+      )
+        (if (eq (get-any validated "kind" null) "alias")
+          (if (path-contains? path key)
+            (runtime-error
+              (string-concat-many
+                "cyclic alias reference detected at "
+                key))
+            (self
+              self
+              (get-any validated "target" null)
+              (path-with path key)))
+          validated))))
+  (type-equals
+    (lambda (left right)
+      (eq
+        (type-key (validate-type left))
+        (type-key (validate-type right)))))
+  (explain-compatible
+    (lambda (left right)
+      (bind (
+        (validated-left (validate-type left))
+        (validated-right (validate-type right))
+        (canonical-left
+          (canonical-compatible-type
+            canonical-compatible-type
+            validated-left
+            (list-of)))
+        (canonical-right
+          (canonical-compatible-type
+            canonical-compatible-type
+            validated-right
+            (list-of)))
+        (compatible
+          (eq (type-key canonical-left) (type-key canonical-right)))
+        (rule
+          (if (type-equals validated-left validated-right)
+            "exact_equality_v1"
+            (if compatible
+              "transparent_alias_v1"
+              "nominal_type_mismatch_v1")))
+      )
+        (assoc-many
+          (map-of)
+          "compatible" compatible
+          "rule" rule
+          "reason"
+            (if compatible
+              "equal"
+              "type_mismatch")
+          "left" validated-left
+          "right" validated-right
+          "canonical_left" canonical-left
+          "canonical_right" canonical-right
+          "left_display" (type->string validated-left)
+          "right_display" (type->string validated-right)))))
+  (type-compatible
+    (lambda (left right)
+      (get-any (explain-compatible left right) "compatible" false)))
+)
+  (do
+    (assoc-many
+      semantics
+      "type-equals" pure-semantics
+      "type-compatible" pure-semantics
+      "explain-compatible" pure-semantics)
+    (assoc-many
+      exports
+      "type-equals" type-equals
+      "type-compatible" type-compatible
+      "explain-compatible" explain-compatible
+      "__contract_semantics__" semantics)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.types.equality"
+      exports)
+    exports))

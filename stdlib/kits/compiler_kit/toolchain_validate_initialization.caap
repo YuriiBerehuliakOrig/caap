@@ -1,0 +1,222 @@
+; stdlib/compiler_kit/toolchain_validate_initialization.caap
+; Top-level read-before-initialization validation helpers for validate_graph.
+(bind (
+  (emit-graph-error
+    (lambda (ctx node message code)
+      (ctfe-compiler-error ctx node message code)))
+  (literal-truthiness
+    (lambda (node)
+      (if (not (ctfe-node-is-literal node))
+        null
+        (bind (
+          (value (ctfe-node-literal-value node))
+        )
+          (if (eq value null)
+            false
+            (if (value-is-bool value)
+              value
+              (if (value-is-int value)
+                (not (eq value 0))
+                (if (value-is-string value)
+                  (not (eq value ""))
+                  null))))))))
+  (validate-top-level-read
+    (lambda (self ctx node runtime-names initialized)
+      (if (ctfe-node-is-literal node)
+        null
+        (if (ctfe-node-is-name node)
+          (bind (
+            (entry
+              (ctfe-node-resolved-name-entry node null))
+            (source
+              (if (eq entry null)
+                null
+                (ctfe-semantic-entry-source entry)))
+            (name
+              (if (eq entry null)
+                null
+                (ctfe-semantic-entry-name entry)))
+          )
+            (if
+              (and
+                (eq source "top-level")
+                (contains runtime-names name)
+                (not (contains initialized name)))
+              (emit-graph-error
+                ctx
+                node
+                (string-concat-many
+                  "top-level name '"
+                  name
+                  "' is read before its defining form initializes it")
+                "caap.validate.top_level.initialization")))
+          (if (ctfe-node-is-call node)
+            (bind (
+              (scope (ctfe-node-call-scope-descriptor node))
+              (control
+                (ctfe-node-call-control-descriptor node))
+            )
+              (if
+                (and
+                  (not (eq scope null))
+                  (eq (get scope "result_kind" null) "closure"))
+                null
+                (if
+                  (and
+                    (not (eq scope null))
+                    (eq (get scope "result_kind" null) "scoped_eval"))
+                  (bind (
+                    (bindings
+                      (get scope "bindings" (list-of)))
+                    (bodies (get scope "bodies" (list-of)))
+                  )
+                    (do
+                      (sequence-each
+                        bindings
+                        (lambda (binding)
+                          (bind (
+                            (binding-node
+                              (get binding "node" null))
+                          )
+                            (if (not (eq binding-node null))
+                              (self self ctx binding-node runtime-names initialized)))))
+                      (sequence-each
+                        bodies
+                        (lambda (body)
+                          (self self ctx body runtime-names initialized)))))
+                  (if (not (eq control null))
+                    (bind (
+                      (values
+                        (get control "values" (list-of)))
+                    )
+                      (sequence-each
+                        values
+                        (lambda (value)
+                          (self self ctx value runtime-names initialized))))
+                    (bind (
+                      (callee (ctfe-node-call-callee node))
+                      (args (ctfe-node-call-args node))
+                      (arg-count (size args))
+                      (eval-policy
+                        (ctfe-node-call-eval-policy node null))
+                      (short-circuit-policy
+                        (ctfe-node-call-short-circuit-policy node "none"))
+                      (short-each
+                        (lambda ()
+                          (sequence-any
+                            args
+                            (lambda (arg)
+                              (do
+                                (self self ctx arg runtime-names initialized)
+                                (bind (
+                                  (truthiness
+                                    (literal-truthiness arg))
+                                )
+                                  (if (eq truthiness null)
+                                    false
+                                    (or
+                                      (and (eq short-circuit-policy "truthy") truthiness)
+                                      (and (eq short-circuit-policy "falsey") (not truthiness))))))))))
+                    )
+                      (do
+                        (self self ctx callee runtime-names initialized)
+                        (if (or (eq eval-policy "eager") (eq eval-policy "sequential"))
+                          (sequence-each
+                            args
+                            (lambda (arg)
+                              (self self ctx arg runtime-names initialized)))
+                          (if (eq eval-policy "lazy_if")
+                            (do
+                              (if (value-lt 0 arg-count)
+                                (self self ctx (get args 0 null) runtime-names initialized))
+                              (if (value-lt 1 arg-count)
+                                (bind (
+                                  (truthiness
+                                    (literal-truthiness (get args 0 null)))
+                                )
+                                  (if (not (eq truthiness null))
+                                    (if truthiness
+                                      (self self ctx (get args 1 null) runtime-names initialized)
+                                      (if (value-lt 2 arg-count)
+                                        (self self ctx (get args 2 null) runtime-names initialized)))))))
+                            (if (not (eq short-circuit-policy "none"))
+                              (short-each)))))))))))))))
+  (validate-top-level-initialization
+    (lambda (ctx)
+      (bind (
+        (unit (ctfe-provider-unit ctx))
+        (symbols (ctfe-unit-top-level-symbols unit))
+        (runtime-names (map-of))
+        (initialized (map-of))
+        (forms (ctfe-unit-top-level-forms unit))
+        (form-loop
+          (lambda (form)
+            (bind (
+              (scope
+                (if (ctfe-node-is-call form)
+                  (ctfe-node-call-scope-descriptor form)
+                  null))
+            )
+              (do
+                (if
+                  (and
+                    (not (eq scope null))
+                    (get scope "exports_to_parent_scope" false))
+                  (bind (
+                    (bindings
+                      (get scope "bindings" (list-of)))
+                    (bodies (get scope "bodies" (list-of)))
+                  )
+                    (do
+                      (sequence-each
+                        bindings
+                        (lambda (binding)
+                          (bind (
+                            (name (get binding "name" null))
+                            (node (get binding "node" null))
+                          )
+                            (do
+                              (if (not (eq node null))
+                                (validate-top-level-read
+                                  validate-top-level-read
+                                  ctx
+                                  node
+                                  runtime-names
+                                  initialized))
+                              (if (contains runtime-names name)
+                                (assoc initialized name true))))))
+                      (sequence-each
+                        bodies
+                        (lambda (body)
+                          (validate-top-level-read
+                            validate-top-level-read
+                            ctx
+                            body
+                            runtime-names
+                            initialized)))))
+                  (validate-top-level-read
+                    validate-top-level-read
+                    ctx
+                    form
+                    runtime-names
+                    initialized))))))
+      )
+        (do
+          (sequence-each
+            symbols
+            (lambda (symbol)
+              (if (not (eq (get symbol "node" null) null))
+                (assoc runtime-names (get symbol "name" null) true))))
+          (sequence-each forms form-loop)))))
+  (exports
+    (assoc-many
+      (map-of)
+      "validate-top-level-initialization"
+        validate-top-level-initialization))
+)
+  (do
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.compiler-kit.validate.initialization"
+      exports)
+    exports))

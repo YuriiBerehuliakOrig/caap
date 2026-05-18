@@ -1,0 +1,31 @@
+(module "sys.fs")
+
+(module-capability "host_services")
+
+(import-namespace
+  "stdlib.internal.system-module-helpers"
+  "system-module-helpers")
+(import-namespace
+  "stdlib.module"
+  "module")
+
+;; Host-backed filesystem module.
+;;
+;; Export groups:
+;; - default-capability
+;; - path helpers: read-text, write-text, append-text, exists, is-file,
+;;   is-dir, metadata, canonicalize, list-dir
+;; - mutation helpers: create-dir, create-dir-all, remove-file, remove-dir,
+;;   remove-dir-all, rename, copy-file
+;; - handle helpers: open-file, close-file, file-read-all-text,
+;;   file-read-line, file-write, file-flush, file-seek, file-metadata,
+;;   open-dir, close-dir, dir-list
+(bind (
+  (system-module-helpers
+    (ctfe-compiler-lookup-value compiler "stdlib.internal.system-module-helpers"))
+  (bootstrap-system-modules
+    (get system-module-helpers "bootstrap-system-modules"))
+)
+  (bootstrap-system-modules
+    compiler
+    (list-of (list-of "sys.fs" "fs" "sys.fs"))))

@@ -1,0 +1,86 @@
+(module "stdlib.types.functions")
+
+(import-namespace "stdlib.types.core" "core")
+
+(import-namespace "stdlib.types.validation" "validation")
+
+(import-namespace "stdlib.sequence" "sequence")
+
+(export "stdlib.types.functions")
+
+(bind (
+  (exports (map-of))
+  (semantics (map-of))
+  (get-any (get sequence "get" null))
+  (get-or-null (get sequence "get-or-null" null))
+  (fold-left (get sequence "fold-left" null))
+  (pure-semantics (get core "pure-semantics" null))
+  (make-type (get core "make-type" null))
+  (type-key (get core "type-key" null))
+  (validate-type (get validation "validate-type" null))
+  (function-param-piece
+    (lambda (param)
+      (type-key (validate-type (get-any param "type" null)))))
+  (function-param-key
+    (lambda (params)
+      (fold-left
+        params
+        ""
+        (lambda (acc param)
+          (bind (
+            (piece (function-param-piece param))
+          )
+            (if (eq acc "")
+              piece
+              (string-concat-many acc "," piece)))))))
+  (function-key
+    (lambda (params result)
+      (string-concat-many
+        "function:("
+        (function-param-key params)
+        ")->"
+        (type-key (validate-type result)))))
+  (make-function-type
+    (lambda (params result)
+      (bind (
+        (type (make-type "function" (function-key params result)))
+      )
+        (do
+          (assoc-many type "params" params "result" result)
+          (validate-type type)))))
+  (function-params
+    (lambda (type)
+      (bind (
+        (validated (validate-type type))
+      )
+        (if (not (eq (get-or-null validated "kind") "function"))
+          (runtime-error "expected a function type")
+          (get-or-null validated "params")))))
+  (function-result
+    (lambda (type)
+      (bind (
+        (validated (validate-type type))
+      )
+        (if (not (eq (get-or-null validated "kind") "function"))
+          (runtime-error "expected a function type")
+          (get-or-null validated "result")))))
+)
+  (do
+    (assoc-many
+      semantics
+      "function-key" pure-semantics
+      "make-function-type" pure-semantics
+      "function-params" pure-semantics
+      "function-result" pure-semantics)
+    (assoc-many
+      exports
+      "function-key" function-key
+      "make-function-type" make-function-type
+      "function-params" function-params
+      "function-result" function-result
+      "__contract_semantics__" semantics)
+    (ctfe-compiler-register-value
+      compiler
+      "stdlib.types.functions"
+      exports)
+    exports))
