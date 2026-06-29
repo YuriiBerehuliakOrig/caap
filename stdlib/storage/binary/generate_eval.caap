@@ -1,0 +1,223 @@
+; stdlib/storage/binary/generate_eval.caap — spec data -> generated eval IR
+; (module stdlib.storage.binary.generate_eval).
+;
+; The EVAL codegen target: lowers a parsed spec to dynamic list/map IR that runs
+; on the kernel today (an encode->decode round-trip without a C toolchain). Each
+; generated function references the byte runtime (le_bytes/read_le/crc32/…) BY
+; NAME, so the unit using `storage` imports the runtime. The native target lives
+; in generate_native; this module also exposes the small builders + sizing
+; helpers (`field_size`, `with_tail`) the native target reuses, and the docs /
+; snapshot table builders the generate driver assembles.
+(module stdlib.storage.binary.generate_eval)
+
+(use stdlib.syntax.ast
+  call? head_is? name_of arg sym lit calln call lam seq)
+(use stdlib.syntax.ir subst)
+(use stdlib.syntax.render render)
+(use stdlib.lib.collections.sequence each)
+(use stdlib.lib.text.buffer buf_new push_str to_string)
+
+; Small IR builders. Generated functions reference the byte runtime BY NAME, so
+; the unit using `storage` imports it (the demo does).
+(bind kget  (lambda (obj key) (calln "get" (list_of obj (lit key) (lit null)))))
+(bind kbind (lambda (nm val body) (calln "bind" (list_of (lit nm) val body))))
+(bind with_tail
+  (lambda (stmts tail)
+    (bind ((out (list_of))) (do (each stmts (lambda (s) (append out s))) (append out tail) out))))
+
+(bind field_size (lambda (f) (get (get f "type") "size" 0)))
+(bind record_size
+  (lambda (rec)
+    (bind ((n (ref 0)))
+      (do (each (get rec "fields") (lambda (f) (set_ref n (int_add (deref n) (field_size f))))) (deref n)))))
+
+; encode: (lambda (rec) (bind ((acc (list_of))) (do <emit each field> acc)))
+; emit_scalar/emit_pad/emit_crc — one `(emit! acc …)` statement spec per field
+; kind. `be?` selects the byte-order helper (le_bytes / be_bytes) so a `(endian
+; big)` spec lowers to the big-endian writer; bytes[N] fields stay byte-order
+; agnostic (a raw slice). A bool value is folded to 0/1 first (the byte runtime
+; is integer-only); a signed value needs no special-casing — int_mod/int_div are
+; Euclidean, so the bytes of a negative are already its two's-complement encoding.
+(bind emit_scalar
+  (lambda (be? src n)
+    (calln "emit!" (list_of (sym "acc")
+      (calln (if be? "be_bytes" "le_bytes") (list_of src (lit n)))))))
+(bind bool_to_int (lambda (e) (calln "if" (list_of e (lit 1) (lit 0)))))
+(bind encode_stmt
+  (lambda (be? f)
+    (bind ((ty (get f "type")) (k (get ty "kind")))
+      (cond
+        ((get f "crc" false)
+          (emit_scalar be? (calln "crc32" (list_of (sym "acc") (lit 0) (calln "size" (list_of (sym "acc"))))) 4))
+        ((eq k "bytes")
+          (calln "emit!" (list_of (sym "acc")
+            (calln "pad_bytes" (list_of (kget (sym "rec") (get f "name")) (lit (get ty "size")))))))
+        ((eq k "bool")
+          (emit_scalar be? (bool_to_int (kget (sym "rec") (get f "name"))) 1))
+        ((eq k "float")
+          (emit_scalar be?
+            (calln (if (eq (get ty "size") 8) "float_to_bits" "float_to_bits_f32")
+              (list_of (kget (sym "rec") (get f "name"))))
+            (get ty "size")))
+        (else
+          (emit_scalar be? (kget (sym "rec") (get f "name")) (get ty "size")))))))
+(bind gen_encode
+  (lambda (be? rec)
+    (bind ((stmts (list_of)))
+      (do
+        (each (get rec "fields") (lambda (f) (append stmts (encode_stmt be? f))))
+        (lam (list_of "rec")
+          (kbind "acc" (calln "list_of" (list_of)) (seq (with_tail stmts (sym "acc")))))))))
+
+; decode: (lambda (bs) (bind ((rec (map_of))) (do <guard> <read each field at off> <crc-verify> rec)))
+; decode_value — the read-expression spec for one field at baked offset `off`.
+; `be?` selects the byte-order reader (read_le* / read_be*):
+;   bytes      -> slice_bytes (a sub-list; byte-order agnostic)
+;   bool       -> (ne (read_* …) 0)        (one byte back to a boolean)
+;   signed int -> read_*_signed             (two's-complement, sign-extended)
+;   otherwise  -> read_*                    (plain unsigned)
+(bind decode_value
+  (lambda (be? ty off sz)
+    (bind ((rd  (if be? "read_be" "read_le"))
+           (rds (if be? "read_be_signed" "read_le_signed")))
+      (cond
+        ((eq (get ty "kind") "bytes")
+          (calln "slice_bytes" (list_of (sym "bs") (lit off) (lit sz))))
+        ((eq (get ty "kind") "bool")
+          (calln "ne" (list_of
+            (calln rd (list_of (sym "bs") (lit off) (lit sz))) (lit 0))))
+        ((eq (get ty "kind") "float")
+          (calln (if (eq sz 8) "bits_to_float" "bits_to_float_f32")
+            (list_of (calln rd (list_of (sym "bs") (lit off) (lit sz))))))
+        ((get ty "signed" false)
+          (calln rds (list_of (sym "bs") (lit off) (lit sz))))
+        (else
+          (calln rd (list_of (sym "bs") (lit off) (lit sz))))))))
+; gen_decode — prepends a length GUARD ((if (lt (size bs) RECORD_SIZE) (throw …)))
+; so a short buffer raises instead of reading off-the-end zeros, and (for a record
+; with a crc field) appends a CRC-verify ((if (ne (crc32 bs 0 crc_off) stored)
+; (throw …))) so a corrupt buffer is rejected at decode time, not silently
+; accepted. The crc field is validated to be the last u32 field, so crc_off is the
+; running offset when it is reached and the stored value is the decoded crc field.
+(bind gen_decode
+  (lambda (be? rec)
+    (bind ((stmts (list_of)) (off (ref 0)) (rn (get rec "name"))
+           (need (record_size rec)) (crc_off (ref -1)) (crc_name (ref null)))
+      (do
+        ; (a) bounds guard: refuse a buffer shorter than the fixed record size
+        (append stmts
+          (calln "if" (list_of
+            (calln "lt" (list_of (calln "size" (list_of (sym "bs"))) (lit need)))
+            (calln "throw" (list_of (lit (string_concat_many
+              "decode " rn ": buffer too short (need " (int_to_string need) " bytes)"))))
+            (lit null))))
+        (each (get rec "fields")
+          (lambda (f)
+            (bind ((ty (get f "type")) (sz (field_size f)))
+              (do
+                (when (get f "crc" false)
+                  (do (set_ref crc_off (deref off)) (set_ref crc_name (get f "name"))))
+                (append stmts
+                  (calln "assoc" (list_of (sym "rec") (lit (get f "name"))
+                    (decode_value be? ty (deref off) sz))))
+                (set_ref off (int_add (deref off) sz))))))
+        ; (b) crc verify: recompute over [0,crc_off) and compare to the stored value
+        (when (ge (deref crc_off) 0)
+          (append stmts
+            (calln "if" (list_of
+              (calln "ne" (list_of
+                (calln "crc32" (list_of (sym "bs") (lit 0) (lit (deref crc_off))))
+                (kget (sym "rec") (deref crc_name))))
+              (calln "throw" (list_of (lit (string_concat_many
+                "decode " rn ": crc mismatch (data corrupt)"))))
+              (lit null)))))
+        (lam (list_of "bs")
+          (kbind "rec" (calln "map_of" (list_of)) (seq (with_tail stmts (sym "rec")))))))))
+
+; validate: (lambda (rec) (do <if (not <where>) (throw …)> … true)) — where-clauses
+; with field names rewritten to (get rec "field") via ir.subst.
+(bind field_subst
+  (lambda (rec)
+    (bind ((m (map_of)))
+      (do (each (get rec "fields")
+            (lambda (f) (assoc m (get f "name") (kget (sym "rec") (get f "name")))))
+          m))))
+(bind gen_validate
+  (lambda (rec)
+    (bind ((stmts (list_of)) (sub (field_subst rec)))
+      (do
+        (each (get rec "fields")
+          (lambda (f)
+            (if (not (eq (get f "where") null))
+              (append stmts
+                (calln "if" (list_of
+                  (calln "not" (list_of (subst (get f "where") sub)))
+                  (calln "throw" (list_of (lit (string_concat_many
+                    "validate: `where` failed for " (get f "name") " in " (get rec "name")))))
+                  (lit null))))
+              null)))
+        (lam (list_of "rec") (seq (with_tail stmts (lit true))))))))
+
+; migrate: (lambda (old) (assoc (map_of) "f" <expr> …)); (old X) -> (get old "X").
+(bind migrate_expr
+  (lambda (e)
+    (if (and (call? e) (head_is? e "old")) (kget (sym "old") (name_of (arg e 0))) e)))
+(bind gen_migrate
+  (lambda (mig)
+    (bind ((args (list_of (calln "map_of" (list_of)))))
+      (do
+        (each (get mig "sets")
+          (lambda (s)
+            (do (append args (lit (get s "field"))) (append args (migrate_expr (get s "expr"))))))
+        (lam (list_of "old") (calln "assoc" args))))))
+
+(bind latest_record
+  (lambda (records rn)
+    (bind ((best (ref null)))
+      (do
+        (each records (lambda (r)
+          (if (and (eq (get r "name") rn)
+                   (or (eq (deref best) null) (gt (get r "version") (get (deref best) "version"))))
+            (set_ref best r) null)))
+        (deref best)))))
+
+; ── documentation table + readable snapshot ──────────────────────────────────
+(bind build_docs
+  (lambda (spec)
+    ; crc is null when the spec omits a `(crc …)` directive — show "none" then
+    ; (the key is present, so a `get` default would not apply). The table is
+    ; built with a text/buffer (push the same fragments in order, one `to_string`
+    ; join at the end) instead of the O(n²) (ref "") + string_concat_many reflow;
+    ; the joined bytes are identical to the old accumulator.
+    (bind ((crc_name (if (eq (get spec "crc") null) "none" (get spec "crc")))
+           (out (buf_new)))
+      (do
+        (push_str out (string_concat_many "storage " (get spec "name")
+          " (endian " (get spec "endian") ", crc " crc_name ")\n"))
+        (each (get spec "records")
+          (lambda (rec)
+            (do
+              (push_str out (string_concat_many "  record " (get rec "name")
+                " v" (int_to_string (get rec "version")) " (" (int_to_string (record_size rec)) " bytes)\n"))
+              (each (get rec "fields")
+                (lambda (f)
+                  (push_str out (string_concat_many "    " (get f "name")
+                    " : " (get (get f "type") "spelling" "?")
+                    " (" (int_to_string (field_size f)) "B)\n")))))))
+        (to_string out)))))
+(bind build_snapshot
+  (lambda (pairs)
+    ; same text/buffer treatment as build_docs: push each rendered binding +
+    ; "\n\n" and join once, instead of the O(n²) (ref "") + string_concat_many
+    ; reflow — byte-identical output.
+    (bind ((out (buf_new)))
+      (do
+        (each pairs
+          (lambda (p)
+            (push_str out (string_concat_many
+              (render (calln "bind" (list_of (lit (get p "k")) (get p "v")))) "\n\n"))))
+        (to_string out)))))
+
+(export gen_encode gen_decode gen_validate gen_migrate
+        latest_record build_docs build_snapshot
+        record_size field_size with_tail)

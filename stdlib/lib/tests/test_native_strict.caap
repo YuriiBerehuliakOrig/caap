@@ -1,0 +1,41 @@
+; stdlib/lib/tests/test_native_strict.caap — opt-in native-strict profile (audit #15).
+;
+; The strict native profile is OWNED by backend/prep (set_strict!/clear_strict!), a
+; HIGHER tier than the type pass (semantics/types/infer); a lower tier cannot import
+; a higher one, so infer could not read prep's flag directly. Audit #1's session is
+; the tier-legal BRIDGE: both prep and infer ask session_cell! for the SAME
+; "backend.prep.strict_mode" cell, so prep's set_strict! is visible to infer's
+; effect-strictness gate. This proves that bridge (the enabling mechanism #15 adds).
+;
+; The gate body itself (infer.caap, after settle_effect!) is guarded by this flag
+; and default-OFF, so the whole codegen golden runs it OFF (byte-identical); its
+; correctness rests on reading the SAME cell, proven here.
+;
+; NB: strict is captured into refs and CLEARED before any assertion, so a failing
+; assert cannot leak strict-on into later corpus modules.
+;; @area: types
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.backend.prep set_strict! clear_strict! strict?)
+(use stdlib.semantics.session session_cell!)
+
+(do
+  (bind (
+    ; the SAME cell infer's native_strict? reads (idempotent session_cell!)
+    (cell (session_cell! "backend.prep.strict_mode" (lambda () false)))
+    (r_off0 (ref true)) (r_on1 (ref false)) (r_strict_on (ref false))
+    (r_off2 (ref true))
+  )
+    (do
+      ; capture: off -> on -> off, reading prep's flag AND the shared cell
+      (clear_strict!)  (set_ref r_off0 (deref cell))
+      (set_strict!)    (set_ref r_on1 (deref cell)) (set_ref r_strict_on (strict?))
+      (clear_strict!)  (set_ref r_off2 (deref cell))
+
+      ; assertions (strict already cleared)
+      (assert_eq (deref r_off0) false "strict profile is off by default")
+      (assert_eq (deref r_on1) true
+        "set_strict! flips the SHARED session cell the type pass's gate reads")
+      (assert_true (deref r_strict_on) "prep strict? agrees while pinned")
+      (assert_eq (deref r_off2) false "clear_strict! resets the shared cell"))))

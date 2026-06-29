@@ -1,0 +1,146 @@
+; stdlib/lib/tests/test_float.caap — in-language tests for lib/core/float.
+;
+; Floats are compared with approx_eq (the module's own tolerance helper), never
+; exact ==, since most of these are transcendental results. Edge cases cover
+; trunc on negatives, clamp at both bounds, signum/copysign signs, and the
+; NaN / inf / finite classifiers.
+
+;; @area: numeric
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_true)
+(use stdlib.lib.core.float
+  pi e tau
+  sqrt cbrt hypot pow
+  floor ceil round trunc
+  fabs fmin fmax clamp signum copysign lerp
+  sin cos tan asin acos atan atan2 exp ln log2 log10 log_base
+  expm1 log1p sinh cosh tanh asinh acosh atanh sign_f
+  is_nan? is_inf? is_finite?
+  deg_to_rad rad_to_deg approx_eq to_int of_int)
+
+; ── tolerance + constants ────────────────────────────────────────────────────
+(bind eps 0.0000001)
+
+(assert_true (approx_eq pi  3.141592653589793 eps) "pi")
+(assert_true (approx_eq e   2.718281828459045 eps) "e")
+(assert_true (approx_eq tau 6.283185307179586 eps) "tau")
+(assert_true (approx_eq tau (float_mul 2.0 pi) eps) "tau = 2*pi")
+
+; ── roots & powers ───────────────────────────────────────────────────────────
+(assert_true (approx_eq (sqrt 2.0) 1.4142135623730951 eps) "sqrt2")
+(assert_true (approx_eq (sqrt 9.0) 3.0 eps) "sqrt9")
+(assert_true (approx_eq (cbrt 27.0) 3.0 eps) "cbrt27")
+(assert_true (approx_eq (cbrt 8.0) 2.0 eps) "cbrt8")
+; cbrt is sign-correct for negatives (not nan) and exact at zero
+(assert_true (approx_eq (cbrt -27.0) -3.0 eps) "cbrt -27 = -3")
+(assert_true (approx_eq (cbrt -8.0) -2.0 eps) "cbrt -8 = -2")
+(assert_true (approx_eq (cbrt 0.0) 0.0 eps) "cbrt 0 = 0")
+(assert_true (is_finite? (cbrt -1.0)) "cbrt of a negative is finite, not nan")
+(assert_true (approx_eq (hypot 3.0 4.0) 5.0 eps) "hypot 3-4-5")
+(assert_true (approx_eq (pow 2.0 10.0) 1024.0 eps) "pow 2^10")
+(assert_true (approx_eq (pow 9.0 0.5) 3.0 eps) "pow as sqrt")
+
+; ── rounding ─────────────────────────────────────────────────────────────────
+(assert_true (approx_eq (floor 2.7) 2.0 eps) "floor pos")
+(assert_true (approx_eq (floor -2.3) -3.0 eps) "floor neg")
+(assert_true (approx_eq (ceil 2.3) 3.0 eps) "ceil pos")
+(assert_true (approx_eq (ceil -2.7) -2.0 eps) "ceil neg")
+(assert_true (approx_eq (round 2.5) 3.0 eps) "round half up")
+(assert_true (approx_eq (round 2.4) 2.0 eps) "round down")
+(assert_true (approx_eq (trunc 2.9) 2.0 eps) "trunc pos toward zero")
+(assert_true (approx_eq (trunc -2.9) -2.0 eps) "trunc neg toward zero")
+(assert_true (approx_eq (trunc -0.5) 0.0 eps) "trunc small neg")
+
+; ── magnitude, sign & combination ────────────────────────────────────────────
+(assert_true (approx_eq (fabs -3.5) 3.5 eps) "fabs neg")
+(assert_true (approx_eq (fabs 3.5) 3.5 eps) "fabs pos")
+(assert_true (approx_eq (fmin 2.0 5.0) 2.0 eps) "fmin")
+(assert_true (approx_eq (fmax 2.0 5.0) 5.0 eps) "fmax")
+(assert_true (approx_eq (clamp 5.0 0.0 10.0) 5.0 eps) "clamp in range")
+(assert_true (approx_eq (clamp -2.0 0.0 10.0) 0.0 eps) "clamp at low bound")
+(assert_true (approx_eq (clamp 99.0 0.0 10.0) 10.0 eps) "clamp at high bound")
+(assert_true (approx_eq (signum -7.0) -1.0 eps) "signum neg")
+(assert_true (approx_eq (signum 7.0) 1.0 eps) "signum pos")
+(assert_true (approx_eq (signum 0.0) 0.0 eps) "signum zero")
+(assert_true (approx_eq (copysign 3.0 -1.0) -3.0 eps) "copysign onto neg")
+(assert_true (approx_eq (copysign -3.0 5.0) 3.0 eps) "copysign onto pos")
+(assert_true (approx_eq (lerp 0.0 10.0 0.5) 5.0 eps) "lerp mid")
+(assert_true (approx_eq (lerp 0.0 10.0 0.0) 0.0 eps) "lerp start")
+(assert_true (approx_eq (lerp 0.0 10.0 1.0) 10.0 eps) "lerp end")
+
+; ── trigonometry & exponentials ──────────────────────────────────────────────
+(assert_true (approx_eq (sin 0.0) 0.0 eps) "sin 0")
+(assert_true (approx_eq (sin (float_div pi 2.0)) 1.0 eps) "sin pi/2")
+(assert_true (approx_eq (cos 0.0) 1.0 eps) "cos 0")
+(assert_true (approx_eq (tan 0.0) 0.0 eps) "tan 0")
+(assert_true (approx_eq (asin 1.0) (float_div pi 2.0) eps) "asin 1")
+(assert_true (approx_eq (acos 1.0) 0.0 eps) "acos 1")
+(assert_true (approx_eq (atan 0.0) 0.0 eps) "atan 0")
+(assert_true (approx_eq (atan2 1.0 1.0) (float_div pi 4.0) eps) "atan2 quarter")
+(assert_true (approx_eq (exp 0.0) 1.0 eps) "exp 0")
+(assert_true (approx_eq (exp 1.0) e eps) "exp 1 = e")
+(assert_true (approx_eq (ln e) 1.0 eps) "ln e")
+(assert_true (approx_eq (ln 1.0) 0.0 eps) "ln 1")
+(assert_true (approx_eq (log2 8.0) 3.0 eps) "log2 8")
+(assert_true (approx_eq (log10 1000.0) 3.0 eps) "log10 1000")
+(assert_true (approx_eq (log_base 81.0 3.0) 4.0 eps) "log_base 3 of 81")
+
+; ── expm1 / log1p (exp/ln near zero) ─────────────────────────────────────────
+(assert_true (approx_eq (expm1 0.0) 0.0 eps) "expm1 0 = 0")
+(assert_true (approx_eq (expm1 1.0) (float_sub e 1.0) eps) "expm1 1 = e-1")
+(assert_true (approx_eq (log1p 0.0) 0.0 eps) "log1p 0 = 0")
+(assert_true (approx_eq (log1p (float_sub e 1.0)) 1.0 eps) "log1p(e-1) = 1")
+; expm1 and log1p are inverses
+(assert_true (approx_eq (log1p (expm1 0.5)) 0.5 eps) "log1p(expm1 x) = x")
+
+; ── hyperbolic functions ─────────────────────────────────────────────────────
+(assert_true (approx_eq (sinh 0.0) 0.0 eps) "sinh 0 = 0")
+(assert_true (approx_eq (cosh 0.0) 1.0 eps) "cosh 0 = 1")
+(assert_true (approx_eq (tanh 0.0) 0.0 eps) "tanh 0 = 0")
+; cosh^2 - sinh^2 = 1 (the hyperbolic identity)
+(assert_true
+  (approx_eq (float_sub (float_mul (cosh 1.3) (cosh 1.3))
+                        (float_mul (sinh 1.3) (sinh 1.3))) 1.0 eps)
+  "cosh^2 - sinh^2 = 1")
+(assert_true (approx_eq (tanh 1.3) (float_div (sinh 1.3) (cosh 1.3)) eps)
+  "tanh = sinh/cosh")
+; tanh saturates toward +/-1 for large |x|
+(assert_true (approx_eq (tanh 20.0) 1.0 eps) "tanh large -> 1")
+
+; ── inverse hyperbolic functions (logarithmic forms) ─────────────────────────
+(assert_true (approx_eq (asinh 0.0) 0.0 eps) "asinh 0 = 0")
+(assert_true (approx_eq (acosh 1.0) 0.0 eps) "acosh 1 = 0")
+(assert_true (approx_eq (atanh 0.0) 0.0 eps) "atanh 0 = 0")
+; round-trips: asinh(sinh x)=x, acosh(cosh x)=x (x>=0), atanh(tanh x)=x
+(assert_true (approx_eq (asinh (sinh 0.7)) 0.7 eps) "asinh(sinh x) = x")
+(assert_true (approx_eq (acosh (cosh 0.7)) 0.7 eps) "acosh(cosh x) = x")
+(assert_true (approx_eq (atanh (tanh 0.7)) 0.7 eps) "atanh(tanh x) = x")
+
+; ── sign_f (the float-named signum alias) ────────────────────────────────────
+(assert_true (approx_eq (sign_f -7.0) -1.0 eps) "sign_f neg")
+(assert_true (approx_eq (sign_f 7.0) 1.0 eps) "sign_f pos")
+(assert_true (approx_eq (sign_f 0.0) 0.0 eps) "sign_f zero")
+
+; ── classification ───────────────────────────────────────────────────────────
+; NaN comes from sqrt of a negative; inf from a huge power.
+(assert_true (is_nan? (sqrt -1.0)) "sqrt -1 is nan")
+(assert_true (not (is_nan? 1.0)) "1.0 is not nan")
+(assert_true (is_inf? (pow 10.0 400.0)) "huge pow is inf")
+(assert_true (not (is_inf? 1.0)) "1.0 is not inf")
+(assert_true (is_finite? 1.0) "1.0 is finite")
+(assert_true (not (is_finite? (sqrt -1.0))) "nan is not finite")
+(assert_true (not (is_finite? (pow 10.0 400.0))) "inf is not finite")
+
+; ── angles & approximate equality ────────────────────────────────────────────
+(assert_true (approx_eq (deg_to_rad 180.0) pi eps) "deg_to_rad 180 = pi")
+(assert_true (approx_eq (rad_to_deg pi) 180.0 eps) "rad_to_deg pi = 180")
+(assert_true (approx_eq (deg_to_rad (rad_to_deg 1.0)) 1.0 eps) "deg/rad round-trip")
+(assert_true (approx_eq 1.0 1.0 eps) "approx_eq equal")
+(assert_true (not (approx_eq 1.0 2.0 eps)) "approx_eq far apart")
+
+; ── int bridges ──────────────────────────────────────────────────────────────
+(assert_true (eq (to_int 3.9) 3) "to_int truncates toward zero")
+(assert_true (eq (to_int -3.9) -3) "to_int neg truncates toward zero")
+(assert_true (approx_eq (of_int 42) 42.0 eps) "of_int")
+(assert_true (eq (to_int (of_int 7)) 7) "int round-trip")

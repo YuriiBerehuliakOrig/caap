@@ -1,0 +1,3 @@
+; negative: enum value 300 does not fit in the declared u8.
+(use stdlib.storage.binary le_bytes)
+(storage Bad (record R 1 (field kind (enum u8 (file 1) (huge 300)))))

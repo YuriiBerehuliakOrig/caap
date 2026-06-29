@@ -1,48 +1,24 @@
 /// Compiler provider/stage CTFE builtins — port of the stage-registration
 /// subset of `caap/builtins/compiler/provider_registration.py`.
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
+use indexmap::IndexMap;
 
 use crate::builtins::compiler_registry::{
     require_compiler_bridge, require_named_string, require_string,
 };
-use crate::compiler::{
-    CompilerBridgeValue, QueryProviderRegistrationSpec, SemanticPolicyRegistration,
-};
+use crate::compiler::{QueryProviderRegistrationSpec, SemanticPolicyRegistration};
 use crate::eval::{eval_args, Evaluator};
-use crate::semantic::{ControlPolicy, EffectPolicy, EvalPolicy, PhasePolicy, ScopePolicy};
-use crate::values::{eval_err, BuiltinInfo, EvalSignal, MapKey, RuntimeValue};
+use crate::semantic::{EntrySource, SemanticEntry};
+use crate::values::{eval_err, EvalSignal, MapKey, RuntimeValue};
+
+use super::semantic_projection::{runtime_semantic_policy_fields, SemanticPolicyDefaults};
 
 pub fn register(ev: &mut Evaluator) {
-    ev.register_builtin(BuiltinInfo {
-        name: "ctfe-compiler-diagnostic-explanation-register".to_string(),
-        metadata: crate::values::BuiltinMetadata::compile_time_compiler_registry(),
-        min_arity: 3,
-        max_arity: Some(3),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
-            let args = eval_args(ev, call, env)?;
-            let bridge = require_compiler_bridge(
-                &args[0],
-                "ctfe-compiler-diagnostic-explanation-register expects a compiler bridge",
-            )?;
-            let code = require_named_string(
-                &args[1],
-                "ctfe-compiler-diagnostic-explanation-register expects a non-empty diagnostic code",
-            )?;
-            register_diagnostic_explanation(bridge, &code, args[2].clone())?;
-            Ok(RuntimeValue::Null)
-        }),
-    });
-
-    ev.register_builtin(BuiltinInfo {
-        name: "ctfe-compiler-provider-register".to_string(),
-        metadata: crate::values::BuiltinMetadata::compile_time_compiler_registry(),
-        min_arity: 4,
-        max_arity: Some(7),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "ctfe_compiler_provider_register",
+        4,
+        Some(7),
+        crate::values::BuiltinMetadata::compile_time_compiler_registry(),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
             let bridge = require_compiler_bridge(
                 &args[0],
@@ -70,16 +46,15 @@ pub fn register(ev: &mut Evaluator) {
                 .register_provider(name, target, callback, requires, effects, spec)
                 .map_err(eval_err)?;
             Ok(RuntimeValue::Null)
-        }),
-    });
+        },
+    );
 
-    ev.register_builtin(BuiltinInfo {
-        name: "ctfe-compiler-register-semantic-policy".to_string(),
-        metadata: crate::values::BuiltinMetadata::compile_time_compiler_registry(),
-        min_arity: 3,
-        max_arity: Some(4),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "ctfe_compiler_register_semantic_policy",
+        3,
+        Some(4),
+        crate::values::BuiltinMetadata::compile_time_compiler_registry(),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
             let bridge = require_compiler_bridge(
                 &args[0],
@@ -93,16 +68,15 @@ pub fn register(ev: &mut Evaluator) {
             policy.normalizer = args.get(3).cloned().unwrap_or(RuntimeValue::Null);
             bridge.register_semantic_policy(policy).map_err(eval_err)?;
             Ok(RuntimeValue::Null)
-        }),
-    });
+        },
+    );
 
-    ev.register_builtin(BuiltinInfo {
-        name: "ctfe-compiler-fact-schema-type-bridge-register".to_string(),
-        metadata: crate::values::BuiltinMetadata::compile_time_compiler_registry(),
-        min_arity: 3,
-        max_arity: Some(3),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "ctfe_compiler_fact_schema_type_bridge_register",
+        3,
+        Some(3),
+        crate::values::BuiltinMetadata::compile_time_compiler_registry(),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
             let bridge = require_compiler_bridge(
                 &args[0],
@@ -120,16 +94,15 @@ pub fn register(ev: &mut Evaluator) {
                 .register_fact_schema_type_bridge(label, bridge_name)
                 .map_err(eval_err)?;
             Ok(RuntimeValue::Null)
-        }),
-    });
+        },
+    );
 
-    ev.register_builtin(BuiltinInfo {
-        name: "ctfe-compiler-fact-schema-register".to_string(),
-        metadata: crate::values::BuiltinMetadata::compile_time_compiler_registry(),
-        min_arity: 3,
-        max_arity: Some(5),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "ctfe_compiler_fact_schema_register",
+        3,
+        Some(5),
+        crate::values::BuiltinMetadata::compile_time_compiler_registry(),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
             let bridge = require_compiler_bridge(
                 &args[0],
@@ -159,39 +132,36 @@ pub fn register(ev: &mut Evaluator) {
                 .register_fact_schema(predicate, type_label, allow_none, description)
                 .map_err(eval_err)?;
             Ok(RuntimeValue::Null)
-        }),
-    });
+        },
+    );
 
-    ev.register_builtin(BuiltinInfo {
-        name: "ctfe-compiler-register-python-language-builtin-bridge".to_string(),
-        metadata: crate::values::BuiltinMetadata::compile_time_compiler_registry(),
-        min_arity: 2,
-        max_arity: Some(2),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special("ctfe_compiler_register_base_semantic_entries", 2, Some(2), crate::values::BuiltinMetadata::compile_time_compiler_registry(), |ev, call, env| {
             let args = eval_args(ev, call, env)?;
             let bridge = require_compiler_bridge(
                 &args[0],
-                "ctfe-compiler-register-python-language-builtin-bridge expects a compiler bridge",
+                "ctfe-compiler-register-base-semantic-entries expects a compiler bridge",
             )?;
-            let name = require_named_string(
-                &args[1],
-                "ctfe-compiler-register-python-language-builtin-bridge expects a non-empty bridge name",
+            let entries = base_semantic_entries(
+                args.get(1),
+                "ctfe-compiler-register-base-semantic-entries expects semantic entry descriptor maps",
             )?;
+            if entries.is_empty() {
+                return Err(eval_err(
+                    "ctfe-compiler-register-base-semantic-entries expects at least one semantic entry descriptor",
+                ));
+            }
             bridge
-                .register_language_builtin_bridge(name)
+                .register_base_semantic_entries(entries)
                 .map_err(eval_err)?;
             Ok(RuntimeValue::Null)
-        }),
-    });
+        });
 
-    ev.register_builtin(BuiltinInfo {
-        name: "ctfe-compiler-stage-register".to_string(),
-        metadata: crate::values::BuiltinMetadata::compile_time_compiler_registry(),
-        min_arity: 2,
-        max_arity: Some(7),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "ctfe_compiler_stage_register",
+        2,
+        Some(7),
+        crate::values::BuiltinMetadata::compile_time_compiler_registry(),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
             let bridge = require_compiler_bridge(
                 &args[0],
@@ -232,111 +202,8 @@ pub fn register(ev: &mut Evaluator) {
                 )
                 .map_err(eval_err)?;
             Ok(RuntimeValue::Null)
-        }),
-    });
-
-    ev.register_builtin(BuiltinInfo {
-        name: "ctfe-compiler-stage-alias-register".to_string(),
-        metadata: crate::values::BuiltinMetadata::compile_time_compiler_registry(),
-        min_arity: 3,
-        max_arity: Some(3),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
-            let args = eval_args(ev, call, env)?;
-            let bridge = require_compiler_bridge(
-                &args[0],
-                "ctfe-compiler-stage-alias-register expects a compiler bridge",
-            )?;
-            let stage = require_named_string(
-                &args[1],
-                "ctfe-compiler-stage-alias-register expects a non-empty stage name",
-            )?;
-            let alias = require_named_string(
-                &args[2],
-                "ctfe-compiler-stage-alias-register expects a non-empty alias",
-            )?;
-            bridge
-                .register_stage_alias(stage, alias)
-                .map_err(eval_err)?;
-            Ok(RuntimeValue::Null)
-        }),
-    });
-
-    ev.register_builtin(BuiltinInfo {
-        name: "ctfe-compiler-stage-restart-policy-register".to_string(),
-        metadata: crate::values::BuiltinMetadata::compile_time_compiler_registry(),
-        min_arity: 3,
-        max_arity: Some(3),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
-            let args = eval_args(ev, call, env)?;
-            let bridge = require_compiler_bridge(
-                &args[0],
-                "ctfe-compiler-stage-restart-policy-register expects a compiler bridge",
-            )?;
-            let stage = require_named_string(
-                &args[1],
-                "ctfe-compiler-stage-restart-policy-register expects a non-empty stage name",
-            )?;
-            let restart_stage = require_named_string(
-                &args[2],
-                "ctfe-compiler-stage-restart-policy-register expects a non-empty restart stage name",
-            )?;
-            bridge
-                .register_stage_restart_policy(stage, restart_stage)
-                .map_err(eval_err)?;
-            Ok(RuntimeValue::Null)
-        }),
-    });
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct DiagnosticExplanationSpec {
-    title: String,
-    body: String,
-    help: Vec<String>,
-}
-
-fn register_diagnostic_explanation(
-    bridge: &CompilerBridgeValue,
-    code: &str,
-    spec_value: RuntimeValue,
-) -> Result<(), EvalSignal> {
-    let RuntimeValue::Map(spec_map) = &spec_value else {
-        return Err(eval_err(
-            "ctfe-compiler-diagnostic-explanation-register expects an explanation map",
-        ));
-    };
-
-    let registry_name = "caap.diagnostics.explanations";
-    let explanations = match bridge
-        .lookup_registered_value(registry_name)
-        .map_err(eval_err)?
-    {
-        Some(RuntimeValue::Map(map)) => map,
-        Some(_) => {
-            return Err(eval_err(format!(
-                "compiler registry value {registry_name:?} must be a map"
-            )))
-        }
-        None => {
-            let map = Rc::new(RefCell::new(HashMap::new()));
-            bridge
-                .register_value(registry_name, RuntimeValue::Map(Rc::clone(&map)))
-                .map_err(eval_err)?;
-            map
-        }
-    };
-    let spec = diagnostic_explanation_spec_from_map(&spec_map.borrow())?;
-    explanations
-        .borrow_mut()
-        .insert(MapKey::Str(code.into()), spec_value);
-    if let Some(spec) = spec {
-        bridge
-            .register_diagnostic_explanation(code.to_string(), spec.title, spec.body, spec.help)
-            .map_err(eval_err)?;
-    }
-    Ok(())
+        },
+    );
 }
 
 fn semantic_policy_registration(
@@ -349,68 +216,33 @@ fn semantic_policy_registration(
         ));
     };
     let borrow = map.borrow();
+    reject_unknown_map_keys(
+        &borrow,
+        &[
+            "phase_policy",
+            "effect_policy",
+            "eval_policy",
+            "control_policy",
+            "scope_policy",
+            "fold_policy",
+            "form_policy",
+        ],
+        "ctfe_compiler_register_semantic_policy",
+    )?;
+    let policies = runtime_semantic_policy_fields(&borrow, SemanticPolicyDefaults::default())?;
     Ok(SemanticPolicyRegistration {
         name: name.to_string(),
-        phase_policy: map_phase_policy(
-            borrow.get(&MapKey::Str("phase".into())),
-            PhasePolicy::Runtime,
-        )?,
-        effect_policy: map_effect_policy(borrow.get(&MapKey::Str("effect".into())))?,
-        eval_policy: map_eval_policy(borrow.get(&MapKey::Str("eval".into())), EvalPolicy::Eager)?,
-        control_policy: map_control_policy(
-            borrow.get(&MapKey::Str("control".into())),
-            ControlPolicy::Plain,
-        )?,
-        scope_policy: map_scope_policy(
-            borrow.get(&MapKey::Str("scope".into())),
-            ScopePolicy::None,
-        )?,
-        form_policy: map_form_policy(borrow.get(&MapKey::Str("form".into())))?,
+        phase_policy: policies.phase_policy,
+        effect_policy: policies.effect_policy,
+        eval_policy: policies.eval_policy,
+        control_policy: policies.control_policy,
+        scope_policy: policies.scope_policy,
+        fold_policy: policies.fold_policy,
+        form_policy: map_form_policy(borrow.get(&MapKey::Str("form_policy".into())))?,
         normalizer: RuntimeValue::Null,
         unit_id: None,
         stable_id: None,
     })
-}
-
-fn diagnostic_explanation_spec_from_map(
-    map: &HashMap<MapKey, RuntimeValue>,
-) -> Result<Option<DiagnosticExplanationSpec>, EvalSignal> {
-    let summary = optional_map_named_string(
-        map,
-        "summary",
-        "ctfe-compiler-diagnostic-explanation-register expects summary to be a string",
-    )?;
-    let title = optional_map_named_string(
-        map,
-        "title",
-        "ctfe-compiler-diagnostic-explanation-register expects title to be a string",
-    )?
-    .or_else(|| summary.clone());
-    let body = optional_map_named_string(
-        map,
-        "body",
-        "ctfe-compiler-diagnostic-explanation-register expects body to be a string",
-    )?
-    .or(summary);
-    let Some(title) = title else {
-        return Ok(None);
-    };
-    let Some(body) = body else {
-        return Ok(None);
-    };
-    let help = diagnostic_help(map.get(&MapKey::Str("help".into())))?;
-    Ok(Some(DiagnosticExplanationSpec { title, body, help }))
-}
-
-fn diagnostic_help(value: Option<&RuntimeValue>) -> Result<Vec<String>, EvalSignal> {
-    match value {
-        None | Some(RuntimeValue::Null) => Ok(Vec::new()),
-        Some(RuntimeValue::Str(help)) => Ok(vec![help.to_string()]),
-        Some(value) => optional_string_sequence(
-            Some(value),
-            "ctfe-compiler-diagnostic-explanation-register expects help to be a string or sequence of strings",
-        ),
-    }
 }
 
 fn optional_named_string(
@@ -454,83 +286,74 @@ fn optional_string_sequence(
     }
 }
 
-fn map_eval_policy(
+fn base_semantic_entries(
     value: Option<&RuntimeValue>,
-    default: EvalPolicy,
-) -> Result<EvalPolicy, EvalSignal> {
-    let Some(value) = value else {
-        return Ok(default);
-    };
-    match require_named_string(value, "expected eval policy")?.as_str() {
-        "eager" => Ok(EvalPolicy::Eager),
-        "lazy_if" => Ok(EvalPolicy::LazyIf),
-        "sequential" => Ok(EvalPolicy::Sequential),
-        "special_form" => Ok(EvalPolicy::SpecialForm),
-        _ => Err(eval_err("expected eval policy")),
-    }
-}
-
-fn map_control_policy(
-    value: Option<&RuntimeValue>,
-    default: ControlPolicy,
-) -> Result<ControlPolicy, EvalSignal> {
-    let Some(value) = value else {
-        return Ok(default);
-    };
-    match require_named_string(value, "expected control policy")?.as_str() {
-        "plain" => Ok(ControlPolicy::Plain),
-        "conditional_branch" => Ok(ControlPolicy::ConditionalBranch),
-        "structured_exit" => Ok(ControlPolicy::StructuredExit),
-        _ => Err(eval_err("expected control policy")),
-    }
-}
-
-fn map_scope_policy(
-    value: Option<&RuntimeValue>,
-    default: ScopePolicy,
-) -> Result<ScopePolicy, EvalSignal> {
-    let Some(value) = value else {
-        return Ok(default);
-    };
-    match require_named_string(value, "expected scope policy")?.as_str() {
-        "none" => Ok(ScopePolicy::None),
-        "lexical_binding" => Ok(ScopePolicy::LexicalBinding),
-        _ => Err(eval_err("expected scope policy")),
-    }
-}
-
-fn map_phase_policy(
-    value: Option<&RuntimeValue>,
-    default: PhasePolicy,
-) -> Result<PhasePolicy, EvalSignal> {
-    let Some(value) = value else {
-        return Ok(default);
-    };
-    match require_named_string(value, "expected phase policy")?.as_str() {
-        "runtime" => Ok(PhasePolicy::Runtime),
-        "compile_time" | "compile-time" => Ok(PhasePolicy::CompileTime),
-        "dual" => Ok(PhasePolicy::Dual),
-        _ => Err(eval_err("expected phase policy")),
-    }
-}
-
-fn map_effect_policy(value: Option<&RuntimeValue>) -> Result<EffectPolicy, EvalSignal> {
+    message: &str,
+) -> Result<Vec<SemanticEntry>, EvalSignal> {
     match value {
-        None | Some(RuntimeValue::Null) => Ok(EffectPolicy::pure()),
-        Some(RuntimeValue::Str(text)) if text.as_ref() == "pure" => Ok(EffectPolicy::pure()),
-        Some(RuntimeValue::Str(text)) => EffectPolicy::single(text.to_string()).map_err(eval_err),
         Some(RuntimeValue::Tuple(items)) => items
             .iter()
-            .map(|item| require_named_string(item, "expected effect policy tag"))
-            .collect::<Result<Vec<_>, _>>()
-            .and_then(|tags| EffectPolicy::new(tags).map_err(eval_err)),
+            .map(|item| base_semantic_entry(item, message))
+            .collect(),
         Some(RuntimeValue::List(items)) => items
             .borrow()
             .iter()
-            .map(|item| require_named_string(item, "expected effect policy tag"))
-            .collect::<Result<Vec<_>, _>>()
-            .and_then(|tags| EffectPolicy::new(tags).map_err(eval_err)),
-        Some(_) => Err(eval_err("expected effect policy")),
+            .map(|item| base_semantic_entry(item, message))
+            .collect(),
+        _ => Err(eval_err(message)),
+    }
+}
+
+fn base_semantic_entry(value: &RuntimeValue, message: &str) -> Result<SemanticEntry, EvalSignal> {
+    let RuntimeValue::Map(map) = value else {
+        return Err(eval_err(message));
+    };
+    let borrow = map.borrow();
+    reject_unknown_map_keys(
+        &borrow,
+        &[
+            "name",
+            "source",
+            "phase_policy",
+            "effect_policy",
+            "eval_policy",
+            "control_policy",
+            "scope_policy",
+            "fold_policy",
+        ],
+        "ctfe_compiler_register_base_semantic_entries",
+    )?;
+    let name = optional_map_named_string(
+        &borrow,
+        "name",
+        "ctfe-compiler-register-base-semantic-entries expects entry name to be a non-empty string",
+    )?
+    .ok_or_else(|| eval_err("ctfe-compiler-register-base-semantic-entries requires entry name"))?;
+    let source = map_entry_source(borrow.get(&MapKey::Str("source".into())))?;
+    let policies = runtime_semantic_policy_fields(&borrow, SemanticPolicyDefaults::default())?;
+    let mut entry = SemanticEntry::new(name, source).map_err(eval_err)?;
+    entry.phase_policy = policies.phase_policy;
+    entry.effect_policy = policies.effect_policy;
+    entry.eval_policy = policies.eval_policy;
+    entry.control_policy = policies.control_policy;
+    entry.scope_policy = policies.scope_policy;
+    entry.fold_policy = policies.fold_policy;
+    Ok(entry)
+}
+
+fn map_entry_source(value: Option<&RuntimeValue>) -> Result<EntrySource, EvalSignal> {
+    let Some(value) = value else {
+        return Err(eval_err(
+            "ctfe-compiler-register-base-semantic-entries requires entry source",
+        ));
+    };
+    match require_named_string(value, "expected semantic entry source")?.as_str() {
+        "builtin" => Ok(EntrySource::Builtin),
+        "registered" => Ok(EntrySource::Registered),
+        "external" => Ok(EntrySource::External),
+        _ => Err(eval_err(
+            "base semantic entry source must be builtin, registered, or external",
+        )),
     }
 }
 
@@ -562,6 +385,20 @@ fn provider_registration_spec(
         ));
     };
     let borrow = map.borrow();
+    reject_unknown_map_keys(
+        &borrow,
+        &[
+            "family",
+            "input_schema",
+            "requires_data",
+            "provides_data",
+            "reads",
+            "writes",
+            "cache_scope",
+            "resume_policy",
+        ],
+        "ctfe_compiler_provider_register",
+    )?;
     Ok(QueryProviderRegistrationSpec {
         family: optional_map_named_string(
             &borrow,
@@ -589,7 +426,7 @@ fn provider_registration_spec(
 }
 
 fn optional_map_string(
-    map: &std::collections::HashMap<MapKey, RuntimeValue>,
+    map: &indexmap::IndexMap<MapKey, RuntimeValue>,
     key: &str,
 ) -> Result<Option<String>, EvalSignal> {
     map.get(&MapKey::Str(key.into()))
@@ -608,7 +445,7 @@ fn optional_map_string(
 }
 
 fn optional_map_named_string(
-    map: &HashMap<MapKey, RuntimeValue>,
+    map: &IndexMap<MapKey, RuntimeValue>,
     key: &str,
     message: &str,
 ) -> Result<Option<String>, EvalSignal> {
@@ -618,11 +455,109 @@ fn optional_map_named_string(
 }
 
 fn map_string_sequence(
-    map: &HashMap<MapKey, RuntimeValue>,
+    map: &IndexMap<MapKey, RuntimeValue>,
     key: &str,
 ) -> Result<Vec<String>, EvalSignal> {
     optional_string_sequence(
         map.get(&MapKey::Str(key.into())),
         "ctfe-compiler-provider-register expects provider spec string sequences",
     )
+}
+
+fn reject_unknown_map_keys(
+    map: &IndexMap<MapKey, RuntimeValue>,
+    allowed: &[&str],
+    context: &str,
+) -> Result<(), EvalSignal> {
+    for key in map.keys() {
+        let MapKey::Str(key) = key else {
+            return Err(eval_err(format!(
+                "{context} descriptor keys must be strings"
+            )));
+        };
+        if !allowed.iter().any(|allowed| key.as_ref() == *allowed) {
+            return Err(eval_err(format!(
+                "{context} descriptor contains unknown field {key:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::semantic::{PhasePolicy, ScopePolicy};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn string(value: &str) -> RuntimeValue {
+        RuntimeValue::Str(value.into())
+    }
+
+    fn map(entries: impl IntoIterator<Item = (&'static str, RuntimeValue)>) -> RuntimeValue {
+        RuntimeValue::Map(Rc::new(RefCell::new(
+            entries
+                .into_iter()
+                .map(|(key, value)| (MapKey::Str(key.into()), value))
+                .collect(),
+        )))
+    }
+
+    #[test]
+    fn semantic_policy_registration_rejects_legacy_policy_fields() {
+        let value = map([("phase", string("runtime"))]);
+
+        let error = semantic_policy_registration("demo.policy", &value)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unknown field"));
+        assert!(error.contains("phase"));
+    }
+
+    #[test]
+    fn base_semantic_entry_accepts_explicit_policy_fields() {
+        let value = map([
+            ("name", string("demo")),
+            ("source", string("builtin")),
+            ("phase_policy", string("compile_time")),
+            ("effect_policy", string("read_ir")),
+            ("scope_policy", string("lexical_binding")),
+        ]);
+
+        let entry = base_semantic_entry(&value, "expected base entry").unwrap();
+
+        assert_eq!(entry.phase_policy, PhasePolicy::CompileTime);
+        assert!(entry.effect_policy.allows("read_ir"));
+        assert_eq!(entry.scope_policy, ScopePolicy::LexicalBinding);
+    }
+
+    #[test]
+    fn base_semantic_entry_rejects_legacy_policy_fields() {
+        let value = map([
+            ("name", string("demo")),
+            ("source", string("builtin")),
+            ("scope", string("lexical_binding")),
+        ]);
+
+        let error = base_semantic_entry(&value, "expected base entry")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unknown field"));
+        assert!(error.contains("scope"));
+    }
+
+    #[test]
+    fn provider_registration_spec_rejects_unknown_fields() {
+        let value = map([("cache_scope", string("none")), ("cache", string("none"))]);
+
+        let error = provider_registration_spec(Some(&value))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unknown field"));
+        assert!(error.contains("cache"));
+    }
 }

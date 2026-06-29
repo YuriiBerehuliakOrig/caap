@@ -1,0 +1,88 @@
+; stdlib/lib/tests/test_letgen.caap — B5 let-generalization (P1 fresh vars, P2
+; multi-param).
+;
+; A plain `(bind id (lambda (x) x))` infers a GENERIC signature: each untyped
+; FIXED param gets its own fresh type variable (`_T0`/`_T1`/… — disjoint from
+; the A-Z A2 namespace), the body walk runs with the params at those variables,
+; so the inferred result mentions whichever flow out. Each call instantiates
+; them through the SAME call-site unification (check_call_sig → unify →
+; finalize_result) that defn-generics (A2) already use, with a FRESH subst per
+; call — so `(id 42)` narrows to int and `(id "hi")` to string, independently.
+;
+; This file's mere CLEAN LOAD is the primary proof of safety: generic locals
+; (one- AND multi-param) used at heterogeneous concrete types in one module
+; must NOT false-flag. The runtime assertions prove the lambdas still behave
+; identically (generalization touches only the inferred TYPE, never
+; evaluation). The genuine-mismatch counterpart — that a real type error is
+; STILL caught after generalization — lives in stdlib_types_tests
+; (fixtures/letgen_bad.caap), since a corpus file must LOAD CLEAN.
+
+;; @area: types
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq)
+
+; ── single-param generic local: the headline ───────────────────────────────
+; `id` infers {params: [{type "_T0"}], result "_T0"}. The type pass accepts it
+; and instantiates the variable per call; were generalization broken into a
+; single shared binding across calls, `(id 42)` and `(id "hi")` would conflict.
+(bind id (lambda (x) x))
+
+; a second single-param generic local, body forwards the param to `id` — still
+; one param, still generalized; proves a generic local can call a generic local.
+(bind echo (lambda (y) (id y)))
+
+; ── multi-param generalization (P2): EACH untyped param its OWN fresh var ────
+; a TWO-param lambda now generalizes: `a : _Ti`, `b : _Tj` (distinct fresh
+; variables). Used here at MIXED argument types in BOTH orders — each call
+; instantiates the variables with a FRESH subst, so `(pick2 "s" 1)` and
+; `(pick2 9 "t")` never conflict (no "type variable was int, got string").
+(bind pick2 (lambda (a b) a))
+
+; another 2-param generic local returning the SECOND param: pins that distinct
+; variables flow out independently (the result mentions `b`'s variable, not
+; `a`'s), and that mixed-type use across calls stays clean.
+(bind const2 (lambda (x y) y))
+
+; a 3-param generic local: more than two distinct fresh variables in one
+; signature, exercising the monotone counter past `_T9`-ish boundaries and the
+; finalize_result collapse of the leftover (unreturned) variables.
+(bind third3 (lambda (a b c) c))
+
+; a ZERO-param thunk: outside the param loop (no fresh variable), stays as today.
+(bind k7 (lambda () 7))
+
+; a single REST param (`&xs` collects a LIST of args, not one value): excluded
+; explicitly, so it stays UNTYPED (no fresh variable on a list of arguments).
+; Pins the rest-param boundary — even with per-param generalization a `&`-param
+; never gets a variable.
+(bind firstish (lambda (&xs) (get xs 0)))
+
+(do
+  ; ── narrowing is type-preserving at runtime (value identity) ───────────────
+  (assert_eq (id 42) 42 "id over an int returns it unchanged")
+  (assert_eq (id "hi") "hi" "id over a string returns it unchanged")
+  (assert_eq (id true) true "id over a bool returns it unchanged")
+
+  ; the SAME generic local at two concrete types in one module — the load that
+  ; reached this point already proved the type pass did not false-flag it.
+  (assert_eq (echo 7) 7 "echo (generic local calling a generic local) over int")
+  (assert_eq (echo "z") "z" "echo over a string")
+
+  ; multi-param generalization: heterogeneous args in both orders, no spurious
+  ; "type variable was X, got Y" — each call gets a fresh subst over the
+  ; per-param variables, and the value is preserved.
+  (assert_eq (pick2 "s" 1) "s" "2-param generic returns first, mixed types")
+  (assert_eq (pick2 9 "t") 9 "2-param generic, other arg order")
+  (assert_eq (const2 1 "y") "y" "2-param generic returns second, mixed types")
+  (assert_eq (const2 "a" 2) 2 "const2 over the other type order")
+  (assert_eq (third3 1 "b" true) true "3-param generic returns the third")
+  (assert_eq (third3 "x" 2 9) 9 "3-param generic, all distinct arg types")
+
+  ; the 0-param thunk is likewise unaffected.
+  (assert_eq (k7) 7 "0-param thunk has no params to generalize")
+
+  ; the single-rest-param lambda stays untyped (`&xs` gets no variable): still
+  ; behaves identically, collecting its args into a list.
+  (assert_eq (firstish 5 6 7) 5 "single rest param stays untyped (no variable)")
+  true)

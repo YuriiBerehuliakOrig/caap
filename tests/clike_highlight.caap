@@ -1,0 +1,18 @@
+(surface stdlib.frontend.clike)
+
+// Fixture for caap-lsp's parser-derived semantic-highlighting golden test.
+// `px` is a struct FIELD (property) below AND, inside the body, both a field
+// access (`p->px` -> property) and a plain local USE (`px == depth` -> variable):
+// the SAME spelling with DIFFERENT categories, which is only possible if every
+// category comes from the real parser + its scope, never from the name.
+Color enum export = { RED = 0, GREEN = 1 }
+
+Point struct = { px i32, py i32 }
+
+shade (p Point*, depth u32) i32 = {
+  px i32 = p->px
+  if px == depth {
+    return GREEN
+  }
+  return RED
+}

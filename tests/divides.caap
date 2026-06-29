@@ -1,0 +1,6 @@
+; divides — a perfectly well-typed module that the no_int_div USER pass
+; (fixtures/lint_pass.caap) rejects at load.
+(module stdlib.fixtures.divides)
+(defn halve ((n int)) int
+  (int_div n 2))
+(export halve)

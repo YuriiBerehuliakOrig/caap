@@ -1,0 +1,17 @@
+; alias_bad — loaded AFTER alias_demo registers the cross-alias pass. `p` holds a
+; POINTER (int_to_ptr); `q := p` copies it, so q aliases p's object; then `p` is
+; moved and `q` is read THROUGH (ptr_read). Plain borrow would NOT catch this (it
+; only knows `p` was moved, not `q`); the alias pass taints q's whole points-to
+; class — flagged as a pointer class by the pointer ops — and FAILS the load.
+; (int_to_ptr / ptr_read are the native pointer vocabulary; stubbed here as
+; identities so the hosted load type-checks while the pass still reads the heads.)
+(module stdlib.fixtures.alias_bad)
+(use stdlib.semantics.passes.borrow move)
+(defn int_to_ptr ((x int) (t int)) int x)
+(defn ptr_read ((p int)) int p)
+(defn dangle ((a int)) int
+  (bind ((p (int_to_ptr a 0)) (q p))
+    (do
+      (move p)
+      (ptr_read q))))
+(export dangle)

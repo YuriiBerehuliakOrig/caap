@@ -1,0 +1,101 @@
+; stdlib/lib/tests/test_ssa_gvn.caap — SSA-based global value numbering
+; (stdlib.semantics.passes.ssa_gvn): a cross-control-flow CSE. Proves THE WIN (a pure
+; expression reused across an `if`/`while`/`bind` boundary cse stops at), behaviour
+; preservation by EVALUATION, the cse CONTRAST (cse leaves the recomputation), and —
+; the cardinal soundness stress — SHADOWING (a keyed expr's free name rebound before a
+; reuse must NOT reuse) over a differential grid eval(body) == eval(ssa_gvn_node body).
+
+;; @area: passes
+;; @kind: regression
+;; @slow: false
+(use stdlib.lib.test assert_true assert_eq)
+(use stdlib.semantics.passes.ssa_gvn ssa_gvn_node)
+(use stdlib.semantics.passes.cse cse_node)
+(use stdlib.syntax.ast sym lit calln eval_ir walk call? head_is?)
+(use stdlib.syntax.ir node_eq)
+(do
+  (bind (
+    (setr (lambda (r v) (calln "set_ref" (list_of (sym r) v))))
+    (drf  (lambda (r)   (calln "deref" (list_of (sym r)))))
+    (mkref (lambda (v)  (calln "ref" (list_of v))))
+    (rb (lambda (r v body) (calln "bind" (list_of (lit r) v body))))   ; (bind "r" v body)
+    (add (lambda (a b) (calln "int_add" (list_of a b))))
+    (mul (lambda (a b) (calln "int_mul" (list_of a b))))
+    (sub (lambda (a b) (calln "int_sub" (list_of a b))))
+    (iff (lambda (c t e) (calln "if" (list_of c t e))))
+    (doN (lambda (xs) (calln "do" xs)))
+    ; count of nodes structurally equal to `pat` anywhere in `node`.
+    (counteq (lambda (node pat)
+      (bind ((c (ref 0)))
+        (do (walk node (lambda (n) (when (node_eq n pat) (set_ref c (int_add (deref c) 1))))) (deref c)))))
+    (cases (ref 0)) (mism (ref 0))
+    ; differential: eval(body) == eval(ssa_gvn_node body).
+    (chk (lambda (b)
+      (bind ((v0 (eval_ir b)) (vg (eval_ir (ssa_gvn_node b))))
+        (do (set_ref cases (int_add (deref cases) 1))
+          (bind ((ok (value_eq v0 vg)))
+            (do (unless ok (set_ref mism (int_add (deref mism) 1)))
+              (assert_true ok (string_concat_many "MISCOMPILE v0=" (value_to_string v0) " gvn=" (value_to_string vg)))))))))
+  )
+    (do
+      ; ════ THE WIN — (int_add x y) bound to a, recomputed in BOTH if-arms ════
+      ; cse stops at the if (off-spine) and keeps all 3; gvn reuses a -> leaves 1.
+      (bind ((pat (add (sym "x") (sym "y")))
+             (win (rb "x" (lit 3) (rb "y" (lit 4) (rb "c" (lit true)
+                    (rb "a" (add (sym "x") (sym "y"))
+                      (iff (sym "c") (mul (add (sym "x") (sym "y")) (lit 2)) (add (sym "x") (sym "y")))))))))
+        (do
+          (assert_eq (eval_ir win) 14 "WIN: original evals 14")
+          (assert_eq (eval_ir (ssa_gvn_node win)) 14 "WIN: gvn eval preserved")
+          (assert_eq (counteq (ssa_gvn_node win) pat) 1 "WIN: gvn leaves ONE (int_add x y) (the binding)")
+          (assert_eq (counteq (cse_node win) pat) 3 "WIN/contrast: cse keeps all 3 (stops at the if)")))
+
+      ; ════ WIN 2 — a pre-loop pure value reused INSIDE a while body ════
+      ; (bind x (bind y (bind k (x+y) (bind i (ref 0) (do (while (lt i 2) (set_ref i (+ i (x+y)))) i)))))
+      ; (x+y) is available as k inside the loop; gvn reuses it there, cse cannot.
+      (bind (
+        (pat (add (sym "x") (sym "y")))
+        (loopbody (calln "while"
+          (list_of (calln "lt" (list_of (drf "i") (lit 9)))
+                   (setr "i" (add (drf "i") (add (sym "x") (sym "y")))))))
+        (win (rb "x" (lit 2) (rb "y" (lit 5)
+               (rb "k" (add (sym "x") (sym "y"))
+                 (rb "i" (mkref (lit 0)) (doN (list_of loopbody (drf "i"))))))))
+      )
+        (do
+          (assert_eq (eval_ir win) 14 "WIN2: original evals 14 (0 -> 7 -> 14)")
+          (assert_eq (eval_ir (ssa_gvn_node win)) 14 "WIN2: gvn eval preserved")
+          (assert_true (lt (counteq (ssa_gvn_node win) pat) (counteq (cse_node win) pat))
+            "WIN2: gvn reuses (x+y) inside the loop; cse keeps more occurrences")))
+
+      ; ════ SHADOW soundness — rebound free name must NOT reuse ════
+      ; (bind x 1 (bind a (x+10) (bind x 2 (x+10)))) -> inner is 12, NEVER a(=11)
+      (bind ((shadow (rb "x" (lit 1) (rb "a" (add (sym "x") (lit 10)) (rb "x" (lit 2) (add (sym "x") (lit 10)))))))
+        (do
+          (assert_eq (eval_ir shadow) 12 "SHADOW: original evals 12")
+          (assert_eq (eval_ir (ssa_gvn_node shadow)) 12 "SHADOW: gvn did NOT reuse the shadowed a (sound)")))
+
+      ; ════ differential grid: cross-control + shadow-in-arm + ref-cell (SSA path) ════
+      (for xv (list_of 2 5)
+        (for yv (list_of 3 7)
+          (for cv (list_of (lit true) (lit false))
+            (do
+              ; cross-control reuse, both arms + nested
+              (chk (rb "x" (lit xv) (rb "y" (lit yv) (rb "c" cv
+                     (rb "a" (add (sym "x") (sym "y"))
+                       (iff (sym "c") (mul (add (sym "x") (sym "y")) (lit 2)) (add (add (sym "x") (sym "y")) (lit 1))))))))
+              ; shadow inside an arm
+              (chk (rb "x" (lit xv) (rb "a" (add (sym "x") (lit 1))
+                     (iff cv (rb "x" (lit yv) (add (sym "x") (lit 1))) (sub (add (sym "x") (lit 1)) (lit 1))))))
+              ; ref-cell straight-line (SSA path): compute over deref reused after a set
+              (chk (rb "r" (mkref (lit xv)) (doN (list_of (setr "r" (lit yv))
+                     (rb "p" (add (drf "r") (lit 1))
+                       (doN (list_of (mul (add (drf "r") (lit 1)) (lit 2)) (sym "p"))))))))
+              ; ref-cell value-position-if HAZARD (gvn must take raw path -> sound)
+              (chk (rb "r" (mkref (lit xv)) (doN (list_of (setr "r" (lit yv))
+                     (rb "p" (add (drf "r") (lit 1)) (iff cv (mul (add (drf "r") (lit 1)) (lit 2)) (sym "p")))))))))))
+
+      (assert_true (eq (deref mism) 0)
+        (string_concat_many "gvn differential: " (value_to_string (deref mism)) " mismatches / " (value_to_string (deref cases)) " cases"))
+      (assert_true (gt (deref cases) 30) "gvn differential: ran the grid")
+      true)))

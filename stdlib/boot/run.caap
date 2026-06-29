@@ -1,0 +1,51 @@
+; stdlib/boot/run.caap — the DAP run commands (module stdlib.run).
+; MODULE IDENTITY: intentionally the SHORT name `stdlib.run`, not the
+; path-canonical `stdlib.boot.run` — it is the established DAP run-command
+; identity (sibling of stdlib.analyze/stdlib.commands). Allowlisted in
+; stdlib/CONVENTIONS.md + stdlib_module_identity_check.
+;
+; The debug worker evaluates exactly:
+;
+;   (bind ((command (ctfe_compiler_lookup_value compiler
+;                     "stdlib.module.run_source"))) (command "<path>"))
+;   …                "stdlib.module.run_from_root"))) (command "<root>" "<entry>"))
+;
+; under the thread-local eval hook — stepping/breakpoints ride the spans the
+; loader's per-form evaluation carries. Both commands are thin entries into
+; the stdlib loader:
+;   run_source     PATH        -> load the file (a value-shaped program
+;                                  returns its value; a module registers and
+;                                  returns its export map)
+;   run_from_root  ROOT ENTRY  -> discover(ROOT) indexes every named module
+;                                  under the directory, then load_module ENTRY
+(module stdlib.run)
+
+(import stdlib.load loader_api)
+
+(bind run_source
+  (lambda (path)
+    ((get loader_api "load") path)))
+
+(bind run_from_root
+  (lambda (root entry)
+    (do
+      ((get loader_api "discover") root)
+      ((get loader_api "load_module") entry))))
+
+; run_source_checked — the DATA variant for tooling: never throws.
+;   -> {ok: true, value} | {ok: false, diagnostics: [string…]}
+; A failed load's located findings ride the message; tooling that wants a
+; structured channel uses this, the classic run_source keeps its
+; exit-code/throw contract.
+(bind run_source_checked
+  (lambda (path)
+    (try
+      (assoc (map_of) "ok" true "value" ((get loader_api "load") path))
+      (catch e
+        (assoc (map_of) "ok" false
+          "diagnostics"
+          (list_of (if (eq (value_type e) "map")
+                     (get e "message" (value_to_string e))
+                     (value_to_string e))))))))
+
+(export run_source run_from_root run_source_checked)

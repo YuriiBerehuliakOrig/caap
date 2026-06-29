@@ -1,0 +1,146 @@
+; stdlib/lib/tests/test_diag.caap — the diagnostic-code registry.
+
+;; @area: diag
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.diag.registry
+     register_code! register_code_full! register_owned! register_owned_full!
+     describe describe_full severity_of category_of explainer_of help_url_of
+     codes qualify owner_of local_of
+     clear! codes_by_category codes_by_owner)
+(use stdlib.lib.diag.error error? error_code)
+(use stdlib.lib.collections.sequence contains?)
+
+(do
+  ; ── existing surface (backward compatible) ────────────────────────────────
+  (assert_true
+    (string_contains (describe "stdlib.llvm.error") "LLVM")
+    "tower codes pre-registered")
+  (assert_eq (describe "no.such.code") null "unknown -> null")
+  (register_code! "test.code" "a test summary")
+  (assert_eq (describe "test.code") "a test summary" "register + describe")
+  (assert_true (contains? (codes) "stdlib.json.encode") "inventory")
+
+  ; ── namespacing: owner:code ───────────────────────────────────────────────
+  (assert_eq (qualify "a" "parse") "a:parse" "qualify spells the key")
+  (assert_eq (owner_of "a:parse") "a" "owner_of of qualified")
+  (assert_eq (local_of "a:parse") "parse" "local_of of qualified")
+  (assert_eq (owner_of "caap.eval") null "owner_of of dotted -> null")
+  (assert_eq (local_of "caap.eval") "caap.eval" "local_of of dotted -> self")
+
+  ; two owners share a bare local code without colliding
+  (register_owned! "owner_a" "parse" "A's parse")
+  (register_owned! "owner_b" "parse" "B's parse")
+  (assert_eq (describe (qualify "owner_a" "parse")) "A's parse"
+    "owned describe resolves owner A")
+  (assert_eq (describe (qualify "owner_b" "parse")) "B's parse"
+    "owned describe resolves owner B (no collision)")
+  (assert_true (contains? (codes) "owner_a:parse") "owned key in inventory")
+
+  ; ── collision discipline ──────────────────────────────────────────────────
+  ; re-registering the SAME summary is idempotent (a module may load twice)
+  (register_code! "test.code" "a test summary")
+  (assert_eq (describe "test.code") "a test summary" "same summary idempotent")
+
+  ; a CONFLICTING summary for an existing key is a protocol error
+  (bind ((dup (try (register_code! "test.code" "DIFFERENT")
+                 (catch e e))))
+    (do
+      (assert_true (error? dup) "conflict raises a protocol error")
+      (assert_eq (error_code dup) "stdlib.diag.duplicate" "conflict code")))
+  (assert_eq (describe "test.code") "a test summary"
+    "conflict left the original summary intact")
+
+  ; ── full records: severity / category / explainer / help-url ───────────────
+  ; register_code! defaults: severity "error", empty category/explainer/help_url
+  (assert_eq (severity_of "test.code") "error" "register_code! defaults severity to error")
+  (assert_eq (category_of "test.code") "" "register_code! leaves category empty")
+  (assert_eq (severity_of "no.such.code") "error" "unknown code -> default severity error")
+  ; register_code_full! sets every field; describe still returns the summary
+  (register_code_full! "test.full" "the summary" "warning" "syntax"
+    "a longer explanation" "https://example/x")
+  (assert_eq (describe "test.full") "the summary" "describe_full code -> summary only")
+  (assert_eq (severity_of "test.full") "warning" "full severity")
+  (assert_eq (category_of "test.full") "syntax" "full category")
+  (assert_eq (explainer_of "test.full") "a longer explanation" "full explainer")
+  (assert_eq (help_url_of "test.full") "https://example/x" "full help_url")
+  (assert_eq (get (describe_full "test.full") "severity" "") "warning" "describe_full record")
+  ; re-registering the SAME full record is idempotent
+  (register_code_full! "test.full" "the summary" "warning" "syntax"
+    "a longer explanation" "https://example/x")
+  (assert_eq (severity_of "test.full") "warning" "same full record idempotent")
+  ; a record differing ONLY in a non-summary field (severity) still conflicts
+  (bind ((dup2 (try (register_code_full! "test.full" "the summary" "error" "syntax"
+                      "a longer explanation" "https://example/x")
+                 (catch e e))))
+    (do
+      (assert_true (error? dup2) "a differing-severity re-registration conflicts")
+      (assert_eq (error_code dup2) "stdlib.diag.duplicate" "conflict code (full record)")))
+  ; the code real collisions raise is itself documented with a full record
+  (assert_eq (category_of "stdlib.diag.duplicate") "diag"
+    "the duplicate code carries a category")
+  (assert_true (string_contains (explainer_of "stdlib.diag.duplicate") "register_owned!")
+    "the duplicate code carries an explainer")
+
+  ; ── codes_by_category: the category-filtered slice of the inventory ────────
+  (register_code_full! "cat.one" "first"  "error" "filtercat" "" "")
+  (register_code_full! "cat.two" "second" "error" "filtercat" "" "")
+  (register_code_full! "cat.three" "third" "error" "othercat"  "" "")
+  (bind ((fc (codes_by_category "filtercat")))
+    (do
+      (assert_eq (size fc) 2 "codes_by_category returns exactly the matching keys")
+      (assert_true (contains? fc "cat.one")   "codes_by_category includes cat.one")
+      (assert_true (contains? fc "cat.two")   "codes_by_category includes cat.two")
+      (assert_eq (contains? fc "cat.three") false
+        "codes_by_category excludes a different category")))
+  ; the pre-registered duplicate code lives under category "diag"
+  (assert_true (contains? (codes_by_category "diag") "stdlib.diag.duplicate")
+    "codes_by_category finds a tower code by its category")
+  ; an empty category matches register_code!'s default (category "")
+  (register_code! "nocat.code" "no category")
+  (assert_true (contains? (codes_by_category "") "nocat.code")
+    "codes_by_category \"\" matches the default-empty category")
+
+  ; ── codes_by_owner: the owner-namespaced slice of the inventory ────────────
+  (register_owned! "filterowner" "alpha" "A")
+  (register_owned! "filterowner" "beta"  "B")
+  (register_owned! "elsewhere"   "alpha" "X")
+  (bind ((fo (codes_by_owner "filterowner")))
+    (do
+      (assert_eq (size fo) 2 "codes_by_owner returns exactly the owner's keys")
+      (assert_true (contains? fo "filterowner:alpha") "codes_by_owner includes alpha")
+      (assert_true (contains? fo "filterowner:beta")  "codes_by_owner includes beta")
+      (assert_eq (contains? fo "elsewhere:alpha") false
+        "codes_by_owner excludes another owner's key")))
+  ; dotted/bare codes (owner_of -> null) never appear in any owner's slice
+  (assert_eq (contains? (codes_by_owner "caap") "caap.eval") false
+    "codes_by_owner does not match a dotted code by its first segment")
+
+  ; ── clear!: drop every code (reload hygiene). DESTRUCTIVE on the shared global
+  ;    registry, so SNAPSHOT every code's full record first and RESTORE it after —
+  ;    otherwise sibling corpus tests (e.g. test_bag's registered-summary render,
+  ;    which reads the tower-registered "stdlib.json.encode") lose those codes. ─
+  (bind ((snapshot (map_of)))
+    (do
+      (for k (codes) (assoc snapshot k (describe_full k)))
+      (assert_true (gt (size (codes)) 0) "registry is non-empty before clear!")
+      (assert_eq (clear!) null "clear! returns null")
+      (assert_eq (size (codes)) 0 "clear! empties the whole registry")
+      (assert_eq (describe "stdlib.diag.duplicate") null
+        "clear! drops even the tower's own pre-registered codes")
+      ; after clear!, a fresh registration starts from a clean slate (no stale dup)
+      (register_code! "reload.code" "documented again")
+      (assert_eq (describe "reload.code") "documented again"
+        "a code re-registers cleanly after clear!")
+      (assert_eq (size (codes)) 1 "only the freshly registered code remains")
+      ; RESTORE the shared registry to its pre-test state (drop the scratch code,
+      ; re-register every snapshotted record) so the shared corpus session is intact.
+      (clear!)
+      (for k (map_keys snapshot)
+        (bind ((r (get snapshot k)))
+          (register_code_full! k (get r "summary") (get r "severity")
+            (get r "category") (get r "explainer") (get r "help_url"))))
+      (assert_eq (size (codes)) (size snapshot)
+        "registry fully restored after the clear! test")))
+  true)

@@ -1,0 +1,122 @@
+; stdlib/lib/tests/test_bits.caap — in-language tests for lib/core/bits.
+;
+; Every export is exercised at its edges: 0, single-bit, all-bits-set (-1),
+; i64::MIN (the lone sign bit), and large width-boundary values — the cases
+; where the arithmetic-vs-logical shift distinction bites.
+
+;; @area: numeric
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.core.bits
+  popcount trailing_zeros leading_zeros ilog2 is_pow2?
+  bit_set? set_bit clear_bit toggle_bit rotate_left rotate_right)
+
+; ── popcount — treats n as an unsigned 64-bit pattern ────────────────────────
+(assert_eq (popcount 0) 0 "popcount 0")
+(assert_eq (popcount 1) 1 "popcount 1")
+(assert_eq (popcount 7) 3 "popcount 7 = 0b111")
+(assert_eq (popcount 255) 8 "popcount 255 = 0xff")
+(assert_eq (popcount 256) 1 "popcount 256 = 1<<8")
+(assert_eq (popcount 1023) 10 "popcount 1023")
+(assert_eq (popcount -1) 64 "popcount -1 = all bits")
+(assert_eq (popcount -9223372036854775808) 1 "popcount i64::MIN = lone sign bit")
+(assert_eq (popcount 9223372036854775807) 63 "popcount i64::MAX = 63 bits")
+
+; ── trailing_zeros — count low 0 bits (tz 0 = 64 by convention) ───────────────
+(assert_eq (trailing_zeros 0) 64 "trailing_zeros 0 = 64")
+(assert_eq (trailing_zeros 1) 0 "trailing_zeros 1")
+(assert_eq (trailing_zeros 2) 1 "trailing_zeros 2")
+(assert_eq (trailing_zeros 8) 3 "trailing_zeros 8")
+(assert_eq (trailing_zeros 256) 8 "trailing_zeros 256")
+(assert_eq (trailing_zeros 12) 2 "trailing_zeros 12 = 0b1100")
+(assert_eq (trailing_zeros -1) 0 "trailing_zeros -1 (low bit set)")
+(assert_eq (trailing_zeros -9223372036854775808) 63 "trailing_zeros i64::MIN = 63")
+
+; ── leading_zeros — count high 0 bits (lz 0 = 64, lz negative = 0) ────────────
+(assert_eq (leading_zeros 0) 64 "leading_zeros 0 = 64")
+(assert_eq (leading_zeros 1) 63 "leading_zeros 1 = 63")
+(assert_eq (leading_zeros 2) 62 "leading_zeros 2 = 62")
+(assert_eq (leading_zeros 255) 56 "leading_zeros 255 = 56")
+(assert_eq (leading_zeros 9223372036854775807) 1 "leading_zeros i64::MAX = 1")
+(assert_eq (leading_zeros -1) 0 "leading_zeros -1 (sign bit set)")
+(assert_eq (leading_zeros -9223372036854775808) 0 "leading_zeros i64::MIN = 0")
+; leading_zeros + ilog2 = 63 for any positive n
+(assert_eq (int_add (leading_zeros 1234) (ilog2 1234)) 63 "lz + ilog2 = 63")
+
+; ── ilog2 — floor log2 (n > 0 required) ──────────────────────────────────────
+(assert_eq (ilog2 1) 0 "ilog2 1 = 0")
+(assert_eq (ilog2 2) 1 "ilog2 2 = 1")
+(assert_eq (ilog2 3) 1 "ilog2 3 = 1 (floor)")
+(assert_eq (ilog2 8) 3 "ilog2 8 = 3")
+(assert_eq (ilog2 255) 7 "ilog2 255 = 7")
+(assert_eq (ilog2 256) 8 "ilog2 256 = 8")
+(assert_eq (ilog2 9223372036854775807) 62 "ilog2 i64::MAX = 62")
+; ilog2 throws on non-positive input (no silent fallback)
+(assert_eq (try (do (ilog2 0) "no-throw") (catch e "threw")) "threw" "ilog2 0 throws")
+(assert_eq (try (do (ilog2 -5) "no-throw") (catch e "threw")) "threw" "ilog2 neg throws")
+
+; ── is_pow2? — exactly one set bit, n > 0 ────────────────────────────────────
+(assert_eq (is_pow2? 1) true "is_pow2? 1")
+(assert_eq (is_pow2? 2) true "is_pow2? 2")
+(assert_eq (is_pow2? 8) true "is_pow2? 8")
+(assert_eq (is_pow2? 1024) true "is_pow2? 1024")
+(assert_eq (is_pow2? 4611686018427387904) true "is_pow2? 1<<62")
+(assert_eq (is_pow2? 0) false "is_pow2? 0")
+(assert_eq (is_pow2? 3) false "is_pow2? 3")
+(assert_eq (is_pow2? 6) false "is_pow2? 6")
+(assert_eq (is_pow2? -8) false "is_pow2? negative")
+(assert_eq (is_pow2? -9223372036854775808) false "is_pow2? i64::MIN (sign bit, n<=0)")
+
+; ── bit_set? — query bit i (i in 0..62) ──────────────────────────────────────
+(assert_eq (bit_set? 5 0) true "bit_set? 5 bit0 (0b101)")
+(assert_eq (bit_set? 5 1) false "bit_set? 5 bit1")
+(assert_eq (bit_set? 5 2) true "bit_set? 5 bit2")
+(assert_eq (bit_set? 0 0) false "bit_set? 0 bit0")
+(assert_eq (bit_set? 1 0) true "bit_set? 1 bit0")
+(assert_eq (bit_set? 256 8) true "bit_set? 256 bit8")
+(assert_eq (bit_set? 4611686018427387904 62) true "bit_set? 1<<62 bit62")
+(assert_eq (bit_set? -1 62) true "bit_set? -1 any bit (all set)")
+
+; ── set_bit / clear_bit / toggle_bit (i in 0..62) ────────────────────────────
+(assert_eq (set_bit 0 3) 8 "set_bit 0 bit3 = 8")
+(assert_eq (set_bit 8 3) 8 "set_bit idempotent")
+(assert_eq (set_bit 0 0) 1 "set_bit 0 bit0 = 1")
+(assert_eq (set_bit 5 1) 7 "set_bit 5 bit1 = 7")
+(assert_eq (clear_bit 15 1) 13 "clear_bit 15 bit1 = 13")
+(assert_eq (clear_bit 8 3) 0 "clear_bit 8 bit3 = 0")
+(assert_eq (clear_bit 8 0) 8 "clear_bit no-op on clear bit")
+(assert_eq (toggle_bit 0 4) 16 "toggle_bit 0 bit4 = 16")
+(assert_eq (toggle_bit 16 4) 0 "toggle_bit back to 0")
+(assert_eq (toggle_bit 5 0) 4 "toggle_bit 5 bit0 = 4")
+; round-trip: toggle twice restores; set then clear restores
+(assert_eq (toggle_bit (toggle_bit 12345 7) 7) 12345 "double toggle restores")
+(assert_eq (clear_bit (set_bit 12345 1) 1) (clear_bit 12345 1) "set then clear")
+(assert_true (bit_set? (set_bit 0 40) 40) "set_bit then bit_set? high bit")
+
+; ── rotate_left / rotate_right over a bit-width ───────────────────────────────
+; width 32
+(assert_eq (rotate_left 1 4 32) 16 "rotate_left 1 by 4 = 16")
+(assert_eq (rotate_left 2147483648 1 32) 1 "rotate_left wraps top bit to bottom")
+(assert_eq (rotate_left 12345 0 32) 12345 "rotate_left by 0 = identity")
+(assert_eq (rotate_left 12345 32 32) 12345 "rotate_left by width = identity")
+(assert_eq (rotate_right 16 4 32) 1 "rotate_right 16 by 4 = 1")
+(assert_eq (rotate_right 1 1 32) 2147483648 "rotate_right wraps bottom bit to top")
+(assert_eq (rotate_right 12345 0 32) 12345 "rotate_right by 0 = identity")
+; rotate_left and rotate_right are inverse for same k
+(assert_eq (rotate_right (rotate_left 305419896 7 32) 7 32) 305419896
+  "rol then ror restores (width 32)")
+(assert_eq (rotate_left (rotate_right 305419896 11 32) 11 32) 305419896
+  "ror then rol restores (width 32)")
+; only the low `width` bits participate (high bits of n are masked off)
+(assert_eq (rotate_left 4294967296 1 32) 0 "rotate_left masks bits above width")
+; width 8
+(assert_eq (rotate_left 1 1 8) 2 "rotate_left 1 by 1 width 8")
+(assert_eq (rotate_left 128 1 8) 1 "rotate_left 0x80 by 1 width 8 wraps")
+(assert_eq (rotate_right 1 1 8) 128 "rotate_right 1 by 1 width 8 wraps")
+(assert_eq (rotate_left 1 9 8) 2 "rotate_left k reduced mod width (9 mod 8 = 1)")
+; width 16
+(assert_eq (rotate_left 1 4 16) 16 "rotate_left width 16")
+(assert_eq (rotate_right 32768 1 16) 16384 "rotate_right 0x8000 by 1 width 16")
+
+true

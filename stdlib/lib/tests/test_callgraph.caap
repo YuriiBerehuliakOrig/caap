@@ -1,0 +1,74 @@
+; stdlib/lib/tests/test_callgraph.caap — the module-level call-graph analysis:
+; dead-definition detection + recursion (incl. mutual) over synthetic modules.
+
+;; @area: passes
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.callgraph analyze)
+(use stdlib.syntax.ast sym lit calln lam)
+(use stdlib.lib.collections.sequence any?)
+
+(do
+  (bind (
+    ; a top-level definition form: (bind "name" value)
+    (def (lambda (nm v) (calln "bind" (list_of (lit nm) v))))
+    ; wrap forms as the loader's located list
+    (located (lambda (forms)
+               (bind ((out (list_of)))
+                 (do (for f forms (append out (assoc (map_of) "node" f "loc" "m")))
+                     out))))
+    (in? (lambda (lst x) (any? lst (lambda (e) (eq e x)))))
+  )
+    (do
+      ; ── clean chain: main -> helper, main exported ──
+      (bind ((g (analyze (located (list_of
+                  (def "helper" (lam (list_of) (lit 1)))
+                  (def "main" (lam (list_of) (calln "helper" (list_of))))
+                  (calln "export" (list_of (sym "main"))))))))
+        (assert_eq (size (get g "dead" (list_of))) 0
+          "reachable chain has no dead definitions"))
+
+      ; ── dead orphan: defined, never referenced, not exported ──
+      (bind ((g (analyze (located (list_of
+                  (def "used" (lam (list_of) (lit 1)))
+                  (def "orphan" (lam (list_of) (lit 2)))
+                  (calln "export" (list_of (sym "used"))))))))
+        (do
+          (assert_true (in? (get g "dead") "orphan") "orphan is dead")
+          (assert_true (not (in? (get g "dead") "used")) "exported `used` is live")))
+
+      ; ── direct recursion is a FACT, not death ──
+      (bind ((g (analyze (located (list_of
+                  (def "fib" (lam (list_of "n") (calln "fib" (list_of (sym "n")))))
+                  (calln "export" (list_of (sym "fib"))))))))
+        (do
+          (assert_true (eq (get (get g "recursive") "fib" false) true)
+            "fib detected as recursive")
+          (assert_eq (size (get g "dead" (list_of))) 0
+            "exported recursive fn is live")))
+
+      ; ── mutual recursion: a <-> b ──
+      (bind ((g (analyze (located (list_of
+                  (def "a" (lam (list_of) (calln "b" (list_of))))
+                  (def "b" (lam (list_of) (calln "a" (list_of))))
+                  (calln "export" (list_of (sym "a"))))))))
+        (do
+          (assert_true (eq (get (get g "recursive") "a" false) true) "a is (mutually) recursive")
+          (assert_true (eq (get (get g "recursive") "b" false) true) "b is (mutually) recursive")))
+
+      ; ── a non-recursive leaf is NOT marked recursive ──
+      (bind ((g (analyze (located (list_of
+                  (def "leaf" (lam (list_of) (lit 7)))
+                  (calln "export" (list_of (sym "leaf"))))))))
+        (assert_true (not (eq (get (get g "recursive") "leaf" false) true))
+          "leaf is not recursive"))
+
+      ; ── a top-level name redefined twice is ONE graph node (def_order is a
+      ; set): the latest value wins, so it is dead exactly once, not twice ──
+      (bind ((g (analyze (located (list_of
+                  (def "dup" (lam (list_of) (lit 1)))
+                  (def "dup" (lam (list_of) (lit 2))))))))
+        (do
+          (assert_eq (size (get g "def_order")) 1 "redefined name listed once")
+          (assert_eq (size (get g "dead")) 1 "redefined dead name flagged once"))))))

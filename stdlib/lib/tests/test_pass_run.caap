@@ -1,0 +1,49 @@
+; stdlib/lib/tests/test_pass_run.caap — per-run pass-fact scope (audit #8).
+;
+; Proves with_pass_run isolates the fact store per run: a previous run's facts do
+; not leak IN, the run sees its own facts, the run's facts do not leak OUT, the
+; outer store is restored afterwards, and the run returns {value, facts}.
+;; @area: passes
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.registry fact! fact_of with_pass_run)
+
+(do
+  ; seed an OUTER (session-level) fact
+  (fact! "test.run.outer" "a" 1)
+
+  (bind ((result
+          (with_pass_run
+            (lambda ()
+              (do
+                ; inside the run the outer store is NOT visible (no leak in)
+                (assert_eq (fact_of "test.run.outer" "a" 0) 0
+                  "run starts with a fresh fact store (outer facts do not leak in)")
+                ; the run sees its OWN facts
+                (fact! "test.run.inner" "b" 42)
+                (assert_eq (fact_of "test.run.inner" "b" 0) 42
+                  "a run sees the facts it writes")
+                "ok")))))
+    (do
+      ; with_pass_run returns {value, facts}
+      (assert_eq (get result "value") "ok" "with_pass_run returns the thunk's value")
+      (assert_eq (get (get (get result "facts") "test.run.inner") "b") 42
+        "with_pass_run returns a snapshot of the facts the run produced")
+
+      ; after the run: the run-local fact did NOT leak out, the outer fact restored
+      (assert_eq (fact_of "test.run.inner" "b" 0) 0
+        "a run's facts do not leak out after it returns")
+      (assert_eq (fact_of "test.run.outer" "a" 0) 1
+        "the outer fact store is restored after the run")
+
+      ; two independent runs do not contaminate each other
+      (with_pass_run (lambda () (fact! "test.run.p1" "x" 7)))
+      (assert_eq (fact_of "test.run.p1" "x" 0) 0
+        "run 1's facts are gone once it returns")
+      (assert_eq
+        (get (with_pass_run
+               (lambda () (fact_of "test.run.p1" "x" 0)))
+             "value")
+        0
+        "run 2 does not see run 1's facts"))))

@@ -1,0 +1,566 @@
+; stdlib/lib/text/regex.caap — a small pure regex engine (module stdlib.lib.text.regex).
+;
+; A self-contained, dependency-free regular-expression matcher: it parses a
+; pattern string into a regex AST (a plain data value), then matches by
+; backtracking over the input's characters (kernel string_chars — unicode
+; codepoints, NOT bytes). It does NOT use peg/ — this is a standalone engine.
+;
+; ── supported subset ────────────────────────────────────────────────────────
+;   literals            a b c …            (any char that is not a metacharacter)
+;   any                 .                  (matches one char, including newline)
+;   char class          [a-z0-9_]          ranges + literals
+;   negated class       [^abc]             complement (one char, any not listed)
+;   anchors             ^   $              start / end of the whole input
+;   quantifiers         *  +  ?            greedy: 0+, 1+, 0-or-1
+;   bounded quantifier  {m}  {m,}  {m,n}   greedy counted repetition
+;   alternation         a|b|c              ordered choice (first alternative that
+;                                          lets the rest match wins)
+;   grouping + capture  ( … )              every group captures (group 0 = whole)
+;   escapes             \d \w \s           digit / word / whitespace classes
+;                       \D \W \S           their negations
+;                       \. \* \( …         escape a metacharacter to its literal
+;
+; ── deliberately OUT of scope (documented limits) ───────────────────────────
+;   no lookahead / lookbehind, no backreferences, no named groups, no non-greedy
+;   (`*?`) quantifiers, no inline flags, no word boundary `\b`. `^` and `$`
+;   anchor the WHOLE input only (not multiline). `.` matches any single char
+;   including newline. Capture groups are numbered 1.. in the order their `(`
+;   opens; group 0 is the whole match. The \d/\w/\s classes are ASCII.
+;
+;   This is a recursive backtracking matcher (no DFA/NFA simulation): match cost
+;   can blow up on pathological patterns (e.g. (a+)+ over a long non-matching
+;   input) and recursion depth grows with input length, so it is meant for SHORT
+;   inputs and simple patterns, not megabyte scanning. Malformed bounds are
+;   rejected at compile time (→ ok:false): an inverted {m,n} with n<m, an
+;   inverted class range [z-a], an escape used as a class range endpoint [a-\d],
+;   and an over-large repetition count.
+;
+; ── value shapes ────────────────────────────────────────────────────────────
+;   compiled  = { ok: true,  ast: <node>, ngroups: int }      (from rx_compile)
+;   error     = { ok: false, error: "<message>" }
+;   search    = { found: true,  start, end, match, groups: [ {start,end,text} … ] }
+;            or { found: false }
+;
+; The matcher is continuation-passing: match_node takes a success continuation
+; `k` (pos -> end-pos | -1). Quantifiers/alternation backtrack by trying choices
+; and threading the SAME k; the first choice whose k succeeds wins. Capture
+; group bounds live in a shared `ref` cell (caps) so a successful path records
+; them; failed paths restore the prior span.
+(module stdlib.lib.text.regex)
+
+; the \d class reuses the canonical char.is_digit? (same ASCII class + (size c)=1
+; guard, so \d matching is unchanged). \w (word?) and \s (space?) have no exact
+; sibling — char.is_space? omits the form feed \f that the \s class includes — so
+; they stay local below.
+(use stdlib.lib.text.char is_digit?)
+
+; ── small char helpers (inline; ASCII classes for \d \w \s) ──────────────────
+
+; digit? = the canonical char.is_digit? (imported above); the \d class.
+(bind digit? is_digit?)
+
+; word? — ASCII word char: letter, digit, or underscore (the \w class).
+(bind word?
+  (lambda (c)
+    (and (eq (size c) 1)
+         (or (string_contains "abcdefghijklmnopqrstuvwxyz" c)
+             (or (string_contains "ABCDEFGHIJKLMNOPQRSTUVWXYZ" c)
+                 (or (string_contains "0123456789" c)
+                     (eq c "_")))))))
+
+; space? — ASCII whitespace (the \s class): space, tab, newline, CR, FF.
+(bind space?
+  (lambda (c) (and (eq (size c) 1) (string_contains " \t\n\r\f" c))))
+
+; ── parser ──────────────────────────────────────────────────────────────────
+; Hand recursive-descent over the pattern's char list. State is a position ref
+; `p` (index into `pcs`, the pattern chars) and a group counter ref `gc`. Each
+; node is a map tagged by "t":
+;   {t:"lit",  c}                 one literal char
+;   {t:"any"}                     .
+;   {t:"class", neg, items}       [..]; items: {kind:"ch"|"rng"|"pred", …}
+;   {t:"start"} {t:"end"}         ^ $
+;   {t:"star"|"plus"|"opt", x}    x* x+ x?
+;   {t:"rep", x, min, max}        x{m,n}; max = -1 means unbounded
+;   {t:"seq", xs}                 concatenation (a list of nodes)
+;   {t:"alt", xs}                 alternation (a list of branches)
+;   {t:"group", n, x}             ( x ) capturing as group n
+
+; p_at — current pattern char, or "" past the end.
+(bind p_at
+  (lambda (pcs p) (if (lt (deref p) (size pcs)) (get pcs (deref p)) "")))
+
+; p_adv — consume one char.
+(bind p_adv (lambda (p) (set_ref p (int_add (deref p) 1))))
+
+; parse_int — read a run of digits starting at p; return the int (0 if none).
+(bind parse_int
+  (lambda (pcs p)
+    (bind ((acc (ref 0)))
+      (do
+        (while (digit? (p_at pcs p))
+          (do
+            ; cap the accumulator so a huge {…} count surfaces a clean regex:
+            ; diagnostic instead of leaking a kernel integer-overflow message
+            (if (gt (deref acc) 100000000)
+              (throw "regex: repetition count too large")
+              null)
+            (set_ref acc (int_add (int_mul (deref acc) 10)
+                                  (string_to_int (p_at pcs p))))
+            (p_adv p)))
+        (deref acc)))))
+
+; pred_item — a {kind:"pred"} class item for an escape letter.
+(bind pred_item (lambda (pr) (assoc (map_of) "kind" "pred" "pred" pr)))
+; ch_item — a {kind:"ch"} class item for a literal char.
+(bind ch_item (lambda (c) (assoc (map_of) "kind" "ch" "ch" c)))
+
+; class_from_escape — turn an escape letter into a class node ({t:"class"}) for
+; \d \w \s (+ negations), else null when the letter is not a class escape.
+(bind class_from_escape
+  (lambda (e)
+    (cond
+      ((eq e "d") (assoc (map_of) "t" "class" "neg" false "items" (list_of (pred_item "d"))))
+      ((eq e "D") (assoc (map_of) "t" "class" "neg" false "items" (list_of (pred_item "D"))))
+      ((eq e "w") (assoc (map_of) "t" "class" "neg" false "items" (list_of (pred_item "w"))))
+      ((eq e "W") (assoc (map_of) "t" "class" "neg" false "items" (list_of (pred_item "W"))))
+      ((eq e "s") (assoc (map_of) "t" "class" "neg" false "items" (list_of (pred_item "s"))))
+      ((eq e "S") (assoc (map_of) "t" "class" "neg" false "items" (list_of (pred_item "S"))))
+      (else null))))
+
+; unescape_char — the literal char an escape sequence \e denotes (\n \t \r, else e).
+(bind unescape_char
+  (lambda (e)
+    (cond ((eq e "n") "\n") ((eq e "t") "\t") ((eq e "r") "\r") (else e))))
+
+; parse_class — parse the body of [ … ] (the opening [ already consumed).
+; Returns a class node; throws "regex:" on a malformed class.
+(bind parse_class
+  (lambda (pcs p)
+    (bind ((neg (ref false)) (items (ref (list_of))))
+      (do
+        ; leading ^ negates
+        (if (eq (p_at pcs p) "^") (do (set_ref neg true) (p_adv p)) null)
+        (while (and (not (eq (p_at pcs p) "]")) (not (eq (p_at pcs p) "")))
+          (bind ((c (p_at pcs p)))
+            (do
+              (p_adv p)
+              (cond
+                ; escape inside a class: \d \w \s (+ neg) become pred items, else literal
+                ((eq c "\\")
+                  (bind ((e (p_at pcs p)))
+                    (do
+                      (p_adv p)
+                      (if (eq e "") (throw "regex: trailing backslash in class") null)
+                      (cond
+                        ((eq e "d") (append (deref items) (pred_item "d")))
+                        ((eq e "D") (append (deref items) (pred_item "D")))
+                        ((eq e "w") (append (deref items) (pred_item "w")))
+                        ((eq e "W") (append (deref items) (pred_item "W")))
+                        ((eq e "s") (append (deref items) (pred_item "s")))
+                        ((eq e "S") (append (deref items) (pred_item "S")))
+                        (else (append (deref items) (ch_item (unescape_char e))))))))
+                ; range a-z when a '-' followed by a non-] char is present
+                ((and (eq (p_at pcs p) "-")
+                      (and (not (eq (get pcs (int_add (deref p) 1) "") "]"))
+                           (not (eq (get pcs (int_add (deref p) 1) "") ""))))
+                  (bind ((hi (get pcs (int_add (deref p) 1))))
+                    (do
+                      ; an escaped range endpoint (e.g. [a-\d]) is not a single
+                      ; char — reject it rather than silently consume the backslash
+                      (if (eq hi "\\")
+                        (throw "regex: escape as character-class range endpoint")
+                        null)
+                      ; reject an inverted range like [z-a] (lo > hi → matches nothing)
+                      (if (gt c hi)
+                        (throw (string_concat_many
+                          "regex: inverted character-class range " c "-" hi))
+                        null)
+                      (p_adv p) (p_adv p)
+                      (append (deref items)
+                        (assoc (map_of) "kind" "rng" "lo" c "hi" hi)))))
+                (else (append (deref items) (ch_item c)))))))
+        (if (eq (p_at pcs p) "]")
+          (p_adv p)
+          (throw "regex: unterminated character class"))
+        (assoc (map_of) "t" "class" "neg" (deref neg) "items" (deref items))))))
+
+; parse_atom — one atomic unit: group, class, ., anchor, escape, or literal.
+; `parse_alt_ref` is a ref holding parse_alt so groups can recurse into it.
+(bind parse_atom
+  (lambda (pcs p gc parse_alt_ref)
+    (bind ((c (p_at pcs p)))
+      (cond
+        ((eq c "(")
+          (do
+            (p_adv p)
+            (set_ref gc (int_add (deref gc) 1))
+            (bind ((n (deref gc)) (inner ((deref parse_alt_ref) pcs p gc parse_alt_ref)))
+              (do
+                (if (eq (p_at pcs p) ")")
+                  (p_adv p)
+                  (throw "regex: missing closing paren"))
+                (assoc (map_of) "t" "group" "n" n "x" inner)))))
+        ((eq c "[") (do (p_adv p) (parse_class pcs p)))
+        ((eq c ".") (do (p_adv p) (assoc (map_of) "t" "any")))
+        ((eq c "^") (do (p_adv p) (assoc (map_of) "t" "start")))
+        ((eq c "$") (do (p_adv p) (assoc (map_of) "t" "end")))
+        ((eq c "\\")
+          (do
+            (p_adv p)
+            (bind ((e (p_at pcs p)))
+              (do
+                (p_adv p)
+                (if (eq e "") (throw "regex: trailing backslash") null)
+                (bind ((cls (class_from_escape e)))
+                  (if (not (eq cls null))
+                    cls
+                    (assoc (map_of) "t" "lit" "c" (unescape_char e))))))))
+        ((eq c "") (throw "regex: unexpected end of pattern"))
+        ((or (eq c ")") (or (eq c "|") (or (eq c "*") (or (eq c "+") (eq c "?")))))
+          (throw (string_concat_many "regex: unexpected '" c "'")))
+        (else (do (p_adv p) (assoc (map_of) "t" "lit" "c" c)))))))
+
+; parse_quant — an atom followed by an optional quantifier (* + ? {m,n}).
+(bind parse_quant
+  (lambda (pcs p gc parse_alt_ref)
+    (bind ((atom (parse_atom pcs p gc parse_alt_ref)) (q (p_at pcs p)))
+      (cond
+        ((eq q "*") (do (p_adv p) (assoc (map_of) "t" "star" "x" atom)))
+        ((eq q "+") (do (p_adv p) (assoc (map_of) "t" "plus" "x" atom)))
+        ((eq q "?") (do (p_adv p) (assoc (map_of) "t" "opt"  "x" atom)))
+        ((eq q "{")
+          (bind ((save (deref p)))
+            (do
+              (p_adv p)
+              (if (not (digit? (p_at pcs p)))
+                ; not a real {m,n} → treat '{' as a literal: rewind, return atom
+                (do (set_ref p save) atom)
+                (bind ((mn (parse_int pcs p)) (mx (ref mn)))
+                  (do
+                    (if (eq (p_at pcs p) ",")
+                      (do
+                        (p_adv p)
+                        (if (digit? (p_at pcs p))
+                          (set_ref mx (parse_int pcs p))
+                          (set_ref mx -1)))            ; {m,} unbounded
+                      null)
+                    (if (eq (p_at pcs p) "}")
+                      (p_adv p)
+                      (throw "regex: malformed {m,n}"))
+                    ; reject an inverted bound {m,n} with n < m (a dead pattern)
+                    (if (and (ge (deref mx) 0) (lt (deref mx) mn))
+                      (throw (string_concat_many
+                        "regex: {m,n} with max < min ({"
+                        (int_to_string mn) "," (int_to_string (deref mx)) "})"))
+                      null)
+                    (assoc (map_of) "t" "rep" "x" atom
+                           "min" mn "max" (deref mx))))))))
+        (else atom)))))
+
+; parse_seq — a concatenation of quantified atoms (stops at | or ) or end).
+(bind parse_seq
+  (lambda (pcs p gc parse_alt_ref)
+    (bind ((xs (ref (list_of))))
+      (do
+        (while (and (not (eq (p_at pcs p) ""))
+                    (and (not (eq (p_at pcs p) "|")) (not (eq (p_at pcs p) ")"))))
+          (append (deref xs) (parse_quant pcs p gc parse_alt_ref)))
+        (assoc (map_of) "t" "seq" "xs" (deref xs))))))
+
+; parse_alt — alternation: seq ( '|' seq )*  (the top of the grammar).
+(bind parse_alt
+  (lambda (pcs p gc parse_alt_ref)
+    (bind ((branches (ref (list_of (parse_seq pcs p gc parse_alt_ref)))))
+      (do
+        (while (eq (p_at pcs p) "|")
+          (do
+            (p_adv p)
+            (append (deref branches) (parse_seq pcs p gc parse_alt_ref))))
+        (if (eq (size (deref branches)) 1)
+          (get (deref branches) 0)
+          (assoc (map_of) "t" "alt" "xs" (deref branches)))))))
+
+; rx_compile — parse a pattern string into a compiled regex value.
+;   pattern : the regex source
+;   ->      : { ok:true, ast, ngroups } | { ok:false, error }
+(bind rx_compile
+  (lambda (pattern)
+    (try
+      (bind ((pcs (string_chars pattern))
+             (p (ref 0))
+             (gc (ref 0))
+             (parse_alt_ref (ref parse_alt))
+             (ast (parse_alt pcs p gc parse_alt_ref)))
+        (if (not (eq (deref p) (size pcs)))
+          (assoc (map_of) "ok" false "error"
+            (string_concat_many "regex: trailing characters at " (int_to_string (deref p))))
+          (assoc (map_of) "ok" true "ast" ast "ngroups" (deref gc))))
+      ; a thrown parse error is a plain string ((throw "regex: …")); a non-fatal
+      ; eval error is a {message,category} map — extract the text from either.
+      (catch e
+        (assoc (map_of) "ok" false "error"
+          (if (eq (value_type e) "map") (get e "message" "regex: parse error") e))))))
+
+; ── matcher (continuation-passing backtracking) ─────────────────────────────
+; match_node(node, cs, pos, caps, k) -> end-pos | -1
+;   cs   : the input char list
+;   pos  : current index into cs
+;   caps : ref to a map  "<n>" -> [start, end]  recording group spans
+;   k    : continuation (pos') -> end-pos | -1 ; the first path with k>=0 wins.
+
+; class_item? — does char `c` satisfy class item `it`?
+(bind class_item?
+  (lambda (it c)
+    (bind ((kind (get it "kind")))
+      (cond
+        ((eq kind "ch")  (eq c (get it "ch")))
+        ((eq kind "rng") (and (ge c (get it "lo")) (le c (get it "hi"))))
+        ((eq kind "pred")
+          (bind ((pr (get it "pred")))
+            (cond
+              ((eq pr "d") (digit? c))
+              ((eq pr "D") (not (digit? c)))
+              ((eq pr "w") (word? c))
+              ((eq pr "W") (not (word? c)))
+              ((eq pr "s") (space? c))
+              ((eq pr "S") (not (space? c)))
+              (else false))))
+        (else false)))))
+
+; class_match? — does `c` match the whole class node (honouring negation)?
+(bind class_match?
+  (lambda (node c)
+    (bind ((items (get node "items")) (hit (ref false)))
+      (do
+        (sequence_each items
+          (lambda (it) (if (class_item? it c) (set_ref hit true) null)))
+        (if (get node "neg") (not (deref hit)) (deref hit))))))
+
+; mrec — the recursive matcher dispatcher, written self-passing (it takes itself
+; as `me`) so it can recurse without a forward bind reference. `match_seq` and
+; `match_rep` are inner closures that also receive `me`. Returns the input
+; position after a successful match of `node` followed by a successful
+; continuation `k`, or -1.
+;   me   : mrec itself (self-application)
+;   node : the AST node to match
+;   cs   : the input char list
+;   pos  : current index into cs
+;   caps : ref to a map  "<n>" -> [start, end]  recording group spans
+;   k    : continuation (pos') -> end-pos | -1
+(bind mrec
+  (lambda (me node cs pos caps k)
+    (bind (
+        ; match a list of nodes left to right, threading the continuation.
+        (match_seq
+          (lambda (seq_self xs i pos2 k2)
+            (if (ge i (size xs))
+              (k2 pos2)
+              (me me (get xs i) cs pos2 caps
+                (lambda (np) (seq_self seq_self xs (int_add i 1) np k2))))))
+        ; greedy repetition of `x`: try one more before accepting here. `min` is
+        ; the lower bound (1 for +, m for {m,n}); `max` < 0 means unbounded.
+        ; A zero-width step is allowed only while we are still climbing to `min`
+        ; (so e.g. `(a*)+` can satisfy a mandatory iteration on empty input); once
+        ; `count >= min` a zero-width step is refused, so a repeat over an empty
+        ; match cannot loop forever — we accept the current position instead.
+        (match_rep
+          (lambda (rep_self x pos2 count min max k2)
+            (bind ((can_more (or (lt max 0) (lt count max)))
+                   (more
+                     (if can_more
+                       (me me x cs pos2 caps
+                         (lambda (np)
+                           (if (and (eq np pos2) (ge count min))
+                             -1                       ; zero-width & min met → stop
+                             (rep_self rep_self x np (int_add count 1) min max k2))))
+                       -1)))
+              (if (ge more 0)
+                more
+                (if (ge count min) (k2 pos2) -1)))))
+        (t (get node "t"))
+      )
+      (cond
+        ((eq t "lit")
+          (if (and (lt pos (size cs)) (eq (get cs pos) (get node "c")))
+            (k (int_add pos 1)) -1))
+        ((eq t "any")
+          (if (lt pos (size cs)) (k (int_add pos 1)) -1))
+        ((eq t "class")
+          (if (and (lt pos (size cs)) (class_match? node (get cs pos)))
+            (k (int_add pos 1)) -1))
+        ((eq t "start") (if (eq pos 0) (k pos) -1))
+        ((eq t "end")   (if (eq pos (size cs)) (k pos) -1))
+        ((eq t "seq")   (match_seq match_seq (get node "xs") 0 pos k))
+        ((eq t "alt")
+          (bind ((xs (get node "xs")) (res (ref -1)) (i (ref 0)))
+            (do
+              (while (and (lt (deref res) 0) (lt (deref i) (size xs)))
+                (do
+                  (set_ref res (me me (get xs (deref i)) cs pos caps k))
+                  (set_ref i (int_add (deref i) 1))))
+              (deref res))))
+        ((eq t "star") (match_rep match_rep (get node "x") pos 0 0 -1 k))
+        ((eq t "plus") (match_rep match_rep (get node "x") pos 0 1 -1 k))
+        ((eq t "opt")
+          (bind ((r (me me (get node "x") cs pos caps k)))
+            (if (ge r 0) r (k pos))))
+        ((eq t "rep")
+          (match_rep match_rep (get node "x") pos 0 (get node "min") (get node "max") k))
+        ((eq t "group")
+          (bind ((key (int_to_string (get node "n"))))
+            (me me (get node "x") cs pos caps
+              (lambda (np)
+                (bind ((prev (get (deref caps) key null)))
+                  (do
+                    (set_ref caps (assoc (deref caps) key (list_of pos np)))
+                    (bind ((r (k np)))
+                      (do
+                        ; if the continuation failed, restore the prior span
+                        (if (lt r 0)
+                          (set_ref caps
+                            (if (eq prev null)
+                              (bind ((m (deref caps))) (do (map_delete m key) m))
+                              (assoc (deref caps) key prev)))
+                          null)
+                        r))))))))
+        (else -1)))))
+
+; match_node — entry point: kicks off mrec with itself (the 5-arg public shape).
+(bind match_node
+  (lambda (node cs pos caps k) (mrec mrec node cs pos caps k)))
+
+; ── search / public API ─────────────────────────────────────────────────────
+
+; build_groups — assemble the [{start,end,text}…] list (index 0 = whole match).
+(bind build_groups
+  (lambda (cs caps ngroups start end)
+    (bind ((out (ref (list_of (assoc (map_of)
+                    "start" start "end" end
+                    "text" (sequence_join (sequence_slice cs start end) ""))))))
+      (do
+        (bind ((i (ref 1)))
+          (while (le (deref i) ngroups)
+            (do
+              (bind ((span (get (deref caps) (int_to_string (deref i)) null)))
+                (if (eq span null)
+                  (append (deref out) (assoc (map_of) "start" -1 "end" -1 "text" null))
+                  (append (deref out)
+                    (assoc (map_of)
+                      "start" (get span 0) "end" (get span 1)
+                      "text" (sequence_join (sequence_slice cs (get span 0) (get span 1)) "")))))
+              (set_ref i (int_add (deref i) 1)))))
+        (deref out)))))
+
+; try_at — attempt a full-AST match anchored at position `from`; on success
+; returns a search-result map, else null.
+(bind try_at
+  (lambda (rx cs from)
+    (bind ((caps (ref (map_of)))
+           (end (match_node (get rx "ast") cs from caps (lambda (p) p))))
+      (if (ge end 0)
+        (assoc (map_of)
+          "found" true "start" from "end" end
+          "match" (sequence_join (sequence_slice cs from end) "")
+          "groups" (build_groups cs caps (get rx "ngroups") from end))
+        null))))
+
+; rx_search — find the leftmost match anywhere in `s`.
+;   rx : a compiled regex (the result of rx_compile)
+;   s  : the subject string
+;   -> : { found:true, start, end, match, groups } | { found:false }
+(bind rx_search
+  (lambda (rx s)
+    (if (not (get rx "ok" false))
+      (assoc (map_of) "found" false)
+      (bind ((cs (string_chars s)) (n (size s)) (i (ref 0)) (res (ref null)))
+        (do
+          (while (and (eq (deref res) null) (le (deref i) n))
+            (do
+              (set_ref res (try_at rx cs (deref i)))
+              (set_ref i (int_add (deref i) 1))))
+          (if (eq (deref res) null) (assoc (map_of) "found" false) (deref res)))))))
+
+; rx_match? — does the regex match the ENTIRE string (anchored both ends)?
+;   -> : bool
+(bind rx_match?
+  (lambda (rx s)
+    (if (not (get rx "ok" false))
+      false
+      (bind ((cs (string_chars s)) (caps (ref (map_of)))
+             (end (match_node (get rx "ast") cs 0 caps
+                    (lambda (p) (if (eq p (size cs)) p -1)))))
+        (ge end 0)))))
+
+; rx_find_all — every non-overlapping match, left to right.
+;   -> : list of search-result maps (empty when none)
+(bind rx_find_all
+  (lambda (rx s)
+    (if (not (get rx "ok" false))
+      (list_of)
+      (bind ((cs (string_chars s)) (n (size s)) (i (ref 0)) (out (ref (list_of))))
+        (do
+          (while (le (deref i) n)
+            (bind ((m (try_at rx cs (deref i))))
+              (if (eq m null)
+                (set_ref i (int_add (deref i) 1))
+                (do
+                  (append (deref out) m)
+                  ; advance past the match; for a zero-width match step by 1
+                  (set_ref i (if (eq (get m "end") (deref i))
+                               (int_add (deref i) 1)
+                               (get m "end")))))))
+          (deref out))))))
+
+; rx_replace — replace every match of `rx` in `s` with the literal `repl`.
+; `repl` is inserted verbatim (no $1 substitution — keeps the subset modest).
+;   -> : the rewritten string
+(bind rx_replace
+  (lambda (rx s repl)
+    (if (not (get rx "ok" false))
+      s
+      (bind ((cs (string_chars s)) (n (size s)) (i (ref 0)) (out (ref (list_of))))
+        (do
+          (while (le (deref i) n)
+            (bind ((m (try_at rx cs (deref i))))
+              (if (eq m null)
+                (do
+                  (if (lt (deref i) n) (append (deref out) (get cs (deref i))) null)
+                  (set_ref i (int_add (deref i) 1)))
+                (if (eq (get m "end") (deref i))
+                  ; zero-width: emit repl then the current char, advance by 1
+                  (do
+                    (append (deref out) repl)
+                    (if (lt (deref i) n) (append (deref out) (get cs (deref i))) null)
+                    (set_ref i (int_add (deref i) 1)))
+                  (do
+                    (append (deref out) repl)
+                    (set_ref i (get m "end")))))))
+          (sequence_join (deref out) ""))))))
+
+; rx_split — split `s` on each match of `rx` (the delimiter is the match text).
+; Zero-width matches are skipped so the result stays well-behaved.
+;   -> : list of substrings
+(bind rx_split
+  (lambda (rx s)
+    (if (not (get rx "ok" false))
+      (list_of s)
+      (bind ((cs (string_chars s)) (n (size s))
+             (i (ref 0)) (last (ref 0)) (out (ref (list_of))))
+        (do
+          (while (lt (deref i) n)
+            (bind ((m (try_at rx cs (deref i))))
+              (if (eq m null)
+                (set_ref i (int_add (deref i) 1))
+                (if (eq (get m "end") (deref i))
+                  (set_ref i (int_add (deref i) 1)) ; skip zero-width split point
+                  (do
+                    (append (deref out)
+                      (sequence_join (sequence_slice cs (deref last) (deref i)) ""))
+                    (set_ref last (get m "end"))
+                    (set_ref i (get m "end")))))))
+          (append (deref out)
+            (sequence_join (sequence_slice cs (deref last) n) ""))
+          (deref out))))))
+
+(export rx_compile rx_match? rx_search rx_find_all rx_replace rx_split)

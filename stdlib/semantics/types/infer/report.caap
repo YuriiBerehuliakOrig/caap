@@ -1,0 +1,41 @@
+; stdlib/semantics/types/infer/report.caap — the type pass's diagnostic sink
+; emitter + its fallback-location cell.
+;
+; Split out of types/infer so BOTH the walker (the facade) AND the argument-
+; checking leaves (infer/unify, infer/constraint) share ONE `report!` and ONE
+; `current_floc` cell. The cell is module-level state (one instance per
+; session), so a write through `set_floc!` is visible to every reader — exactly
+; the clike.state precedent (the owning module exports a setter, not the raw
+; ref). check_module_types sets the form's loc per top-level form; the leaves
+; only ever READ it through `report!`.
+(module stdlib.semantics.types.infer.report)
+
+(use stdlib.syntax.ast loc_or)
+
+; ── locating + reporting ────────────────────────────────────────────────────
+; the current top-level form's "path:line:col" — the FALLBACK location for a
+; finding whose offending node carries no span (synthetic / detached). Set per
+; form by check_module_types (through set_floc!).
+(bind current_floc (ref "<unknown>"))
+
+; set_floc! — set the per-form fallback location. The ONE writer of the cell
+; (check_module_types calls it per top-level form); exported as a setter so
+; consumers never hold the raw ref.
+(bind set_floc!
+  (lambda (loc) (set_ref current_floc loc)))
+
+; loc_of — a node's "path:line:col" (sub-EXPRESSION precision; expand
+; preserves origin spans), or the form fallback. The reader lives in
+; lib/ast (loc_or) — the one place node-span knowledge sits.
+(bind loc_of loc_or)
+
+; report! — append a finding located at the OFFENDING node (or the current
+; form when the node has no span). The single sink-emitter, so every type-pass
+; diagnostic carries the most precise location available.
+;   sink / msg / node : the diagnostics list, the message, the offending node
+(bind report!
+  (lambda (sink msg node)
+    (append sink
+      (string_concat_many (loc_of node (deref current_floc)) ": " msg))))
+
+(export report! set_floc!)

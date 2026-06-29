@@ -1,0 +1,420 @@
+; stdlib/lib/tests/test_pe.caap — POLYVARIANT binding-time specialization:
+; annotated literal-static calls are redirected to named variants, generated on
+; demand (inter-procedural + recursive). The output is a complete, def-before-use
+; module: variants in dependency order ahead of their uses, dead originals DCE'd.
+
+;; @area: passes
+;; @kind: regression
+;; @slow: true
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.pe static! clear! static_in! clear_in! run)
+(use stdlib.syntax.ast
+  sym lit calln lam if3 call? name? name_of head_of arg literal_of)
+(use stdlib.lib.collections.sequence find)
+
+; ── located introspection helpers (order-independent) ────────────────────────
+; the generated variant `(bind <key> (lambda …))` form, or null. pe emits the
+; binder as a NAME node (the kernel's evaluable top-level-definition shape, so a
+; variant is reachable from the redirected call sites at eval time), so the key
+; is read with name_of, not literal_of.
+(bind variant_def
+  (lambda (located key)
+    (find located
+      (lambda (f)
+        (bind ((n (get f "node")))
+          (and (call? n) (and (eq (head_of n) "bind")
+                              (eq (name_of (arg n 0)) key))))))))
+; the variant body (the lambda's body expression), or null.
+(bind variant_body
+  (lambda (located key)
+    (bind ((vd (variant_def located key)))
+      (if (eq vd null) null (arg (arg (get vd "node") 1) 1)))))
+; the redirected call-site form headed by `h` (e.g. "scale__i_1"), or null.
+(bind call_with_head
+  (lambda (located h)
+    (find located
+      (lambda (f)
+        (bind ((n (get f "node"))) (and (call? n) (eq (head_of n) h)))))))
+; the position of the first form matching `pred`, or -1.
+(bind form_index
+  (lambda (located pred)
+    (bind ((idx (ref -1)) (i (ref 0)))
+      (do
+        (for f located
+          (do
+            (when (and (eq (deref idx) -1) (pred f)) (set_ref idx (deref i)))
+            (set_ref i (int_add (deref i) 1))))
+        (deref idx)))))
+(bind variant_index
+  (lambda (located key)
+    (form_index located
+      (lambda (f)
+        (bind ((n (get f "node")))
+          (and (call? n) (and (eq (head_of n) "bind")
+                              (eq (name_of (arg n 0)) key))))))))
+
+(do
+  (clear!)
+  ; scale's parameter 0 (factor) is static
+  (static! "scale" (list_of 0))
+  (bind (
+    ; (defn scale (factor x) (if (eq factor 1) x (int_mul factor x)))
+    (scale_def
+      (calln "bind"
+        (list_of (lit "scale")
+          (lam (list_of "factor" "x")
+            (if3 (calln "eq" (list_of (sym "factor") (lit 1)))
+                 (sym "x")
+                 (calln "int_mul" (list_of (sym "factor") (sym "x"))))))))
+    (use1 (calln "scale" (list_of (lit 1) (sym "y"))))
+    (use3 (calln "scale" (list_of (lit 3) (sym "y"))))
+    (located (list_of
+               (assoc (map_of) "node" scale_def "loc" "m")
+               (assoc (map_of) "node" use1 "loc" "m")
+               (assoc (map_of) "node" use3 "loc" "m")))
+  )
+    (do
+      (run located)
+
+      ; ── call sites are redirected to the specialized variants ──
+      ; keys are kind-tagged + identifier-safe: the static int 1 -> "i_1".
+      (bind ((r1 (call_with_head located "scale__i_1")))
+        (do
+          (assert_true (not (eq r1 null)) "(scale 1 y) -> (scale__i_1 y)")
+          (assert_eq (name_of (arg (get r1 "node") 0)) "y" "dynamic arg y carried")))
+      (assert_true (not (eq (call_with_head located "scale__i_3") null))
+        "(scale 3 y) -> (scale__i_3 y)")
+
+      ; ── the variant bodies are the specialized residuals ──
+      ; scale__i_1 = (lambda (x) x) — the identity branch folded away
+      (bind ((b1 (variant_body located "scale__i_1")))
+        (do
+          (assert_true (name? b1) "scale__i_1 body is a bare name")
+          (assert_eq (name_of b1) "x" "scale__i_1 = (lambda (x) x)")))
+      ; scale__i_3 = (lambda (x) (int_mul 3 x)) — branch resolved, factor inlined
+      (bind ((b3 (variant_body located "scale__i_3")))
+        (do
+          (assert_eq (head_of b3) "int_mul" "scale__i_3 body is the multiply")
+          (assert_eq (literal_of (arg b3 0)) 3 "static factor 3 inlined")
+          (assert_eq (name_of (arg b3 1)) "x" "dynamic x")))
+
+      ; ── DCE: the original `scale` is fully specialized away (dead) ──
+      (assert_true (eq (variant_def located "scale") null)
+        "the dead original `scale` def was removed")))
+
+  ; ── RECURSIVE specialization: a static exponent unrolls to a finite chain of
+  ; variants, bottoming out at a constant, in def-before-use order ──
+  (clear!)
+  (static! "pow" (list_of 1))
+  (bind (
+    ; (defn pow (base n) (if (eq n 0) 1 (int_mul base (pow base (int_sub n 1)))))
+    (pow_def
+      (calln "bind"
+        (list_of (lit "pow")
+          (lam (list_of "base" "n")
+            (if3 (calln "eq" (list_of (sym "n") (lit 0)))
+                 (lit 1)
+                 (calln "int_mul"
+                   (list_of (sym "base")
+                     (calln "pow"
+                       (list_of (sym "base")
+                         (calln "int_sub" (list_of (sym "n") (lit 1))))))))))))
+    (call_site (calln "pow" (list_of (sym "y") (lit 3))))
+    (located (list_of
+               (assoc (map_of) "node" pow_def "loc" "m")
+               (assoc (map_of) "node" call_site "loc" "m")))
+  )
+    (do
+      (run located)
+      ; the call redirects to pow__i_3 (static int 3 -> "i_3")
+      (assert_true (not (eq (call_with_head located "pow__i_3") null)) "(pow y 3) -> (pow__i_3 y)")
+      ; the whole chain pow__i_3..pow__i_0 was generated
+      (assert_true (not (eq (variant_def located "pow__i_0") null)) "pow__i_0 generated (base case)")
+      (assert_true (not (eq (variant_def located "pow__i_3") null)) "pow__i_3 generated")
+      ; pow__i_0 = (lambda (base) 1) — the base case folded to a constant
+      (assert_eq (literal_of (variant_body located "pow__i_0")) 1 "pow__i_0 = (lambda (base) 1)")
+      ; pow__i_3 = (lambda (base) (int_mul base (pow__i_2 base))) — recursion redirected
+      (bind ((b3 (variant_body located "pow__i_3")))
+        (do
+          (assert_eq (head_of b3) "int_mul" "pow__i_3 body is a multiply")
+          (assert_eq (head_of (arg b3 1)) "pow__i_2" "pow__i_3 recurses into pow__i_2")))
+
+      ; ── DEF-BEFORE-USE: each variant precedes the deeper one it calls, and all
+      ; variants precede the call site (a valid, loadable module order) ──
+      (assert_true (lt (variant_index located "pow__i_0") (variant_index located "pow__i_1"))
+        "pow__i_0 defined before pow__i_1")
+      (assert_true (lt (variant_index located "pow__i_2") (variant_index located "pow__i_3"))
+        "pow__i_2 (used by pow__i_3) defined before pow__i_3")
+      (assert_true (lt (variant_index located "pow__i_3")
+                       (form_index located (lambda (f) (eq (head_of (get f "node")) "pow__i_3"))))
+        "the (pow__i_3 y) call site comes after pow__i_3 is defined")
+      ; DCE removed the dead original `pow`
+      (assert_true (eq (variant_def located "pow") null) "the dead original `pow` def was removed")))
+
+  ; ── COMPILE-TIME EVALUATION: a fully-static call to a user function (NO
+  ; annotation) folds to its result literal — even through recursion ──
+  (clear!)
+  (bind (
+    (double_def (calln "bind" (list_of (lit "double")
+                  (lam (list_of "x") (calln "int_mul" (list_of (sym "x") (lit 2)))))))
+    (fact_def (calln "bind" (list_of (lit "fact")
+                (lam (list_of "n")
+                  (if3 (calln "eq" (list_of (sym "n") (lit 0))) (lit 1)
+                       (calln "int_mul" (list_of (sym "n")
+                         (calln "fact"
+                           (list_of (calln "int_sub" (list_of (sym "n") (lit 1))))))))))))
+    (located (list_of
+               (assoc (map_of) "node" double_def "loc" "m")
+               (assoc (map_of) "node" (calln "double" (list_of (lit 21))) "loc" "m")
+               (assoc (map_of) "node" fact_def "loc" "m")
+               (assoc (map_of) "node" (calln "fact" (list_of (lit 5))) "loc" "m")))
+  )
+    (do
+      (run located)
+      ; no variants generated by a fold -> order preserved; the call forms are
+      ; now their result literals
+      (assert_eq (literal_of (get (get located 1) "node")) 42
+        "(double 21) compile-time evaluates to 42 (no annotation)")
+      (assert_eq (literal_of (get (get located 3) "node")) 120
+        "(fact 5) evaluates to 120 — recursive compile-time evaluation")))
+
+  ; ── AUTO binding-time: an unannotated MIXED call specializes on its literal
+  ; positions automatically ──
+  (clear!)
+  (bind (
+    (add3_def (calln "bind" (list_of (lit "add3")
+                (lam (list_of "a" "b" "c")
+                  (calln "int_add" (list_of (sym "a")
+                    (calln "int_add" (list_of (sym "b") (sym "c")))))))))
+    (located (list_of
+               (assoc (map_of) "node" add3_def "loc" "m")
+               (assoc (map_of) "node"
+                 (calln "add3" (list_of (lit 10) (sym "x") (lit 5))) "loc" "m")))
+  )
+    (do
+      (run located)
+      (assert_true (not (eq (call_with_head located "add3__i_10__i_5") null))
+        "(add3 10 x 5) auto-specializes to add3__i_10__i_5 with no annotation")
+      (assert_eq (head_of (variant_body located "add3__i_10__i_5")) "int_add"
+        "the variant residual keeps the dynamic add")))
+
+  ; ── COMPTIME requirement: (comptime name) demands every call fully evaluate;
+  ; a static call folds, a dynamic-arg call is a hard error ──
+  (clear!)
+  (bind (
+    (answer_def (calln "bind" (list_of (lit "answer") (lam (list_of) (lit 42)))))
+    (located (list_of
+               (assoc (map_of) "node" answer_def "loc" "m")
+               (assoc (map_of) "node" (lit (list_of "::comptime" "answer")) "loc" "m")
+               (assoc (map_of) "node" (calln "answer" (list_of)) "loc" "m")))
+  )
+    (do
+      (run located)
+      (assert_eq (literal_of (get (get located 2) "node")) 42
+        "a comptime fn folds to its result")))
+  (clear!)
+  (bind (
+    (idf_def (calln "bind" (list_of (lit "idf") (lam (list_of "x") (sym "x")))))
+    (loc2 (list_of
+            (assoc (map_of) "node" idf_def "loc" "m")
+            (assoc (map_of) "node" (lit (list_of "::comptime" "idf")) "loc" "m")
+            (assoc (map_of) "node" (calln "idf" (list_of (sym "y"))) "loc" "m")))
+    (caught (ref false))
+  )
+    (do
+      (try (run loc2) (catch _e (set_ref caught true)))
+      (assert_true (deref caught)
+        "a comptime fn called with a dynamic argument is a hard error")))
+
+  ; ── KEY ENCODING: a static STRING value (even one holding a space or a quote)
+  ; produces a VALID identifier variant name, and two distinct static values
+  ; that printed the same under the old `value_to_string` scheme (the string "1"
+  ; vs the int 1; "a b" vs "a_b") get DISTINCT keys — no collision, no broken IR.
+  (clear!)
+  ; valid_ident? — a 1+-char string over [A-Za-z_][A-Za-z0-9_]* (the LLVM-name
+  ; charset every emitted variant name must satisfy). Self-contained membership
+  ; check so the test does not depend on a char module.
+  (bind valid_ident?
+    (lambda (s)
+      (bind (
+        (alpha "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_")
+        (alnum "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789")
+        (chars (string_chars s))
+        (ok (ref (and (gt (size chars) 0) (string_contains alpha (get chars 0))))))
+        (do
+          (for c chars (when (not (string_contains alnum c)) (set_ref ok false)))
+          (deref ok)))))
+  (static! "box" (list_of 0))
+  (bind (
+    ; (defn box (tag x) x) — tag is the static parameter 0
+    (box_def (calln "bind" (list_of (lit "box")
+               (lam (list_of "tag" "x") (sym "x")))))
+    (use_space  (calln "box" (list_of (lit "a b") (sym "y"))))   ; string with a space
+    (use_quote  (calln "box" (list_of (lit "q\"q") (sym "y"))))  ; string with a quote
+    (use_strone (calln "box" (list_of (lit "1") (sym "y"))))     ; the STRING "1"
+    (use_intone (calln "box" (list_of (lit 1) (sym "y"))))       ; the INT 1
+    (located (list_of
+               (assoc (map_of) "node" box_def "loc" "m")
+               (assoc (map_of) "node" use_space "loc" "m")
+               (assoc (map_of) "node" use_quote "loc" "m")
+               (assoc (map_of) "node" use_strone "loc" "m")
+               (assoc (map_of) "node" use_intone "loc" "m")))
+  )
+    (do
+      (run located)
+      ; the redirected heads, by the kind-tagged scheme:
+      ;   "a b"  -> s3_<hex of 61 20 62> = s3_612062   -> box__s3_612062
+      ;   "q\"q" -> s3_<hex of 71 22 71> = s3_712271   -> box__s3_712271
+      ;   "1"    -> s1_<hex of 31>       = s1_31       -> box__s1_31
+      ;    1     -> i_1                                -> box__i_1
+      (bind (
+        (k_space  "box__s3_612062")
+        (k_quote  "box__s3_712271")
+        (k_strone "box__s1_31")
+        (k_intone "box__i_1")
+      )
+        (do
+          ; (1) string statics with a space / a quote yield VALID identifier names
+          (assert_true (valid_ident? k_space)
+            "a static string with a SPACE produces a valid identifier key")
+          (assert_true (valid_ident? k_quote)
+            "a static string with a QUOTE produces a valid identifier key")
+          (assert_true (not (eq (call_with_head located k_space) null))
+            "(box \"a b\" y) -> box__s3_612062 (call redirected to the safe key)")
+          (assert_true (not (eq (call_with_head located k_quote) null))
+            "(box \"q\\\"q\" y) -> box__s3_712271 (call redirected to the safe key)")
+          ; (2) string "1" and int 1 are DISTINCT keys — no collision (the old
+          ; value_to_string scheme rendered both as "1" and would have collided)
+          (assert_true (not (eq k_strone k_intone))
+            "the string \"1\" and the int 1 get DISTINCT keys (no collision)")
+          (assert_true (not (eq (call_with_head located k_strone) null))
+            "(box \"1\" y) -> box__s1_31")
+          (assert_true (not (eq (call_with_head located k_intone) null))
+            "(box 1 y) -> box__i_1")))))
+
+  ; run_err — run `located` and return the caught THROW value as a string (the
+  ; located diagnostic that pe throws is a plain string), or "" if run did not
+  ; throw. Lets a test assert on the ACTUAL diagnostic, not merely "something
+  ; threw" (a downstream out-of-range get would also throw and falsely pass).
+  (bind run_err
+    (lambda (located)
+      (try (do (run located) "") (catch e (value_to_string e)))))
+
+  ; ── ANNOTATION VALIDATION: a static index that is out of range (>= arity) is a
+  ; LOCATED hard error carrying the validation message, never a raw out-of-range
+  ; crash against `params`/`args`. We assert the MESSAGE, so disabling the guard
+  ; (and letting the downstream get crash) would NOT falsely pass this test. ──
+  (clear!)
+  (static! "two" (list_of 5))   ; idx 5, but `two` has arity 2 -> out of range
+  (bind (
+    (two_def (calln "bind" (list_of (lit "two")
+               (lam (list_of "a" "b") (calln "int_add" (list_of (sym "a") (sym "b")))))))
+    (locbad (list_of
+              (assoc (map_of) "node" two_def "loc" "m")
+              (assoc (map_of) "node" (calln "two" (list_of (lit 1) (lit 2))) "loc" "m")))
+  )
+    (assert_true (string_contains (run_err locbad) "is out of range")
+      "an out-of-range static index throws the LOCATED validation diagnostic"))
+  ; a negative static index is likewise rejected with the SAME validation message
+  (clear!)
+  (static! "two" (list_of -1))
+  (bind (
+    (two_def (calln "bind" (list_of (lit "two")
+               (lam (list_of "a" "b") (calln "int_add" (list_of (sym "a") (sym "b")))))))
+    (locneg (list_of
+              (assoc (map_of) "node" two_def "loc" "m")
+              (assoc (map_of) "node" (calln "two" (list_of (lit 1) (lit 2))) "loc" "m")))
+  )
+    (assert_true (string_contains (run_err locneg) "is out of range")
+      "a negative static index throws the LOCATED validation diagnostic"))
+
+  ; ── SCOPE HYGIENE (def-presence gate): a data-API `(static! …)` declared while
+  ; another module was loaded does not merge into a module that does NOT define
+  ; that name. We make the difference OBSERVABLE: the global annotation's index is
+  ; out of range; if it (wrongly) merged it would trip the validation throw. The
+  ; gate skips it because module B has no `scale`, so run completes cleanly. ──
+  (clear!)
+  (static! "scale" (list_of 4))   ; idx 4 — would be out of range for any small fn
+  (bind (
+    ; module B defines an UNRELATED `widen` (no `scale` at all)
+    (widen_def (calln "bind" (list_of (lit "widen")
+                 (lam (list_of "w") (calln "int_add" (list_of (sym "w") (lit 1)))))))
+    (modB (list_of
+            (assoc (map_of) "node" widen_def "loc" "B")
+            (assoc (map_of) "node" (calln "widen" (list_of (sym "z"))) "loc" "B")))
+  )
+    (assert_eq (run_err modB) ""
+      "a global static! for an absent name does NOT merge into module B (no throw, no bleed)"))
+  (clear!)
+
+  ; ── SCOPE HYGIENE (module-scoped isolation): static_in! pins an annotation to a
+  ; SINGLE module tag. A DIFFERENT module with its OWN same-named function does
+  ; NOT see it. Made decisive: the "A"-pinned index is out of range for module C's
+  ; `scale`; if A's pin leaked into C, validation would throw — isolated, C is
+  ; clean. (This is the case the bare def-presence gate cannot cover.) ──
+  (clear!)
+  (clear_in! "C")
+  (static_in! "A" "scale" (list_of 3))   ; idx 3, pinned to tag "A" only
+  (bind (
+    ; module C (tag "C") has its OWN arity-1 `scale`; idx 3 is out of range for it
+    (scaleC_def (calln "bind" (list_of (lit "scale")
+                  (lam (list_of "x") (sym "x")))))
+    (modC (list_of
+            (assoc (map_of) "node" scaleC_def "loc" "C")
+            (assoc (map_of) "node" (calln "scale" (list_of (lit 9))) "loc" "C")))
+  )
+    (assert_eq (run_err modC) ""
+      "module C does NOT see the \"A\"-pinned static_in! annotation (no leak, no throw)"))
+  (clear_in! "A")
+
+  ; ── MODULE-SCOPED honoring: module "A" DOES honor its own static_in! pin, and
+  ; the pin RESTRICTS the static set to its index (proving it is not just the auto
+  ; path). `scale` is called with BOTH args literal: pinning idx 0 ONLY leaves the
+  ; 2nd arg dynamic -> a `(scale__i_3 5)` variant call. WITHOUT the pin the auto
+  ; path would treat both literals as static and fully FOLD to a constant (no
+  ; scale__i_3 call). So the surviving `scale__i_3` call proves the pin was used. ──
+  (clear!)
+  (clear_in! "A")
+  (static_in! "A" "scale" (list_of 0))   ; pin ONLY idx 0 for module tag "A"
+  (bind (
+    (scaleA_def (calln "bind" (list_of (lit "scale")
+                  (lam (list_of "factor" "x")
+                    (if3 (calln "eq" (list_of (sym "factor") (lit 1)))
+                         (sym "x")
+                         (calln "int_mul" (list_of (sym "factor") (sym "x"))))))))
+    (modA (list_of
+            (assoc (map_of) "node" scaleA_def "loc" "A")
+            (assoc (map_of) "node" (calln "scale" (list_of (lit 3) (lit 5))) "loc" "A")))
+  )
+    (do
+      (run modA)
+      (bind ((c (call_with_head modA "scale__i_3")))
+        (do
+          (assert_true (not (eq c null))
+            "module \"A\" honors its static_in! pin: idx-0-only static -> a scale__i_3 variant call (not a fully-folded constant)")
+          (assert_eq (literal_of (arg (get c "node") 0)) 5
+            "the 2nd (unpinned) arg stayed a DYNAMIC literal carried to the variant")))))
+
+  ; ── clear_in! removes the pin: re-running the SAME module after clear_in! no
+  ; longer specializes via the pin — the all-literal call now AUTO-folds to the
+  ; constant 15 (no scale__i_3 call), proving the pinned marker is gone. ──
+  (clear_in! "A")
+  (bind (
+    (scaleA2_def (calln "bind" (list_of (lit "scale")
+                   (lam (list_of "factor" "x")
+                     (if3 (calln "eq" (list_of (sym "factor") (lit 1)))
+                          (sym "x")
+                          (calln "int_mul" (list_of (sym "factor") (sym "x"))))))))
+    (modA2 (list_of
+             (assoc (map_of) "node" scaleA2_def "loc" "A")
+             (assoc (map_of) "node" (calln "scale" (list_of (lit 3) (lit 5))) "loc" "A")))
+  )
+    (do
+      (run modA2)
+      (assert_true (eq (call_with_head modA2 "scale__i_3") null)
+        "after clear_in!, the pin is gone: the all-literal call AUTO-folds (no scale__i_3 variant)")
+      (assert_eq (literal_of (get (get modA2 1) "node")) 15
+        "(scale 3 5) folds to 15 once the pin no longer restricts the static set")))
+  (clear!)
+  (clear_in! "A")
+  (clear_in! "C"))

@@ -1,0 +1,227 @@
+; stdlib/lib/collections/bimap.caap — a bidirectional map (bijection) and a
+; one-to-many multimap, both over kernel maps (module
+; stdlib.lib.collections.bimap).
+;
+; A BIMAP keeps two synced kernel maps — forward (k -> v) and backward
+; (v -> k) — so both `get` and the reverse `get_key` are O(1). It is a
+; BIJECTION: each key maps to exactly one value and vice-versa, so putting a
+; key that already maps drops the stale reverse entry, and putting a value that
+; already has a key drops the stale forward entry. Keys AND values are kernel
+; map keys (strings); for arbitrary structural keys, use the dict module.
+;
+; A MULTIMAP maps each key to a LIST of values (one-to-many). Absent keys read
+; as the empty list, never throw.
+;
+; Every operation is PURE: derived structures are fresh (the inner maps/buckets
+; are copied before mutation), inputs are never touched. The `out`/`fwd`/`bwd`
+; accumulators are the function's own fresh state, so mutating them stays
+; effect-free.
+(module stdlib.lib.collections.bimap)
+
+; ── BIMAP: construction & queries ───────────────────────────────────────────
+
+; bimap_new — an empty bimap.
+;   -> : a fresh bimap with empty forward and backward maps
+(bind bimap_new
+  (lambda () (assoc (map_of) "fwd" (map_of) "bwd" (map_of))))
+
+; bimap_get — the value bound to key `k`, or null when absent. Total: never
+; throws (use bimap_has_key? to distinguish a null value from absence).
+;   b / k : a bimap and a key
+;   ->    : the forward value, or null
+(bind bimap_get
+  (lambda (b k) (get (get b "fwd") k null)))
+
+; bimap_get_key — the key bound to value `v` (the reverse lookup), or null when
+; no key maps to it. Total: never throws.
+;   b / v : a bimap and a value
+;   ->    : the backward key, or null
+(bind bimap_get_key
+  (lambda (b v) (get (get b "bwd") v null)))
+
+; bimap_has_key? — does some value map FROM key `k`?
+(bind bimap_has_key?   (lambda (b k) (contains (get b "fwd") k)))
+
+; bimap_has_value? — does some key map TO value `v`?
+(bind bimap_has_value? (lambda (b v) (contains (get b "bwd") v)))
+
+; bimap_keys — the keys (forward side) as a list.
+(bind bimap_keys   (lambda (b) (map_keys (get b "fwd"))))
+
+; bimap_values — the values (forward side) as a list.
+(bind bimap_values (lambda (b) (map_values (get b "fwd"))))
+
+; bimap_size — the number of key/value pairs.
+(bind bimap_size   (lambda (b) (size (get b "fwd"))))
+
+; bimap_empty? — has the bimap no pairs?
+(bind bimap_empty? (lambda (b) (eq (size (get b "fwd")) 0)))
+
+; copy_pair — internal: a fresh {fwd, bwd} from two source maps (each copied so
+; later mutation leaves the originals untouched).
+(bind copy_pair
+  (lambda (fwd bwd) (assoc (map_of) "fwd" (map_merge fwd) "bwd" (map_merge bwd))))
+
+; ── BIMAP: edits (pure) ─────────────────────────────────────────────────────
+
+; bimap_put — a fresh bimap with `k -> v` bound in BOTH directions. To keep the
+; bijection, any prior value of `k` loses its reverse entry, and any prior key
+; of `v` loses its forward entry.
+;   b / k / v : the source bimap and the pair to bind
+;   ->        : a fresh bimap (b untouched)
+(bind bimap_put
+  (lambda (b k v)
+    (bind ((out (copy_pair (get b "fwd") (get b "bwd")))
+           (fwd (get out "fwd"))
+           (bwd (get out "bwd")))
+      (do
+        ; drop the stale reverse entry of k's old value (if k was bound)
+        (when (contains fwd k) (map_delete bwd (get fwd k)))
+        ; drop the stale forward entry of v's old key (if v was bound)
+        (when (contains bwd v) (map_delete fwd (get bwd v)))
+        (assoc fwd k v)
+        (assoc bwd v k)
+        out))))
+
+; bimap_del_key — a fresh bimap with key `k` (and its reverse entry) removed.
+; An absent key yields an unchanged fresh copy.
+;   b / k : the source bimap and the key to drop
+;   ->    : a fresh bimap (b untouched)
+(bind bimap_del_key
+  (lambda (b k)
+    (bind ((out (copy_pair (get b "fwd") (get b "bwd")))
+           (fwd (get out "fwd"))
+           (bwd (get out "bwd")))
+      (do
+        (when (contains fwd k)
+          (do (map_delete bwd (get fwd k)) (map_delete fwd k)))
+        out))))
+
+; bimap_del_value — a fresh bimap with value `v` (and its forward entry)
+; removed. An absent value yields an unchanged fresh copy.
+;   b / v : the source bimap and the value to drop
+;   ->    : a fresh bimap (b untouched)
+(bind bimap_del_value
+  (lambda (b v)
+    (bind ((out (copy_pair (get b "fwd") (get b "bwd")))
+           (fwd (get out "fwd"))
+           (bwd (get out "bwd")))
+      (do
+        (when (contains bwd v)
+          (do (map_delete fwd (get bwd v)) (map_delete bwd v)))
+        out))))
+
+; bimap_inverse — a fresh bimap with the directions swapped (keys become
+; values and vice-versa). `(bimap_inverse (bimap_inverse b))` equals `b`.
+;   b  : a bimap
+;   -> : a fresh bimap whose forward map is `b`'s backward map
+(bind bimap_inverse
+  (lambda (b) (copy_pair (get b "bwd") (get b "fwd"))))
+
+; ── MULTIMAP: key -> list of values ─────────────────────────────────────────
+
+; mm_new — an empty multimap.
+;   -> : a fresh multimap (an empty kernel map)
+(bind mm_new (lambda () (map_of)))
+
+; mm_get — the list of values bound to key `k`, or the empty list when absent.
+; Total: never throws. The result is a fresh copy, so callers cannot mutate the
+; stored bucket.
+;   m / k : a multimap and a key
+;   ->    : a fresh list of values
+(bind mm_get
+  (lambda (m k)
+    (bind ((out (list_of)))
+      (do
+        (when (contains m k) (for x (get m k) (append out x)))
+        out))))
+
+; mm_copy — internal: a fresh multimap with every bucket copied, so a mutation
+; touches neither the source map nor its shared bucket lists.
+(bind mm_copy
+  (lambda (m)
+    (bind ((out (map_of)))
+      (do
+        (for k (map_keys m)
+          (bind ((bucket (list_of)))
+            (do (for x (get m k) (append bucket x)) (assoc out k bucket))))
+        out))))
+
+; mm_bucket_has? — internal: is value `v` already in list `bucket`?
+(bind mm_bucket_has?
+  (lambda (bucket v)
+    (bind ((found (ref false)))
+      (do
+        (for x bucket (when (eq x v) (set_ref found true)))
+        (deref found)))))
+
+; mm_add — a fresh multimap with `v` appended to the bucket of key `k`
+; (duplicates are kept; use mm_add_unique to dedup).
+;   m / k / v : the source multimap, key, and value
+;   ->        : a fresh multimap (m and its buckets untouched)
+(bind mm_add
+  (lambda (m k v)
+    (bind ((out (mm_copy m))
+           (bucket (if (contains out k) (get out k) (list_of))))
+      (do (append bucket v) (assoc out k bucket) out))))
+
+; mm_add_unique — like mm_add, but a `v` already in the bucket of `k` is not
+; appended again (the bucket stays a set of distinct values).
+;   m / k / v : the source multimap, key, and value
+;   ->        : a fresh multimap (m and its buckets untouched)
+(bind mm_add_unique
+  (lambda (m k v)
+    (bind ((out (mm_copy m))
+           (bucket (if (contains out k) (get out k) (list_of))))
+      (do
+        (unless (mm_bucket_has? bucket v) (append bucket v))
+        (assoc out k bucket)
+        out))))
+
+; mm_remove — a fresh multimap with every occurrence of `v` dropped from the
+; bucket of key `k`. When the bucket becomes empty, the key is removed entirely.
+; An absent key/value yields an unchanged fresh copy.
+;   m / k / v : the source multimap, key, and value to drop
+;   ->        : a fresh multimap (m untouched)
+(bind mm_remove
+  (lambda (m k v)
+    (bind ((out (mm_copy m)))
+      (do
+        (when (contains out k)
+          (bind ((kept (list_of)))
+            (do
+              (for x (get out k) (unless (eq x v) (append kept x)))
+              (if (eq (size kept) 0) (map_delete out k) (assoc out k kept)))))
+        out))))
+
+; mm_count — the number of values bound to key `k` (0 when absent).
+;   m / k : a multimap and a key
+;   ->    : int
+(bind mm_count
+  (lambda (m k) (if (contains m k) (size (get m k)) 0)))
+
+; mm_keys — the keys of the multimap as a list.
+;   m  : a multimap
+;   -> : a list of keys
+(bind mm_keys (lambda (m) (map_keys m)))
+
+; mm_size — the number of keys (NOT the total value count).
+;   m  : a multimap
+;   -> : int
+(bind mm_size (lambda (m) (size m)))
+
+; mm_flatten — every key/value association as a flat list of [k v] pairs.
+;   m  : a multimap
+;   -> : a fresh list of 2-element lists, one per (k, value-in-bucket)
+(bind mm_flatten
+  (lambda (m)
+    (bind ((out (list_of)))
+      (do
+        (for k (map_keys m)
+          (for v (get m k) (append out (list_of k v))))
+        out))))
+
+(export bimap_new bimap_get bimap_get_key bimap_has_key? bimap_has_value?
+        bimap_keys bimap_values bimap_size bimap_empty?
+        bimap_put bimap_del_key bimap_del_value bimap_inverse
+        mm_new mm_get mm_add mm_remove mm_count mm_keys mm_size mm_flatten)

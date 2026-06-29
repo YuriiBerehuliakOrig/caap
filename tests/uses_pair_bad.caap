@@ -1,0 +1,7 @@
+; uses_pair_bad — field `b` of (pair int string) is a string; declaring the
+; result int is a certain body mismatch.
+(module stdlib.fixtures.uses_pair_bad)
+(use stdlib.fixtures.user_typefn registered)
+(defn snd_as_int ((p (pair int string))) int
+  (get p "b" ""))
+(export snd_as_int)

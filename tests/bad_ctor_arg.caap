@@ -1,0 +1,9 @@
+; tests/bad_ctor_arg.caap — wrong argument type to a struct
+; constructor (a string into an i32 field) fails the load-time type pass.
+(module stdlib.fixtures.bad_ctor_arg)
+
+(struct Pt2 (x i32) (y i32))
+
+(bind p (make_Pt2 "a" 2))
+
+(export p)

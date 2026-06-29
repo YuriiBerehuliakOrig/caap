@@ -1,0 +1,431 @@
+; stdlib/lib/crypto/digest.caap — cryptographic message digests in pure CAAP
+; (module stdlib.lib.crypto.digest).
+;
+; SHA-256, SHA-1 and MD5 — the three digests a build/tooling layer reaches for
+; (content addressing, subresource integrity, legacy interop). Output is a
+; lowercase hex string via stdlib.lib.text.encoding.hex_encode.
+;
+; All three are 32-bit-word algorithms. The kernel int is i64 and its bitwise/
+; arithmetic builtins are CHECKED (clean errors, never wraps), so every add,
+; rotate and shift is MASKED back to 32 bits with `(int_and … mask32)` to wrap
+; exactly like a real `u32`. That masking is the whole correctness story: drop a
+; mask and the i64 value drifts and the digest is wrong — the known-answer
+; vectors in tests/test_digest.caap catch any such bug.
+;
+; Endianness is per-spec: SHA-1/SHA-256 are big-endian (length and word packing
+; high byte first); MD5 is little-endian (low byte first).
+;
+; SHA-512 is DEFERRED: it operates on 64-bit lanes whose intermediate sums need
+; the full u64 range (the kernel i64 cannot hold a u64 add before masking), so a
+; correct port needs limb arithmetic — out of scope for this masking-only unit.
+(module stdlib.lib.crypto.digest)
+
+(use stdlib.lib.text.encoding hex_encode hex_decode)
+(use stdlib.lib.collections.sequence each range reverse concat)
+
+; ── 32-bit primitives ───────────────────────────────────────────────────────
+; mask32 — 0xFFFFFFFF, the 32-bit wrap-around mask.
+(bind mask32 4294967295)
+
+; m32 — confine `x` to 32 bits.
+(bind m32 (lambda (x) (int_and x mask32)))
+
+; add32 — 32-bit wrapping add of two already-masked words.
+(bind add32 (lambda (a b) (m32 (int_add a b))))
+
+; add32_4 / add32_5 — n-ary wrapping adds (compression rounds add several
+; terms; folding through add32 keeps every partial sum inside 32 bits).
+(bind add32_4 (lambda (a b c d) (add32 (add32 a b) (add32 c d))))
+(bind add32_5 (lambda (a b c d e) (add32 (add32_4 a b c d) e)))
+
+; shr32 — logical right shift. `x` is masked so the sign bit is clear and the
+; kernel's arithmetic `int_shr` behaves as a logical shift here.
+(bind shr32 (lambda (x n) (int_shr x n)))
+
+; rotr32 / rotl32 — 32-bit rotates. Mask the OR so the bits shifted past bit 31
+; on the left half are discarded.
+(bind rotr32
+  (lambda (x n)
+    (m32 (int_or (int_shr x n) (int_shl x (int_sub 32 n))))))
+(bind rotl32
+  (lambda (x n)
+    (m32 (int_or (int_shl x n) (int_shr x (int_sub 32 n))))))
+
+; ── small compare helpers ────────────────────────────────────────────────────
+; int_lt / int_ge — comparison aliases (loops below read clearer with names that
+; say "integer comparison"; `lt`/`ge` are the kernel's polymorphic ops).
+(bind int_lt (lambda (a b) (lt a b)))
+(bind int_ge (lambda (a b) (ge a b)))
+
+; ── input / output helpers ──────────────────────────────────────────────────
+; bytes_of — a string's UTF-8 bytes as a list of ints 0..255; an existing byte
+; list passes through. Every public digest accepts either spelling.
+(bind bytes_of
+  (lambda (v)
+    (if (eq (value_type v) "string")
+      (bytes_to_list (string->bytes v))
+      v)))
+
+; to_hex — a list of digest bytes (0..255 ints) -> lowercase hex string. Routed
+; through hex_encode, which speaks bytes, so the int list is sealed into a
+; kernel bytes value first.
+(bind to_hex (lambda (byte_list) (hex_encode (bytes_from_list byte_list))))
+
+; digest_bytes — a digest's hex string decoded back to a byte list. HMAC
+; re-feeds an inner digest (and a long key's digest) as bytes; the imported
+; hex_decode validates even-length/hex and returns a kernel bytes value, which
+; we explode to an indexable/iterable int list.
+(bind digest_bytes (lambda (hex) (bytes_to_list (hex_decode hex))))
+
+; ── padding ─────────────────────────────────────────────────────────────────
+; length_bytes — a non-negative length-in-bits as 8 bytes, big- or
+; little-endian. Built little-endian via shift/mask, then reversed for
+; big-endian. Real inputs are far under 2^53 bytes, so the bit length fits an
+; i64 exactly (no high-word wrap needed).
+(bind length_bytes
+  (lambda (value big_endian)
+    (bind ((le (list_of)) (v (ref value)) (i (ref 0)))
+      (do
+        (while (int_lt (deref i) 8)
+          (do
+            (append le (int_and (deref v) 255))
+            (set_ref v (int_shr (deref v) 8))
+            (set_ref i (int_add (deref i) 1))))
+        (if big_endian (reverse le) le)))))
+
+; pad_message — append the standard Merkle–Damgård padding: a 0x80 byte, then
+; 0x00 bytes until the length is 56 mod 64, then the original BIT length as an
+; 8-byte integer. `big_endian` selects the length field's byte order
+; (SHA = big-endian, MD5 = little-endian).
+;   bytes       : the message as a byte list (0..255)
+;   big_endian  : true for SHA, false for MD5
+;   ->          : a new byte list whose length is a multiple of 64
+(bind pad_message
+  (lambda (bytes big_endian)
+    (bind ((out (list_of))
+           (n (size bytes))
+           (bit_len (int_mul n 8)))
+      (do
+        (each (range 0 n) (lambda (i) (append out (get bytes i))))
+        (append out 128)
+        (while (not (eq (int_mod (size out) 64) 56))
+          (append out 0))
+        (each (length_bytes bit_len big_endian) (lambda (b) (append out b)))
+        out))))
+
+; ── word packing ────────────────────────────────────────────────────────────
+; read_word_be / read_word_le — the 4 bytes at offset `off` as one 32-bit word.
+(bind read_word_be
+  (lambda (bytes off)
+    (m32 (int_or
+           (int_or (int_shl (get bytes off) 24)
+                   (int_shl (get bytes (int_add off 1)) 16))
+           (int_or (int_shl (get bytes (int_add off 2)) 8)
+                   (get bytes (int_add off 3)))))))
+(bind read_word_le
+  (lambda (bytes off)
+    (m32 (int_or
+           (int_or (get bytes off)
+                   (int_shl (get bytes (int_add off 1)) 8))
+           (int_or (int_shl (get bytes (int_add off 2)) 16)
+                   (int_shl (get bytes (int_add off 3)) 24))))))
+
+; words_be / words_le — a padded message split into 32-bit words (one list).
+(bind words_be
+  (lambda (padded)
+    (bind ((out (list_of)) (n (size padded)) (i (ref 0)))
+      (do
+        (while (int_lt (deref i) n)
+          (do
+            (append out (read_word_be padded (deref i)))
+            (set_ref i (int_add (deref i) 4))))
+        out))))
+(bind words_le
+  (lambda (padded)
+    (bind ((out (list_of)) (n (size padded)) (i (ref 0)))
+      (do
+        (while (int_lt (deref i) n)
+          (do
+            (append out (read_word_le padded (deref i)))
+            (set_ref i (int_add (deref i) 4))))
+        out))))
+
+; word_bytes_be / word_bytes_le — a 32-bit word as 4 bytes appended onto `out`.
+(bind word_bytes_be
+  (lambda (out w)
+    (do
+      (append out (int_and (int_shr w 24) 255))
+      (append out (int_and (int_shr w 16) 255))
+      (append out (int_and (int_shr w 8) 255))
+      (append out (int_and w 255))
+      out)))
+(bind word_bytes_le
+  (lambda (out w)
+    (do
+      (append out (int_and w 255))
+      (append out (int_and (int_shr w 8) 255))
+      (append out (int_and (int_shr w 16) 255))
+      (append out (int_and (int_shr w 24) 255))
+      out)))
+
+; block_words — words[base .. base+16) as a fresh 16-word list (one message
+; block's worth, shared by every digest's per-block loop).
+(bind block_words_at
+  (lambda (allwords base)
+    (bind ((bw (list_of)))
+      (do
+        (each (range 0 16) (lambda (j) (append bw (get allwords (int_add base j)))))
+        bw))))
+
+; ── SHA-256 ─────────────────────────────────────────────────────────────────
+; sha256_k — the 64 round constants (first 32 bits of the fractional parts of
+; the cube roots of the first 64 primes).
+(bind sha256_k
+  (list_of
+    1116352408 1899447441 3049323471 3921009573 961987163 1508970993
+    2453635748 2870763221 3624381080 310598401 607225278 1426881987
+    1925078388 2162078206 2614888103 3248222580 3835390401 4022224774
+    264347078 604807628 770255983 1249150122 1555081692 1996064986
+    2554220882 2821834349 2952996808 3210313671 3336571891 3584528711
+    113926993 338241895 666307205 773529912 1294757372 1396182291
+    1695183700 1986661051 2177026350 2456956037 2730485921 2820302411
+    3259730800 3345764771 3516065817 3600352804 4094571909 275423344
+    430227734 506948616 659060556 883997877 958139571 1322822218
+    1537002063 1747873779 1955562222 2024104815 2227730452 2361852424
+    2428436474 2756734187 3204031479 3329325298))
+
+; sha256_block — fold one 16-word block into running state h (8 words). Returns
+; the new state list.
+(bind sha256_block
+  (lambda (h block)
+    (bind ((w (list_of)))
+      (do
+        (each (range 0 16) (lambda (i) (append w (get block i))))
+        (each (range 16 64)
+          (lambda (i)
+            (bind ((w15 (get w (int_sub i 15)))
+                   (w2  (get w (int_sub i 2)))
+                   (s0 (int_xor (int_xor (rotr32 w15 7) (rotr32 w15 18)) (shr32 w15 3)))
+                   (s1 (int_xor (int_xor (rotr32 w2 17) (rotr32 w2 19)) (shr32 w2 10))))
+              (append w (add32_4 (get w (int_sub i 16)) s0 (get w (int_sub i 7)) s1)))))
+        (bind ((a (ref (get h 0))) (b (ref (get h 1))) (c (ref (get h 2)))
+               (d (ref (get h 3))) (e (ref (get h 4))) (f (ref (get h 5)))
+               (g (ref (get h 6))) (hh (ref (get h 7))))
+          (do
+            (each (range 0 64)
+              (lambda (i)
+                (bind ((S1 (int_xor (int_xor (rotr32 (deref e) 6) (rotr32 (deref e) 11)) (rotr32 (deref e) 25)))
+                       (ch (int_xor (int_and (deref e) (deref f)) (int_and (m32 (int_not (deref e))) (deref g))))
+                       (t1 (add32_5 (deref hh) S1 ch (get sha256_k i) (get w i)))
+                       (S0 (int_xor (int_xor (rotr32 (deref a) 2) (rotr32 (deref a) 13)) (rotr32 (deref a) 22)))
+                       (maj (int_xor (int_xor (int_and (deref a) (deref b)) (int_and (deref a) (deref c))) (int_and (deref b) (deref c))))
+                       (t2 (add32 S0 maj)))
+                  (do
+                    (set_ref hh (deref g))
+                    (set_ref g (deref f))
+                    (set_ref f (deref e))
+                    (set_ref e (add32 (deref d) t1))
+                    (set_ref d (deref c))
+                    (set_ref c (deref b))
+                    (set_ref b (deref a))
+                    (set_ref a (add32 t1 t2))))))
+            (list_of
+              (add32 (get h 0) (deref a)) (add32 (get h 1) (deref b))
+              (add32 (get h 2) (deref c)) (add32 (get h 3) (deref d))
+              (add32 (get h 4) (deref e)) (add32 (get h 5) (deref f))
+              (add32 (get h 6) (deref g)) (add32 (get h 7) (deref hh)))))))))
+
+; sha256 — SHA-256 digest of `input` (a string or byte list) as 64 lowercase
+; hex chars.
+(defn sha256 ((input any)) string
+    (bind ((padded (pad_message (bytes_of input) true))
+           (allwords (words_be padded))
+           (nblocks (int_div (size allwords) 16))
+           (state (ref (list_of 1779033703 3144134277 1013904242 2773480762
+                                1359893119 2600822924 528734635 1541459225)))
+           (blk (ref 0)))
+      (do
+        (while (int_lt (deref blk) nblocks)
+          (do
+            (set_ref state (sha256_block (deref state) (block_words_at allwords (int_mul (deref blk) 16))))
+            (set_ref blk (int_add (deref blk) 1))))
+        (bind ((out (list_of)))
+          (do
+            (each (deref state) (lambda (wd) (word_bytes_be out wd)))
+            (to_hex out))))))
+
+; ── SHA-1 ───────────────────────────────────────────────────────────────────
+; sha1_block — fold one 16-word block into state h (5 words). Returns the new
+; state list.
+(bind sha1_block
+  (lambda (h block)
+    (bind ((w (list_of)))
+      (do
+        (each (range 0 16) (lambda (i) (append w (get block i))))
+        (each (range 16 80)
+          (lambda (i)
+            (append w
+              (rotl32
+                (int_xor
+                  (int_xor (get w (int_sub i 3)) (get w (int_sub i 8)))
+                  (int_xor (get w (int_sub i 14)) (get w (int_sub i 16))))
+                1))))
+        (bind ((a (ref (get h 0))) (b (ref (get h 1))) (c (ref (get h 2)))
+               (d (ref (get h 3))) (e (ref (get h 4))))
+          (do
+            (each (range 0 80)
+              (lambda (i)
+                (bind ((fk
+                         (cond
+                           ((lt i 20) (list_of
+                                        (int_or (int_and (deref b) (deref c))
+                                                (int_and (m32 (int_not (deref b))) (deref d)))
+                                        1518500249))
+                           ((lt i 40) (list_of
+                                        (int_xor (int_xor (deref b) (deref c)) (deref d))
+                                        1859775393))
+                           ((lt i 60) (list_of
+                                        (int_or (int_or (int_and (deref b) (deref c))
+                                                        (int_and (deref b) (deref d)))
+                                                (int_and (deref c) (deref d)))
+                                        2400959708))
+                           (else (list_of
+                                   (int_xor (int_xor (deref b) (deref c)) (deref d))
+                                   3395469782))))
+                       (f (get fk 0))
+                       (k (get fk 1))
+                       (temp (add32_5 (rotl32 (deref a) 5) f (deref e) k (get w i))))
+                  (do
+                    (set_ref e (deref d))
+                    (set_ref d (deref c))
+                    (set_ref c (rotl32 (deref b) 30))
+                    (set_ref b (deref a))
+                    (set_ref a temp)))))
+            (list_of
+              (add32 (get h 0) (deref a)) (add32 (get h 1) (deref b))
+              (add32 (get h 2) (deref c)) (add32 (get h 3) (deref d))
+              (add32 (get h 4) (deref e)))))))))
+
+; sha1 — SHA-1 digest of `input` as 40 lowercase hex chars.
+(defn sha1 ((input any)) string
+    (bind ((padded (pad_message (bytes_of input) true))
+           (allwords (words_be padded))
+           (nblocks (int_div (size allwords) 16))
+           (state (ref (list_of 1732584193 4023233417 2562383102 271733878 3285377520)))
+           (blk (ref 0)))
+      (do
+        (while (int_lt (deref blk) nblocks)
+          (do
+            (set_ref state (sha1_block (deref state) (block_words_at allwords (int_mul (deref blk) 16))))
+            (set_ref blk (int_add (deref blk) 1))))
+        (bind ((out (list_of)))
+          (do
+            (each (deref state) (lambda (wd) (word_bytes_be out wd)))
+            (to_hex out))))))
+
+; ── MD5 ─────────────────────────────────────────────────────────────────────
+; md5_s — per-round left-rotate amounts (4 groups of 16).
+(bind md5_s
+  (list_of
+    7 12 17 22 7 12 17 22 7 12 17 22 7 12 17 22
+    5 9 14 20 5 9 14 20 5 9 14 20 5 9 14 20
+    4 11 16 23 4 11 16 23 4 11 16 23 4 11 16 23
+    6 10 15 21 6 10 15 21 6 10 15 21 6 10 15 21))
+
+; md5_k — the 64 constants floor(2^32 * abs(sin(i+1))).
+(bind md5_k
+  (list_of
+    3614090360 3905402710 606105819 3250441966 4118548399 1200080426
+    2821735955 4249261313 1770035416 2336552879 4294925233 2304563134
+    1804603682 4254626195 2792965006 1236535329 4129170786 3225465664
+    643717713 3921069994 3593408605 38016083 3634488961 3889429448
+    568446438 3275163606 4107603335 1163531501 2850285829 4243563512
+    1735328473 2368359562 4294588738 2272392833 1839030562 4259657740
+    2763975236 1272893353 4139469664 3200236656 681279174 3936430074
+    3572445317 76029189 3654602809 3873151461 530742520 3299628645
+    4096336452 1126891415 2878612391 4237533241 1700485571 2399980690
+    4293915773 2240044497 1873313359 4264355552 2734768916 1309151649
+    4149444226 3174756917 718787259 3951481745))
+
+; md5_block — fold one 16-word block into state h (4 words). Returns the new
+; state list.
+(bind md5_block
+  (lambda (h block)
+    (bind ((a (ref (get h 0))) (b (ref (get h 1))) (c (ref (get h 2))) (d (ref (get h 3))))
+      (do
+        (each (range 0 64)
+          (lambda (i)
+            (bind ((fg
+                     (cond
+                       ((lt i 16) (list_of
+                                    (int_or (int_and (deref b) (deref c))
+                                            (int_and (m32 (int_not (deref b))) (deref d)))
+                                    i))
+                       ((lt i 32) (list_of
+                                    (int_or (int_and (deref d) (deref b))
+                                            (int_and (m32 (int_not (deref d))) (deref c)))
+                                    (int_mod (int_add (int_mul 5 i) 1) 16)))
+                       ((lt i 48) (list_of
+                                    (int_xor (int_xor (deref b) (deref c)) (deref d))
+                                    (int_mod (int_add (int_mul 3 i) 5) 16)))
+                       (else (list_of
+                               (int_xor (deref c) (m32 (int_or (deref b) (m32 (int_not (deref d))))))
+                               (int_mod (int_mul 7 i) 16)))))
+                   (f (get fg 0))
+                   (g (get fg 1))
+                   (tmp (add32_4 f (deref a) (get md5_k i) (get block g))))
+              (do
+                (set_ref a (deref d))
+                (set_ref d (deref c))
+                (set_ref c (deref b))
+                (set_ref b (add32 (deref b) (rotl32 tmp (get md5_s i))))))))
+        (list_of
+          (add32 (get h 0) (deref a)) (add32 (get h 1) (deref b))
+          (add32 (get h 2) (deref c)) (add32 (get h 3) (deref d)))))))
+
+; md5 — MD5 digest of `input` as 32 lowercase hex chars.
+(defn md5 ((input any)) string
+    (bind ((padded (pad_message (bytes_of input) false))
+           (allwords (words_le padded))
+           (nblocks (int_div (size allwords) 16))
+           (state (ref (list_of 1732584193 4023233417 2562383102 271733878)))
+           (blk (ref 0)))
+      (do
+        (while (int_lt (deref blk) nblocks)
+          (do
+            (set_ref state (md5_block (deref state) (block_words_at allwords (int_mul (deref blk) 16))))
+            (set_ref blk (int_add (deref blk) 1))))
+        (bind ((out (list_of)))
+          (do
+            (each (deref state) (lambda (wd) (word_bytes_le out wd)))
+            (to_hex out))))))
+
+; ── HMAC ─────────────────────────────────────────────────────────────────────
+; hmac — keyed-hash MAC (RFC 2104). `hashfn` is one of the digests above passed
+; as a value (taking bytes/string -> hex). All three share a 64-byte block, so
+; the block size is fixed at 64.
+;   hashfn : sha256 | sha1 | md5
+;   key    : string or byte list
+;   msg    : string or byte list
+;   ->     : the MAC as a lowercase hex string
+; HMAC(K,m) = H((K' ^ opad) || H((K' ^ ipad) || m)), K' = key hashed-if-long then
+; zero-padded to the block size.
+(defn hmac ((hashfn callable) (key any) (msg any)) string
+    (bind ((block 64)
+           (kbytes (bytes_of key))
+           (k0 (if (gt (size kbytes) block) (digest_bytes (hashfn kbytes)) kbytes))
+           (kpad (list_of))
+           (ipad (list_of))
+           (opad (list_of)))
+      (do
+        (each (range 0 block)
+          (lambda (i) (append kpad (if (lt i (size k0)) (get k0 i) 0))))
+        (each (range 0 block)
+          (lambda (i)
+            (do
+              (append ipad (int_xor (get kpad i) 54))     ; 0x36
+              (append opad (int_xor (get kpad i) 92)))))   ; 0x5c
+        (bind ((inner (digest_bytes (hashfn (concat ipad (bytes_of msg))))))
+          (hashfn (concat opad inner))))))
+
+(export sha256 sha1 md5 hmac)

@@ -1,0 +1,101 @@
+; stdlib/lib/test_error.caap — in-language tests for lib/error.
+
+;; @area: diag
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.diag.error make_error error? error_code error_message error_data
+     with_data map_data raise! as_error with_cause error_cause)
+
+(do
+  (bind ((e (make_error "x.y" "boom" (assoc (map_of) "k" 1))))
+    (do
+      (assert_true (error? e) "make_error builds a protocol error")
+      (assert_eq (error_code e) "x.y" "code accessor")
+      (assert_eq (error_message e) "boom" "message accessor")
+      (assert_eq (get (error_data e) "k" 0) 1 "data accessor")))
+  (assert_eq (error? 42) false "non-map is not an error")
+  (assert_eq (error? (map_of)) false "plain map is not an error")
+
+  ; raise!/catch round-trip keeps the value intact
+  (assert_eq
+    (error_code (try (raise! "a.b" "m" null) (catch e e)))
+    "a.b" "raise! throws the protocol value")
+
+  ; as_error: the three channels normalize
+  (assert_eq
+    (error_code (as_error (make_error "keep" "" null)))
+    "keep" "protocol errors pass through")
+  (assert_eq
+    (error_code (as_error (try (int_add 1 (get (map_of) "k" "x")) (catch e e))))
+    "caap.eval" "kernel eval errors normalize")
+  (assert_true
+    (string_contains
+      (error_message (as_error (try (int_add 1 (get (map_of) "k" "x")) (catch e e))))
+      "int_add") "eval message preserved")
+  (assert_eq
+    (error_code (as_error (try (throw "plain") (catch e e))))
+    "caap.thrown" "thrown non-errors normalize")
+
+  ; ── with_data: immutable enrichment of an error's data map ──
+  (bind ((e0 (make_error "x.y" "boom" (assoc (map_of) "a" 1))))
+    (bind ((e1 (with_data e0 "b" 2)))
+      (do
+        (assert_eq (get (error_data e1) "a" 0) 1 "with_data keeps existing data")
+        (assert_eq (get (error_data e1) "b" 0) 2 "with_data adds the new key")
+        (assert_eq (error_code e1) "x.y" "with_data preserves the code")
+        (assert_eq (error_message e1) "boom" "with_data preserves the message")
+        (assert_eq (contains (error_data e0) "b") false "with_data does not mutate the original"))))
+  ; with_data on an error with NO data (null) starts from an empty map
+  (bind ((en (with_data (make_error "n" "m" null) "k" 9)))
+    (assert_eq (get (error_data en) "k" 0) 9 "with_data enriches a null-data error"))
+
+  ; ── map_data: transform the whole data map ──
+  (bind ((em (map_data (make_error "c" "m" (assoc (map_of) "x" 1))
+               (lambda (d) (assoc (map_of) "x" (int_add (get d "x" 0) 10) "y" 5)))))
+    (do
+      (assert_eq (get (error_data em) "x" 0) 11 "map_data sees the current data")
+      (assert_eq (get (error_data em) "y" 0) 5  "map_data installs the new map")))
+  ; map_data over a null-data error hands the transform an empty map
+  (assert_eq
+    (get (error_data (map_data (make_error "c" "m" null)
+                       (lambda (d) (assoc d "seeded" true)))) "seeded" false)
+    true "map_data over null-data starts from an empty map")
+
+  ; ── with_cause / error_cause: a data-only chain of underlying errors ──
+  (bind ((root  (make_error "io.read" "disk failed" null))
+         (outer (with_cause (make_error "load" "could not load" null) root)))
+    (do
+      (assert_eq (error_code (error_cause outer)) "io.read"
+        "error_cause returns the recorded cause")
+      (assert_eq (error_message (error_cause outer)) "disk failed"
+        "the recorded cause keeps its message")
+      (assert_eq (error_code outer) "load" "with_cause preserves the outer code")
+      (assert_eq (error_message outer) "could not load"
+        "with_cause preserves the outer message")
+      ; with_cause does not mutate the original error
+      (assert_eq (error_cause (make_error "load" "could not load" null)) null
+        "a plain error has no cause")))
+  ; error_cause is total on a no-cause / null-data error
+  (assert_eq (error_cause (make_error "x" "m" null)) null
+    "error_cause of a null-data error is null")
+  (assert_eq (error_cause (make_error "x" "m" (assoc (map_of) "k" 1))) null
+    "error_cause of a data-without-cause error is null")
+  ; a cause chain can be walked: error_cause until null
+  (bind ((c0 (make_error "a" "first" null))
+         (c1 (with_cause (make_error "b" "second" null) c0))
+         (c2 (with_cause (make_error "c" "third" null) c1)))
+    (do
+      (assert_eq (error_code (error_cause c2)) "b" "chain: c2's cause is b")
+      (assert_eq (error_code (error_cause (error_cause c2))) "a"
+        "chain: b's cause is a")
+      (assert_eq (error_cause (error_cause (error_cause c2))) null
+        "chain: a has no cause (chain bottoms out)")))
+  ; with_cause coexists with with_data (both write into the data map)
+  (bind ((e (with_data (with_cause (make_error "z" "m" null)
+                         (make_error "u" "under" null))
+              "k" 7)))
+    (do
+      (assert_eq (get (error_data e) "k" 0) 7 "with_data field survives with_cause")
+      (assert_eq (error_code (error_cause e)) "u" "cause survives with_data")))
+  true)

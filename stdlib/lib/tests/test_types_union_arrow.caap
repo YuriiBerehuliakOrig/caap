@@ -1,0 +1,138 @@
+; stdlib/lib/tests/test_types_union_arrow.caap — UNION types and structural
+; ARROW (function) types in the gradual type checker (tier 4).
+;
+; Two gaps this closes:
+;   • the `::union` marker is now a real "union" descriptor in the registry, so
+;     a member-typed value is assignable INTO the union, a union value IS a map
+;     at runtime, and a match over a union value gets MEMBER exhaustiveness.
+;   • a function position spelled `(fn P… R)` lowers to "fn<P…,R>" and resolves
+;     to an "arrow" descriptor, so a higher-order callback's param/result types
+;     are CHECKED instead of collapsing to the opaque `callable` primitive.
+;
+; Driven over the pass + registry APIs directly (like test_alias / test_check),
+; plus the match_check exhaustiveness fact channel (like test_match_check). The
+; gradual contract is asserted alongside: a bare `callable`, `any`, and unknown
+; (null) stay permissive — never a false positive.
+
+;; @area: types
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.types.registry
+     assignable? define_union! union? union_members
+     arrow? arrow_params arrow_result resolve)
+(use stdlib.semantics.passes.match_check check)
+(use stdlib.semantics.passes.registry fact!)
+(use stdlib.syntax.ast sym lit calln call loc)
+(use stdlib.lib.collections.sequence any?)
+
+(do
+  (bind (
+    (has (lambda (fs n) (any? fs (lambda (f) (string_contains f n)))))
+    ; an arm (pat body): a call whose CALLEE is the pattern (match_check shape)
+    (arm (lambda (pat body) (call pat (list_of body))))
+    (member (lambda (nm ty) (assoc (map_of) "name" nm "type" ty)))
+  )
+    (do
+      ; ── UNION descriptor: registered from members, read back ──────────────
+      (define_union! "Reg"
+        (list_of (member "raw" "u32") (member "lo" "u16") (member "b0" "u8")))
+      (assert_true (union? "Reg") "Reg resolves as a union type")
+      (assert_eq (size (union_members "Reg")) 3 "Reg records its three members")
+      (assert_true (eq (get (resolve "Reg") "kind") "union")
+        "resolve sees the union kind")
+
+      ; ── (a) a value of a MEMBER type is assignable INTO the union ──────────
+      ; (overlapping storage: any member-typed value reinterprets as the union)
+      (assert_true (assignable? "Reg" "u32") "a u32 value fits the Reg union")
+      (assert_true (assignable? "Reg" "u16") "a u16 value fits the Reg union")
+      ; a union value IS a map at runtime — both directions pass
+      (assert_true (assignable? "map" "Reg") "a Reg union is a map at runtime")
+      (assert_true (assignable? "Reg" "map") "a map satisfies a Reg union want")
+      ; assigning OUT of the union to a NON-member target is rejected (not every
+      ; reinterpretation — u32/u16/u8 — satisfies string)
+      (assert_true (not (assignable? "string" "Reg"))
+        "a union is not assignable to an unrelated target")
+      ; gradual: unknown / any / callable never false-positive against a union
+      (assert_true (assignable? "Reg" null) "unknown got stays permissive")
+      (assert_true (assignable? "any" "Reg") "any want stays permissive")
+
+      ; ── (b) ARROW (function) types: structural callback signatures ─────────
+      (assert_true (arrow? "fn<int,bool>") "fn<int,bool> resolves as an arrow")
+      (assert_eq (arrow_result "fn<int,bool>") "bool" "arrow result reads back")
+      (assert_eq (size (arrow_params "fn<int,bool>")) 1 "one declared param type")
+      (assert_eq (get (arrow_params "fn<int,bool>") 0) "int"
+        "the declared param type reads back")
+      (assert_true (arrow? "fn<bool>") "a nullary fn<R> is still an arrow")
+      (assert_eq (size (arrow_params "fn<bool>")) 0 "fn<bool> has no params")
+
+      ; a matching higher-order signature typechecks (callback param + result
+      ; agree); a bare `callable` stays gradual and satisfies any arrow want
+      (assert_true (assignable? "fn<int,bool>" "fn<int,bool>")
+        "an arrow is assignable to an identical arrow")
+      (assert_true (assignable? "fn<int,int,bool>" "fn<int,int,bool>")
+        "a two-param arrow matches itself")
+      (assert_true (assignable? "fn<int,bool>" "callable")
+        "a bare callable satisfies an arrow want (gradual)")
+      (assert_true (assignable? "callable" "fn<int,bool>")
+        "an arrow satisfies a bare callable want")
+
+      ; ── (c) REJECTED cases: wrong arrow signature ─────────────────────────
+      ; result mismatch — fn<int,bool> wanted, fn<int,string> given
+      (assert_true (not (assignable? "fn<int,bool>" "fn<int,string>"))
+        "an arrow result mismatch is a certain error")
+      ; arity mismatch — one param wanted, two given
+      (assert_true (not (assignable? "fn<int,bool>" "fn<int,int,bool>"))
+        "an arrow arity mismatch is a certain error")
+      ; param-type mismatch — fn<string,bool> wanted, fn<int,bool> given
+      (assert_true (not (assignable? "fn<string,bool>" "fn<int,bool>"))
+        "an arrow parameter mismatch is a certain error")
+
+      ; ── (c) REJECTED via the THROW path: a duplicate union type name ──────
+      ; define_union! over an already-registered name throws — caught + asserted
+      (assert_true
+        (try (do (define_union! "Reg" (list_of (member "x" "u8"))) false)
+          (catch e (string_contains (value_to_string e) "already defined")))
+        "re-declaring a registered union name is rejected")
+
+      ; ── UNION MATCH EXHAUSTIVENESS (match_check) ──────────────────────────
+      ; a union match covering only "raw" of {raw, lo, b0} is non-exhaustive;
+      ; a union clause matches a member by its NAME (a string-literal pattern).
+      (bind ((sp1 (map_of "start" 0 "end" 1 "start_line" 7 "start_col" 3
+                          "end_line" 7 "end_col" 9 "path" "union_arrow_demo.caap"))
+             (incomplete (ctfe_spec_with_span
+                           (calln "match"
+                             (list_of (sym "r") (arm (lit "raw") (lit 1))))
+                           sp1)))
+        (do
+          (fact! "match_union" (loc incomplete) (list_of "raw" "lo" "b0"))
+          (assert_true (has (check incomplete) "uncovered union member(s)")
+            "non-exhaustive union match is flagged")))
+
+      ; covering every member is exhaustive (no finding)
+      (bind ((sp2 (map_of "start" 0 "end" 1 "start_line" 9 "start_col" 3
+                          "end_line" 9 "end_col" 9 "path" "union_arrow_demo.caap"))
+             (complete (ctfe_spec_with_span
+                         (calln "match"
+                           (list_of (sym "r")
+                             (arm (lit "raw") (lit 1)) (arm (lit "lo") (lit 2))
+                             (arm (lit "b0") (lit 3))))
+                         sp2)))
+        (do
+          (fact! "match_union" (loc complete) (list_of "raw" "lo" "b0"))
+          (assert_eq (size (check complete)) 0
+            "a union match covering every member is exhaustive")))
+
+      ; a catch-all covers any remaining members (reuses the existing machinery)
+      (bind ((sp3 (map_of "start" 0 "end" 1 "start_line" 11 "start_col" 3
+                          "end_line" 11 "end_col" 9 "path" "union_arrow_demo.caap"))
+             (withcatch (ctfe_spec_with_span
+                          (calln "match"
+                            (list_of (sym "r")
+                              (arm (lit "raw") (lit 1)) (arm (sym "_") (lit 0))))
+                          sp3)))
+        (do
+          (fact! "match_union" (loc withcatch) (list_of "raw" "lo" "b0"))
+          (assert_eq (size (check withcatch)) 0
+            "a catch-all covers the remaining union members")))
+      true)))

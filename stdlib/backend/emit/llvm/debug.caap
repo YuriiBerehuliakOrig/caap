@@ -1,0 +1,287 @@
+; stdlib/backend/emit/llvm/debug.caap — target policy + DWARF debug infrastructure
+; for the LLVM emitter (module stdlib.backend.emit.llvm.debug).
+;
+; This leaf owns two opt-in mechanisms that the emitter threads but that are inert
+; on the default (host, no-debug) path, so it is the lowest layer of the split:
+;   - the cross/freestanding TARGET policy (current_target + set_target!/
+;     clear_target!/emit_with_target), shared module-wide via the `current_target`
+;     ref cell; and
+;   - the DWARF debug-info infrastructure (dbg_new + the `di_*` metadata-node
+;     builders), which is a strict no-op when debug_level is "none".
+; It has no dependency back into the type-lowering, instruction, or emit layers —
+; the composite-type builder is passed IN as `composite?` (see di_type_ref /
+; di_subprogram!), so this module carries no forward reference.
+(module stdlib.backend.emit.llvm.debug)
+
+(use stdlib.backend.prep set_target_ptr_bytes! clear_target_ptr_bytes!)
+
+; diag — one emitter diagnostic in the CLI's expected shape.
+(bind diag
+  (lambda (message)
+    (assoc (map_of)
+      "code" "stdlib.llvm.error"
+      "severity" "error"
+      "message" message
+      "node_name" "<llvm-emit>"
+      "path" "<program>")))
+
+; ── target policy (opt-in; host default when unset) ─────────────────────────
+; The emitter is host-neutral by default: it writes NO `target triple`/
+; `target datalayout`, so clang adopts the host's, and every hosted build is
+; unchanged. A cross/freestanding build (Cortex-M, …) needs the module pinned —
+; set_target! records {triple, datalayout}; emit_core prepends them. This is
+; codegen POLICY (stdlib.backend.emit.llvm), not a kernel concern and not a CLI flag.
+(bind current_target (ref null))
+; ptr_bytes_of — the pointer size IN BYTES for a {triple, datalayout}. The
+; datalayout is authoritative: LLVM spells the pointer ABI as a `p:<n>:…`
+; field, so a `p:32:` substring means 4 and `p:64:` (or no `p:` field, which
+; LLVM defaults to 64-bit) means 8. We fall back to the triple's arch prefix
+; when the datalayout is empty/silent. Default 8 keeps every hosted build
+; unchanged; only a 32-bit cross target narrows it.
+(bind ptr_bytes_of
+  (lambda (triple datalayout)
+    (cond
+      ((string_contains datalayout "-p:32:") 4)
+      ((string_contains datalayout "-p:64:") 8)
+      ; no explicit datalayout pointer field — read the triple's arch
+      ((or (string_starts_with triple "thumb")
+           (or (string_starts_with triple "armv7")
+               (or (string_starts_with triple "armv6")
+                   (or (string_starts_with triple "i386")
+                       (or (string_starts_with triple "i686")
+                           (string_starts_with triple "wasm32")))))) 4)
+      (else 8))))
+(bind set_target!
+  (lambda (triple datalayout)
+    (do
+      (set_ref current_target
+        (assoc (map_of) "triple" triple "datalayout" datalayout))
+      ; keep prep's union/struct layout in step with this target's pointer size
+      (set_target_ptr_bytes! (ptr_bytes_of triple datalayout)))))
+(bind clear_target!
+  (lambda ()
+    (do
+      (set_ref current_target null)
+      (clear_target_ptr_bytes!))))
+
+; emit_with_target — run `body_fn` over `unit` with the module pinned to
+; `target` (a {triple, datalayout} map), restoring the PRIOR target
+; AFTERWARDS no matter what. This is the exception-safe scoping the raw
+; set_target!/clear_target! pair leaves to the caller: a throw inside body_fn
+; (an unlowerable type, a missing main, …) would otherwise leak the pinned
+; target into the next emit. We SAVE the prior `(deref current_target)` before
+; pinning and RESTORE it on exit — not clear-to-host — so an outer/nested
+; target survives an inner emit_with_target (proper stacking). When no outer
+; target is set, prior = null → restore is `clear_target!`, identical to the
+; old clear-to-host behavior. The try/catch-rethrow guarantees the restore runs
+; on BOTH the success and the failure path, then re-raises the original error
+; unchanged. Returns body_fn's value on success.
+;   unit    : the compilation unit (passed through to body_fn)
+;   target  : {triple, datalayout} — the cross/freestanding target to pin
+;   body_fn : a 1-arg function (unit -> result), e.g. an emit_* closure
+(bind restore_target!
+  (lambda (prior)
+    (if (eq prior null)
+      (clear_target!)
+      (set_target! (get prior "triple" "") (get prior "datalayout" "")))))
+(bind emit_with_target
+  (lambda (unit target body_fn)
+    (bind ((prior (deref current_target)))
+      (do
+        (set_target! (get target "triple" "") (get target "datalayout" ""))
+        (try
+          (bind ((result (body_fn unit)))
+            (do (restore_target! prior) result))
+          (catch err
+            (do (restore_target! prior) (throw err))))))))
+
+; ── DWARF debug info (opt-in; OFF is byte-identical to no-debug) ─────────────
+; A debug build threads a `debug_level` ("none" | "line-tables" | "full") from
+; the tool down to emit_core. When it is not "none", emit_core builds a DWARF
+; metadata block (textual `!DI…` nodes) and tags instructions with `, !dbg !L`;
+; clang -x ir preserves it into the object's .debug_info (no -g needed). When it
+; IS "none" the entire mechanism is inert and the IR text is unchanged.
+;
+; dbg = the debug context carried alongside the emit state:
+;   level     : the requested level (the gate; "none" disables everything)
+;   on?       : (level != "none")
+;   full?     : (level == "full") — emit locals (DILocalVariable + dbg.declare)
+;   next      : a ref int — the metadata-node id allocator (shared module-wide)
+;   meta      : the accumulated "!N = …" lines, appended at the very module end
+;   cu_id     : a ref — the !DICompileUnit id (null until built)
+;   file_id   : a ref — the !DIFile id (null until a source path is known)
+;   basic     : caap-type-name -> DIBasicType id (a cache)
+;   composite : caap-type-name -> a composite/derived type id (a cache, full)
+;   sp        : a ref — the CURRENT function's !DISubprogram id (set per fn)
+;   loc       : a ref — the CURRENT instruction's !DILocation id (set per node)
+(bind dbg_new
+  (lambda (level)
+    (assoc (map_of)
+      "level" level
+      "on?" (not (eq level "none"))
+      "full?" (eq level "full")
+      "next" (ref 0)
+      "meta" (list_of)
+      "cu_id" (ref null)
+      "file_id" (ref null)
+      "basic" (map_of)
+      "composite" (map_of)
+      "sp" (ref null)
+      "loc" (ref null))))
+
+; di_alloc! — the next free metadata-node id ("!N", referenced as the int N).
+(bind di_alloc!
+  (lambda (dbg)
+    (bind ((n (get dbg "next")))
+      (do (set_ref n (int_add (deref n) 1)) (deref n)))))
+
+; di_node! — append a metadata definition `!N = <body>` and return N. The body
+; is the text AFTER the `=` (e.g. "!DIFile(...)" or "distinct !DICompileUnit(...)").
+(bind di_node!
+  (lambda (dbg body)
+    (bind ((id (di_alloc! dbg)))
+      (do
+        (append (get dbg "meta")
+          (string_concat_many "!" (int_to_string id) " = " body))
+        id))))
+
+; di_ref — "!N" for a metadata id.
+(bind di_ref (lambda (id) (string_concat_many "!" (int_to_string id))))
+
+; di_basic_encoding — {encoding, size} for a scalar CAAP type name, or null
+; when the type has no DWARF basic-type description (a struct/pointer/string).
+(bind di_basic_encoding
+  (lambda (ct)
+    (case ct
+      ("i8"  (assoc (map_of) "enc" "DW_ATE_signed"   "size" 8))
+      ("i16" (assoc (map_of) "enc" "DW_ATE_signed"   "size" 16))
+      ("i32" (assoc (map_of) "enc" "DW_ATE_signed"   "size" 32))
+      ("int" (assoc (map_of) "enc" "DW_ATE_signed"   "size" 32))
+      ("i64" (assoc (map_of) "enc" "DW_ATE_signed"   "size" 64))
+      ("u8"  (assoc (map_of) "enc" "DW_ATE_unsigned" "size" 8))
+      ("u16" (assoc (map_of) "enc" "DW_ATE_unsigned" "size" 16))
+      ("u32" (assoc (map_of) "enc" "DW_ATE_unsigned" "size" 32))
+      ("u64" (assoc (map_of) "enc" "DW_ATE_unsigned" "size" 64))
+      ("bool" (assoc (map_of) "enc" "DW_ATE_boolean" "size" 8))
+      ("f32" (assoc (map_of) "enc" "DW_ATE_float"    "size" 32))
+      ("float" (assoc (map_of) "enc" "DW_ATE_float"  "size" 64))
+      ("f64" (assoc (map_of) "enc" "DW_ATE_float"    "size" 64))
+      (else null))))
+
+; di_basic! — the cached DIBasicType id for a scalar CAAP type, or null when
+; the type cannot be described as a basic type (caller degrades gracefully).
+(bind di_basic!
+  (lambda (dbg ct)
+    (if (eq ct null) null
+      (bind ((cached (get (get dbg "basic") ct)))
+        (if (not (eq cached null)) cached
+          (bind ((e (di_basic_encoding ct)))
+            (if (eq e null) null
+              (bind ((id (di_node! dbg
+                           (string_concat_many
+                             "!DIBasicType(name: \"" ct "\", size: "
+                             (int_to_string (get e "size")) ", encoding: "
+                             (get e "enc") ")"))))
+                (do (assoc (get dbg "basic") ct id) id)))))))))
+
+; di_set_loc! — record THIS node's DILocation as the current instruction loc
+; (so the next emit!s tag with it). `line`/`col` come from the node's span; a
+; node with no span (synthesized/folded) leaves the parent loc untouched.
+(bind di_set_loc!
+  (lambda (dbg line col)
+    (when (and (get dbg "on?") (not (eq (deref (get dbg "sp")) null)))
+      (bind ((id (di_node! dbg
+                   (string_concat_many
+                     "!DILocation(line: " (int_to_string line)
+                     ", column: " (int_to_string col)
+                     ", scope: " (di_ref (deref (get dbg "sp"))) ")"))))
+        (set_ref (get dbg "loc") id)))))
+
+; di_type_ref — a metadata reference for a function's parameter/return CAAP
+; type: a DIBasicType for a scalar (cached); a composite type for a struct /
+; pointer / array under "full"; otherwise "null" (the DWARF spelling of an
+; undescribable / void slot). Degrades gracefully — an unknown type just
+; becomes a `null` element, never a crash or a blocked build. composite? is the
+; Phase-2 composite-type builder, supplied by emit_core (null under
+; line-tables), so this helper has no forward reference.
+(bind di_type_ref
+  (lambda (dbg ct structs composite?)
+    (if (eq ct null) "null"
+      (bind ((b (di_basic! dbg ct)))
+        (if (not (eq b null)) (di_ref b)
+          (if (and (get dbg "full?") (not (eq composite? null)))
+            (bind ((c (composite? dbg ct structs)))
+              (if (eq c null) "null" (di_ref c)))
+            "null"))))))
+
+; di_subprogram! — build (once per function) a !DISubprogram + its
+; !DISubroutineType, set it as the current scope, and return its id (for the
+; ` !dbg !SP` suffix on the define line). `entry` is the fn_entry (name,
+; cresult, ctypes); `line` is the function's source line. Param/return types
+; are described as far as possible; an undescribable one degrades to `null`.
+(bind di_subprogram!
+  (lambda (dbg entry line structs composite?)
+    (bind (
+      (cu (deref (get dbg "cu_id")))
+      (file (deref (get dbg "file_id")))
+      ; the subroutine type list: return type first, then each parameter
+      (tys (list_of (di_type_ref dbg (get entry "cresult") structs composite?)))
+    )
+      (do
+        (sequence_each (get entry "ctypes" (list_of))
+          (lambda (ct) (append tys (di_type_ref dbg ct structs composite?))))
+        (bind (
+          (tylist (di_node! dbg
+                    (string_concat_many "!{" (sequence_join tys ", ") "}")))
+          (subrt (di_node! dbg
+                   (string_concat_many
+                     "!DISubroutineType(types: " (di_ref tylist) ")")))
+          ; a DEFINITION subprogram (it has a body and is referenced by the
+          ; function's !dbg) needs spFlags: DISPFlagDefinition and unit:.
+          (sp (di_node! dbg
+                (string_concat_many
+                  "distinct !DISubprogram(name: \"" (get entry "name" "?")
+                  "\", scope: " (di_ref file)
+                  ", file: " (di_ref file)
+                  ", line: " (int_to_string line)
+                  ", type: " (di_ref subrt)
+                  ", scopeLine: " (int_to_string line)
+                  ", spFlags: DISPFlagDefinition"
+                  ", unit: " (di_ref cu) ")")))
+        )
+          (do (set_ref (get dbg "sp") sp) sp))))))
+
+; di_local_param! — a !DILocalVariable for parameter `pn` (1-based `argno`),
+; scoped to the current function's DISubprogram, typed by `type_ref` (a "!N"
+; reference string the caller computed, or "null"). Returns its id; the caller
+; pairs it with an llvm.dbg.declare over the parameter's spill slot.
+(bind di_local_param!
+  (lambda (dbg pn argno line type_ref)
+    (di_node! dbg
+      (string_concat_many
+        "!DILocalVariable(name: \"" pn "\", arg: " (int_to_string argno)
+        ", scope: " (di_ref (deref (get dbg "sp")))
+        ", file: " (di_ref (deref (get dbg "file_id")))
+        ", line: " (int_to_string line)
+        ", type: " type_ref ")"))))
+
+; di_local_bind! — a !DILocalVariable for a `bind`-local (NOT a parameter), so
+; it carries NO `arg:` slot (a parameter has `arg: N`; omitting the field is how
+; LLVM/DWARF spells "a local", i.e. arg: 0 — a DW_TAG_variable, not a
+; DW_TAG_formal_parameter). It mirrors di_local_param! otherwise (same
+; scope/file/type wiring). The caller pairs it with a debug-only spill alloca +
+; an llvm.dbg.declare.
+(bind di_local_bind!
+  (lambda (dbg vn line type_ref)
+    (di_node! dbg
+      (string_concat_many
+        "!DILocalVariable(name: \"" vn "\""
+        ", scope: " (di_ref (deref (get dbg "sp")))
+        ", file: " (di_ref (deref (get dbg "file_id")))
+        ", line: " (int_to_string line)
+        ", type: " type_ref ")"))))
+
+(export diag current_target ptr_bytes_of set_target! clear_target! restore_target!
+        emit_with_target dbg_new di_alloc! di_node! di_ref di_basic_encoding
+        di_basic! di_set_loc! di_type_ref di_subprogram! di_local_param!
+        di_local_bind!)

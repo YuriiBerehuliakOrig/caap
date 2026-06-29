@@ -1,0 +1,525 @@
+; stdlib/semantics/passes/licm.caap — loop-invariant code motion as a whole-module
+; TRANSFORM (module stdlib.semantics.passes.licm).
+;
+; Loops here are SYNTACTIC: a `(while cond body)` call. No CFG is needed — the
+; loop is a subtree, its "carried state" is the set of refs the body/cond
+; `set_ref`s. For each while node (rebuilt bottom-up by ir.transform, so inner
+; loops are handled first) we hoist loop-invariant computations out:
+;
+;   (while cond body)  ->  (bind "licm__gN" <e> (while cond' body'))
+;
+; where `e` is a non-trivial pure+total subexpression of cond/body whose value
+; does not change across iterations, and cond'/body' are cond/body with every
+; structural occurrence of `e` replaced by `(sym "licm__gN")`.
+;
+; ── why this is behavior-preserving, even for a zero-trip loop ───────────────
+; A `(while cond body)` may run ZERO times, so hoisting an expression OUT of it
+; evaluates that expression EAGERLY on a path the loop would never have taken.
+; That is observationally identical to the original ONLY when the expression is
+;   pure   — eager evaluation has no effect the loop would otherwise withhold;
+;   total  — eager evaluation cannot THROW or DIVERGE on an input the loop's
+;            zero-trip path would never have reached; AND
+;   invariant + scope-stable — same value every iteration, and every free name
+;            resolves to the SAME binding at the hoist site as inside the loop.
+; A failure of ANY of these is a miscompile (a moved throw, a wrong value, an
+; unbound name). Each is checked CONSERVATIVELY below — when unsure, we do not
+; hoist.
+;
+;   pure+total   `licm_pure?` — a CURATED whitelist of heads that are pure AND
+;                TOTAL FOR ALL INPUTS. This is far stricter than "the vocabulary
+;                says pure" and stricter than what constfold can allow:
+;                - The kernel vocabulary marks int_div/int_mod/shifts pure though
+;                  they are PARTIAL (throw on div-by-zero / out-of-range), and
+;                  marks while/do/lambda/bind/ref/deref pure though they are
+;                  control flow / allocation / mutable-cell reads.
+;                - More subtly, the kernel is UNTYPED and its integer arithmetic
+;                  is CHECKED: `int_add`/`int_sub`/`int_mul`/`int_neg` THROW on
+;                  overflow, `size`/`lt`/`gt`/`le`/`ge`/the string queries THROW
+;                  on a wrong-type argument. So they are pure but NOT total — and
+;                  unlike constfold (which folds only CLOSED literal terms and
+;                  catches the throw at eval time), LICM's candidates are OPEN
+;                  (a free loop/param name has no value at transform time), so we
+;                  cannot evaluate-and-catch. We must be sound STATICALLY.
+;                Empirically, the only kernel heads total for EVERY input are the
+;                structural/truthiness ones — `eq`, `ne`, `not`, `value_type` —
+;                so the whitelist is exactly those. Anything else is never
+;                hoisted: a missed optimization, never a moved throw.
+;   invariant    none of the expression's `free_names` is in `mutated` (the set
+;                of refs `set_ref`'d anywhere in cond/body), AND the expression
+;                does not `deref` a mutated ref anywhere inside it (a deref of a
+;                loop-mutated cell varies per iteration even though `deref` itself
+;                is a pure read).
+;   scope-stable every free name of the candidate must bind to the SAME thing
+;                before the loop as inside it. This is now PROVABLY guaranteed by
+;                RULE A (`has_nested_binder?`, see `licm_one_while`): a loop whose
+;                cond or body contains ANY nested binder — `lambda`, `bind`,
+;                `catch`, `match`, or `macro` — BAILS entirely (hoists nothing).
+;                With no nested binder anywhere in the loop, there is no inner
+;                scope for a hoisted candidate's free names to be re-resolved
+;                against, so scope stability holds by construction — independent of
+;                how precisely any single binder shape is modeled. Two earlier
+;                rounds instead tried to ENUMERATE binder shapes (`bind`/`lambda`/
+;                `catch` modeled, `match`/`macro` bailed) and both missed a shape
+;                — the multi-binding `(bind ((n v)…) body)` whose arg0 is a CALL of
+;                pairs, and a `(lambda (k) …)` with a CALL param list — each a
+;                capture miscompile. RULE A removes that whole failure class.
+;                (The per-shape stops in `find_invariant_walk`/`bound_names_in`/
+;                `scope_stable?` remain as defence-in-depth but are unreachable
+;                with a nested binder present.)
+;   hygienic     the INJECTED hoist binder name is made fresh w.r.t. the whole
+;                while node (RULE B, `hygienic_hoist_name`). `gensym` is predictable
+;                (`prefix__gN`), so a name it returns can already occur in the loop;
+;                injecting `(bind licm__gN …)` with such a name would CAPTURE the
+;                existing occurrence (silent wrong value, or a moved throw). We
+;                re-gensym until the name is absent from `(names_set node)`.
+;   non-trivial  a bare literal or name is never hoisted (no win, only churn);
+;                only a CALL that is a real computation.
+;
+; We never descend into a nested `lambda` (nor a `bind`/`catch`) in the body to
+; hoist out of it: a lambda's body runs when the closure is CALLED, not per loop
+; iteration, so its subexpressions are not loop-invariant in the relevant sense
+; (and would change evaluation order). `find_invariant` stops at every binder
+; boundary (`lambda`/`bind`/`catch`) — though RULE A means a loop reaching the
+; hoist machinery has no such binder anyway.
+;
+; SOUND BY CONSTRUCTION, opt-in (registered at -O2 via boot/opt.caap; not in the base
+; pipeline). It hardened over three adversarial-verification rounds (round 1: catch-binder
+; + callee traversal; round 2: gensym-capture hygiene + nested-binder bail; round 3: arity
+; gate on the partial not/value_type purity heads), and a final 9-skeptic adversarial pass
+; reproduced ZERO miscompiles. Soundness rests on three structural guarantees: the
+; hoistable-candidate language is the tiny total-head whitelist {eq,ne,not(arity 1),
+; value_type(arity 1)} over names+literals (RULE on pure_total_heads), RULE A bails the
+; whole loop on ANY nested binder (lambda/bind/catch/match/macro), and RULE B makes the
+; injected hoist name hygienic. Deliberately CONSERVATIVE: it bails on anything it cannot
+; prove invariant + scope-stable — a missed optimization, never a miscompile. A fuller
+; LICM (hoisting arbitrary pure expressions, deref of provably-stable cells) wants SSA.
+(module stdlib.semantics.passes.licm)
+
+(use stdlib.syntax.ast
+  call? name? literal? string_lit? head_of head_is? args_of arg callee
+  name_of literal_of sym calln)
+(use stdlib.syntax.ir transform node_eq free_names gensym names_set)
+(use stdlib.lib.collections.sequence any? all?)
+(use stdlib.semantics.passes.registry install_transform!)
+(use stdlib.semantics.head_meta head_metadata total? scalar_result? may_throw?)
+
+; ── purity: a CURATED whitelist of heads PURE AND TOTAL FOR ALL INPUTS ───────
+; Hoisting moves a computation onto the loop's zero-trip path, so a head is only
+; safe here if it can NEVER throw or diverge, on ANY input. In this UNTYPED,
+; OVERFLOW-CHECKED kernel that rules out almost everything — verified by probing
+; the live runtime:
+;   int_add int_sub int_mul int_neg  — THROW on overflow (checked arithmetic)
+;   int_and int_or int_xor int_not   — THROW on a non-int argument
+;   int_div int_mod int_shl int_shr  — THROW on div-by-zero / out-of-range
+;   lt gt le ge                      — THROW comparing incomparable types
+;   size                             — THROW on a non-sized value (e.g. an int)
+;   int_to_string string_* string_slice string_to_int
+;                                    — THROW on a wrong-type / out-of-range arg
+;   ref deref set_ref                — allocation / mutable-cell read / mutation
+;   list_of map_of assoc append …    — allocate a fresh mutable object
+;   while do lambda if cond and or   — control flow (not a value computation)
+;   println sys.* and friends        — effects
+; What remains TOTAL for every input is the structural / truthiness vocabulary:
+;   eq ne   — structural equality, returns a bool on ANY pair of values
+;   not     — truthiness, returns a bool on ANY value
+;   value_type — returns a tag string for ANY value
+; (constfold can list the partial arithmetic because it folds only CLOSED
+; literal terms and CATCHES the throw at eval time; LICM's candidates are OPEN —
+; a free loop/param name has no value at transform time — so no eval-and-catch
+; is possible and the whitelist must be sound statically.)
+; Conservative by construction: a head not listed is never treated as pure, so
+; an unfamiliar or newly added builtin is simply never hoisted (a missed
+; optimization, never a moved throw).
+; DERIVED FROM THE SINGLE SOURCE (stdlib/semantics/head_meta.caap), not a
+; hand-written list: the hoistable set is exactly
+;   { h in head_metadata : total?(h) AND scalar_result?(h) AND (not may_throw?(h)) }
+; — total + scalar + NEVER-throws-on-any-input. The never-throw bar (may_throw?
+; false) is what excludes the checked-arithmetic / wrong-type-throwing heads
+; (int_*, lt/gt/le/ge, string_*, size) that constfold/dce can list but licm
+; cannot (hoisting moves a computation onto a zero-trip path, so a moved throw is
+; a MISCOMPILE — see the header). Empirically this selects exactly the structural
+; / truthiness vocabulary {eq, ne, not, value_type}. licm has NO known_gaps (its
+; derivation already matches its list head-for-head). The drift guard
+; (stdlib/lib/tests/test_head_meta.caap) pins this exact derivation. Built by
+; iterating head_metadata's keys, so a new never-throwing scalar head in the
+; table becomes hoistable here automatically — no second list to update.
+;
+; eq/ne are total at EVERY arity; not/value_type are total ONLY at arity 1 (they
+; THROW otherwise), so licm_pure? additionally gates their arity below — else a
+; wrong-arity (value_type a b) would be judged hoistable and a moved-throw
+; introduced on a zero-trip path. (Adversarial round 3.) The may_throw? axis in
+; head_meta encodes that same arity-gated view, so this membership set is the
+; arity-1 truth and the arity gate in licm_pure? enforces it.
+(bind pure_total_heads
+  (bind ((m (map_of)))
+    (do
+      (for h (map_keys head_metadata)
+        (when (and (total? h) (and (scalar_result? h) (not (may_throw? h))))
+          (assoc m h true)))
+      m)))
+
+(bind pure_head?
+  (lambda (h) (and (not (eq h null)) (eq (get pure_total_heads h false) true))))
+
+; licm_pure? — is the WHOLE subtree pure+total? Every call head must be a
+; `pure_head?` and every nested call likewise — a single impure/partial head
+; anywhere taints the expression. Literals and names are pure (a name reads a
+; binding; invariance is handled separately via free_names vs mutated). A nested
+; `lambda` makes the expression non-pure for hoisting purposes (we never hoist a
+; closure construction — see header), so it is rejected here too.
+(bind licm_pure?
+  (lambda (node)
+    (cond
+      ((literal? node) true)
+      ((name? node) true)
+      ((call? node)
+        (bind ((h (head_of node)))
+          (and (pure_head? h)
+               ; arity gate: not/value_type are total ONLY at 1 arg (else they throw);
+               ; eq/ne are total at any arity. Reject a wrong-arity partial head so it
+               ; is never hoisted (a moved throw onto a zero-trip path is a miscompile).
+               (if (or (eq h "not") (eq h "value_type"))
+                   (eq (size (args_of node)) 1)
+                   true)
+               (all? (args_of node) (lambda (a) (licm_pure? a))))))
+      (else false))))
+
+; ── the mutated-ref set ──────────────────────────────────────────────────────
+; collect_mutated — every NAME that appears as the FIRST argument of a
+; `(set_ref NAME …)` anywhere in `node` (including under nested lambdas: a
+; closure that escapes and mutates the cell still makes that ref variant).
+; A `set_ref` whose first arg is not a bare name (a computed place) sets the
+; `unknown` flag — we cannot bound what is mutated, so the caller bails on the
+; whole loop and hoists nothing (conservative).
+;   -> { "mutated": {name->true}, "unknown": bool }
+(bind collect_mutated
+  (lambda (node)
+    (bind ((acc (map_of)) (unknown (ref false)))
+      (do
+        (bind ((scan
+                 (lambda (self n)
+                   (when (call? n)
+                     (do
+                       (when (head_is? n "set_ref")
+                         (bind ((nm (name_of (arg n 0))))
+                           (if (eq nm null)
+                             (set_ref unknown true)
+                             (assoc acc nm true))))
+                       ; visit the CALLEE too — a `(set_ref …)` (or a binder) in
+                       ; callee position `((lambda …) …)` would otherwise be missed.
+                       (self self (callee n))
+                       (for c (args_of n) (self self c)))))))
+          (scan scan node))
+        (assoc (map_of) "mutated" acc "unknown" (deref unknown))))))
+
+; reads_mutated_ref? — does `node` `(deref NAME)` for any NAME in `mutated`
+; anywhere inside it? Such a deref reads a loop-mutated cell, so the enclosing
+; expression is VARIANT even though `deref` is a pure read. (A `deref` of a
+; non-mutated ref is fine — invariant.)
+(bind reads_mutated_ref?
+  (lambda (node mutated)
+    (bind ((hit (ref false)))
+      (do
+        (bind ((scan
+                 (lambda (self n)
+                   (when (call? n)
+                     (do
+                       (when (head_is? n "deref")
+                         (bind ((nm (name_of (arg n 0))))
+                           (when (and (not (eq nm null))
+                                      (eq (get mutated nm false) true))
+                             (set_ref hit true))))
+                       ; visit the CALLEE too (see collect_mutated).
+                       (self self (callee n))
+                       (for c (args_of n) (self self c)))))))
+          (scan scan node))
+        (deref hit)))))
+
+; ── scope stability: names a binder INSIDE the loop (re)binds ────────────────
+; bound_names_in — every name introduced by a binder anywhere in `node`. On
+; EXPANDED kernel IR the binders are exactly three: `lambda` (parameter names —
+; the literal-tuple first arg of `(lambda (a b) …)`), `bind` (its bound names,
+; BOTH the kernel flat form `(bind <name-node> v …)` and the canonical merged
+; form `(bind "n1" v1 "n2" v2 … body…)`), and `catch` (the error name `e` it
+; binds over its handler in `(try X (catch e HANDLER))`). The set whose
+; intersection with a candidate's free names means the candidate must NOT be
+; hoisted across this loop (a shadowing capture, see `scope_stable?`).
+; The scan visits the CALLEE node as well as the args, so a binder sitting in
+; callee position `((lambda (p) …) v)` is not skipped.
+(bind bound_names_in
+  (lambda (node)
+    (bind ((acc (map_of)))
+      (do
+        (bind ((scan
+                 (lambda (self n)
+                   (when (call? n)
+                     (do
+                       (cond
+                         ; (lambda (p…) body…) — params are the literal tuple arg0
+                         ((head_is? n "lambda")
+                           (bind ((pv (literal_of (arg n 0))))
+                             (when (not (eq pv null))
+                               (for p pv
+                                 (when (eq (value_type p) "string")
+                                   (assoc acc p true))))))
+                         ; (bind <name-node> v …) — kernel flat let*
+                         ((and (head_is? n "bind") (name? (arg n 0)))
+                           (assoc acc (name_of (arg n 0)) true))
+                         ; (bind "n1" v1 "n2" v2 … body…) — canonical merged bind:
+                         ; every string-literal in a name position is a bound name
+                         ((and (head_is? n "bind") (string_lit? (arg n 0)))
+                           (bind ((as (args_of n)) (i (ref 0)))
+                             (while (and (lt (int_add (deref i) 1) (size as))
+                                         (string_lit? (get as (deref i))))
+                               (do
+                                 (assoc acc (literal_of (get as (deref i))) true)
+                                 (set_ref i (int_add (deref i) 2))))))
+                         ; (catch <name> handler…) — the error name is bound over
+                         ; the handler (the kernel `try`/`catch` binder).
+                         ((and (head_is? n "catch") (name? (arg n 0)))
+                           (assoc acc (name_of (arg n 0)) true))
+                         (else null))
+                       ; recurse into all children regardless (inner binders
+                       ; nested under this one must also be collected), AND into
+                       ; the callee so a binder in callee position is not missed.
+                       (self self (callee n))
+                       (for c (args_of n) (self self c)))))))
+          (scan scan node))
+        acc))))
+
+; scope_stable? — no free name of `e` is (re)bound by any binder inside the loop
+; `body`/`cond`. If it were, hoisting `e` above the loop would re-resolve that
+; name to a DIFFERENT (outer) binding — a capture miscompile. Conservative: a
+; coincidental same-name binder in an unrelated sub-scope also blocks the hoist
+; (the safe direction — never a wrong hoist).
+(bind scope_stable?
+  (lambda (e inner_bound)
+    (not (any? (free_names e)
+           (lambda (fn) (eq (get inner_bound fn false) true))))))
+
+; invariant? — `e` is loop-invariant w.r.t. `mutated` iff it is pure+total, none
+; of its free names is mutated, and it derefs no mutated ref. (free_names of a
+; deref-of-name is the name itself, so the free_names test ALSO catches
+; `(deref i)` when `i` is mutated; the explicit `reads_mutated_ref?` is the
+; belt-and-braces guard for any indirect path the name analysis might miss.)
+; Scope stability is checked SEPARATELY (at the candidate-acceptance site, which
+; has the loop's inner-bound set), not here.
+(bind invariant?
+  (lambda (e mutated)
+    (and (licm_pure? e)
+         (and (not (any? (free_names e)
+                     (lambda (fn) (eq (get mutated fn false) true))))
+              (not (reads_mutated_ref? e mutated))))))
+
+; hoistable? — invariant AND a non-trivial computation (a call, not a bare
+; literal/name: hoisting a literal or a name buys nothing and only churns the
+; tree). Any pure invariant CALL is a valid, safe hoist (scope stability is
+; enforced separately by the caller via `scope_stable?`).
+(bind hoistable?
+  (lambda (e mutated) (and (call? e) (invariant? e mutated))))
+
+; ── finding a maximal hoistable subexpression ────────────────────────────────
+; find_invariant — the FIRST (outermost, hence maximal) hoistable subexpression
+; found in a pre-order walk of `node`, NOT descending into nested lambdas (their
+; bodies don't run per iteration). Returns the node or null. Outermost-first
+; means we hoist the largest invariant computation; its invariant sub-parts ride
+; along inside it.
+; We stop the walk at EVERY binder — on expanded kernel IR that is exactly
+; `lambda`, `bind`, and `catch`: a candidate must come only from the loop's
+; top-level scope — never from inside an inner binding, whose names would be out
+; of scope (or differently bound) at the hoist site. (Stopping at `catch` is
+; belt-and-braces alongside `bound_names_in` adding the catch-bound name to
+; `inner_bound`: either alone makes `scope_stable?` reject a candidate reading
+; the error name.) `scope_stable?` is the second guard, catching a name rebound
+; elsewhere in the loop (e.g. free in cond but shadowed in body).
+; The descent visits the CALLEE node as well as the args, so a hoistable subtree
+; (or an inner binder) in callee position `((lambda …) …)` is not skipped.
+(bind find_invariant_walk
+  (lambda (self node mutated inner_bound)
+    (cond
+      ((not (call? node)) null)
+      ; never hoist out of / descend into a nested binder's scope
+      ((head_is? node "lambda") null)
+      ((head_is? node "bind") null)
+      ((head_is? node "catch") null)
+      ((and (hoistable? node mutated) (scope_stable? node inner_bound)) node)
+      (else
+        (bind ((found (ref null)))
+          (do
+            (bind ((rc (self self (callee node) mutated inner_bound)))
+              (when (not (eq rc null)) (set_ref found rc)))
+            (for a (args_of node)
+              (when (eq (deref found) null)
+                (bind ((r (self self a mutated inner_bound)))
+                  (when (not (eq r null)) (set_ref found r)))))
+            (deref found)))))))
+(bind find_invariant
+  (lambda (node mutated inner_bound)
+    (find_invariant_walk find_invariant_walk node mutated inner_bound)))
+
+; replace_occurrences — replace every structural occurrence of `target` in
+; `node` with `replacement`, via ir.transform + node_eq (bottom-up, span
+; preserved). Swaps each occurrence of the hoisted expression for the fresh name.
+(bind replace_occurrences
+  (lambda (node target replacement)
+    (transform node
+      (lambda (n) (if (node_eq n target) replacement null)))))
+
+; ── RULE A: conservative bail on ANY nested binder (provably sound) ──────────
+; Two prior hardening rounds tried to MODEL each kernel binder shape precisely
+; (which names it binds, where) so a candidate could be hoisted across the ones
+; LICM understood while bailing only on the ones it didn't. Each round missed a
+; shape — the kernel MULTI-binding `(bind ((n v) …) body)` whose arg0 is a CALL
+; of pairs, and a `(lambda (k) …)` whose param list is a CALL not a literal-tuple
+; — and each miss was a CAPTURE miscompile (a hoisted candidate reading an outer
+; name was rewritten into an inner SHADOWED occurrence). Enumerating every binder
+; shape is fragile, so we stop trying.
+;
+; RULE A is the bulletproof guarantee: if the loop's cond OR body contains ANY
+; nested binding construct ANYWHERE — any Call whose head is `lambda`, `bind`,
+; `catch`, `match`, or `macro` — we BAIL the whole loop (hoist nothing, return it
+; unchanged). With NO nested binder anywhere in the loop, NO inner scope can
+; shadow a hoisted candidate's free names, so scope stability is AUTOMATIC — there
+; is simply no binder for a candidate to be wrongly lifted across. This makes the
+; transform sound by construction without depending on the precision of any
+; per-shape scope model. (`bound_names_in`/`scope_stable?`/`find_invariant_walk`'s
+; binder-boundary stops remain as defence-in-depth, but RULE A means they can
+; never be reached with a nested binder present.)
+;
+; The bail is total: `head_is?` of a non-name-headed call is false, and the scan
+; visits the CALLEE node too, so a binder in callee position `((lambda …) …)` is
+; not missed. The positive case — hoisting a pure arithmetic invariant out of a
+; simple `set_ref` loop — has no nested binder, so it STILL fires.
+(bind nested_binder_heads
+  (bind ((m (map_of)))
+    (do (for h (list_of "lambda" "bind" "catch" "match" "macro")
+          (assoc m h true))
+        m)))
+(bind has_nested_binder?
+  (lambda (node)
+    (bind ((hit (ref false)))
+      (do
+        (bind ((scan
+                 (lambda (self n)
+                   (when (and (not (deref hit)) (call? n))
+                     (do
+                       (when (eq (get nested_binder_heads (head_of n) false) true)
+                         (set_ref hit true))
+                       (self self (callee n))
+                       (for c (args_of n) (self self c)))))))
+          (scan scan node))
+        (deref hit)))))
+
+; hygienic_hoist_name — RULE B: a hoist binder name guaranteed ABSENT anywhere in
+; the while node. `gensym` is counter-derived and PREDICTABLE (`prefix__gN`), so
+; the name it returns can already occur in the loop (a user binding, or another
+; pass reusing the `licm__` prefix). Injecting `(bind licm__gN <e> (while …))`
+; with such a colliding name CAPTURES the existing occurrence — the inserted bind
+; shadows the user's value inside the loop (silent wrong value, or a moved throw
+; when the shadowed value had a different type). We close this by re-gensym'ing
+; until the chosen name does not occur in `(names_set wnode)` (every name read in
+; the whole while node). `names_set` is a `name->true` map; membership is `(eq (get
+; … false) true)`. The loop terminates: gensym never repeats a name, and the while
+; node has finitely many names.
+(bind hygienic_hoist_name
+  (lambda (wnode)
+    (bind ((used (names_set wnode)) (nm (ref (gensym "licm"))))
+      (do
+        (while (eq (get used (deref nm) false) true)
+          (set_ref nm (gensym "licm")))
+        (deref nm)))))
+
+; licm_one_while — hoist invariants out of a single `(while cond body)` node,
+; iterating so that after one hoist a now-smaller body can yield another. Returns
+; the rewritten node (a `(bind … (while …))` nest) or null if nothing hoisted.
+; Bails entirely (RULE A) on a loop with an unknown (non-name) mutation place, OR
+; one containing ANY nested binder (`lambda`/`bind`/`catch`/`match`/`macro`) — with
+; no nested binder, no inner scope can shadow a hoisted candidate's free names, so
+; scope stability is automatic and the hoist is sound by construction. Each hoist
+; binder name is made hygienic (RULE B) — guaranteed absent from the whole while
+; node — so the INJECTED `(bind name …)` can never capture an existing occurrence.
+(bind licm_one_while
+  (lambda (node)
+    (bind ((mres (collect_mutated node)))
+      (if (or (eq (get mres "unknown") true) (has_nested_binder? node))
+        null
+        (bind ((mutated (get mres "mutated"))
+               ; names any binder INSIDE the loop (re)binds — a candidate whose
+               ; free names touch this set would be CAPTURED if hoisted, so it is
+               ; rejected by scope_stable?. Computed once from the ORIGINAL node:
+               ; the only thing we inject across iterations is a fresh gensym
+               ; NAME (not a binder inside the loop), so the set is stable.
+               (inner_bound (bound_names_in node))
+               (prelude (list_of))         ; the (name value) pairs we hoist out
+               (cur_cond (ref (arg node 0)))
+               (cur_body (ref (arg node 1)))
+               (steps (ref 0)) (done (ref false)))
+          (do
+            (while (and (not (deref done)) (lt (deref steps) 64))
+              (bind ((cand
+                       (bind ((fb (find_invariant (deref cur_body) mutated inner_bound)))
+                         (if (eq fb null)
+                           (find_invariant (deref cur_cond) mutated inner_bound)
+                           fb))))
+                (if (eq cand null)
+                  (set_ref done true)
+                  ; RULE B: a hoist name guaranteed absent from the ORIGINAL while
+                  ; node, so the injected (bind g …) cannot capture an existing
+                  ; occurrence. gensym is monotonic, so successive hoist names are
+                  ; distinct from each other as well as from the node's names.
+                  (bind ((g (hygienic_hoist_name node)))
+                    (do
+                      (append prelude (assoc (map_of) "name" g "value" cand))
+                      (set_ref cur_cond
+                        (replace_occurrences (deref cur_cond) cand (sym g)))
+                      (set_ref cur_body
+                        (replace_occurrences (deref cur_body) cand (sym g)))
+                      (set_ref steps (int_add (deref steps) 1)))))))
+            (if (eq (size prelude) 0)
+              null
+              ; rebuild: each hoisted pair binds OUTSIDE the while, innermost
+              ; pair closest to the while (later hoists may reference earlier
+              ; names if a maximal expr contained one — though here each is
+              ; independent). Wrap from the LAST pair inward.
+              (bind ((inner (ref (calln "while"
+                              (list_of (deref cur_cond) (deref cur_body)))))
+                     (i (ref (int_sub (size prelude) 1))))
+                (do
+                  (while (ge (deref i) 0)
+                    (bind ((p (get prelude (deref i))))
+                      (do
+                        (set_ref inner
+                          (calln "bind"
+                            (list_of (sym (get p "name")) (get p "value")
+                                     (deref inner))))
+                        (set_ref i (int_sub (deref i) 1)))))
+                  (deref inner))))))))))
+
+; licm_node — the core: rewrite every `(while …)` in `node`, bottom-up, hoisting
+; invariant subexpressions out of each. transform rebuilds children first (inner
+; loops handled before outer), then rewrites the while node.
+(bind licm_node
+  (lambda (node)
+    (transform node
+      (lambda (n)
+        (if (head_is? n "while") (licm_one_while n) null)))))
+
+; run — the transform entry: rewrite every located form IN PLACE.
+(bind run
+  (lambda (located)
+    (for f located
+      (assoc f "node" (licm_node (get f "node"))))))
+
+; register! — install LICM as a load-time TRANSFORM (idempotent).
+(bind register! (lambda () (install_transform! "licm" run)))
+
+; The hardened leaf helpers are exported so the SSA-promotability LICM (ssa_licm) can
+; reuse them VERBATIM — the mutated-set + escape scan, the deref-of-mutated guard, the
+; RULE-A nested-binder bail, RULE-B hygienic naming, occurrence replacement, and the
+; total-purity whitelist — and only RELAX the invariant-leaf set (an unmutated
+; non-escaping ref's `(deref r)` is loop-invariant). Reusing these keeps ssa_licm inside
+; licm's proven soundness envelope instead of reimplementing the fragile parts.
+(export licm_node run register!
+        licm_pure? pure_head? collect_mutated reads_mutated_ref?
+        bound_names_in scope_stable? has_nested_binder? hygienic_hoist_name
+        replace_occurrences pure_total_heads)

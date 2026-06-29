@@ -1,0 +1,249 @@
+; stdlib/lib/collections/sequence.caap — list/sequence helpers.
+;
+; Clean-named facades over the kernel `sequence_*` builtins, plus derived
+; helpers. Predicates take (item)->bool; fold's f is (acc item)->acc.
+;
+; The derived helpers are written as `defn` with GENERIC signatures: the
+; element type rides as the variable `T` (A2), bound at each call site, so
+; `(first (list int))` checks as `int`. The facades stay bare renames — the
+; kernel `sequence_*` builtins carry no type variables, so a typed wrapper
+; would only add indirection (this kernel-blocked boundary is documented in
+; types/README.md). Where the result element comes from a `callable` (map_indexed,
+; flat_map, map_vals), no variable can carry it out, so the result is a bare
+; `list`/`map`.
+(module stdlib.lib.collections.sequence)
+
+; ── facades over kernel sequence_* ──────────────────────────────────────────
+; Builtins are first-class values, so a facade is just a rename — no
+; eta-expanded wrapper lambdas.
+(bind map     sequence_map)        ; (seq f)
+(bind filter  sequence_filter)     ; (seq pred)
+(bind fold    sequence_fold_left)  ; (seq init f)
+(bind each    sequence_each)       ; (seq f)
+(bind range   sequence_range)      ; (lo hi)
+(bind reverse sequence_reverse)    ; (seq)
+(bind find    sequence_find)       ; (seq pred)
+(bind any?    sequence_any)        ; (seq pred)
+(bind all?    sequence_all)        ; (seq pred)
+(bind take    sequence_take)       ; (seq n)
+(bind drop    sequence_drop)       ; (seq n)
+(bind count   sequence_count)      ; (seq pred)
+(bind join    sequence_join)       ; (seq sep)
+(bind zip     sequence_zip)        ; (a b) -> list of pairs
+(bind sort_by sequence_sort_by)    ; (seq key_fn)
+
+; ── derived helpers (real library code) ─────────────────────────────────────
+; These are written as `defn` with GENERIC signatures: the element type rides
+; as the variable `T`, bound at each call site (A2). `(first (list int))`
+; checks as `int`, `(first (list string))` as `string` — the kernel's facades
+; above stay `any` (the kernel carries no type variables; documented in
+; types/README.md). A bare-list argument still satisfies a `(list T)`
+; parameter (assignable? treats the bare kernel container permissively), so
+; nothing that typed before stops typing now.
+(defn length ((seq (list T))) int (size seq))               ; element count
+(defn empty? ((seq (list T))) bool (eq (size seq) 0))
+(defn first  ((seq (list T))) T (get seq 0))                ; first | null
+(defn last   ((seq (list T))) T                             ; last | null
+  (if (empty? seq) null (get seq (int_sub (size seq) 1))))
+(defn sum ((seq (list int))) int                            ; ints only
+  (fold seq 0 (lambda (acc x) (int_add acc x))))
+(defn contains? ((seq (list T)) (x T)) bool                 ; membership by eq
+  (any? seq (lambda (e) (eq e x))))
+
+; prepend — fresh list with `x` in front.
+;   x / seq : the new head and the rest
+;   ->      : [x, seq…] (seq untouched)
+(defn prepend ((x T) (seq (list T))) (list T)
+  (bind ((out (list_of x)))
+    (do (each seq (lambda (e) (append out e))) out)))
+
+; concat — fresh list with all of `a` then all of `b`.
+;   a / b : two lists of the same element type
+;   ->    : [a… b…] (inputs untouched)
+(defn concat ((a (list T)) (b (list T))) (list T)
+  (bind ((out (list_of)))
+    (do
+      (each a (lambda (e) (append out e)))
+      (each b (lambda (e) (append out e)))
+      out)))
+
+; pairs — chunk a flat list into 2-element lists: [k1 v1 k2 v2] -> [[k1 v1]…].
+; The shape of canonical bind pairs and map literals; an odd trailing element
+; is dropped.
+;   seq : the flat list
+;   ->  : fresh list of [a b] pairs
+(defn pairs ((seq (list T))) (list (list T))
+  (bind (
+    (out (list_of))
+    (i (ref 0))
+  )
+    (do
+      (while (lt (int_add (deref i) 1) (size seq))
+        (do
+          (append out (list_of (get seq (deref i))
+                               (get seq (int_add (deref i) 1))))
+          (set_ref i (int_add (deref i) 2))))
+      out)))
+
+; map_indexed — map with the element's position. The result element type is
+; `f`'s RANGE, unrelated to the input's `A` — so the result stays a bare
+; `list` (no variable can carry an unseen type out of a `callable`).
+;   seq : the sequence
+;   f   : (item index) -> new item
+;   ->  : a fresh list of f's results, in order
+(defn map_indexed ((seq (list A)) (f callable)) list
+  (bind ((out (list_of)))
+    (do
+      (for i (range 0 (size seq))
+        (append out (f (get seq i) i)))
+      out)))
+
+; flat_map — map then concatenate the resulting lists into one. As with
+; map_indexed, the output element type comes from `f`, so the result is a
+; bare `list`.
+;   seq : the sequence
+;   f   : (item) -> list
+;   ->  : a flat list of all f's elements, in order
+(defn flat_map ((seq (list A)) (f callable)) list
+  (bind ((out (list_of)))
+    (do (each seq (lambda (e) (each (f e) (lambda (x) (append out x))))) out)))
+
+; flatten — one level: a list of lists -> a single list.
+(defn flatten ((seq (list (list T)))) (list T)
+  (flat_map seq (lambda (e) e)))
+
+; index_of — the 0-based position of the first element eq to `x`, or -1.
+(defn index_of ((seq (list T)) (x T)) int
+  (bind ((out (ref -1)) (i (ref 0)))
+    (do
+      (while (and (eq (deref out) -1) (lt (deref i) (size seq)))
+        (do
+          (when (eq (get seq (deref i)) x) (set_ref out (deref i)))
+          (set_ref i (int_add (deref i) 1))))
+      (deref out))))
+
+; min_by / max_by — the element with the smallest / largest key, or null when
+; empty. `key` is (item) -> int; the chosen ELEMENT keeps the list's type.
+(defn min_by ((seq (list T)) (key callable)) T
+  (if (empty? seq) null
+    (fold (drop seq 1) (first seq)
+      (lambda (best e) (if (lt (key e) (key best)) e best)))))
+(defn max_by ((seq (list T)) (key callable)) T
+  (if (empty? seq) null
+    (fold (drop seq 1) (first seq)
+      (lambda (best e) (if (gt (key e) (key best)) e best)))))
+
+; min / max — smallest / largest element (ints), or null when empty.
+(defn min ((seq (list T))) T (min_by seq (lambda (x) x)))
+(defn max ((seq (list T))) T (max_by seq (lambda (x) x)))
+
+; unique — a fresh list keeping the FIRST occurrence of each element (by eq),
+; order preserved.
+(defn unique ((seq (list T))) (list T)
+  (bind ((out (list_of)))
+    (do (each seq (lambda (e) (unless (contains? out e) (append out e)))) out)))
+
+; partition — split into [matching, rest] by a predicate.
+;   seq / pred : the sequence and (item) -> bool
+;   ->         : a 2-element list [yes no], each of the input's element type
+(defn partition ((seq (list T)) (pred callable)) (list (list T))
+  (bind ((yes (list_of)) (no (list_of)))
+    (do
+      (each seq (lambda (e) (if (pred e) (append yes e) (append no e))))
+      (list_of yes no))))
+
+; take_while / drop_while — prefix satisfying / suffix after it.
+(defn take_while ((seq (list T)) (pred callable)) (list T)
+  (bind ((out (list_of)) (go (ref true)) (i (ref 0)))
+    (do
+      (while (and (deref go) (lt (deref i) (size seq)))
+        (bind ((e (get seq (deref i))))
+          (if (pred e)
+            (do (append out e) (set_ref i (int_add (deref i) 1)))
+            (set_ref go false))))
+      out)))
+(defn drop_while ((seq (list T)) (pred callable)) (list T)
+  (bind ((i (ref 0)))
+    (do
+      (while (and (lt (deref i) (size seq)) (pred (get seq (deref i))))
+        (set_ref i (int_add (deref i) 1)))
+      (drop seq (deref i)))))
+
+; reduce — fold WITHOUT a seed: the first element seeds the fold, then `f`
+; combines it with each remaining element. EMPTY POLICY: an empty sequence has
+; no element to seed with, so this returns `null` (the same empty-policy as
+; `min_by`/`max_by`/`last` above — no throw). A one-element list returns that
+; element unchanged.
+;   seq : the sequence (its first element seeds the fold)
+;   f   : (acc item) -> acc
+;   ->  : the final accumulator, or `null` when `seq` is empty
+(defn reduce ((seq (list T)) (f callable)) T
+  (if (empty? seq) null
+    (fold (drop seq 1) (first seq) f)))
+
+; scan — the list of running accumulations (a left-scan INCLUDING the seed):
+; (scan [a b c] f init) -> [init, f(init,a), f(f(init,a),b), …]. The result has
+; length (size seq)+1; the head is `init` and the last is the full fold. The
+; accumulator type comes from `init`/`f`, so the result is a bare `list`.
+;   seq  : the sequence
+;   f    : (acc item) -> acc
+;   init : the seed (also the first emitted accumulator)
+;   ->   : a fresh list of length (size seq)+1
+(defn scan ((seq (list A)) (f callable) (init B)) list
+  (bind ((out (list_of init)) (acc (ref init)))
+    (do
+      (each seq (lambda (x) (do (set_ref acc (f (deref acc) x)) (append out (deref acc)))))
+      out)))
+
+; chunk — partition into consecutive sublists of size `n` (the last may be
+; shorter). `n` must be positive; a non-positive `n` yields an empty list.
+;   seq : the sequence
+;   n   : the chunk size (> 0)
+;   ->  : a fresh list of sublists, each of the input's element type
+(defn chunk ((seq (list T)) (n int)) (list (list T))
+  (bind ((out (list_of)) (cur (ref (list_of))))
+    (do
+      (when (gt n 0)
+        (each seq
+          (lambda (x)
+            (do
+              (append (deref cur) x)
+              (when (eq (size (deref cur)) n)
+                (do (append out (deref cur)) (set_ref cur (list_of))))))))
+      (when (gt (size (deref cur)) 0) (append out (deref cur)))
+      out)))
+
+; windows — every contiguous sublist of size `n`, sliding by 1. The result is
+; empty when `n` is non-positive or exceeds the sequence length.
+;   seq : the sequence
+;   n   : the window size
+;   ->  : a fresh list of length-n windows, in order
+(defn windows ((seq (list T)) (n int)) (list (list T))
+  (bind ((out (list_of)))
+    (do
+      (when (and (gt n 0) (lt (int_sub n 1) (size seq)))
+        (for i (range 0 (int_add (int_sub (size seq) n) 1))
+          (bind ((w (list_of)))
+            (do
+              (for j (range i (int_add i n)) (append w (get seq j)))
+              (append out w)))))
+      out)))
+
+; enumerate — pair each element with its 0-based index: [[0 a] [1 b] …]. The
+; pair holds an int index and an element of distinct types, so the result is a
+; bare `list` rather than a one-variable container.
+;   seq : the sequence
+;   ->  : a fresh list of [index element] 2-element lists
+(defn enumerate ((seq (list T))) list
+  (bind ((out (list_of)))
+    (do
+      (for i (range 0 (size seq))
+        (append out (list_of i (get seq i))))
+      out)))
+
+(export map filter fold each range reverse find any? all? take drop count join
+        zip sort_by length empty? first last sum contains? map_indexed
+        prepend concat pairs
+        flat_map flatten index_of min_by max_by min max unique partition
+        take_while drop_while
+        reduce scan chunk windows enumerate)

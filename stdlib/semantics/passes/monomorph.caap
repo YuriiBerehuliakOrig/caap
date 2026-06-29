@@ -1,0 +1,389 @@
+; stdlib/semantics/passes/monomorph.caap — NATIVE GENERICS by monomorphization,
+; as a whole-module TRANSFORM (module stdlib.semantics.passes.monomorph).
+;
+; CAAP generics elsewhere are eval-only: call-site unification type-checks a
+; `(list T)` signature but never produces native code (the LLVM backend has no
+; lowering for a type variable). This pass closes that gap for the codegen path
+; by SPECIALIZING explicitly-instantiated generics into concrete `defn`s BEFORE
+; the native gate/codegen ever sees them — so the backend only meets concrete
+; struct-pointer code, which it already lowers.
+;
+; It runs at prep's transform stage (backend/prep.caap, over `acc.expanded`,
+; before classify) — by which point every merged module's generic DEFINITION and
+; all its CALL SITES sit in one form list. A generic is one with a COMPILE-TIME
+; parameter, spelled by a parameter whose type is the marker word `type` (an
+; element/type parameter) or `field` (an intrusive link-field name). At each call
+; the compile-time arguments are read directly (NO inference — the caller names
+; the concrete type/field), so:
+;   - existing eval-dynamic generics (`id_list` over `list<int>`) have NO such
+;     parameter and are left completely untouched (the eval path is safe);
+;   - a specialization is byte-identical to the hand-written concrete function
+;     (a `type` parameter substitutes the type spelling in the signature; a
+;     `field` parameter substitutes the field-name STRING inside `field_ptr`).
+;
+; Pipeline per generic call `(g <ct-args…> <rt-args…>)`:
+;   1. read the compile-time args -> {type-var -> concrete}, {field-param -> name}
+;   2. mint a mangled symbol `g__T0__field0…`; emit ONE specialized `defn` per
+;      unique instantiation (dedup); drop the compile-time params + their args.
+;   3. rewrite the call to `(g__… <rt-args…>)`.
+; Finally the generic TEMPLATES are dropped, so the gate types only concrete code.
+;
+; CONSTRAINTS (documented, not silent — substitution is string/name based, so a
+; few naming rules keep it unambiguous; none is violated by the urun lists):
+;   - A generic body that itself calls another generic is not recursively
+;     specialized (revisit when a caller needs it).
+;   - A `field` parameter substitutes by FIELD NAME: a body access `x->LF`
+;     (LF = the field-param name) on a value whose type is NOT the type parameter
+;     would also be rewritten. Field-param names are short placeholders (`lf`);
+;     do not reuse one as a real field accessed on an unrelated struct in the
+;     same body.
+;   - A `type` parameter is a single-uppercase type variable; do not also use
+;     that letter to name a runtime value (a value REBOUND by a binder is spared
+;     — subst_safe — but a free use in value position is not).
+;   - A concrete type/field argument must not contain `__` (the mangling
+;     separator) — rejected with a diagnostic rather than silently colliding.
+(module stdlib.semantics.passes.monomorph)
+
+(use stdlib.syntax.ast
+  call? name? string_lit? head_is? args_of arg callee
+  name_of literal_of sym lit call calln)
+(use stdlib.syntax.ir transform subst_safe match_node)
+(use stdlib.semantics.types.records marker? sig_marker)
+(use stdlib.semantics.types.registry ctor_of type_args)
+(use stdlib.semantics.passes.registry install_transform!)
+
+; ct_kind — the compile-time kind a parameter type denotes, or null (runtime).
+;   "type"  : an element/type parameter (its concrete type names the spelling)
+;   "field" : an intrusive link-field name (substituted into field_ptr)
+(bind ct_kind
+  (lambda (ptype)
+    (cond ((eq ptype "type") "type")
+          ((eq ptype "field") "field")
+          (else null))))
+
+; has_ct_param? — does a signature carry any compile-time parameter (= generic)?
+(bind has_ct_param?
+  (lambda (sig)
+    (bind ((found (ref false)))
+      (do
+        (when (not (eq sig null))
+          (for p (get sig "params")
+            (when (not (eq (ct_kind (get p "type")) null)) (set_ref found true))))
+        (deref found)))))
+
+; subst_ty — substitute type variables in a NATIVE type spelling. Handles the
+; bare variable (`T` -> `Node`) and the pointer constructor (`ptr_T` -> `ptr_Node`,
+; recursively). subst_type (registry) only knows the `<…>` constructor spelling,
+; not the underscore `ptr_` one the native surface uses, so this is its sibling.
+; nargs — the top-level argument spellings of a NATIVE parameterized type
+; `Ctor<A&B&…>`. The native surface separates generic arguments with `&` (NOT the
+; comma the eval type system / type_args use), because a native type spelling is
+; rendered to kernel SOURCE and re-parsed per module, and `,` is not a kernel
+; symbol char while `&` is — so `List<UR_THREAD&ur_thread_suspend_next>` round-trips
+; where a comma would not. `&`-split at depth 0 (nested `<…>` stays intact).
+(bind nargs
+  (lambda (name)
+    (bind ((at (string_find name "<")))
+      (if (or (eq at null) (not (string_ends_with name ">")))
+        null
+        (bind ((inner (string_slice name (int_add at 1) (int_sub (size name) 1)))
+               (out (list_of)) (cur (ref "")) (depth (ref 0)) (k (ref 0)))
+          (do
+            (while (lt (deref k) (size inner))
+              (bind ((ch (string_slice inner (deref k) (int_add (deref k) 1))))
+                (do
+                  (cond
+                    ((eq ch "<") (do (set_ref depth (int_add (deref depth) 1))
+                                     (set_ref cur (string_concat_many (deref cur) ch))))
+                    ((eq ch ">") (do (set_ref depth (int_sub (deref depth) 1))
+                                     (set_ref cur (string_concat_many (deref cur) ch))))
+                    ((and (eq ch "&") (le (deref depth) 0))
+                      (do (append out (deref cur)) (set_ref cur "")))
+                    (else (set_ref cur (string_concat_many (deref cur) ch))))
+                  (set_ref k (int_add (deref k) 1)))))
+            (append out (deref cur))
+            out))))))
+
+; field_default — the conventional intrusive link-field name a generic struct's
+; `field` parameter takes when it is OMITTED from a `<…>` spelling (the analogue of
+; the List wrapper's own fixed `head`: just as the caller never names `head`, a
+; single-list element need not name its link — it defaults to `next`).
+(bind field_default "next")
+
+; pad_omitted_fields — canonicalise a NATIVE type spelling: when `sp` names a generic
+; whose TRAILING compile-time parameters are omitted, fill each omitted `field`
+; parameter with `next` so the rest of the pipeline always sees the full spelling
+; (`List<UR_TIMER>` -> `List<UR_TIMER&next>`). An omitted `type` parameter is an
+; error — a type has no default. `kinds_of` maps a constructor name to its ordered
+; compile-time parameter kinds (e.g. ["type" "field"]), or null for a non-generic;
+; a fully-applied or non-constructor spelling passes through untouched.
+(bind pad_omitted_fields
+  (lambda (sp kinds_of)
+    (if (eq sp null) sp
+      (bind ((is_ptr (string_starts_with sp "ptr_"))
+             (base   (if is_ptr (string_slice sp 4 (size sp)) sp))
+             (ctor   (ctor_of base)))
+        (if (eq ctor null) sp
+          (bind ((kinds (kinds_of ctor)))
+            (if (eq kinds null) sp
+              (bind ((args (nargs base)))
+                (if (or (eq args null) (ge (size args) (size kinds))) sp
+                  (bind ((out (list_of)) (k (ref (size args))) (spel (ref "")) (j (ref 0)))
+                    (do
+                      (for a args (append out a))
+                      (while (lt (deref k) (size kinds))
+                        (do
+                          (if (eq (get kinds (deref k)) "field")
+                            (append out field_default)
+                            (throw (string_concat_many "generics: `" ctor
+                              "` needs a TYPE argument in `" sp
+                              "` — only a `field` parameter defaults (to `" field_default "`)")))
+                          (set_ref k (int_add (deref k) 1))))
+                      (set_ref spel (string_concat_many ctor "<"))
+                      (while (lt (deref j) (size out))
+                        (do
+                          (when (gt (deref j) 0) (set_ref spel (string_concat_many (deref spel) "&")))
+                          (set_ref spel (string_concat_many (deref spel) (get out (deref j))))
+                          (set_ref j (int_add (deref j) 1))))
+                      (set_ref spel (string_concat_many (deref spel) ">"))
+                      (if is_ptr (string_concat_many "ptr_" (deref spel)) (deref spel)))))))))))))
+
+(bind subst_ty
+  (lambda (name smap)
+    (cond
+      ((eq name null) null)
+      ((not (eq (get smap name) null)) (get smap name))
+      ((string_starts_with name "ptr_")
+        (string_concat_many "ptr_" (subst_ty (string_slice name 4 (size name)) smap)))
+      ; a parameterized spelling `Ctor<A&B>` (e.g. List<T&lf> -> List<UR_THREAD&…>) —
+      ; substitute each argument recursively so a struct-typed param/field carries
+      ; the concrete instantiation into struct_monomorph.
+      ((not (eq (ctor_of name) null))
+        (bind ((spell (ref (string_concat_many (ctor_of name) "<"))) (n (ref 0)))
+          (do
+            (for a (nargs name)
+              (do
+                (when (gt (deref n) 0) (set_ref spell (string_concat_many (deref spell) "&")))
+                (set_ref spell (string_concat_many (deref spell) (subst_ty a smap)))
+                (set_ref n (int_add (deref n) 1))))
+            (string_concat_many (deref spell) ">"))))
+      (else name))))
+
+; defn_shape / decode_defn — read an expanded `(do <marker> (bind name value))`
+; into {name, value (the lambda), marker, sig}, or null for any other shape.
+; (A local twin of prep.caap's private defn_pair — prep does not export it.)
+(bind defn_shape
+  (calln "do" (list_of (sym "?marker")
+                       (calln "bind" (list_of (sym "?name") (sym "?value"))))))
+(bind decode_defn
+  (lambda (node)
+    (bind ((b (match_node defn_shape node)))
+      (if (or (eq b null) (not (marker? (get b "?marker"))))
+        null
+        (assoc (map_of)
+          "name"   (name_of (get b "?name"))
+          "value"  (get b "?value")
+          "marker" (get b "?marker")
+          "sig"    (sig_marker (get b "?marker")))))))
+
+; params_spec — the kernel lambda parameter clause for `names`: `(p0 p1 …)` (a
+; call whose callee is the first name), or the literal null for no parameters.
+(bind params_spec
+  (lambda (names)
+    (if (eq (size names) 0)
+      (lit null)
+      (bind ((rest (list_of)) (k (ref 1)))
+        (do
+          (while (lt (deref k) (size names))
+            (do (append rest (sym (get names (deref k))))
+                (set_ref k (int_add (deref k) 1))))
+          (call (sym (get names 0)) rest))))))
+
+; field_subst_body — replace `(field_ptr X "<param>")` with the concrete field
+; name everywhere in a body, for each {field-param -> concrete} binding.
+(bind field_subst_body
+  (lambda (body field_subst)
+    (if (eq (size (map_keys field_subst)) 0)
+      body
+      (transform body
+        (lambda (n)
+          (if (and (call? n) (head_is? n "field_ptr"))
+            (bind ((fa (arg n 1)))
+              (if (and (string_lit? fa)
+                       (not (eq (get field_subst (literal_of fa)) null)))
+                (calln "field_ptr"
+                  (list_of (arg n 0) (lit (get field_subst (literal_of fa)))))
+                null))
+            null))))))
+
+; subst_body — the body of a specialization: substitute every type-VARIABLE name
+; (a `T` reaching value-position as a cast/null-pointer target, e.g. `0 as T*` ->
+; `(int_to_ptr 0 T)`) with its concrete type NAME node, then substitute the link
+; FIELD strings. CAPTURE-AVOIDING (subst_safe): a value/local that happens to be
+; named `T` and is REBOUND by a binder is left alone — only the type-position
+; uses are rewritten. (Convention still reserves single-uppercase names for type
+; variables; see the CONSTRAINTS note in the header.) Field names ride as string
+; literals, untouched by name substitution.
+(bind subst_body
+  (lambda (body type_subst field_subst)
+    (bind ((tv_map (map_of)))
+      (do
+        (for tv (map_keys type_subst)
+          (assoc tv_map tv (sym (get type_subst tv))))
+        (field_subst_body (subst_safe body tv_map) field_subst)))))
+
+; specialize_call — at a generic call, read the compile-time arguments, record
+; the instantiation (dedup by mangled name), and return the rewritten concrete
+; call `(g__… <rt-args…>)`. Records into `insts`: mangled -> {gen, type_subst,
+; field_subst}.
+(bind specialize_call
+  (lambda (call_node gen insts)
+    (bind (
+      (fname      (get (get gen "sig") "fname"))
+      (params     (get (get gen "sig") "params"))
+      (args       (args_of call_node))
+      (type_subst (map_of))
+      (field_subst (map_of))
+      (new_args   (list_of))
+      (mangle     (ref fname))
+      (i          (ref 0))
+      ; mangling joins parts with `__`; a part that itself contains `__` would
+      ; make the symbol ambiguous (two instantiations collapsing to one name), a
+      ; silent miscompile. Reject loudly instead — `__` never appears in a real
+      ; type/field name. (No silent fallback; principles.md.)
+      (mpart      (lambda (kind v)
+        (if (eq (string_find v "__") null) v
+          (throw (string_concat_many "monomorph: " kind " argument `" v
+            "` to generic `" fname "` contains `__`, which would make the "
+            "specialized symbol name ambiguous")))))
+    )
+      ; UNDER-APPLIED — fewer args than params: the call omits compile-time args
+      ; preresolve could not deduce IN THIS PASS. A GLOBAL receiver is invisible to
+      ; the loader-phase expanded forms (only the codegen/prep phase materialises
+      ; `(global …)`), so preresolve there leaves it under-applied. Leave the call
+      ; untouched: the prep-phase preresolve prepends the deduced args before the
+      ; prep-phase monomorph specializes it. A call STILL under-applied at codegen
+      ; surfaces as an unknown symbol — a real diagnostic, never a wrong specialize.
+      (if (lt (size args) (size params))
+        call_node
+      (do
+        (for p params
+          (do
+            (bind ((a (get args (deref i))) (k (ct_kind (get p "type"))))
+              (cond
+                ((eq k "type")
+                  (bind ((tn (mpart "type" (name_of a))))
+                    (do
+                      (assoc type_subst (get p "name") tn)
+                      (set_ref mangle (string_concat_many (deref mangle) "__" tn)))))
+                ((eq k "field")
+                  (bind ((fv (mpart "field" (if (string_lit? a) (literal_of a) (name_of a)))))
+                    (do
+                      (assoc field_subst (get p "name") fv)
+                      (set_ref mangle (string_concat_many (deref mangle) "__" fv)))))
+                (else (append new_args a))))
+            (set_ref i (int_add (deref i) 1))))
+        (when (eq (get insts (deref mangle)) null)
+          (assoc insts (deref mangle)
+            (assoc (map_of)
+              "gen" gen "mangled" (deref mangle)
+              "type_subst" type_subst "field_subst" field_subst)))
+        (calln (deref mangle) new_args))))))
+
+; rewrite_calls — retarget every call to a generic in `node`, recording each
+; instantiation; non-generic calls pass through untouched.
+(bind rewrite_calls
+  (lambda (node generics insts)
+    (transform node
+      (lambda (n)
+        (if (call? n)
+          (bind ((h (name_of (callee n))))
+            (if (and (not (eq h null)) (not (eq (get generics h) null)))
+              (specialize_call n (get generics h) insts)
+              null))
+          null)))))
+
+; build_spec — the specialized `(do <marker> (bind name lambda))` form + its
+; located entry, from one recorded instantiation.
+(bind build_spec
+  (lambda (inst)
+    (bind (
+      (gen         (get inst "gen"))
+      (sig         (get gen "sig"))
+      (mangled     (get inst "mangled"))
+      (type_subst  (get inst "type_subst"))
+      (field_subst (get inst "field_subst"))
+      ; a FIELD parameter can appear in a TYPE position too — `self: List<T&lf>*`
+      ; carries the link field in the type — so substituting types must apply both
+      ; the type AND field bindings (else `lf` stays literal and mints List__T__lf).
+      (ty_subst    (bind ((m (map_of)))
+                     (do (for kk (map_keys type_subst) (assoc m kk (get type_subst kk)))
+                         (for kk (map_keys field_subst) (assoc m kk (get field_subst kk)))
+                         m)))
+      (eff         (get sig "declared_effect"))
+      (marker_list (list_of "::defn_sig" mangled
+                     (subst_ty (get sig "result") ty_subst)
+                     (if (eq eff null) "?" eff)))
+      (rt_names    (list_of))
+    )
+      (do
+        (for p (get sig "params")
+          (when (eq (ct_kind (get p "type")) null)
+            (do
+              (append marker_list (get p "name"))
+              (append marker_list (subst_ty (get p "type") ty_subst))
+              (append rt_names (get p "name")))))
+        (bind (
+          (body     (subst_body (arg (get gen "value") 1) type_subst field_subst))
+          (new_lam  (calln "lambda" (list_of (params_spec rt_names) body)))
+          (new_node (calln "do" (list_of
+                      (lit marker_list)
+                      (calln "bind" (list_of (sym mangled) new_lam)))))
+          (tmpl     (get gen "entry"))
+        )
+          (assoc (map_of)
+            "node"  new_node
+            "label" (get tmpl "label")
+            "root"  (get tmpl "root")))))))
+
+; run — the transform entry. Indexes generics, retargets every call + records
+; instantiations, appends one specialization per unique instantiation, and drops
+; the generic templates — all in place on `located`. A fast no-op when no
+; generic is present (the common case).
+(bind run
+  (lambda (located)
+    (bind ((generics (map_of)) (gen_idxs (list_of)) (i (ref 0)))
+      (do
+        (for f located
+          (do
+            (bind ((d (decode_defn (get f "node"))))
+              (when (and (not (eq d null)) (has_ct_param? (get d "sig")))
+                (do
+                  (assoc generics (get d "name") (assoc d "entry" f))
+                  (append gen_idxs (deref i)))))
+            (set_ref i (int_add (deref i) 1))))
+        (when (gt (size (map_keys generics)) 0)
+          (bind ((insts (map_of)))
+            (do
+              ; retarget calls everywhere (collects instantiations)
+              (for f located
+                (assoc f "node" (rewrite_calls (get f "node") generics insts)))
+              ; emit one specialization per unique instantiation
+              (for mangled (map_keys insts)
+                (append located (build_spec (get insts mangled))))
+              ; drop the generic templates (highest index first)
+              (bind ((j (ref (int_sub (size gen_idxs) 1))))
+                (while (ge (deref j) 0)
+                  (do
+                    (list_remove_at located (get gen_idxs (deref j)))
+                    (set_ref j (int_sub (deref j) 1))))))))))))
+
+; register_monomorph! — install monomorphization as a load-time TRANSFORM.
+; Required (NOT an optimization): it must run before any other transform and
+; before the gate. Called from backend/prep.caap at load, so EVERY native
+; codegen entry registers it (not just the native_emit leg); never on the
+; eval-only path (prep is native-only).
+(bind register_monomorph! (lambda () (install_transform! "monomorph" run)))
+
+(export ct_kind has_ct_param? decode_defn subst_ty nargs field_default pad_omitted_fields
+        specialize_call build_spec run register_monomorph!)

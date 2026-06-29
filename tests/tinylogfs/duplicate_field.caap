@@ -1,0 +1,3 @@
+; negative: field `a` declared twice in one record.
+(use stdlib.storage.binary le_bytes)
+(storage Bad (record R 1 (field a u32) (field a u16)))

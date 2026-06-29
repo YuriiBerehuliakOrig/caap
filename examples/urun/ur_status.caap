@@ -1,0 +1,26 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  ur_status — the URun service completion codes + wait options, as a shared
+//  ENUM (module stdlib.urun.ur_status). The analogue of the UR_* status
+//  macros in ur_api.h. These cross module boundaries (a service returns a code,
+//  the caller compares it), so they live in their own module and are `export`
+//  exported; every variant is importable by name via `use`.
+// ═══════════════════════════════════════════════════════════════════════════
+(surface stdlib.frontend.clike stdlib.urun.ur_status)
+
+// Service completion codes (the subset this slice produces). Named instead of
+// magic 0/1/10/11/13/26/33 at every return and comparison site.
+UR_STATUS enum export = {
+  UR_SUCCESS = 0,
+  UR_DELETED = 1,
+  UR_QUEUE_EMPTY = 10,
+  UR_QUEUE_FULL = 11,
+  UR_NO_INSTANCE = 13,
+  UR_WAIT_ABORTED = 26,
+  UR_CEILING_EXCEEDED = 33
+}
+
+// Wait option for the blocking services: poll, or block forever. (A finite tick
+// timeout is any other value, so it needs no name.) UR_WAIT_FOREVER is the full
+// 32-bit sentinel; the suspend engine treats only this value as "never expire".
+UR_NO_WAIT () u32 export = { 0 }
+UR_WAIT_FOREVER () u32 export = { 4294967295 }

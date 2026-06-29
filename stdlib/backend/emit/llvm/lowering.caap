@@ -1,0 +1,810 @@
+; stdlib/backend/emit/llvm/lowering.caap — the recursive expression walker for the
+; LLVM emitter (module stdlib.backend.emit.llvm.lowering).
+;
+; lower_dispatch is the lowering cond proper (one expression -> SSA); `lower`
+; wraps it with the per-node DWARF location and trampolines the recursion through
+; `self`. It depends on the debug, types, and instructions leaves.
+(module stdlib.backend.emit.llvm.lowering)
+
+(use stdlib.lib.collections.map clone)
+(use stdlib.syntax.ast
+     call? name? literal? head_of callee args_of arg name_of literal_of bind_pairs)
+(use stdlib.backend.codegen_common
+     unsigned? binops sbinop_index cmp? eq_ne? pointee_of)
+(use stdlib.backend.emit.llvm.debug di_set_loc!)
+(use stdlib.backend.emit.llvm.types
+     ll_type float_ll? float_repr int_bits render_t ll_of ptr_cell field_lookup)
+(use stdlib.backend.emit.llvm.instructions
+     sbinops fbinops float_bitcasts cmps fcmps funify tmp! label! emit! alloca!
+     open_block! need_declare! string_global! unify dbg_spill_local!)
+(use stdlib.backend.emit.llvm.lowering.calls lower_direct_call)
+(use stdlib.backend.emit.llvm.lowering.memory lower_ptr_to_int lower_ptr_add)
+(use stdlib.backend.emit.llvm.lowering.control lower_while lower_do)
+(use stdlib.backend.emit.llvm.lowering.aggregates lower_field_ptr lower_union_field)
+
+; lower_dispatch — the lowering cond proper (one expression -> SSA). `lower`
+; (defined after it, so this carries no forward reference) wraps it with the
+; per-node debug location; the recursion trampolines through `self` = `lower`,
+; so every child node lowers through that wrapper.
+;   self / node / st / env / fns : recursion idiom, the expanded spec, the
+;   emission state, name -> value map, the function table
+(bind lower_dispatch
+  (lambda (self node st env fns)
+    (cond
+      ((literal? node)
+        (bind ((v (literal_of node)))
+          (case (value_type v)
+            ("int" (assoc (map_of) "repr" (int_to_string v) "type" null "ct" null))
+            ; a bare float literal: decimal repr, width adopted at the use site
+            ; (ct "float" so funify/cast tell it apart from an int literal)
+            ("float" (assoc (map_of) "repr" (float_repr v) "type" null "ct" "float"))
+            ("bool" (assoc (map_of) "repr" (if v "1" "0") "type" "i1" "ct" "bool"))
+            ("string" (string_global! st v))
+            (else (throw (string_concat_many
+              "native codegen: unsupported literal type "
+              (value_type v)))))))
+      ((name? node)
+        (bind ((e (get env (name_of node))))
+          (if (eq e null)
+            (throw (string_concat_many
+              "native codegen: unsupported free name `" (name_of node) "`"))
+            e)))
+      (else
+        (bind ((head (head_of node)) (args (args_of node)))
+          (cond
+            ((not (eq (get binops head) null))
+              (bind (
+                (a (self self (get args 0) st env fns))
+                (b (self self (get args 1) st env fns))
+                (t (unify (get a "type") (get b "type")))
+                (r (tmp! st))
+              )
+                (do
+                  (when (eq t "str")
+                    (throw "native codegen: arithmetic over strings"))
+                  (emit! st (string_concat_many
+                    r " = " (get binops head "?") " " t " "
+                    (get a "repr" "?") ", " (get b "repr" "?")))
+                  (assoc (map_of) "repr" r "type" t "ct" null))))
+            ((not (eq (get fbinops head) null))
+              (bind (
+                (a (self self (get args 0) st env fns))
+                (b (self self (get args 1) st env fns))
+                (t (funify (get a "type") (get b "type")))
+                (r (tmp! st))
+              )
+                (do
+                  (unless (float_ll? t)
+                    (throw "native codegen: float_* needs float operands"))
+                  (emit! st (string_concat_many
+                    r " = " (get fbinops head "?") " " t " "
+                    (get a "repr" "?") ", " (get b "repr" "?")))
+                  (assoc (map_of) "repr" r "type" t "ct" "float"))))
+            ((or (eq head "int_to_float") (eq head "float_to_int"))
+              ; explicit int<->float conversions (kernel heads). int_to_float
+              ; -> sitofp/uitofp (sign from the source); float_to_int -> fptosi.
+              (bind (
+                (a (self self (get args 0) st env fns))
+                (r (tmp! st))
+              )
+                (if (eq head "int_to_float")
+                  (bind (
+                    (from (if (eq (get a "type") null) "i32" (get a "type")))
+                    (op (if (unsigned? (get a "ct" "i")) "uitofp" "sitofp"))
+                  )
+                    (do
+                      (emit! st (string_concat_many
+                        r " = " op " " from " " (get a "repr" "?") " to double"))
+                      (assoc (map_of) "repr" r "type" "double" "ct" "float")))
+                  (bind ((from (if (eq (get a "type") null) "double" (get a "type"))))
+                    (do
+                      (emit! st (string_concat_many
+                        r " = fptosi " from " " (get a "repr" "?") " to i32"))
+                      (assoc (map_of) "repr" r "type" "i32" "ct" "int"))))))
+            ((not (eq (get float_bitcasts head) null))
+              ; exact IEEE-754 bit views (the kernel's float_to_bits/_f32 inverse
+              ; bit-casts). Unlike fptosi/sitofp these REINTERPRET the bits — an
+              ; LLVM `bitcast` between equal-width float<->int. Fixed src/dst per
+              ; head (f64<->i64, f32<->i32); the storage codegen emits them so a
+              ; float field round-trips byte-identically to the eval backend.
+              (bind (
+                (cv (get float_bitcasts head))
+                (a (self self (get args 0) st env fns))
+                (r (tmp! st))
+              )
+                (do
+                  (emit! st (string_concat_many
+                    r " = bitcast " (get cv "from") " " (get a "repr" "?")
+                    " to " (get cv "to")))
+                  (assoc (map_of) "repr" r "type" (get cv "to") "ct" (get cv "ct")))))
+            ((not (eq (get sbinops head) null))
+              (bind (
+                (a (self self (get args 0) st env fns))
+                (b (self self (get args 1) st env fns))
+                (t (unify (get a "type") (get b "type")))
+                ; the signed/unsigned slot — unsigned only when an operand's
+                ; CAAP type says so (codegen_common/sbinop_index, the same rule
+                ; the wasm backend's div_s/div_u choice uses)
+                (op (get (get sbinops head)
+                         (sbinop_index (get a "ct") (get b "ct")) "?"))
+                (r (tmp! st))
+              )
+                (do
+                  (when (eq t "str")
+                    (throw "native codegen: arithmetic over strings"))
+                  (emit! st (string_concat_many
+                    r " = " op " " t " "
+                    (get a "repr" "?") ", " (get b "repr" "?")))
+                  (assoc (map_of) "repr" r "type" t "ct" null))))
+            ((eq head "cast")
+              ; (cast value ty): an explicit width/representation conversion —
+              ; integer trunc/zext/sext (sign from the SOURCE caap type), float
+              ; fpext/fptrunc, and int<->float sitofp/uitofp/fptosi. A bare
+              ; literal just adopts the target type. Essential for OS code
+              ; mixing u8/u16/u32/u64 and numeric code mixing int and float.
+              (bind (
+                (a (self self (get args 0) st env fns))
+                (tyn (name_of (get args 1)))
+                (to (if (eq tyn null) null (ll_type tyn)))
+                (from (get a "type"))
+                (a_float (eq (get a "ct") "float"))
+              )
+                (do
+                  (when (eq to null)
+                    (throw "native codegen: cast needs a scalar target type"))
+                  (cond
+                    ; a bare literal: no instruction, just take the target type
+                    ((eq from null)
+                      (assoc (map_of)
+                        "repr" (get a "repr" "?") "type" to "ct" tyn))
+                    ((eq from to)
+                      (assoc (map_of)
+                        "repr" (get a "repr" "?") "type" to "ct" tyn))
+                    (else
+                      (bind (
+                        (from2 (if (and a_float (eq from null)) "double" from))
+                        (src_float (float_ll? from2))
+                        (dst_float (float_ll? to))
+                        (op (cond
+                              ; float <-> float: extend / truncate by width
+                              ((and src_float dst_float)
+                                (if (eq to "double") "fpext" "fptrunc"))
+                              ; int -> float
+                              ((and (not src_float) dst_float)
+                                (if (unsigned? (get a "ct" "i")) "uitofp" "sitofp"))
+                              ; float -> int
+                              ((and src_float (not dst_float)) "fptosi")
+                              ; int -> int by width
+                              ((lt (int_bits to) (int_bits from2)) "trunc")
+                              ((unsigned? (get a "ct" "i")) "zext")
+                              (else "sext")))
+                        (r (tmp! st))
+                      )
+                        (do
+                          (when (and (not src_float) (not dst_float)
+                                     (or (eq (int_bits from2) 0) (eq (int_bits to) 0)))
+                            (throw "native codegen: cast operand has no scalar width"))
+                          (emit! st (string_concat_many
+                            r " = " op " " from2 " " (get a "repr" "?")
+                            " to " to))
+                          (assoc (map_of) "repr" r "type" to "ct" tyn))))))))
+            ((eq head "int_not")
+              ; bitwise complement = xor with all-ones; the width must be
+              ; KNOWN — a bare literal has none, and silently picking i32
+              ; would corrupt a u64 mask, so that is a certain diagnostic
+              (bind (
+                (a (self self (get args 0) st env fns))
+                (t (get a "type"))
+                (r (tmp! st))
+              )
+                (do
+                  (when (eq t null)
+                    (throw "native codegen: int_not needs a typed operand (a bare literal has no width)"))
+                  (emit! st (string_concat_many
+                    r " = xor " t " " (get a "repr" "?") ", -1"))
+                  (assoc (map_of) "repr" r "type" t "ct" (get a "ct")))))
+            ((cmp? head)
+              (bind (
+                (a (self self (get args 0) st env fns))
+                (b (self self (get args 1) st env fns))
+                ; a comparison touching a float (typed or a bare float literal)
+                ; unifies on float widths; otherwise on integer widths
+                (floaty (or (float_ll? (get a "type" "")) (or (float_ll? (get b "type" ""))
+                            (or (eq (get a "ct") "float") (eq (get b "ct") "float")))))
+                (t (if floaty
+                     (funify (get a "type") (get b "type"))
+                     (unify (get a "type") (get b "type"))))
+                (r (tmp! st))
+              )
+                (if (eq t "str")
+                  ; string equality through the runtime; ne = eq + not
+                  (do
+                    (unless (eq_ne? head)
+                      (throw "native codegen: only eq/ne compare strings"))
+                    (need_declare! st "caap_runtime_string_eq"
+                      "declare i1 @caap_runtime_string_eq({ ptr, i64 }, { ptr, i64 })")
+                    (emit! st (string_concat_many
+                      r " = call i1 @caap_runtime_string_eq({ ptr, i64 } "
+                      (get a "repr" "?") ", { ptr, i64 } " (get b "repr" "?") ")"))
+                    (if (eq head "ne")
+                      (bind ((r2 (tmp! st)))
+                        (do
+                          (emit! st (string_concat_many r2 " = xor i1 " r ", true"))
+                          (assoc (map_of) "repr" r2 "type" "i1" "ct" "bool")))
+                      (assoc (map_of) "repr" r "type" "i1" "ct" "bool")))
+                  (if (float_ll? t)
+                    ; float comparison: ordered predicate (NaN -> false)
+                    (do
+                      (emit! st (string_concat_many
+                        r " = fcmp " (get fcmps head "?") " " t " "
+                        (get a "repr" "?") ", " (get b "repr" "?")))
+                      (assoc (map_of) "repr" r "type" "i1" "ct" "bool"))
+                    (do
+                      (emit! st (string_concat_many
+                        r " = icmp " (get cmps head "?") " " t " "
+                        (get a "repr" "?") ", " (get b "repr" "?")))
+                      (assoc (map_of) "repr" r "type" "i1" "ct" "bool"))))))
+            ((eq head "string_concat_many")
+              ; fold left through the runtime's concat2
+              (bind ((slot (map_of)))
+                (do
+                  (unless (gt (size args) 0)
+                    (throw "native codegen: string_concat_many needs arguments"))
+                  (need_declare! st "caap_runtime_string_concat2"
+                    "declare { ptr, i64 } @caap_runtime_string_concat2({ ptr, i64 }, { ptr, i64 })")
+                  (assoc slot "v" (self self (get args 0) st env fns))
+                  (for k (sequence_range 1 (size args))
+                    (bind (
+                      (a (get slot "v"))
+                      (b (self self (get args k) st env fns))
+                      (r (tmp! st))
+                    )
+                      (do
+                        (unless (and (eq (get a "type") "str")
+                                     (eq (get b "type") "str"))
+                          (throw "native codegen: string_concat_many takes strings"))
+                        (emit! st (string_concat_many
+                          r " = call { ptr, i64 } @caap_runtime_string_concat2"
+                          "({ ptr, i64 } " (get a "repr" "?")
+                          ", { ptr, i64 } " (get b "repr" "?") ")"))
+                        (assoc slot "v"
+                          (assoc (map_of) "repr" r "type" "str" "ct" "string")))))
+                  (get slot "v"))))
+            ((eq head "get")
+              ; struct field READ: extractvalue from a struct VALUE, or
+              ; getelementptr+load through a struct POINTER (ptr_<S>). The
+              ; default argument is typed-away — never evaluated here.
+              (bind (
+                (subject (self self (get args 0) st env fns))
+                (stype (get subject "type" ""))
+                (structs (get (get st "prog" (map_of)) "structs" (map_of)))
+                (kv (literal_of (get args 1)))
+              )
+                (do
+                  (unless (and (not (eq kv null)) (eq (value_type kv) "string"))
+                    (throw "native codegen: struct field key must be a string literal"))
+                  (cond
+                    ; a struct VALUE
+                    ((string_starts_with stype "%")
+                      (bind (
+                        (sname (string_slice stype 1))
+                        (f (field_lookup structs sname kv))
+                        (r (tmp! st))
+                      )
+                        (do
+                          (emit! st (string_concat_many
+                            r " = extractvalue " stype " "
+                            (get subject "repr" "?") ", "
+                            (int_to_string (get f "idx"))))
+                          (assoc (map_of)
+                            "repr" r "type" (ll_of (get f "ftype") structs)
+                            "ct" (get f "ftype")))))
+                    ; a struct POINTER (ptr_<S>): GEP to the field, then load
+                    ((and (eq stype "ptr")
+                          (not (eq (get structs (get subject "elemct" "")) null)))
+                      (bind (
+                        (sname (get subject "elemct"))
+                        (f (field_lookup structs sname kv))
+                        (fp (tmp! st))
+                        (r (tmp! st))
+                        (ft (ll_of (get f "ftype") structs))
+                      )
+                        (do
+                          (emit! st (string_concat_many
+                            fp " = getelementptr %" sname ", ptr "
+                            (get subject "repr" "?") ", i32 0, i32 "
+                            (int_to_string (get f "idx"))))
+                          (emit! st (string_concat_many
+                            r " = load " (render_t ft) ", ptr " fp))
+                          (assoc (map_of)
+                            "repr" r "type" ft "ct" (get f "ftype")))))
+                    (else
+                      (throw "native codegen: get lowers for a struct value or a struct pointer"))))))
+            ((eq head "field_ptr")
+              (lower_field_ptr self args st env fns (literal_of (get args 1))))
+            ((eq head "union_field")
+              (lower_union_field self args st env fns (literal_of (get args 1))))
+            ((eq head "if")
+              (do
+                (unless (eq (size args) 3)
+                  (throw "native codegen: only a 3-arm if lowers (use cond with else)"))
+                (bind (
+                  (c (self self (get args 0) st env fns))
+                  (then_l (label! st "then"))
+                  (else_l (label! st "else"))
+                  (cont_l (label! st "cont"))
+                )
+                  (do
+                    (unless (eq (get c "type") "i1")
+                      (throw "native codegen: if condition must be a comparison"))
+                    (emit! st (string_concat_many
+                      "br i1 " (get c "repr" "?")
+                      ", label %" then_l ", label %" else_l))
+                    (open_block! st then_l)
+                    (bind ((tv (self self (get args 1) st env fns))
+                           (then_end (deref (get st "block"))))
+                      (do
+                        (emit! st (string_concat_many "br label %" cont_l))
+                        (open_block! st else_l)
+                        (bind ((ev (self self (get args 2) st env fns))
+                               (else_end (deref (get st "block"))))
+                          (do
+                            (emit! st (string_concat_many "br label %" cont_l))
+                            (open_block! st cont_l)
+                            (bind (
+                              (t (unify (get tv "type") (get ev "type")))
+                              (r (tmp! st))
+                            )
+                              (do
+                                (emit! st (string_concat_many
+                                  r " = phi " (render_t t)
+                                  " [ " (get tv "repr" "?") ", %" then_end " ]"
+                                  ", [ " (get ev "repr" "?") ", %" else_end " ]"))
+                                (assoc (map_of) "repr" r "type" t "ct" null)))))))))))
+            ((eq head "asm")
+              ; (asm "template" "constraints" result_ty arg…) — inline assembly
+              ; for privileged/CPU instructions (cli/hlt/lidt/rdtsc/in/out).
+              ; result_ty `void` -> no value; `sideeffect` so it is never
+              ; dropped. Constraints are raw LLVM (e.g. "={ax},{dx}").
+              (bind (
+                (tmpl (literal_of (get args 0)))
+                (cons (literal_of (get args 1)))
+                (rtn (name_of (get args 2)))
+                (rendered (list_of))
+              )
+                (do
+                  (when (or (eq tmpl null) (eq cons null) (eq rtn null))
+                    (throw "native codegen: asm needs \"template\" \"constraints\" result_ty"))
+                  (for k (sequence_range 3 (size args))
+                    (bind ((a (self self (get args k) st env fns)))
+                      (append rendered
+                        (string_concat_many
+                          (render_t (if (eq (get a "type") null)
+                                      "i32" (get a "type")))
+                          " " (get a "repr" "?")))))
+                  (bind ((argstr (sequence_join rendered ", ")))
+                    (if (eq rtn "void")
+                      (do
+                        (emit! st (string_concat_many
+                          "call void asm sideeffect \"" tmpl "\", \""
+                          cons "\"(" argstr ")"))
+                        (assoc (map_of) "repr" "0" "type" null "ct" null))
+                      (bind ((rt (ll_type rtn)) (r (tmp! st)))
+                        (do
+                          (when (eq rt null)
+                            (throw "native codegen: asm result type is not a scalar"))
+                          (emit! st (string_concat_many
+                            r " = call " rt " asm sideeffect \"" tmpl
+                            "\", \"" cons "\"(" argstr ")"))
+                          (assoc (map_of) "repr" r "type" rt "ct" rtn))))))))
+            ((eq head "volatile_read")
+              ; (volatile_read addr ty): load a hardware register
+              (bind (
+                (a (self self (get args 0) st env fns))
+                (tyn (name_of (get args 1)))
+                (lt_ (if (eq tyn null) null (ll_type tyn)))
+                (at_ (if (eq (get a "type") null) "i64" (get a "type")))
+                (p (tmp! st))
+                (r (tmp! st))
+              )
+                (do
+                  (when (eq lt_ null)
+                    (throw "native codegen: volatile_read needs a scalar type name"))
+                  (emit! st (string_concat_many
+                    p " = inttoptr " at_ " " (get a "repr" "?") " to ptr"))
+                  (emit! st (string_concat_many
+                    r " = load volatile " lt_ ", ptr " p))
+                  (assoc (map_of) "repr" r "type" lt_ "ct" tyn))))
+            ((eq head "volatile_write")
+              ; (volatile_write addr ty val): store to a hardware register
+              (bind (
+                (a (self self (get args 0) st env fns))
+                (tyn (name_of (get args 1)))
+                (lt_ (if (eq tyn null) null (ll_type tyn)))
+                (v (self self (get args 2) st env fns))
+                (at_ (if (eq (get a "type") null) "i64" (get a "type")))
+                (p (tmp! st))
+              )
+                (do
+                  (when (eq lt_ null)
+                    (throw "native codegen: volatile_write needs a scalar type name"))
+                  (emit! st (string_concat_many
+                    p " = inttoptr " at_ " " (get a "repr" "?") " to ptr"))
+                  (emit! st (string_concat_many
+                    "store volatile " lt_ " " (get v "repr" "?") ", ptr " p))
+                  (assoc (map_of) "repr" "0" "type" null "ct" null))))
+            ; ── atomics (SMP / lock-free primitives) ────────────────────────────
+            ; A word at a fixed integer address is accessed ATOMICALLY with
+            ; sequentially-consistent ordering. Like volatile_*, the address is an
+            ; int inttoptr'd to a ptr; unlike volatile_*, the access is an LLVM
+            ; `*atomic`/`atomicrmw`/`cmpxchg` so it is safe against concurrent
+            ; access from another core (the mechanism a future SMP target needs;
+            ; the single-core Cortex-M masks interrupts instead). seq_cst is the
+            ; strongest ordering — correct everywhere, the right default for a
+            ; safe wrapper. The element type must be a scalar integer; its natural
+            ; alignment (bits/8) is required on the explicit-ordering load/store.
+            ((eq head "atomic_load")
+              ; (atomic_load addr ty): an atomic load of a word -> its value
+              (bind (
+                (a (self self (get args 0) st env fns))
+                (tyn (name_of (get args 1)))
+                (lt_ (if (eq tyn null) null (ll_type tyn)))
+                (at_ (if (eq (get a "type") null) "i64" (get a "type")))
+                (p (tmp! st))
+                (r (tmp! st))
+              )
+                (do
+                  (when (or (eq lt_ null) (eq (int_bits lt_) 0))
+                    (throw "native codegen: atomic_load needs a scalar integer type name"))
+                  (emit! st (string_concat_many
+                    p " = inttoptr " at_ " " (get a "repr" "?") " to ptr"))
+                  (emit! st (string_concat_many
+                    r " = load atomic " lt_ ", ptr " p " seq_cst, align "
+                    (int_to_string (int_div (int_bits lt_) 8))))
+                  (assoc (map_of) "repr" r "type" lt_ "ct" tyn))))
+            ((eq head "atomic_store")
+              ; (atomic_store addr ty val): an atomic store of a word; returns 0
+              (bind (
+                (a (self self (get args 0) st env fns))
+                (tyn (name_of (get args 1)))
+                (lt_ (if (eq tyn null) null (ll_type tyn)))
+                (v (self self (get args 2) st env fns))
+                (at_ (if (eq (get a "type") null) "i64" (get a "type")))
+                (p (tmp! st))
+              )
+                (do
+                  (when (or (eq lt_ null) (eq (int_bits lt_) 0))
+                    (throw "native codegen: atomic_store needs a scalar integer type name"))
+                  (emit! st (string_concat_many
+                    p " = inttoptr " at_ " " (get a "repr" "?") " to ptr"))
+                  (emit! st (string_concat_many
+                    "store atomic " lt_ " " (get v "repr" "?") ", ptr " p
+                    " seq_cst, align " (int_to_string (int_div (int_bits lt_) 8))))
+                  (assoc (map_of) "repr" "0" "type" null "ct" null))))
+            ((eq head "atomic_add")
+              ; (atomic_add addr ty val): atomically add `val`, returning the OLD
+              ; value (atomicrmw's result is the value BEFORE the operation)
+              (bind (
+                (a (self self (get args 0) st env fns))
+                (tyn (name_of (get args 1)))
+                (lt_ (if (eq tyn null) null (ll_type tyn)))
+                (v (self self (get args 2) st env fns))
+                (at_ (if (eq (get a "type") null) "i64" (get a "type")))
+                (p (tmp! st))
+                (r (tmp! st))
+              )
+                (do
+                  (when (or (eq lt_ null) (eq (int_bits lt_) 0))
+                    (throw "native codegen: atomic_add needs a scalar integer type name"))
+                  (emit! st (string_concat_many
+                    p " = inttoptr " at_ " " (get a "repr" "?") " to ptr"))
+                  (emit! st (string_concat_many
+                    r " = atomicrmw add ptr " p ", " lt_ " "
+                    (get v "repr" "?") " seq_cst"))
+                  (assoc (map_of) "repr" r "type" lt_ "ct" tyn))))
+            ((eq head "atomic_cas")
+              ; (atomic_cas addr ty expected desired): compare-and-swap. cmpxchg
+              ; yields a { ty, i1 } pair; extractvalue 0 is the value that was in
+              ; memory (the loaded value, == `expected` on success). The wrapper
+              ; returns that loaded value (the lock-free-loop idiom compares it to
+              ; `expected` to decide success).
+              (bind (
+                (a (self self (get args 0) st env fns))
+                (tyn (name_of (get args 1)))
+                (lt_ (if (eq tyn null) null (ll_type tyn)))
+                (exp (self self (get args 2) st env fns))
+                (des (self self (get args 3) st env fns))
+                (at_ (if (eq (get a "type") null) "i64" (get a "type")))
+                (p (tmp! st))
+                (pair (tmp! st))
+                (r (tmp! st))
+              )
+                (do
+                  (when (or (eq lt_ null) (eq (int_bits lt_) 0))
+                    (throw "native codegen: atomic_cas needs a scalar integer type name"))
+                  (emit! st (string_concat_many
+                    p " = inttoptr " at_ " " (get a "repr" "?") " to ptr"))
+                  (emit! st (string_concat_many
+                    pair " = cmpxchg ptr " p ", " lt_ " " (get exp "repr" "?")
+                    ", " lt_ " " (get des "repr" "?") " seq_cst seq_cst"))
+                  (emit! st (string_concat_many
+                    r " = extractvalue { " lt_ ", i1 } " pair ", 0"))
+                  (assoc (map_of) "repr" r "type" lt_ "ct" tyn))))
+            ((eq head "println")
+              ; runtime IO: dispatch on the argument's lowered type
+              (bind (
+                (a (self self (get args 0) st env fns))
+                (r (tmp! st))
+              )
+                (do
+                  (if (eq (get a "type") "str")
+                    (do
+                      (need_declare! st "caap_runtime_print_string_ln"
+                        "declare i32 @caap_runtime_print_string_ln({ ptr, i64 })")
+                      (emit! st (string_concat_many
+                        r " = call i32 @caap_runtime_print_string_ln({ ptr, i64 } "
+                        (get a "repr" "?") ")")))
+                    (bind ((t (unify (get a "type") "i32")))
+                      (do
+                        (when (not (eq t "i32"))
+                          (throw "native codegen: println takes a string or an i32"))
+                        (need_declare! st "caap_runtime_print_i32_ln"
+                          "declare i32 @caap_runtime_print_i32_ln(i32)")
+                        (emit! st (string_concat_many
+                          r " = call i32 @caap_runtime_print_i32_ln(i32 "
+                          (get a "repr" "?") ")")))))
+                  (assoc (map_of) "repr" r "type" "i32" "ct" "int"))))
+            ((eq head "ref")
+              ; a mutable cell: alloca + initial store
+              (bind (
+                (v (self self (get args 0) st env fns))
+                (t (if (eq (get v "type") null) "i32" (get v "type")))
+                (cell (tmp! st))
+              )
+                (do
+                  (alloca! st (string_concat_many cell " = alloca " (render_t t)))
+                  (emit! st (string_concat_many
+                    "store " (render_t t) " " (get v "repr" "?") ", ptr " cell))
+                  (assoc (map_of)
+                    "repr" cell "type" "ptr"
+                    "elem" t "elemct" (get v "ct") "ct" null))))
+            ((eq head "array_local")
+              ; (array_local N elem) — a stack buffer [N x T]; its alloca is
+              ; hoisted to the entry block, and the value DECAYS to a typed
+              ; pointer to element 0, so ptr_add/ptr_read/ptr_write index it
+              (bind (
+                (n (literal_of (get args 0)))
+                (en (name_of (get args 1)))
+                (structs (get (get st "prog" (map_of)) "structs" (map_of)))
+                (cell (tmp! st))
+              )
+                (do
+                  (when (or (eq n null) (not (eq (value_type n) "int")))
+                    (throw "native codegen: array_local needs a literal length"))
+                  (when (le n 0)
+                    (throw "native codegen: array_local length must be a positive integer"))
+                  (when (or (eq en null) (eq (ll_of en structs) null))
+                    (throw "native codegen: array_local needs an element type"))
+                  (alloca! st (string_concat_many
+                    cell " = alloca [" (int_to_string n) " x "
+                    (render_t (ll_of en structs)) "]"))
+                  ; carry the array shape on the value record for the DWARF path
+                  ; ONLY (the length N and element CAAP type). The lowering path
+                  ; ignores these extra keys — the value still decays to a typed
+                  ; pointer (type "ptr"), so codegen is byte-identical. Used by
+                  ; dbg_spill_local! to describe a genuine DW_TAG_array_type
+                  ; instead of the decayed pointer when full-debug is on.
+                  (assoc (ptr_cell cell en structs) "array_len" n "array_elem_ct" en))))
+            ; deref / ptr_read — load through a ref cell OR a typed pointer
+            ((or (eq head "deref") (eq head "ptr_read"))
+              (bind (
+                (r (self self (get args 0) st env fns))
+                (t (tmp! st))
+                (rty (get r "elem"))
+                (slotct (get r "elemct"))
+                (structs (get (get st "prog" (map_of)) "structs" (map_of)))
+              )
+                (do
+                  (unless (eq (get r "type") "ptr")
+                    (throw "native codegen: deref/ptr_read expects a pointer"))
+                  (emit! st (string_concat_many
+                    t " = load " (render_t rty)
+                    ", ptr " (get r "repr" "?")))
+                  ; When the loaded LLVM type is itself a pointer, rebuild a
+                  ; fully-typed pointer value (elem/elemct) so downstream
+                  ; field_ptr/ptr_add see what it points to. The slot's CAAP
+                  ; element type names the pointee either directly (a ref cell
+                  ; holding ptr_<S> records elemct = S) or as a pointer-type
+                  ; name (a `ptr_<S>` struct field records elemct = "ptr_<S>");
+                  ; normalise both to the pointee S.
+                  (if (eq rty "ptr")
+                    (bind ((pointee (pointee_of slotct structs)))
+                      (assoc (map_of)
+                        "repr" t "type" "ptr"
+                        "elem" (if (eq pointee null) null (ll_of pointee structs))
+                        "elemct" pointee "ct" pointee))
+                    (assoc (map_of)
+                      "repr" t "type" rty
+                      "ct" slotct)))))
+            ; set_ref / ptr_write — store through a ref cell OR a typed pointer
+            ((or (eq head "set_ref") (eq head "ptr_write"))
+              (bind (
+                (r (self self (get args 0) st env fns))
+                (v (self self (get args 1) st env fns))
+              )
+                (do
+                  (unless (eq (get r "type") "ptr")
+                    (throw "native codegen: set_ref/ptr_write expects a pointer"))
+                  (when (and (not (eq (get v "type") null))
+                             (not (eq (get v "type") (get r "elem"))))
+                    (throw (string_concat_many
+                      "native codegen: storing "
+                      (get v "type" "?") " through a "
+                      (get r "elem" "?") " pointer")))
+                  (emit! st (string_concat_many
+                    "store " (render_t (get r "elem" "?")) " " (get v "repr" "?")
+                    ", ptr " (get r "repr" "?")))
+                  (assoc (map_of) "repr" "0" "type" null "ct" null))))
+            ((eq head "fn_ptr")
+              ; (fn_ptr name): the address of a program function as a ptr
+              ; value — store it in an IRQ/syscall table, then call_ptr it
+              (bind ((fname (name_of (get args 0))))
+                (do
+                  (when (or (eq fname null) (eq (get fns fname) null))
+                    (throw (string_concat_many
+                      "native codegen: fn_ptr of unknown function `"
+                      (if (eq fname null) "?" fname) "`")))
+                  (assoc (map_of)
+                    "repr" (string_concat_many "@" fname)
+                    "type" "ptr" "ct" "fnptr"))))
+            ((eq head "call_ptr")
+              ; (call_ptr fp ret_ty arg…): an INDIRECT call through a function
+              ; pointer (handler tables, vtables). ret_ty `void` -> no value;
+              ; argument types come from the lowered args.
+              (bind (
+                (fp (self self (get args 0) st env fns))
+                (rtn (name_of (get args 1)))
+                (structs (get (get st "prog" (map_of)) "structs" (map_of)))
+                (rendered (list_of))
+              )
+                (do
+                  (unless (eq (get fp "type") "ptr")
+                    (throw "native codegen: call_ptr expects a function pointer"))
+                  (when (eq rtn null)
+                    (throw "native codegen: call_ptr needs a result type (or void)"))
+                  (for k (sequence_range 2 (size args))
+                    (bind ((a (self self (get args k) st env fns)))
+                      (append rendered
+                        (string_concat_many
+                          (render_t (if (eq (get a "type") null)
+                                      "i32" (get a "type")))
+                          " " (get a "repr" "?")))))
+                  (bind ((argstr (sequence_join rendered ", ")))
+                    (if (eq rtn "void")
+                      (do
+                        (emit! st (string_concat_many
+                          "call void " (get fp "repr" "?") "(" argstr ")"))
+                        (assoc (map_of) "repr" "0" "type" null "ct" null))
+                      (bind ((rt (ll_of rtn structs)) (r (tmp! st)))
+                        (do
+                          (when (eq rt null)
+                            (throw "native codegen: call_ptr result type is not lowerable"))
+                          (emit! st (string_concat_many
+                            r " = call " (render_t rt) " "
+                            (get fp "repr" "?") "(" argstr ")"))
+                          (assoc (map_of) "repr" r "type" rt "ct" rtn))))))))
+            ((eq head "int_to_ptr")
+              ; (int_to_ptr addr elem_ty): an integer address as a typed ptr
+              (bind (
+                (a (self self (get args 0) st env fns))
+                (en (name_of (get args 1)))
+                (structs (get (get st "prog" (map_of)) "structs" (map_of)))
+                (at_ (if (eq (get a "type") null) "i64" (get a "type")))
+                (p (tmp! st))
+              )
+                (do
+                  (when (or (eq en null) (eq (ll_of en structs) null))
+                    (throw "native codegen: int_to_ptr needs an element type name"))
+                  (emit! st (string_concat_many
+                    p " = inttoptr " at_ " " (get a "repr" "?") " to ptr"))
+                  (ptr_cell p en structs))))
+            ((eq head "ptr_to_int")
+              (lower_ptr_to_int self args st env fns))
+            ((eq head "ptr_add")
+              (lower_ptr_add self args st env fns))
+            ((eq head "while")
+              (lower_while self args st env fns))
+            ((eq head "do")
+              (lower_do self args st env fns))
+            ((eq head "bind")
+              (bind ((first (arg node 0)))
+                (cond
+                  ; flat (bind name value body…): extends the CURRENT scope,
+                  ; like the kernel
+                  ((name? first)
+                    (do
+                      (assoc env (name_of first)
+                        (self self (get args 1) st env fns))
+                      ; full-debug: spill the local for the debugger (additive)
+                      (dbg_spill_local! st (name_of first)
+                        (get env (name_of first)) (get args 1))
+                      (bind ((slot (map_of)))
+                        (do
+                          (assoc slot "v" (get env (name_of first)))
+                          (for k (sequence_range 2 (size args))
+                            (assoc slot "v"
+                              (self self (get args k) st env fns)))
+                          (get slot "v")))))
+                  ; canonical ["n1" v1 … body…] — the frontend lowers every
+                  ; multi-bind to this flat shape (string-literal name/value
+                  ; pairs, then the body); a child scope
+                  ((and (literal? first)
+                        (eq (value_type (literal_of first)) "string"))
+                    ; decomposed by the single reader, lib/ast bind_pairs
+                    ; (let*: each value lowers in the child scope so far)
+                    (bind ((bp (bind_pairs node)) (child (clone env))
+                           (slot (map_of)))
+                      (do
+                        (for p (get bp "pairs" (list_of))
+                          (do
+                            (assoc child (get p "name")
+                              (self self (get p "value") st child fns))
+                            ; full-debug: spill the local (additive, codegen
+                            ; unchanged); the line comes from the value node
+                            (dbg_spill_local! st (get p "name")
+                              (get child (get p "name")) (get p "value"))))
+                        (assoc slot "v"
+                          (assoc (map_of) "repr" "0" "type" null "ct" null))
+                        (for b (get bp "body" (list_of))
+                          (assoc slot "v" (self self b st child fns)))
+                        (get slot "v"))))
+                  ; multi ((n v)…) body…: a child scope
+                  ((call? first)
+                    (bind ((child (clone env)))
+                      (do
+                        (for pair_
+                          (bind ((items (list_of (callee first))))
+                            (do (for a2 (args_of first) (append items a2)) items))
+                          (when (call? pair_)
+                            (do
+                              (assoc child
+                                (head_of pair_)
+                                (self self (arg pair_ 0) st child fns))
+                              ; full-debug: spill the local (additive)
+                              (dbg_spill_local! st (head_of pair_)
+                                (get child (head_of pair_)) (arg pair_ 0)))))
+                        (bind ((slot (map_of)))
+                          (do
+                            (assoc slot "v" (assoc (map_of) "repr" "0" "type" null "ct" null))
+                            (for k (sequence_range 1 (size args))
+                              (assoc slot "v"
+                                (self self (get args k) st child fns)))
+                            (get slot "v"))))))
+                  (else (throw "native codegen: unsupported bind shape")))))
+            ((not (eq (get fns head) null))
+              (lower_direct_call self head args st env fns))
+            (else
+              (throw (string_concat_many
+                "native codegen: unsupported head `"
+                (if (eq head null) "<computed>" head) "`")))))))))
+
+; lower — the dispatch wrapper. With debug on, set THIS node's DILocation as the
+; current loc for the instructions it emits, then restore the parent's on the
+; way out (so a trailing parent instruction is not mis-attributed to a child); a
+; node with no span (synthesized/folded) keeps the parent loc untouched. With
+; debug off it is a thin pass-through — byte-identical to before. emit_fn calls
+; (lower lower …); the trampoline `self` is THIS function.
+(bind lower
+  (lambda (self node st env fns)
+    (bind ((dbg (get st "dbg")))
+      (if (or (eq dbg null) (not (get dbg "on?")))
+        (lower_dispatch self node st env fns)
+        (bind ((saved (deref (get dbg "loc")))
+               (sp (ctfe_spec_span node)))
+          (do
+            (when (and (not (eq sp null)) (not (eq (get sp "start_line") null)))
+              (di_set_loc! dbg (get sp "start_line" 0) (get sp "start_col" 0)))
+            (bind ((result (lower_dispatch self node st env fns)))
+              (do (set_ref (get dbg "loc") saved) result))))))))
+
+(export lower_dispatch lower)

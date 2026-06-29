@@ -1,0 +1,223 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  ur_thread — the THREAD MANAGEMENT API (module stdlib.urun.ur_thread). The
+//  analogue of the service half of URun's ur_thread_*.c: create + the public
+//  thread services (resume / suspend / terminate / delete / relinquish /
+//  priority_change / sleep / wait_abort) + the info accessors.
+//
+//  The scheduler MECHANISM it sits on — the thread control block, the ready /
+//  delayed lists, the context-switch dispatch, and the low-level state-transition
+//  engine — lives one layer down in stdlib.urun.ur_scheduler. This module never
+//  touches scheduler state directly; it calls the exported engine/list operations
+//  under nesting-safe critical sections (ur_interrupt_save / ur_interrupt_restore)
+//  so a public API call cannot interleave with SysTick/PendSV.
+// ═══════════════════════════════════════════════════════════════════════════
+(surface stdlib.frontend.clike stdlib.urun.ur_thread)
+
+use stdlib.urun.ur_scheduler (UR_THREAD, UR_READY, UR_COMPLETED, UR_SUSPENDED, UR_TERMINATED, UR_SLEEP, UR_STACK_CANARY, ur_null_thread, ur_thread_current, _ur_thread_resume, _ur_thread_suspend_timed, _ur_call_cleanup, _ur_ready_insert, _ur_ready_remove, _ur_delayed_remove)
+use stdlib.urun.ur_port (ur_pend_switch, ur_interrupt_save, ur_interrupt_restore, _ur_build_stack)
+use stdlib.urun.ur_status (UR_WAIT_ABORTED)
+use stdlib.urun.ur_list (Node)
+
+// thread-exit trampoline: a thread's entry function returns INTO this (it is
+// seeded as the exception frame's `lr` by _ur_build_stack). Mark the thread
+// UR_COMPLETED, drop it from the ready list, and yield — UR_COMPLETED is not
+// resumable, so once the switch takes us away this thread is never scheduled
+// again. This is the sole producer of UR_COMPLETED, and it turns a returning
+// thread (today an undefined `bx 0` HardFault) into a clean self-termination.
+_ur_thread_exit () i32 export = {
+  prev u32 = ur_interrupt_save()
+  cur UR_THREAD* = ur_thread_current()
+  _ur_ready_remove(cur)
+  cur->ur_thread_state = UR_COMPLETED
+  ur_pend_switch()
+  ur_interrupt_restore(prev)           // PendSV fires here: switch away for good
+  while 0 == 0 { }                      // unreachable safety net (we never run again)
+  0
+}
+
+// ── thread create (auto-start: enters the ready list immediately) ────────────
+ur_thread_create (t UR_THREAD*, task_entry u32, prio u32, stack_base u32, stack_top u32) i32 export = {
+  // null the three intrusive Node hooks first (a `(&hook)->next = …` statement
+  // must not follow a bare-identifier rvalue, which the separator-free surface
+  // would glue into a call), then the scalar fields.
+  (&t->ur_thread_ready_next)->next = ur_null_thread()
+  (&t->ur_thread_suspend_next)->next = ur_null_thread()
+  (&t->ur_thread_delayed_next)->next = ur_null_thread()
+  t->ur_thread_priority = prio
+  t->ur_thread_state = UR_READY
+  t->ur_thread_timeout = 0
+  t->ur_thread_suspend_status = 0
+  t->ur_thread_cleanup = 0
+  t->ur_thread_suspend_control = 0
+  t->ur_thread_run_count = 0
+  t->ur_thread_stack_base = stack_base
+  ptr_write(stack_base as u32*, UR_STACK_CANARY())    // seed the overflow canary
+  t->ur_thread_stack_ptr = _ur_build_stack(stack_top, task_entry, fn_ptr(_ur_thread_exit) as u32)
+  _ur_ready_insert(t)
+  0
+}
+
+// performance stat: how many times this thread has been dispatched (scheduled
+// onto the CPU). Bumped once per context switch into the thread; lets a demo or
+// monitor show per-thread CPU share without any extra bookkeeping.
+ur_thread_performance_get (t UR_THREAD*) u32 export = {
+  t->ur_thread_run_count
+}
+
+// the top (high end) of a 256-word stack array, as an integer address.
+ur_stack_top (base u32*) u32 export = {
+  cast(ptr_to_int(base + 256), u32)
+}
+// the low end (base) of the stack array, as an integer address — where create
+// seeds the overflow canary.
+ur_stack_base (base u32*) u32 export = {
+  cast(ptr_to_int(base), u32)
+}
+
+// ── thread services (the public management API over the scheduler engine) ─────
+
+// resume an explicitly-suspended thread (ur_thread_suspend / sleep / block).
+// Masks interrupts so the ready/delayed-list mutation cannot interleave with a
+// SysTick/PendSV. `_ur_thread_resume` already no-ops an already-ready thread.
+ur_thread_resume (t UR_THREAD*) i32 export = {
+  prev u32 = ur_interrupt_save()
+  _ur_thread_resume(t)
+  ur_interrupt_restore(prev)
+  0
+}
+
+// unconditionally suspend an arbitrary thread (URun ur_thread_suspend). Takes
+// it off the ready list; if it is the running thread, pend a switch so the CPU
+// leaves it at once. The list edits run under a critical section.
+ur_thread_suspend (t UR_THREAD*) i32 export = {
+  prev u32 = ur_interrupt_save()
+  _ur_delayed_remove(t)
+  _ur_ready_remove(t)
+  t->ur_thread_state = UR_SUSPENDED
+  cur UR_THREAD* = ur_thread_current()
+  if t as uptr == cur as uptr {
+    ur_pend_switch()
+  } else {
+    0
+  }
+  ur_interrupt_restore(prev)
+  0
+}
+
+// terminate a thread: remove it from every list and mark it TERMINATED. A
+// terminated thread is never scheduled again (no restart in this slice). If the
+// thread was blocked on an object, run its cleanup callback FIRST so the object
+// drops the (about-to-be-stale) TCB from its suspension list, then clear the
+// cleanup/control fields. All under a critical section.
+ur_thread_terminate (t UR_THREAD*) i32 export = {
+  prev u32 = ur_interrupt_save()
+  _ur_delayed_remove(t)
+  _ur_ready_remove(t)
+  if t->ur_thread_cleanup != 0 {
+    _ur_call_cleanup(t->ur_thread_cleanup, t)
+  } else {
+    0
+  }
+  t->ur_thread_cleanup = 0
+  t->ur_thread_suspend_control = 0
+  t->ur_thread_state = UR_TERMINATED
+  cur UR_THREAD* = ur_thread_current()
+  if t as uptr == cur as uptr {
+    ur_pend_switch()
+  } else {
+    0
+  }
+  ur_interrupt_restore(prev)
+  0
+}
+
+// delete a (terminated/completed) thread. With static control blocks there is
+// nothing to free; just ensure it is off every list and mark it terminated. As
+// with terminate, unlink it from any owning object via its cleanup callback.
+ur_thread_delete (t UR_THREAD*) i32 export = {
+  prev u32 = ur_interrupt_save()
+  _ur_delayed_remove(t)
+  _ur_ready_remove(t)
+  if t->ur_thread_cleanup != 0 {
+    _ur_call_cleanup(t->ur_thread_cleanup, t)
+  } else {
+    0
+  }
+  t->ur_thread_cleanup = 0
+  t->ur_thread_suspend_control = 0
+  t->ur_thread_state = UR_TERMINATED
+  ur_interrupt_restore(prev)
+  0
+}
+
+// relinquish: yield the CPU to equal-priority peers. The scheduler already
+// rotates a still-ready running thread to the tail of its priority group on each
+// switch, so a relinquish is just "pend a switch".
+ur_thread_relinquish () i32 export = {
+  ur_pend_switch()
+  0
+}
+
+// change a thread's priority; returns the OLD priority. If the thread is ready,
+// reinsert it at the new priority and pend a switch (the ready set may change).
+ur_thread_priority_change (t UR_THREAD*, newprio u32) u32 export = {
+  prev u32 = ur_interrupt_save()
+  old u32 = t->ur_thread_priority
+  if t->ur_thread_state == UR_READY {
+    _ur_ready_remove(t)
+    t->ur_thread_priority = newprio
+    _ur_ready_insert(t)
+    ur_pend_switch()
+  } else {
+    t->ur_thread_priority = newprio
+  }
+  ur_interrupt_restore(prev)
+  old
+}
+
+// sleep the CURRENT thread for `ticks` timer ticks (UR_WAIT-style relative
+// delay, no object). A timeout with no cleanup: the timer wakes it after the
+// count elapses. ticks == 0 is a no-op (URun returns immediately).
+ur_thread_sleep (ticks u32) i32 export = {
+  if ticks == 0 {
+    0
+  } else {
+    prev u32 = ur_interrupt_save()
+    cur UR_THREAD* = ur_thread_current()
+    _ur_thread_suspend_timed(cur, 0, 0, ticks)
+    cur->ur_thread_state = UR_SLEEP                  // SLEEP (informational)
+    ur_pend_switch()
+    ur_interrupt_restore(prev)                              // switch away until the timer wakes us
+    0
+  }
+}
+
+// info accessors (the slice's stand-in for ur_thread_info_get's out-pointers).
+ur_thread_state_get (t UR_THREAD*) u32 export = {
+  t->ur_thread_state
+}
+ur_thread_priority_get (t UR_THREAD*) u32 export = {
+  t->ur_thread_priority
+}
+
+// abort a thread's suspension: run its object cleanup (unlinks it + sets a
+// status), then OVERRIDE the status to UR_WAIT_ABORTED (0x1A) and resume it, so
+// the blocking call returns "aborted". A plain sleep (UR_SLEEP, no cleanup) is
+// also abortable: it has no cleanup, so the resume just wakes it early. Runs
+// under a critical section.
+ur_thread_wait_abort (t UR_THREAD*) i32 export = {
+  prev u32 = ur_interrupt_save()
+  if t->ur_thread_state == UR_SUSPENDED || t->ur_thread_state == UR_SLEEP {
+    if t->ur_thread_cleanup != 0 {
+      _ur_call_cleanup(t->ur_thread_cleanup, t)
+    } else {
+      0
+    }
+    t->ur_thread_suspend_status = UR_WAIT_ABORTED
+    _ur_thread_resume(t)
+  } else {
+    0
+  }
+  ur_interrupt_restore(prev)
+  0
+}

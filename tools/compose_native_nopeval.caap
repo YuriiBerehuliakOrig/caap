@@ -1,0 +1,19 @@
+; compose_native_nopeval.caap — bootstrap + the codegen layer, but WITHOUT
+; registering peval as a load-time transform. Temporary profiling harness (C7)
+; to isolate how much of the native-emit cost is the peval fixpoint vs the raw
+; codegen-module loading. Mirrors boot/native_emit.caap minus the peval leg.
+(do
+  (ctfe_compiler_execute_bootstrap_file compiler "../stdlib/bootstrap.caap")
+  (bind ((load (get (ctfe_compiler_lookup_value compiler "stdlib.load") "load")))
+    (do
+      (load "../stdlib/syntax/render.caap")
+      (load "../stdlib/lib/core/equal.caap")
+      (load "../stdlib/syntax/ir.caap")
+      (load "../stdlib/backend/prep.caap")
+      (load "../stdlib/backend/emit/llvm.caap")
+      (load "../stdlib/backend/emit/wasm.caap")
+      (load "../stdlib/frontend/surface.caap")
+      (load "../stdlib/backend/driver.caap")
+      (load "../stdlib/frontend/clike.caap")))
+  (ctfe_compiler_register_value compiler "stdlib.llvm.emit"
+    (get (ctfe_compiler_lookup_value compiler "stdlib.backend.emit.llvm") "emit_program")))

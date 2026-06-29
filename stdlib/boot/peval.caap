@@ -1,0 +1,26 @@
+; stdlib/boot/peval.caap — OPT-IN: enable load-time partial evaluation.
+; MODULE IDENTITY: a RAW bootstrap script (run via ctfe_compiler_execute_bootstrap_file /
+; run_expanded BEFORE the `module` form is a bound name), so it carries NO `(module …)`
+; form — adding one would raise `unknown name: module`. Its registry identity is set
+; explicitly via ctfe_compiler_register_value. Allowlisted in stdlib/CONVENTIONS.md +
+; stdlib_module_identity_check (caap/tests/stdlib_governance_tests.rs).
+;
+; Execute AFTER stdlib/bootstrap.caap in a composed bootstrap (the
+; boot/native_emit.caap pattern):
+;
+;   ; composed.caap: (do (ctfe_compiler_execute_bootstrap_file compiler ".../bootstrap.caap")
+;   ;                    (ctfe_compiler_execute_bootstrap_file compiler ".../boot/peval.caap"))
+;   caap composed.caap program.caap
+;
+; Every module loaded AFTERWARDS is partially evaluated — constprop -> constfold ->
+; simplify -> dce, driven to a fixpoint — before the load-time check gate (the loader
+; runs the transform registry by name; loading peval registers it). It is
+; BEHAVIOUR-PRESERVING (only folds constants and drops dead code), so a program's
+; result never changes; only the IR is optimized.
+;
+; It is OPT-IN, not on by default: the fixpoint adds load-time cost, so the base
+; bootstrap stays fast and you compose this leg when you want the optimized IR (e.g.
+; before a native build). Loading peval pulls in its use/import deps (syntax/ir,
+; the constfold/simplify/dce blocks, the passes registry) by name. (Raw kernel forms.)
+(bind ((load (get (ctfe_compiler_lookup_value compiler "stdlib.load") "load")))
+  ((get (load "../semantics/passes/peval.caap") "register!")))

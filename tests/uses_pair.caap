@@ -1,0 +1,6 @@
+; uses_pair — (pair int string) in a signature; field `a` types as int.
+(module stdlib.fixtures.uses_pair)
+(use stdlib.fixtures.user_typefn registered)
+(defn fst ((p (pair int string))) int
+  (get p "a" 0))
+(export fst)

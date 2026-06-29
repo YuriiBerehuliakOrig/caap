@@ -1,0 +1,92 @@
+; stdlib/semantics/passes/constfold.caap — constant folding as a whole-module TRANSFORM
+; (module stdlib.semantics.passes.constfold).
+;
+; Where the `const` form folds ONE explicitly-marked expression, this folds them
+; ALL: a register_transform! pass that rewrites every loaded module, bottom-up,
+; replacing any call to a proven-pure head whose arguments are all literals with
+; the evaluated literal. `(int_add (int_mul 2 3) 1)` becomes `7` in one pass
+; (children fold first, so the parent then sees literal args).
+;
+; A transform runs AFTER expansion and BEFORE the check/type gate, so what gets
+; checked and evaluated is the folded tree. Folding is semantics-preserving on
+; the pure subset; an eval that would throw (e.g. div-by-zero) is caught and the
+; expression is left intact for the normal pipeline to handle. This is the first
+; concrete step toward partial evaluation (ROADMAP A1).
+(module stdlib.semantics.passes.constfold)
+
+(use stdlib.syntax.ast call? literal? head_of args_of lit eval_ir)
+(use stdlib.syntax.ir transform)
+(use stdlib.lib.collections.sequence any?)
+(use stdlib.semantics.passes.registry install_transform!)
+(use stdlib.semantics.head_meta head_metadata pure? scalar_result?)
+
+; pure_heads — kernel heads that are pure functions of their arguments (no
+; effect, result determined by the args), safe to evaluate at fold time. Most are
+; TOTAL; a few are partial (* may throw: div/mod by zero, an out-of-range shift,
+; a bad string_to_int) — those are still folded because a throwing fold is CAUGHT
+; below and the node is left intact, so partiality only costs a missed fold, never
+; a wrong one. Conservative by construction: anything not selected is never folded.
+; Excluded entirely: anything with an effect (println, ref/set_ref, sys.*) AND
+; any head whose result is a MUTABLE collection (list_of/map_of/string_chars) —
+; folding those would bake ONE shared object into the IR, so a later in-place
+; mutation would leak across evaluations (the fresh-per-call constructor would no
+; longer be fresh). Only heads yielding an immutable scalar (int/bool/string) fold.
+;
+; DERIVED FROM THE SINGLE SOURCE (stdlib/semantics/head_meta.caap), not a
+; hand-written list: the foldable set is exactly
+;   { h in head_metadata : pure?(h) AND scalar_result?(h) }  MINUS  known_gaps
+; — a head is foldable iff it is pure (safe to eval at fold time) and yields an
+; immutable scalar (so folding does not bake a shared mutable object into the IR;
+; this is what excludes list_of/map_of/string_chars). The drift guard
+; (stdlib/lib/tests/test_head_meta.caap) pins this exact derivation. Built by
+; iterating head_metadata's keys, so adding a head to the table that is pure +
+; scalar_result automatically makes it foldable here — no second list to update.
+;
+; known_gaps — heads the derivation SELECTS but constfold DELIBERATELY omits, a
+; documented, reviewable conservatism (NOT a silent drop). `value_type` is pure +
+; total + scalar_result (axis-identical to eq/ne/not), so the derivation would
+; fold it — but constfold has never folded it (licm DOES treat it as total). This
+; set preserves that pre-existing behavior byte-for-byte; the same gap is recorded
+; in the drift guard's `cf_gaps`. Resolving it (folding value_type) is a tiny,
+; sound behavior change deliberately deferred — to do so, drop it from BOTH sets.
+(bind known_gaps
+  (bind ((m (map_of))) (do (assoc m "value_type" true) m)))
+(bind pure_heads
+  (bind ((m (map_of)))
+    (do
+      (for h (map_keys head_metadata)
+        (when (and (pure? h) (scalar_result? h) (not (eq (get known_gaps h false) true)))
+          (assoc m h true)))
+      m)))
+; foldable_head? — is `h` in the derived `pure_heads` set (and a real head)? Named
+; distinctly from head_meta's imported `pure?` axis predicate (used above to BUILD
+; pure_heads) so the two never collide — this asks set-membership, that asks an axis.
+(bind foldable_head? (lambda (h) (and (not (eq h null)) (eq (get pure_heads h false) true))))
+
+; all_literals? — every node in the list is a literal.
+(bind all_literals?
+  (lambda (nodes) (not (any? nodes (lambda (n) (not (literal? n)))))))
+
+; fold_node — bottom-up constant folding via ir.transform. transform rebuilds
+; children FIRST (so a parent sees already-folded args) and re-attaches the
+; original span (located diagnostics survive); at each rebuilt node a pure head
+; with all-literal args is evaluated to a literal, a throwing eval (div-by-zero)
+; returns null to keep the node intact.
+(bind fold_node
+  (lambda (node)
+    (transform node
+      (lambda (n)
+        (if (and (call? n) (foldable_head? (head_of n)) (all_literals? (args_of n)))
+          (try (lit (eval_ir n)) (catch e null))
+          null)))))
+
+; run — the transform entry: rewrite every located form IN PLACE.
+(bind run
+  (lambda (located)
+    (for f located
+      (assoc f "node" (fold_node (get f "node"))))))
+
+; register! — install constant folding as a load-time TRANSFORM (idempotent).
+(bind register! (lambda () (install_transform! "constfold" run)))
+
+(export fold_node run register! pure_heads)

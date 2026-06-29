@@ -1,0 +1,145 @@
+; stdlib/semantics/passes/dce.caap — dead-binding elimination as a whole-module
+; TRANSFORM (module stdlib.semantics.passes.dce).
+;
+; The rewrite companion to lint's "unused binding" finding: where lint REPORTS a
+; dead local binding, this REMOVES it. A register_transform! pass that, for every
+; `(bind "n" v … body…)` WITH a body (top-level module binds — bodyless, the
+; public API — are left alone), drops each binding whose name is unread in the
+; later bindings and the body, to a fixpoint (removing one can free another).
+;
+; Soundness: a binding is dropped ONLY when its value is provably side-effect
+; free AND total (cannot throw) — a literal, a name, a lambda, or a call to a
+; small whitelist of total-pure heads with such arguments. So removing it cannot
+; drop an effect or suppress an error. `_`-prefixed names are kept (intentional).
+; A throwing or effectful value (`(println …)`, `(int_div … 0)`) is never
+; removed even if unused. Runs after expansion, before the check/type gate.
+(module stdlib.semantics.passes.dce)
+
+(use stdlib.syntax.ast
+  call? name? literal? head_of head_is? args_of arg string_lit? bind_pairs sym lit call)
+(use stdlib.syntax.ir names_set transform)
+(use stdlib.lib.collections.sequence any?)
+(use stdlib.semantics.passes.registry ignored? install_transform!)
+(use stdlib.semantics.head_meta head_metadata pure? total?)
+
+; total_pure_heads — heads that are pure AND total (never throw): safe to delete
+; an unused binding to. Deliberately EXCLUDES partial heads — int_div/int_mod
+; (div-by-zero), int_shl/int_shr (shift-out-of-range), string_to_int (parse
+; failure) — because dropping an unused binding to a throwing value would suppress
+; that error; and anything effectful. (Unlike constfold, dce only REMOVES the
+; binding, so the list_of/map_of aliasing concern there does not apply here.)
+;
+; DERIVED FROM THE SINGLE SOURCE (stdlib/semantics/head_meta.caap), not a
+; hand-written list: the droppable set is exactly
+;   { h in head_metadata : pure?(h) AND total?(h) }  MINUS  known_gaps
+; — pure (no effect to drop) and total in dce's sense (cannot throw on a real
+; program's inputs, so dropping it suppresses no error a later pass must keep).
+; The partial heads (int_div/int_mod/shifts/string_to_int/size) are NOT total in
+; the table, so they fall out automatically; list_of/map_of/string_chars ARE
+; total here (dce only removes the binding, so the constfold aliasing concern
+; does not apply) and are included. The drift guard
+; (stdlib/lib/tests/test_head_meta.caap) pins this exact derivation. Built by
+; iterating head_metadata's keys, so a new pure+total head in the table becomes
+; droppable here automatically — no second list to update.
+;
+; known_gaps — heads the derivation SELECTS but dce DELIBERATELY omits, a
+; documented, reviewable conservatism (NOT a silent drop). `value_type` is pure +
+; total + scalar_result, so the derivation would mark it droppable — but dce has
+; never dropped it. This set preserves that pre-existing behavior byte-for-byte;
+; the same gap is recorded in the drift guard's `dce_gaps`. Resolving it is a
+; tiny, sound behavior change deliberately deferred — drop it from BOTH sets.
+(bind known_gaps
+  (bind ((m (map_of))) (do (assoc m "value_type" true) m)))
+(bind total_pure_heads
+  (bind ((m (map_of)))
+    (do
+      (for h (map_keys head_metadata)
+        (when (and (pure? h) (total? h) (not (eq (get known_gaps h false) true)))
+          (assoc m h true)))
+      m)))
+
+; droppable? — evaluating `node` has no effect and cannot throw, so a binding to
+; it is safe to remove when unused.
+(bind droppable?
+  (lambda (self node)
+    (cond
+      ((literal? node) true)
+      ((name? node) true)
+      ((not (call? node)) true)
+      ((head_is? node "lambda") true)            ; defining a lambda is effect-free
+      ((eq (get total_pure_heads (head_of node) false) true)
+        (not (any? (args_of node) (lambda (a) (not (self self a))))))
+      (else false))))
+(bind drop_ok? (lambda (node) (droppable? droppable? node)))
+
+; used? — does `nm` appear (read) anywhere across the list of `nodes`?
+(bind used?
+  (lambda (nm nodes)
+    (any? nodes (lambda (n) (eq (get (names_set n) nm false) true)))))
+
+; rebuild_bind — a bind node from kept pairs + body (canonical flat shape), or
+; the collapsed body when no bindings remain.
+(bind rebuild_bind
+  (lambda (pairs body)
+    (if (eq (size pairs) 0)
+      (if (eq (size body) 1) (get body 0) (call (sym "do") body))
+      (bind ((parts (list_of)))
+        (do
+          (for p pairs
+            (do (append parts (lit (get p "name")))
+                (append parts (get p "value"))))
+          (for b body (append parts b))
+          (call (sym "bind") parts))))))
+
+; prune — drop unused+droppable pairs to a fixpoint; -> the surviving pairs.
+(bind prune
+  (lambda (pairs body)
+    (bind ((keep (list_of)) (changed (ref true)))
+      (do
+        (for p pairs (append keep p))
+        (while (deref changed)
+          (do
+            (set_ref changed false)
+            (bind ((i (ref (int_sub (size keep) 1))))
+              (while (ge (deref i) 0)
+                (bind (
+                  (p (get keep (deref i)))
+                  (nm (get p "name"))
+                  (later (list_of))
+                )
+                  (do
+                    ; names visible to pair i: later pairs' values + the body
+                    (sequence_each (sequence_range (int_add (deref i) 1) (size keep))
+                      (lambda (j) (append later (get (get keep j) "value"))))
+                    (for b body (append later b))
+                    (when (and (not (ignored? nm))
+                               (drop_ok? (get p "value"))
+                               (not (used? nm later)))
+                      (do (list_remove_at keep (deref i)) (set_ref changed true)))
+                    (set_ref i (int_sub (deref i) 1))))))))
+        keep))))
+
+; rewrite_node — bottom-up dead-binding elimination via ir.transform. transform
+; rebuilds children FIRST (span preserved), so at a `(bind … body…)` node the
+; values and body are already rewritten; `prune` then drops unread + droppable
+; bindings to a fixpoint. Bodyless top-level binds (the public API) are kept.
+(bind rewrite_node
+  (lambda (node)
+    (transform node
+      (lambda (n)
+        (if (and (call? n) (head_is? n "bind") (string_lit? (arg n 0))
+                 (gt (size (get (bind_pairs n) "body" (list_of))) 0))
+          (bind ((bp (bind_pairs n)))
+            (rebuild_bind (prune (get bp "pairs") (get bp "body")) (get bp "body")))
+          null)))))
+
+; run — the transform entry: rewrite every located form IN PLACE.
+(bind run
+  (lambda (located)
+    (for f located
+      (assoc f "node" (rewrite_node (get f "node"))))))
+
+; register! — install dead-binding elimination as a load-time TRANSFORM.
+(bind register! (lambda () (install_transform! "dce" run)))
+
+(export droppable? rewrite_node run register! total_pure_heads)

@@ -1,0 +1,773 @@
+; stdlib/semantics/ssa.caap — SSA as a FORM of the one 3-node IR, with a total,
+; round-trip-correct transform between mutable-ref form and SSA form (module
+; stdlib.semantics.ssa).
+;
+; ── what this is (and is NOT) ─────────────────────────────────────────────────
+; SSA here is NOT a separate IR and NOT a side analysis-view. It is a FORM of the
+; SAME single IR (Name / Literal / Call). A φ-function is an explicit Call node
+; `(__phi__ a b)` — in CAAP everything is a Call (`(if …)`, `(lambda …)`,
+; `(+ …)`), so `(__phi__ …)` is ordinary, valid 3-node IR. The `__`-prefix never
+; collides with a user name (the checker's naming rules forbid `__`-prefixed
+; identifiers in written source), so `__phi__` is a safe reserved head. This is a
+; pure analysis/transform substrate — like dominators.caap, it is NOT a registered
+; transform; it is the API the SSA-aware passes (ssa_ccp / ssa_dce) consume.
+;
+;   to_ssa(body)   -> the SAME 3-node IR in SSA FORM: each PROMOTABLE mutable ref
+;                     cell is rewritten so it is read/written through versioned
+;                     SINGLE-ASSIGNMENT bindings (`r__0`, `r__1`, …), and a control-
+;                     flow merge of two versions at an `if` is an EXPLICIT φ Call
+;                     `(__phi__ then-version else-version)`.
+;   from_ssa(ssair)-> EXECUTABLE IR with NO `__phi__` surviving (eval_ir must never
+;                     see a φ). Destructed STRUCTURALLY (CAAP IR is structured —
+;                     if/while/do/bind are nested Calls, so there is NO flat CFG and
+;                     no relooper): an `if`-merge φ becomes the value the preceding
+;                     `(if c then-val else-val)` expression RETURNS (the φ folds into
+;                     the if's result); a `while` loop-carried value is re-
+;                     materialized as ONE threaded loop ref for the back-edge (it was
+;                     never promoted, so it is already a ref).
+;
+; ── the cardinal correctness proof ───────────────────────────────────────────
+;   eval_ir(from_ssa(to_ssa(body))) == eval_ir(body)   for every SUPPORTED body.
+; When a body is UNSUPPORTED, to_ssa / from_ssa are IDENTITY (return it verbatim),
+; so the proof holds vacuously. Verified exhaustively by the round-trip corpus in
+; stdlib/lib/tests/test_ssa.caap — THE gate.
+;
+; ── how the SSA form is laid out (and why it round-trips) ─────────────────────
+; For a promotable ref r bound `(bind "r" (ref V) BODY)`, to_ssa emits:
+;   (bind "r__0" V <BODY with r's accesses versioned>)
+; where, threading a CURRENT-version name through BODY structurally:
+;   * `(deref r)`        -> `(sym r__cur)`          a read of the live version
+;   * `(set_ref r E)`    -> opens `(bind "r__k" E' <rest>)`; r__cur := r__k
+;   * `(if c T E)` where the two arms leave r at DIFFERENT tail versions ->
+;       `(bind "r__m" (if c T' E')   <— each arm ENDS in its tail version value
+;          (__phi__ r__thentail r__elsetail)   <— the explicit φ, the merge witness
+;          <rest>)`
+;     The φ's ARGUMENTS are the two incoming versions; its value at run time, were it
+;     evaluated, equals the if's value — but it is NEVER evaluated: from_ssa erases it.
+;     The if-EXPRESSION already yields the merged value; the φ is the redundant SSA
+;     witness the passes read. r__cur := r__m and the if's value is bound to r__m.
+;   * `(while c WB)`     -> recursed verbatim; a non-loop-carried ref is not written
+;       in the loop (guaranteed by the loop_carried filter), so its version is stable.
+;
+; from_ssa is the structural inverse: it DROPS every `(__phi__ …)` STATEMENT (the φ
+; sits as a no-op statement right after the if whose value already populated r__m, so
+; deleting it changes nothing) and leaves the rest — an executable, φ-free node that
+; evaluates exactly as the original body did.
+;
+; ── what is SSA'd vs kept-as-ref ──────────────────────────────────────────────
+;  * SSA'd: straight-line stores + reads, and if-merges, of a PROMOTABLE ref.
+;  * KEPT AS A REF: a WHILE loop-carried ref (read+written across the back-edge). It
+;    cannot become a pure single-assignment value without a functional-loop primitive
+;    (CAAP `while` is imperative), so it stays a mutable `(ref …)` — the "re-
+;    materialized loop ref". Only a ref whose round-trip we can PROVE is promoted.
+;
+; ── the read API the passes consume ──────────────────────────────────────────
+;   ssa_phis(w)            -> [ {var, args:[ver…], node} … ]  every φ recorded
+;   ssa_version_def(w,ver) -> the defining VALUE node of version `ver` | null
+;   ssa_version_uses(w,ver)-> [node…] the use sites of version `ver`
+;   ssa_versions(w)        -> [ver…] every version with a recorded def
+;   is_ssa_form?(node)     -> does the node contain a `__phi__` (is it SSA form)?
+;   supported?/ssa_supported?(body) -> is the body promotable at all?
+;   ssa_node(w)/ssa_view(w)-> unwrap the IR node / the view record from a to_ssa result
+(module stdlib.semantics.ssa)
+
+(use stdlib.syntax.ast
+  call? name? string_lit? head_of head_is? args_of arg name_of
+  callee sym lit call calln mkbind bind_pairs walk)
+(use stdlib.semantics.passes.dead_store simple_refs fresh_ref_names)
+(use stdlib.syntax.ir free_names)
+
+; ── reserved φ head ───────────────────────────────────────────────────────────
+; PHI_HEAD — the reserved Call head for a φ-function. `__`-prefixed, so it can never
+; collide with a user identifier. is_phi? recognises it; phi builds one.
+(bind PHI_HEAD "__phi__")
+(bind is_phi? (lambda (n) (head_is? n PHI_HEAD)))
+(bind phi (lambda (vals) (call (sym PHI_HEAD) vals)))
+
+; ver_name — the SSA version name of ref `base` at counter `n`: `base__N`. `__`-
+; prefixed segment, so it never collides with user source.
+(bind ver_name
+  (lambda (base n) (string_concat_many base "__" (int_to_string n))))
+
+; ── promotability: which ref NAMES may become SSA versions ────────────────────
+; multiply_bound_names — names bound as a TARGET more than once anywhere (a same-name
+; shadow). Re-derived locally (the multi-shape bind-target counter), as ccp does, to
+; avoid widening a tier-2 export. A multiply-bound name is never promotable.
+(bind multiply_bound_names
+  (lambda (node)
+    (bind ((counts (map_of)) (out (map_of)))
+      (do
+        (bind (
+          (bump
+            (lambda (nm)
+              (when (not (eq nm null))
+                (bind ((c (get counts nm 0)))
+                  (do
+                    (assoc counts nm (int_add c 1))
+                    (when (eq c 1) (assoc out nm true)))))))
+        )
+          (walk node
+            (lambda (n)
+              (when (call? n)
+                (cond
+                  ((and (head_is? n "bind") (string_lit? (arg n 0)))
+                    (bind ((bp (bind_pairs n)))
+                      (when (not (eq bp null))
+                        (for p (get bp "pairs") (bump (get p "name"))))))
+                  ((and (head_is? n "bind") (name? (arg n 0)))
+                    (bump (name_of (arg n 0))))
+                  (else null))))))
+        out))))
+
+; control_bail_heads — constructs we DECLINE to SSA. if / while / bind / do are
+; ALLOWED (the supported structured shapes); these introduce control edges
+; (exception, multi-way, non-local) we do not destruct, or a deferred read through a
+; capture, or a lexical mutation. A body containing ANY of these bails to identity.
+(bind control_bail_heads
+  (bind ((m (map_of)))
+    (do
+      (for h (list_of "match" "try" "catch" "throw" "leave" "block" "lambda"
+                      "set!" "assign_lexical")
+        (assoc m h true))
+      m)))
+
+; has_bail? — does `node` contain (it or a descendant) any bail head?
+(bind has_bail?
+  (lambda (node)
+    (bind ((hit (ref false)))
+      (do
+        (walk node
+          (lambda (n)
+            (when (and (call? n)
+                       (eq (get control_bail_heads (head_of n) false) true))
+              (set_ref hit true))))
+        (deref hit)))))
+
+; flat_name_bound — names bound by a FLAT name-node bind `(bind <name> v …)`
+; anywhere. A candidate ref also flat-name-bound is rejected (the flat bind leaks
+; into the current scope — not a clean fresh, scoped ref cell).
+(bind flat_name_bound
+  (lambda (node)
+    (bind ((s (map_of)))
+      (do
+        (walk node
+          (lambda (n)
+            (when (and (call? n) (head_is? n "bind") (name? (arg n 0)))
+              (assoc s (name_of (arg n 0)) true))))
+        s))))
+
+; loop_carried_refs — refs WRITTEN inside a `while` body anywhere (loop-carried). A
+; ref set_ref'd inside a loop body carries its value across the back-edge, so it stays
+; a mutable ref (the re-materialized loop ref) rather than a pure SSA version.
+(bind loop_carried_refs
+  (lambda (node)
+    (bind ((s (map_of)))
+      (do
+        (walk node
+          (lambda (n)
+            (when (and (call? n) (head_is? n "while"))
+              (bind ((wb (arg n 1)))
+                (when (not (eq wb null))
+                  (walk wb
+                    (lambda (m)
+                      (when (and (call? m) (head_is? m "set_ref")
+                                 (name? (arg m 0)))
+                        (assoc s (name_of (arg m 0)) true)))))))))
+        s))))
+
+; promotable_refs — the SET (name->true) of ref names we MAY turn into SSA versions
+; over `body`: SIMPLE (every occurrence a set_ref-dest / deref-arg, never aliased /
+; captured — simple_refs), FRESH (every binding a literal `(ref V)` — fresh_ref_names),
+; NOT multiply-bound, NOT flat-name-bound, and NOT loop-carried. The intersection of
+; the adversarially-earned dead_store/ccp guards plus the loop-carried exclusion.
+(bind promotable_refs
+  (lambda (body)
+    (bind (
+      (simple (simple_refs body))
+      (fresh (fresh_ref_names body))
+      (multi (multiply_bound_names body))
+      (flat (flat_name_bound body))
+      (loop (loop_carried_refs body))
+      (out (map_of))
+    )
+      (do
+        (for nm (map_keys simple)
+          (when (and (eq (get fresh nm false) true)
+                     (and (not (eq (get multi nm false) true))
+                          (and (not (eq (get flat nm false) true))
+                               (not (eq (get loop nm false) true)))))
+            (assoc out nm true)))
+        out))))
+
+; ── the from_ssa value-hazard guard (lifted here so EVERY consumer is protected) ─
+; The well-scopedness self-validation (below, in to_ssa) catches version LEAKS, but a
+; second hazard class produces a well-scoped yet WRONG value: when a promoted ref is
+; touched OUTSIDE a specific flat spine — a `(deref r)`/`set_ref` in a VALUE position,
+; a value/tail `if` over the ref, a ref-touching binder value, a nested do/bind — the
+; round-trip threads the wrong version (e.g. a value-position `(int_add (deref r) 1)`
+; in a bind value yields the ref version, not the computed value). A free-name check
+; cannot see this (no name leaks). So `to_ssa` ADMITS only the proven-sound shape and
+; bails on everything else: `safe_body?` is a strict WHITELIST validator; `hazardous?`
+; (folded into supported? below) is its negation over every promotable ref. Bailing
+; only ever misses an optimization, never miscompiles — this is what makes the cardinal
+; contract eval_ir(from_ssa(to_ssa body)) == eval_ir(body) hold on the value axis too.
+;
+; touches_ref? — does `node` (or a descendant) `deref`/`set_ref` any promoted ref?
+(bind touches_ref?
+  (lambda (node promo)
+    (bind ((hit (ref false)))
+      (do
+        (walk node
+          (lambda (n)
+            (when (and (call? n)
+                       (or (head_is? n "deref") (head_is? n "set_ref"))
+                       (name? (arg n 0))
+                       (eq (get promo (name_of (arg n 0)) false) true))
+              (set_ref hit true))))
+        (deref hit)))))
+
+; mutates_ref? — does `node` (or a descendant) `set_ref` any promoted ref (a version
+; MUTATION, the part of a ref access that mints a new SSA version)?
+(bind mutates_ref?
+  (lambda (node promo)
+    (bind ((hit (ref false)))
+      (do
+        (walk node
+          (lambda (n)
+            (when (and (call? n) (head_is? n "set_ref")
+                       (name? (arg n 0))
+                       (eq (get promo (name_of (arg n 0)) false) true))
+              (set_ref hit true))))
+        (deref hit)))))
+
+; safe_statement? — a NON-TAIL statement is sound iff: a `(set_ref r E)` whose value E
+; does not touch the ref; a statement-`if` (condition ref-free, each arm a safe
+; statement, the φ-merge case); or any node that does not touch the ref at all.
+(bind safe_statement?
+  (lambda (self node promo)
+    (cond
+      ((not (call? node)) true)
+      ((and (head_is? node "set_ref") (name? (arg node 0))
+            (eq (get promo (name_of (arg node 0)) false) true))
+        (not (touches_ref? (arg node 1) promo)))
+      ((and (head_is? node "if") (eq (size (args_of node)) 3))
+        (and (not (touches_ref? (arg node 0) promo))
+             (and (self self (arg node 1) promo)
+                  (self self (arg node 2) promo))))
+      (else (not (touches_ref? node promo))))))
+
+; safe_tail? — a tail must not mint a version (no set_ref of the ref) and must not host
+; an `if` over the ref (whose value the round-trip corrupts). Pure deref reads /
+; arithmetic over `(deref r)` are fine.
+(bind safe_tail?
+  (lambda (node promo)
+    (bind ((bad (ref false)))
+      (do
+        (when (mutates_ref? node promo) (set_ref bad true))
+        (walk node
+          (lambda (n)
+            (when (and (call? n) (head_is? n "if") (touches_ref? n promo))
+              (set_ref bad true))))
+        (not (deref bad))))))
+
+; safe_body? — the strict whitelist: a binder CHAIN whose values are ref-free and whose
+; continuation is safe; OR a `(do s0 … sN)` with safe non-tail statements + a safe tail;
+; OR a node that does not touch the ref at all. Anything else that touches the ref is
+; declined (conservative).
+(bind safe_body?
+  (lambda (self node promo)
+    (cond
+      ((not (call? node)) true)
+      ((not (touches_ref? node promo)) true)
+      ((and (head_is? node "bind") (string_lit? (arg node 0)) (not (eq (bind_pairs node) null)))
+        (bind ((bp (bind_pairs node)) (ok (ref true)))
+          (do
+            (for p (get bp "pairs")
+              (when (touches_ref? (get p "value") promo) (set_ref ok false)))
+            (bind ((body (get bp "body")) (n (size (get bp "body"))))
+              (for i (sequence_range 0 n)
+                (bind ((last? (eq i (int_sub n 1))))
+                  (if last?
+                    (when (not (self self (get body i) promo)) (set_ref ok false))
+                    (when (not (safe_statement? safe_statement? (get body i) promo))
+                      (set_ref ok false))))))
+            (deref ok))))
+      ((head_is? node "do")
+        (bind ((as (args_of node)) (n (size (args_of node))) (ok (ref true)))
+          (do
+            (for i (sequence_range 0 n)
+              (bind ((last? (eq i (int_sub n 1))))
+                (if last?
+                  (when (not (safe_tail? (get as i) promo)) (set_ref ok false))
+                  (when (not (safe_statement? safe_statement? (get as i) promo))
+                    (set_ref ok false)))))
+            (deref ok))))
+      (else false))))
+
+; hazardous? — the negation of safe_body? over every promotable ref (unsafe for ANY).
+(bind hazardous?
+  (lambda (body)
+    (bind ((promo (promotable_refs body)) (bad (ref false)))
+      (do
+        (for r (map_keys promo)
+          (bind ((one (map_of)))
+            (do
+              (assoc one r true)
+              (when (not (safe_body? safe_body? body one)) (set_ref bad true)))))
+        (deref bad)))))
+
+; supported? / ssa_supported? — will we SSA `body` at all? It must have NO bail head
+; AND at least ONE promotable ref. NOTE: supported? admits MORE than `hazardous?`
+; rejects — to_ssa correctly handles while-loops, accumulate-in-statement, and other
+; shapes that the strict straight-line-fold guard declines. `hazardous?` (above) is the
+; predicate a CONSUMER doing a value-position-sensitive rewrite (ssa_ccp / ssa_gvn) uses
+; to bail on the from_ssa VALUE hazard — a `(deref r)`-bearing `if` in a value/tail
+; position whose round-trip yields the ref version instead of the if's own value. The
+; round-trip suite (test_ssa) is the authority on what `to_ssa` itself handles soundly.
+(bind supported?
+  (lambda (body)
+    (and (not (has_bail? body))
+         (gt (size (map_keys (promotable_refs body))) 0))))
+(bind ssa_supported? supported?)
+
+; ── the SSA view (φ list, version->def, version->uses) ────────────────────────
+; A mutable view record the transform fills as it renames; the passes read it back.
+(bind new_view
+  (lambda ()
+    (assoc (map_of)
+      "phis" (list_of)            ; [ {var, args:[ver…], node} … ]
+      "defs" (map_of)             ; ver -> defining value node
+      "uses" (map_of))))          ; ver -> [use node…]
+(bind view_record_def!
+  (lambda (view ver value) (assoc (get view "defs") ver value)))
+(bind view_record_use!
+  (lambda (view ver node)
+    (bind ((u (get view "uses")))
+      (do
+        (when (eq (get u ver null) null) (assoc u ver (list_of)))
+        (append (get u ver) node)))))
+(bind view_record_phi!
+  (lambda (view var args node)
+    (append (get view "phis")
+      (assoc (map_of) "var" var "args" args "node" node))))
+
+; rebuild_stmts — process a flat `do` statement list, threading r's version. This is
+; the ONE place a NEW version is scoped over the REMAINING statements: a version
+; introduced by a `(set_ref r E)` statement OR by an `(if …)` φ-merge statement must
+; be visible to every later statement, so its binder's BODY is the rest of the list.
+;   rbself : rebuild_stmts itself (self-recursion idiom — module top-level is not
+;            letrec, so a bind cannot name itself)
+;   rn     : the per-node renamer (rename_ref), applied to each statement / sub-part
+; The two version-introducing statement shapes are handled HERE (not in rename_ref's
+; value-position cases) so the new version scopes over the continuation:
+;   * `(set_ref r E)` statement -> `(bind "r__k" E' <rest>)`.
+;   * `(if c T E)` statement whose arms diverge on r -> compute the per-arm tail
+;     versions (each arm with a `(deref r)` appended so it yields r's value in scope),
+;     then `(bind "r__m" (if c T' E') (__phi__ then else) <rest>)` — the merged version
+;     scopes over the rest; the φ is the recorded witness (from_ssa drops it). When the
+;     arms do NOT diverge, the if is emitted as a plain statement (version unchanged).
+; Any other statement is renamed in place; non-last ones are sequenced with `(do …)`.
+; The LAST statement is the do's value (its version read, or its renamed value).
+(bind rebuild_stmts
+  (lambda (rbself rn stmts i r cur ctr view)
+    (if (ge i (size stmts))
+      (sym (deref cur))
+      (bind ((s (get stmts i)) (last? (eq i (int_sub (size stmts) 1))))
+        (cond
+          ; ── a (set_ref r E) statement: new version over the rest ──
+          ((and (call? s) (head_is? s "set_ref")
+                (name? (arg s 0)) (eq (name_of (arg s 0)) r))
+            (bind (
+              (e2 (rn rn (arg s 1) r cur ctr view))
+              (k (deref ctr)) (vn (ver_name r k))
+            )
+              (do
+                (set_ref ctr (int_add k 1))
+                (set_ref cur vn)
+                (view_record_def! view vn e2)
+                (if last?
+                  (mkbind (list_of (assoc (map_of) "name" vn "value" e2))
+                          (list_of (sym vn)))
+                  (mkbind (list_of (assoc (map_of) "name" vn "value" e2))
+                          (list_of (rbself rbself rn stmts (int_add i 1)
+                                     r cur ctr view)))))))
+
+          ; ── an (if c T E) STATEMENT that writes r on some arm: φ-merge over the rest ──
+          ((and (call? s) (head_is? s "if") (eq (size (args_of s)) 3))
+            (bind (
+              (c2 (rn rn (arg s 0) r cur ctr view))
+              (entry_v (deref cur))
+              ; append a (deref r) to each arm so it yields r's value in scope.
+              (then_src (calln "do" (list_of (arg s 1) (calln "deref" (list_of (sym r))))))
+              (else_src (calln "do" (list_of (arg s 2) (calln "deref" (list_of (sym r))))))
+              (then_cur (ref entry_v))
+              (t2 (rn rn then_src r then_cur ctr view))
+              (then_v (deref then_cur))
+              (else_cur (ref entry_v))
+              (e2 (rn rn else_src r else_cur ctr view))
+              (else_v (deref else_cur))
+            )
+              (if (eq then_v else_v)
+                ; no divergence: the if is a plain statement; version unchanged.
+                (do
+                  (set_ref cur then_v)
+                  (bind ((if_node (call (sym "if") (list_of c2 t2 e2))))
+                    (if last? if_node
+                      (calln "do"
+                        (list_of if_node
+                          (rbself rbself rn stmts (int_add i 1) r cur ctr view))))))
+                ; divergence: bind the merged version r__m over the rest; record the φ.
+                (bind (
+                  (k (deref ctr)) (vn (ver_name r k))
+                  (if_val (call (sym "if") (list_of c2 t2 e2)))
+                  (phi_node (phi (list_of (sym then_v) (sym else_v))))
+                )
+                  (do
+                    (set_ref ctr (int_add k 1))
+                    (set_ref cur vn)
+                    (view_record_def! view vn if_val)
+                    (view_record_phi! view r (list_of then_v else_v) phi_node)
+                    (if last?
+                      (mkbind (list_of (assoc (map_of) "name" vn "value" if_val))
+                              (list_of phi_node (sym vn)))
+                      (mkbind (list_of (assoc (map_of) "name" vn "value" if_val))
+                              (list_of phi_node
+                                (rbself rbself rn stmts (int_add i 1)
+                                  r cur ctr view)))))))))
+
+          ; ── any other statement: rename in place; sequence before the rest ──
+          (else
+            (bind ((s2 (rn rn s r cur ctr view)))
+              (if last?
+                s2
+                (calln "do"
+                  (list_of s2 (rbself rbself rn stmts (int_add i 1)
+                                r cur ctr view)))))))))))
+
+; ── the per-ref straight-line / if renamer ────────────────────────────────────
+; rename_ref — rewrite `node`, versioning every access to ref `r`, given the CURRENT-
+; version metaprogram cell `cur` (holds r's live version NAME), a counter cell `ctr`,
+; and the `view`. Returns the rewritten node. `cur`/`ctr` are `(ref …)` cells of THIS
+; metaprogram — not part of the emitted IR.
+;
+;   * `(deref r)`     -> `(sym r__cur)`, record a use of r__cur.
+;   * `(set_ref r E)` in non-statement (value) position -> `(bind "r__k" E' (sym r__k))`
+;       so the form's VALUE is the written one; r__cur := r__k.
+;   * `(do s…)`       -> threaded statement-by-statement (a set_ref STATEMENT opens a
+;       `(bind "r__k" E' <rest>)` scoping the new version over the rest).
+;   * `(if c T E)`    -> branch cur into each arm from the SAME entry version; if the
+;       arms diverge, emit a `(bind "r__m" (if c T-tail E-tail) (__phi__ …) (sym r__m))`
+;       — the if yields the merged value, the explicit φ records the two incoming
+;       versions as a no-op statement (from_ssa drops it), r__cur := r__m.
+;   * `(while c WB)`  -> recursed verbatim (r is not written inside — not loop-carried).
+;   * a bind of OTHER names -> recurse into pair values + body.
+;   * a name / literal / other call -> recurse structurally; r appears only in
+;     deref/set_ref slots (SIMPLE), so a bare r-name never reaches here.
+(bind rename_ref
+  (lambda (self node r cur ctr view)
+    (cond
+      ; ── (deref r): read the current version ──
+      ((and (call? node) (head_is? node "deref")
+            (name? (arg node 0)) (eq (name_of (arg node 0)) r))
+        (bind ((v (deref cur)) (use_node (sym (deref cur))))
+          (do (view_record_use! view v use_node) use_node)))
+
+      ; ── (set_ref r E) in VALUE position: new version, value = written one ──
+      ((and (call? node) (head_is? node "set_ref")
+            (name? (arg node 0)) (eq (name_of (arg node 0)) r))
+        (bind (
+          (e2 (self self (arg node 1) r cur ctr view))
+          (k (deref ctr)) (vn (ver_name r k))
+        )
+          (do
+            (set_ref ctr (int_add k 1))
+            (set_ref cur vn)
+            (view_record_def! view vn e2)
+            (mkbind (list_of (assoc (map_of) "name" vn "value" e2))
+                    (list_of (sym vn))))))
+
+      ; ── (do s…): thread the version through the statement list ──
+      ((and (call? node) (head_is? node "do"))
+        (rebuild_stmts rebuild_stmts self (args_of node) 0 r cur ctr view))
+
+      ; ── (if c T E): branch + φ-merge ──
+      ; The merged value an `if` must carry forward is the REF's value at each arm's
+      ; end (NOT the arm's natural return). So we append a `(deref r)` to each arm
+      ; BEFORE renaming: the renamer then emits the tail-version read as the arm's
+      ; in-scope final expression (a `(deref r)` -> `(sym r__tail)` inside the arm's
+      ; own nested binds, never leaking the version out of scope). Each arm thus
+      ; YIELDS its tail-version value; the if returns the merged value; r__m binds it.
+      ((and (call? node) (head_is? node "if") (eq (size (args_of node)) 3))
+        (bind (
+          (c2 (self self (arg node 0) r cur ctr view))
+          (entry_v (deref cur))
+          ; tail-read appended so the arm yields r's value at its end, in scope.
+          (then_src (calln "do" (list_of (arg node 1) (calln "deref" (list_of (sym r))))))
+          (else_src (calln "do" (list_of (arg node 2) (calln "deref" (list_of (sym r))))))
+          (then_cur (ref entry_v))
+          (t2 (self self then_src r then_cur ctr view))
+          (then_v (deref then_cur))
+          (else_cur (ref entry_v))
+          (e2 (self self else_src r else_cur ctr view))
+          (else_v (deref else_cur))
+        )
+          (if (eq then_v else_v)
+            ; both arms left r at the SAME version: no merge, the version is unchanged.
+            ; The appended (deref r) is harmless (reads the unchanged version); we still
+            ; emit it so the if has a value, but the ref version after the if is then_v.
+            (do
+              (set_ref cur then_v)
+              (call (sym "if") (list_of c2 t2 e2)))
+            ; arms diverge: φ-merge to a fresh version r__m. Each arm yields its tail-
+            ; version value (the appended in-scope read); the if returns the merged
+            ; value; an explicit φ records the two incoming versions (a no-op witness
+            ; statement from_ssa drops); r__cur := r__m.
+            (bind (
+              (k (deref ctr)) (vn (ver_name r k))
+              (if_val (call (sym "if") (list_of c2 t2 e2)))
+              (phi_node (phi (list_of (sym then_v) (sym else_v))))
+            )
+              (do
+                (set_ref ctr (int_add k 1))
+                (set_ref cur vn)
+                (view_record_def! view vn if_val)
+                (view_record_phi! view r (list_of then_v else_v) phi_node)
+                ; `(bind "r__m" (if …) (__phi__ then else) (sym r__m))`: the if's
+                ; value initialises r__m; the φ is a no-op merge-witness statement
+                ; (from_ssa drops it); the form's value is r__m.
+                (mkbind (list_of (assoc (map_of) "name" vn "value" if_val))
+                        (list_of phi_node (sym vn))))))))
+
+      ; ── (while c WB): recurse (a non-loop-carried r is stable across the loop) ──
+      ((and (call? node) (head_is? node "while") (eq (size (args_of node)) 2))
+        (call (sym "while")
+          (list_of (self self (arg node 0) r cur ctr view)
+                   (self self (arg node 1) r cur ctr view))))
+
+      ; ── a bind of OTHER names: recurse into pair values + body ──
+      ((and (call? node) (not (eq (bind_pairs node) null)))
+        (bind ((bp (bind_pairs node)) (op (list_of)) (ob (list_of)))
+          (do
+            (for p (get bp "pairs")
+              (append op (assoc (map_of) "name" (get p "name")
+                           "value" (self self (get p "value") r cur ctr view))))
+            (for b (get bp "body")
+              (append ob (self self b r cur ctr view)))
+            (mkbind op ob))))
+
+      ; ── a name / literal: unchanged ──
+      ((not (call? node)) node)
+
+      ; ── any other call: recurse structurally ──
+      (else
+        (call (self self (callee node) r cur ctr view)
+          (bind ((out (list_of)))
+            (do
+              (for a (args_of node) (append out (self self a r cur ctr view)))
+              out)))))))
+
+; ── the top-level transform: promote each promotable ref binder ───────────────
+; ssa_transform — walk the tree; at each canonical `(bind …)` whose FIRST promotable
+; pair binds a fresh `(ref V)` ref r, promote r over everything after it: emit
+; `(bind "r__0" V <rest renamed>)`. Pairs before r stay as outer binders; nested
+; binders are reached by recursion on the promoted body.
+(bind ssa_transform
+  (lambda (self body view loopset)
+    (cond
+      ((not (call? body)) body)
+
+      ((not (eq (bind_pairs body) null))
+        (bind ((bp (bind_pairs body)) (pairs (get bp "pairs")) (bbody (get bp "body")))
+          (bind ((promote_idx (ref -1)))
+            (do
+              (for i (sequence_range 0 (size pairs))
+                (when (eq (deref promote_idx) -1)
+                  (bind ((nm (get (get pairs i) "name")) (v (get (get pairs i) "value")))
+                    (when (and (call? v) (head_is? v "ref")
+                               (eq (get (get view "promotable") nm false) true)
+                               (not (eq (get loopset nm false) true)))
+                      (set_ref promote_idx i)))))
+              (if (eq (deref promote_idx) -1)
+                ; no promotable pair here: recurse into pair values + body.
+                (bind ((op (list_of)) (ob (list_of)))
+                  (do
+                    (for p pairs
+                      (append op (assoc (map_of) "name" (get p "name")
+                                   "value" (self self (get p "value") view loopset))))
+                    (for b bbody (append ob (self self b view loopset)))
+                    (mkbind op ob)))
+                ; promote pair `promote_idx`.
+                (bind (
+                  (pi (deref promote_idx))
+                  (rp (get pairs pi))
+                  (r (get rp "name"))
+                  (initV (arg (get rp "value") 0))    ; V from (ref V)
+                  (ctr (ref 1))                        ; r__0 = V; next version r__1
+                  (cur (ref (ver_name r 0)))
+                  (before (list_of)) (after_pairs (list_of))
+                )
+                  (do
+                    (for j (sequence_range 0 pi) (append before (get pairs j)))
+                    (for j (sequence_range (int_add pi 1) (size pairs))
+                      (append after_pairs (get pairs j)))
+                    (bind (
+                      (cont (mkbind after_pairs bbody))   ; rest = later pairs over body
+                      (renamed (rename_ref rename_ref cont r cur ctr view))
+                      (promoted
+                        (mkbind (list_of (assoc (map_of) "name" (ver_name r 0)
+                                           "value" initV))
+                                (list_of renamed)))
+                    )
+                      (do
+                        (view_record_def! view (ver_name r 0) initV)
+                        ; recurse into the promoted body for NESTED promotions, and
+                        ; into the before-pairs' values; wrap the before-pairs back as
+                        ; outer binders.
+                        (bind (
+                          (inner (self self promoted view loopset))
+                          (recursed_before (list_of))
+                        )
+                          (do
+                            (for bp2 before
+                              (append recursed_before
+                                (assoc (map_of) "name" (get bp2 "name")
+                                  "value" (self self (get bp2 "value") view loopset))))
+                            (mkbind recursed_before (list_of inner)))))))))))))
+
+      (else
+        (call (callee body)
+          (bind ((out (list_of)))
+            (do
+              (for a (args_of body) (append out (self self a view loopset)))
+              out)))))))
+
+; ── the raw transform: to_ssa_raw (the public to_ssa wraps it with validation) ──
+; to_ssa_raw — convert a function body to SSA FORM. Unsupported -> IDENTITY (wrapped
+; with an empty view so the read API stays uniform). Supported -> a WRAPPER map
+; { node, view, ssa?, orig } whose `node` is the SSA-form IR and whose `view` carries
+; the φ list / version maps. NOTE: this is the RAW transform — it may, on shapes where
+; a write sits in a bind-pair VALUE position, emit a version that leaks lexical scope;
+; the public `to_ssa` (defined after from_ssa) validates the round-trip and bails to
+; identity if so. Internal code must NOT call to_ssa_raw without that validation.
+(bind to_ssa_raw
+  (lambda (body)
+    (if (not (supported? body))
+      (assoc (map_of) "node" body "view" (new_view) "ssa?" false "orig" body)
+      (bind ((view (new_view)) (loopset (loop_carried_refs body)))
+        (do
+          (assoc view "promotable" (promotable_refs body))
+          (bind ((ssa_ir (ssa_transform ssa_transform body view loopset)))
+            (assoc (map_of) "node" ssa_ir "view" view "ssa?" true "orig" body)))))))
+
+; ssa_node — the SSA-form IR node from a to_ssa wrapper (or a bare node passed through).
+(bind ssa_node
+  (lambda (w) (if (and (eq (value_type w) "map") (contains w "node")) (get w "node") w)))
+; ssa_view — the view record from a wrapper (or an empty view for a bare node).
+(bind ssa_view
+  (lambda (w) (if (and (eq (value_type w) "map") (contains w "view")) (get w "view") (new_view))))
+
+; ── from_ssa: destruct φ back to executable IR ────────────────────────────────
+; strip_phi — structurally remove every φ. A `(__phi__ …)` appears ONLY as a no-op
+; STATEMENT inside a `(bind … (if …) (__phi__ …) (sym r__m))` (the merged value is
+; already in r__m via the if). We therefore drop a φ wherever it sits as a non-final
+; statement of a `(bind …)` body or a `(do …)`: deleting it changes nothing (it is
+; never read — the following `(sym r__m)` is the value). A φ that somehow reaches a
+; VALUE position is lowered to its last argument as a defensive fallback (it should
+; never happen in our pipeline; the test asserts no __phi__ survives the node).
+(bind strip_phi
+  (lambda (self node)
+    (cond
+      ((not (call? node)) node)
+      ; a φ in VALUE position (defensive — should not occur): lower to last arg.
+      ((is_phi? node)
+        (bind ((as (args_of node)))
+          (if (eq (size as) 0) node (self self (get as (int_sub (size as) 1))))))
+      ; a canonical bind: drop φ statements from its BODY, recurse into pairs + body.
+      ((not (eq (bind_pairs node) null))
+        (bind ((bp (bind_pairs node)) (op (list_of)) (ob (list_of)))
+          (do
+            (for p (get bp "pairs")
+              (append op (assoc (map_of) "name" (get p "name")
+                           "value" (self self (get p "value")))))
+            (for b (get bp "body")
+              (unless (and (call? b) (is_phi? b))
+                (append ob (self self b))))
+            (mkbind op ob))))
+      ; a (do s…): drop φ statements, recurse into the rest.
+      ((head_is? node "do")
+        (bind ((out (list_of)))
+          (do
+            (for s (args_of node)
+              (unless (and (call? s) (is_phi? s))
+                (append out (self self s))))
+            (if (eq (size out) 1) (get out 0) (calln "do" out)))))
+      ; any other call: recurse into callee + args.
+      (else
+        (call (self self (callee node))
+          (bind ((out (list_of)))
+            (do
+              (for a (args_of node) (append out (self self a)))
+              out)))))))
+
+(bind from_ssa
+  (lambda (w) (strip_phi strip_phi (ssa_node w))))
+
+; ── public to_ssa: round-trip self-validation, bail to identity on any leak ────
+; The raw transform threads a single `cur` version cell in EVAL order but emits
+; versions with LEXICAL scope. The two coincide for a write that is a `do` STATEMENT
+; (rebuild_stmts scopes the new version over the continuation) and for if-STATEMENT
+; merges, but NOT when a version-introducing write (a `set_ref`, or a divergent `if`)
+; sits in a bind-pair VALUE position: there the new version is bound only INSIDE that
+; value, yet a later read in the bind BODY still names it — so it leaks out of scope
+; (e.g. `(bind ((q (set_ref r 5))) (deref r))` round-trips to a free `r__1`).
+; Rather than enumerate every unsound shape syntactically, to_ssa VALIDATES its own
+; output: if from_ssa(raw) has any free name that was NOT free in the original body, a
+; version leaked, so the SSA form is unsound for this body and we BAIL to identity
+; (behaviour-preserving — only an optimization is missed, never a miscompile). This
+; makes the cardinal contract  eval_ir(from_ssa(to_ssa body)) == eval_ir(body)  hold
+; for EVERY body, by construction, not by case analysis.
+(bind ssa_well_scoped?
+  (lambda (w body)
+    (bind ((origset (map_of)) (ok (ref true)))
+      (do
+        (for nm (free_names body) (assoc origset nm true))
+        (for nm (free_names (from_ssa w))
+          (unless (eq (get origset nm false) true) (set_ref ok false)))
+        (deref ok)))))
+(bind to_ssa
+  (lambda (body)
+    (bind ((w (to_ssa_raw body)))
+      (if (and (eq (get w "ssa?" false) true) (not (ssa_well_scoped? w body)))
+        (assoc (map_of) "node" body "view" (new_view) "ssa?" false "orig" body)
+        w))))
+
+; ── is_ssa_form? ──────────────────────────────────────────────────────────────
+; is_ssa_form? — does `node` contain a `__phi__` head (the explicit SSA-form witness)?
+(bind is_ssa_form?
+  (lambda (node)
+    (bind ((hit (ref false)))
+      (do
+        (walk node (lambda (n) (when (and (call? n) (is_phi? n)) (set_ref hit true))))
+        (deref hit)))))
+
+; ── view accessors (the read API for ssa_ccp / ssa_dce) ───────────────────────
+(bind ssa_phis (lambda (w) (get (ssa_view w) "phis" (list_of))))
+(bind ssa_version_def
+  (lambda (w ver) (get (get (ssa_view w) "defs" (map_of)) ver null)))
+(bind ssa_version_uses
+  (lambda (w ver) (get (get (ssa_view w) "uses" (map_of)) ver (list_of))))
+(bind ssa_versions (lambda (w) (map_keys (get (ssa_view w) "defs" (map_of)))))
+
+(export
+  ; the transform
+  to_ssa from_ssa
+  ; support / form predicates
+  supported? ssa_supported? is_ssa_form?
+  ; wrapper accessors
+  ssa_node ssa_view
+  ; the read API for the passes
+  ssa_phis ssa_version_def ssa_version_uses ssa_versions
+  ; φ helpers a pass may reuse
+  phi is_phi? PHI_HEAD ver_name promotable_refs
+  ; the from_ssa value-hazard predicate (a body to_ssa would value-miscompile)
+  hazardous?)

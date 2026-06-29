@@ -1,0 +1,48 @@
+; stdlib/lib/core/equal.caap — structural equality (module stdlib.lib.core.equal).
+;
+; The kernel `eq` is IDENTITY for lists and maps (two distinct maps with the
+; same entries are not eq). `deep_eq` is the structural twin: it compares
+; scalars by value and lists/maps by their contents, recursively.
+(module stdlib.lib.core.equal)
+
+; deep_eq — structural equality, now a FACADE over the kernel's value_eq
+; (lists/tuples element-wise, maps by key set, scalars/identities like eq,
+; cycle-safe). The in-language walker this replaced lives in git history.
+(bind deep_eq value_eq)
+
+; deep_ne — the negation, for symmetry with the kernel `ne`.
+(bind deep_ne
+  (lambda (a b) (not (deep_eq a b))))
+
+; deep_compare — a TOTAL structural order over any two values, a facade over the
+; kernel value_compare: -1 when a < b, 0 when structurally equal (exactly when
+; deep_eq), 1 when a > b. Orders by a stable type rank then structurally within a
+; kind (lists/tuples lexicographically, maps by sorted pairs); no int/float
+; coercion, cycle-safe. The order twin of deep_eq — sort keys, structural map
+; keys, and cache fingerprints all build on it.
+(bind deep_compare value_compare)
+
+; structural_hash — a structural hash (int) over the kernel value_hash:
+; deep_eq-equal values hash equal (maps fold order-independently), cycle-safe,
+; deterministic across runs for data kinds. The companion to deep_compare for
+; bucketing structurally-equal values.
+(bind structural_hash value_hash)
+
+; deep_eq_by — structural equality of two values' PROJECTIONS: compare
+; (keyfn a) against (keyfn b) with deep_eq. The "compare on a derived key"
+; combinator — e.g. (deep_eq_by (lambda (p) (get p "id")) a b) compares records
+; by id regardless of their other fields.
+;   keyfn : a 1-arg projection applied to both values
+;   a / b : the two values to compare via their projections
+(bind deep_eq_by
+  (lambda (keyfn a b) (deep_eq (keyfn a) (keyfn b))))
+
+; compare_by — the total-order twin of deep_eq_by: deep_compare of the two
+; projections (-1 / 0 / 1). The standard key-extractor for sorting structured
+; values, e.g. (compare_by (lambda (p) (get p "age")) a b) orders by age.
+;   keyfn : a 1-arg projection applied to both values
+;   a / b : the two values whose projections are ordered
+(bind compare_by
+  (lambda (keyfn a b) (deep_compare (keyfn a) (keyfn b))))
+
+(export deep_eq deep_ne deep_compare structural_hash deep_eq_by compare_by)

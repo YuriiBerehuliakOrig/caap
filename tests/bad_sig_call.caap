@@ -1,0 +1,5 @@
+; tests/bad_sig_call.caap — a string where the defn declares u8.
+(module stdlib.fixtures.bad_sig_call)
+(defn add8 ((a u8) (b u8)) u8 (int_add a b))
+(bind broken (lambda () (add8 1 "x")))
+(export broken)

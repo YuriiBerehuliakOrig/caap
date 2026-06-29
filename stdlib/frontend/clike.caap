@@ -1,0 +1,38 @@
+; stdlib/frontend/clike.caap — a C-LIKE SURFACE LANGUAGE on the stdlib tower
+; (module stdlib.frontend.clike)
+(module stdlib.frontend.clike)
+
+(use stdlib.frontend.surface parse_forms_at)
+(use stdlib.frontend.clike.grammar clike_units)
+(use stdlib.frontend.clike.program lower_program_at)
+(use stdlib.frontend.clike.analyze analyze_program_impl)
+(use stdlib.frontend.clike.sem_tokens sem_token_sink)
+(use stdlib.frontend.clike.decls
+     register_decl_kind! register_attribute! register_decl_classifier!)
+(use stdlib.frontend.clike.block register_statement!)
+(use stdlib.frontend.clike.expr
+     register_infix_op! register_assign_op! register_prefix_op!
+     register_primary_handler! register_postfix_handler!)
+
+; analyze_program — the LSP view of a clike file. The analysis leaf is a pure
+; consumer; the facade supplies the parser, lowering entry, and shared semantic
+; token sink.
+(bind analyze_program
+  (lambda (text path)
+    (analyze_program_impl
+      (assoc (map_of)
+        "parse_forms_at" parse_forms_at
+        "clike_units" clike_units
+        "lower_program_at" lower_program_at
+        "sem_token_sink" sem_token_sink)
+      text path)))
+
+; lower_program — the 1-arg classic (anonymous path).
+(bind lower_program
+  (lambda (text) (lower_program_at text "<clike>")))
+
+(export lower_program lower_program_at analyze_program
+        register_decl_kind! register_attribute! register_decl_classifier!
+        register_statement!
+        register_infix_op! register_assign_op! register_prefix_op!
+        register_primary_handler! register_postfix_handler!)

@@ -1,0 +1,84 @@
+; stdlib/lib/tests/test_ssa_licm.caap — SSA-promotability loop-invariant code motion
+; (stdlib.semantics.passes.ssa_licm). Hoists an invariant `(deref r)` of a NON-ESCAPING
+; ref out of a while loop — the read licm cannot move (deref is not in licm's totality
+; whitelist). Proves THE WIN (the hoist fires; the conservative licm leaves the loop
+; unchanged — the contrast), MUST-NOT-HOIST a mutated ref's read, and behaviour
+; preservation by EVALUATION over a differential grid eval(body) == eval(ssa_licm_node body).
+
+;; @area: passes
+;; @kind: regression
+;; @slow: false
+(use stdlib.lib.test assert_true assert_eq)
+(use stdlib.semantics.passes.ssa_licm ssa_licm_node)
+(use stdlib.semantics.passes.licm licm_node)
+(use stdlib.syntax.ast sym lit calln eval_ir walk call? head_is? args_of name? name_of)
+(use stdlib.syntax.ir node_eq)
+(do
+  (bind (
+    (setr (lambda (r v) (calln "set_ref" (list_of (sym r) v))))
+    (drf  (lambda (r)   (calln "deref" (list_of (sym r)))))
+    (mkref (lambda (v)  (calln "ref" (list_of v))))
+    (rb (lambda (r v body) (calln "bind" (list_of (lit r) v body))))
+    (add (lambda (a b) (calln "int_add" (list_of a b))))
+    (lt2 (lambda (a b) (calln "lt" (list_of a b))))
+    (doN (lambda (xs) (calln "do" xs)))
+    (whl (lambda (c b) (calln "while" (list_of c b))))
+    (count_drf (lambda (node nm)
+      (bind ((c (ref 0)))
+        (do (walk node (lambda (n) (when (and (call? n) (head_is? n "deref")
+                 (name? (get (args_of n) 0)) (eq (name_of (get (args_of n) 0)) nm))
+                 (set_ref c (int_add (deref c) 1))))) (deref c)))))
+    (cases (ref 0)) (mism (ref 0))
+    (chk (lambda (b)
+      (bind ((v0 (eval_ir b)) (vl (eval_ir (ssa_licm_node b))))
+        (do (set_ref cases (int_add (deref cases) 1))
+          (bind ((ok (value_eq v0 vl)))
+            (do (unless ok (set_ref mism (int_add (deref mism) 1)))
+              (assert_true ok (string_concat_many "MISCOMPILE v0=" (value_to_string v0) " licm=" (value_to_string vl)))))))))
+  )
+    (do
+      ; ════ THE WIN — an invariant (deref r) read inside the loop is hoisted ════
+      ; (bind r (ref 5) (bind i (ref 0) (do (while (lt i 3) (set_ref i (+ i (deref r)))) i)))
+      (bind ((win (rb "r" (mkref (lit 5)) (rb "i" (mkref (lit 0))
+                    (doN (list_of
+                      (whl (lt2 (drf "i") (lit 3)) (setr "i" (add (drf "i") (drf "r"))))
+                      (drf "i")))))))
+        (do
+          (assert_eq (eval_ir win) 5 "WIN: original evals 5")
+          (assert_eq (eval_ir (ssa_licm_node win)) 5 "WIN: ssa_licm eval preserved")
+          (bind ((sl (ssa_licm_node win)) (cl (licm_node win)))
+            (do
+              ; ssa_licm HOISTED the invariant read -> the tree changed; total (deref r)
+              ; count is unchanged (relocated to the hoist bind, not removed/duplicated).
+              (assert_true (not (node_eq sl win))
+                "WIN: ssa_licm hoisted the invariant (deref r) (tree changed)")
+              (assert_eq (count_drf sl "r") (count_drf win "r")
+                "WIN: the deref is RELOCATED (same total count), not duplicated/dropped")
+              ; CONTRAST — licm cannot hoist a deref, so it leaves the loop UNCHANGED
+              (assert_true (node_eq cl win)
+                "WIN/contrast: licm leaves the loop unchanged (deref not in its whitelist)")))))
+
+      ; ════ MUST-NOT-HOIST — a MUTATED ref's read is variant, never hoisted ════
+      ; (bind r (ref 0) (bind i (ref 0) (do (while (lt i 3) (do (set_ref r (+ r 1)) (set_ref i (+ i 1)))) r)))
+      (bind ((b (rb "r" (mkref (lit 0)) (rb "i" (mkref (lit 0))
+                  (doN (list_of
+                    (whl (lt2 (drf "i") (lit 3)) (doN (list_of (setr "r" (add (drf "r") (lit 1))) (setr "i" (add (drf "i") (lit 1))))))
+                    (drf "r")))))))
+        (do
+          (assert_eq (eval_ir b) 3 "NOHOIST: original evals 3")
+          (assert_eq (eval_ir (ssa_licm_node b)) 3 "NOHOIST: eval preserved (r mutated -> not hoisted)")
+          (assert_true (node_eq (ssa_licm_node b) b) "NOHOIST: ssa_licm leaves the loop unchanged (r is mutated)")))
+
+      ; ════ differential grid: invariant read / mutated ref / deref-in-condition ════
+      (for r0 (list_of 2 5)
+        (for n (list_of 0 2 4)
+          (do
+            (chk (rb "r" (mkref (lit r0)) (rb "i" (mkref (lit 0))
+              (doN (list_of (whl (lt2 (drf "i") (lit n)) (setr "i" (add (drf "i") (add (drf "r") (lit 1))))) (drf "i"))))))
+            (chk (rb "r" (mkref (lit r0)) (rb "i" (mkref (lit 0))
+              (doN (list_of (whl (lt2 (drf "i") (lit n)) (doN (list_of (setr "r" (add (drf "r") (lit 1))) (setr "i" (add (drf "i") (lit 1)))))) (drf "r"))))))
+            (chk (rb "r" (mkref (lit r0)) (rb "i" (mkref (lit 0))
+              (doN (list_of (whl (lt2 (drf "i") (drf "r")) (setr "i" (add (drf "i") (lit 1)))) (drf "i")))))))))
+      (assert_true (eq (deref mism) 0)
+        (string_concat_many "ssa_licm differential: " (value_to_string (deref mism)) " mismatches / " (value_to_string (deref cases)) " cases"))
+      true)))

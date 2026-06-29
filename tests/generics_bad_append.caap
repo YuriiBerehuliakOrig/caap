@@ -1,0 +1,7 @@
+; appending a string onto an inferred list<int> — certain element mismatch.
+(module stdlib.fixtures.generics_bad_append)
+(bind broken
+  (lambda ()
+    (bind ((nums (list_of 1 2 3)))
+      (append nums "x"))))
+(export broken)

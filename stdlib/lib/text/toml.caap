@@ -1,0 +1,594 @@
+; stdlib/lib/text/toml.caap — a TOML subset in pure CAAP (module stdlib.lib.text.toml).
+;
+;   toml_parse  TEXT -> {ok: true, value} | {ok: false, error}
+;   toml_emit   MAP  -> canonical TOML text
+;
+; Supported subset (a useful slice of TOML, not the whole spec):
+;   * tables          [table]   and dotted/nested   [a.b.c]
+;   * key = value with scalars:
+;       - basic string   "..."  (escapes \" \\ \n \t \r)
+;       - literal string '...'  (no escapes)
+;       - int            42 / -7 / +3
+;       - float          2.5 / -1e3
+;       - bool           true / false
+;   * arrays          [1, 2, 3]   ["a", "b"]   (heterogeneous, trailing comma ok)
+;   * inline tables   {a = 1, b = 2}
+;   * comments        # … to end of line
+;   * blank lines
+;
+; NOT modelled: datetimes (RFC 3339 offset/local) are PARSED AS STRINGS — TOML
+; datetime literals are bare (unquoted) tokens, so `d = 1979-05-27` yields the
+; STRING "1979-05-27" rather than a datetime value (CAAP has no datetime type).
+;
+; The result mirrors CAAP data 1:1: a TOML document is a nested map, arrays are
+; lists, scalars are themselves. A parse failure is DATA with a "line:col:"
+; located message (same shape as lib/text/json), never a raised error.
+(module stdlib.lib.text.toml)
+
+; reuse the canonical char predicates (same ASCII classes + the same (size c)=1
+; guard, so behaviour is identical to the old inline copies): is_digit? replaces
+; the private `digit?`; is_alpha?/is_digit? back key_char?.
+(use stdlib.lib.text.char is_digit? is_alpha?)
+
+; ── cursor helpers ──────────────────────────────────────────────────────────
+; the value/inline parsers walk a PRE-SPLIT char list (string_chars, O(n) once);
+; `text` is that list and indexing is O(1).
+(bind ch
+  (lambda (text i) (get text i "")))
+
+; slice_str — chars [i0, iend) of `text` (the pre-split list) joined to a string.
+(bind slice_str
+  (lambda (text i0 iend)
+    (sequence_join (sequence_slice text i0 iend) "")))
+
+(bind ws?
+  (lambda (c) (or (eq c " ") (or (eq c "\t") (eq c "\r")))))
+
+; skip_ws — advance past spaces/tabs/CR (but NOT newlines: those delimit lines).
+(bind skip_ws
+  (lambda (text i)
+    (bind ((j (ref i)))
+      (do
+        (while (and (lt (deref j) (size text)) (ws? (ch text (deref j))))
+          (set_ref j (int_add (deref j) 1)))
+        (deref j)))))
+
+; pos — "line:col" of char offset `i` (error paths only).
+(bind pos
+  (lambda (text i)
+    (bind ((line (ref 1)) (col (ref 1)) (k (ref 0)))
+      (do
+        (while (lt (deref k) i)
+          (do
+            (if (eq (ch text (deref k)) "\n")
+              (do (set_ref line (int_add (deref line) 1)) (set_ref col 1))
+              (set_ref col (int_add (deref col) 1)))
+            (set_ref k (int_add (deref k) 1))))
+        (string_concat_many
+          (int_to_string (deref line)) ":" (int_to_string (deref col)))))))
+
+(bind fail
+  (lambda (text i message)
+    (assoc (map_of) "ok" false
+      "error" (string_concat_many "toml: " (pos text i) ": " message))))
+
+(bind good
+  (lambda (value i)
+    (assoc (map_of) "ok" true "value" value "i" i)))
+
+; digit? = the canonical char.is_digit? (imported above); same class + guard.
+(bind digit? is_digit?)
+
+; ── basic string  "..."  (escapes) ─────────────────────────────────────────
+(bind unescape
+  (assoc (map_of) "\"" "\"" "\\" "\\" "n" "\n" "t" "\t" "r" "\r"))
+; `out` accumulates decoded chunks in a LOCAL list, joined once on success (O(n))
+; instead of concatenated onto a growing string per char (O(n^2)); the joined
+; pieces are unchanged, so the parsed value is byte-identical.
+(bind parse_basic_string
+  (lambda (text i0)
+    (bind ((out (list_of)) (i (ref (int_add i0 1))) (res (ref null)))
+      (do
+        (while (and (eq (deref res) null) (lt (deref i) (size text)))
+          (bind ((c (ch text (deref i))))
+            (cond
+              ((eq c "\"")
+                (set_ref res (good (sequence_join out "") (int_add (deref i) 1))))
+              ((eq c "\n")
+                (set_ref res (fail text i0 "unterminated string")))
+              ((eq c "\\")
+                (bind ((e (ch text (int_add (deref i) 1))))
+                  (if (not (eq (get unescape e) null))
+                    (do
+                      (append out (get unescape e ""))
+                      (set_ref i (int_add (deref i) 2)))
+                    (set_ref res
+                      (fail text (deref i) (string_concat_many "bad escape \\" e))))))
+              (else
+                (do
+                  (append out c)
+                  (set_ref i (int_add (deref i) 1)))))))
+        (if (eq (deref res) null)
+          (fail text i0 "unterminated string")
+          (deref res))))))
+
+; ── literal string  '...'  (no escapes, any byte but the closing quote) ─────
+; `out` is a LOCAL list joined once on success (O(n)), not a growing-string
+; concat per char (O(n^2)); the joined chars are identical to the old form.
+(bind parse_literal_string
+  (lambda (text i0)
+    (bind ((out (list_of)) (i (ref (int_add i0 1))) (res (ref null)))
+      (do
+        (while (and (eq (deref res) null) (lt (deref i) (size text)))
+          (bind ((c (ch text (deref i))))
+            (cond
+              ((eq c "'")
+                (set_ref res (good (sequence_join out "") (int_add (deref i) 1))))
+              ((eq c "\n")
+                (set_ref res (fail text i0 "unterminated literal string")))
+              (else
+                (do
+                  (append out c)
+                  (set_ref i (int_add (deref i) 1)))))))
+        (if (eq (deref res) null)
+          (fail text i0 "unterminated literal string")
+          (deref res))))))
+
+; ── bare value token — runs up to a delimiter (, ] } # newline or space) ────
+; the lexeme is then classified: bool / int / float / else string (datetimes &
+; other bare tokens fall through to a string, by design).
+(bind bare_end?
+  (lambda (c)
+    (or (eq c "")
+      (or (eq c ",")
+        (or (eq c "]")
+          (or (eq c "}")
+            (or (eq c "#")
+              (or (eq c "\n")
+                (or (eq c " ") (eq c "\t"))))))))))
+
+; int_token? / float_token? — a strict shape gate so we don't hand a malformed
+; lexeme to string_to_int/string_to_float (which RAISE on bad input).
+(bind sign_skip
+  (lambda (cs k)
+    (if (or (eq (get cs (deref k) "") "+") (eq (get cs (deref k) "") "-"))
+      (set_ref k (int_add (deref k) 1)) null)))
+(bind int_token?
+  (lambda (cs)
+    (bind ((n (size cs)) (k (ref 0)) (any (ref false)))
+      (do
+        (sign_skip cs k)
+        (while (digit? (get cs (deref k) ""))
+          (do (set_ref any true) (set_ref k (int_add (deref k) 1))))
+        (and (deref any) (eq (deref k) n))))))
+(bind float_token?
+  (lambda (cs)
+    (bind ((n (size cs)) (k (ref 0)) (any (ref false))
+           (dot (ref false)) (exp (ref false)))
+      (do
+        (sign_skip cs k)
+        (while (digit? (get cs (deref k) ""))
+          (do (set_ref any true) (set_ref k (int_add (deref k) 1))))
+        (if (eq (get cs (deref k) "") ".")
+          (do
+            (set_ref dot true)
+            (set_ref k (int_add (deref k) 1))
+            (while (digit? (get cs (deref k) ""))
+              (do (set_ref any true) (set_ref k (int_add (deref k) 1)))))
+          null)
+        (if (or (eq (get cs (deref k) "") "e") (eq (get cs (deref k) "") "E"))
+          (do
+            (set_ref exp true)
+            (set_ref k (int_add (deref k) 1))
+            (sign_skip cs k)
+            (if (not (digit? (get cs (deref k) "")))
+              (set_ref any false)
+              (while (digit? (get cs (deref k) ""))
+                (set_ref k (int_add (deref k) 1)))))
+          null)
+        ; a float needs a "." or exponent (else it is an int), some digit, and a
+        ; full consume of the lexeme.
+        (and (deref any)
+          (and (or (deref dot) (deref exp)) (eq (deref k) n)))))))
+
+; classify_bare — map a bare lexeme to a value. The int/float shape gates pass
+; only well-formed digit shapes, but string_to_int RAISES past i64 range and
+; string_to_float can overflow to inf; both are caught and the lexeme is kept as
+; a STRING rather than raised, preserving the "failures are DATA" contract.
+(bind classify_bare
+  (lambda (lex)
+    (cond
+      ((eq lex "true") true)
+      ((eq lex "false") false)
+      ((int_token? (string_chars lex))
+        (try (string_to_int lex) (catch e lex)))
+      ((float_token? (string_chars lex))
+        (try
+          (bind ((f (string_to_float lex)))
+            (if (or (float_inf? f) (float_nan? f)) lex f))
+          (catch e lex)))
+      ; everything else (datetimes, bare words) stays a string
+      (else lex))))
+
+(bind parse_bare
+  (lambda (text i0)
+    (bind ((i (ref i0)))
+      (do
+        (while (and (lt (deref i) (size text)) (not (bare_end? (ch text (deref i)))))
+          (set_ref i (int_add (deref i) 1)))
+        (bind ((lex (slice_str text i0 (deref i))))
+          (if (eq lex "")
+            (fail text i0 "expected a value")
+            (good (classify_bare lex) (deref i))))))))
+
+; the mutually recursive value/array/inline parsers share one dispatch record.
+(bind T (map_of))
+
+; ── arrays  [v, v, …] ───────────────────────────────────────────────────────
+; skip_layout — whitespace, newlines, and comments (arrays may span lines).
+(bind skip_layout
+  (lambda (text i)
+    (bind ((j (ref i)) (go (ref true)))
+      (do
+        (while (deref go)
+          (bind ((c (ch text (deref j))))
+            (cond
+              ((or (ws? c) (eq c "\n")) (set_ref j (int_add (deref j) 1)))
+              ((eq c "#")
+                (while (and (lt (deref j) (size text)) (not (eq (ch text (deref j)) "\n")))
+                  (set_ref j (int_add (deref j) 1))))
+              (else (set_ref go false)))))
+        (deref j)))))
+
+(bind parse_array
+  (lambda (text i0)
+    (bind ((items (list_of)) (i (ref (skip_layout text (int_add i0 1))))
+           (res (ref null)) (expect_value (ref true)))
+      (do
+        (while (eq (deref res) null)
+          (bind ((c (ch text (deref i))))
+            (cond
+              ((eq c "]")
+                (set_ref res (good items (int_add (deref i) 1))))
+              ((eq c "")
+                (set_ref res (fail text i0 "unterminated array")))
+              ((not (deref expect_value))
+                ; after a value we want a "," or "]"
+                (if (eq c ",")
+                  (do
+                    (set_ref expect_value true)
+                    (set_ref i (skip_layout text (int_add (deref i) 1))))
+                  (set_ref res (fail text (deref i) "expected `,` or `]`"))))
+              (else
+                (bind ((r ((get T "value") text (deref i))))
+                  (if (not (get r "ok" false))
+                    (set_ref res r)
+                    (do
+                      (set_ref expect_value false)
+                      (append items (get r "value"))
+                      (set_ref i (skip_layout text (get r "i" 0))))))))))
+        (deref res)))))
+
+; ── inline tables  {k = v, …} ───────────────────────────────────────────────
+(bind parse_inline_table
+  (lambda (text i0)
+    (bind ((m (map_of)) (i (ref (skip_ws text (int_add i0 1))))
+           (res (ref null)) (first (ref true)))
+      (do
+        (while (eq (deref res) null)
+          (bind ((c (ch text (deref i))))
+            (cond
+              ((eq c "}")
+                (set_ref res (good m (int_add (deref i) 1))))
+              ((eq c "")
+                (set_ref res (fail text i0 "unterminated inline table")))
+              (else
+                (bind ((sep (if (deref first)
+                              (deref i)
+                              (if (eq c ",")
+                                (skip_ws text (int_add (deref i) 1))
+                                -1))))
+                  (if (lt sep 0)
+                    (set_ref res (fail text (deref i) "expected `,` or `}`"))
+                    (bind ((k ((get T "key") text sep)))
+                      (if (not (get k "ok" false))
+                        (set_ref res k)
+                        (bind ((eqp (skip_ws text (get k "i" 0))))
+                          (if (not (eq (ch text eqp) "="))
+                            (set_ref res (fail text eqp "expected `=`"))
+                            (bind ((v ((get T "value") text
+                                        (skip_ws text (int_add eqp 1)))))
+                              (if (not (get v "ok" false))
+                                (set_ref res v)
+                                (do
+                                  (set_ref first false)
+                                  (assoc m (get k "value") (get v "value"))
+                                  (set_ref i (skip_ws text (get v "i" 0))))))))))))))))
+        (deref res)))))
+
+; ── one key segment — bare (A-Za-z0-9_-) or a quoted string ─────────────────
+; A-Za-z0-9_- — is_alpha?/is_digit? each carry their own (size c)=1 guard, and
+; the "_"/"-" literals only match a 1-char string, so this is identical to the
+; old inline form (which wrapped the alphabets in one outer size guard).
+(bind key_char?
+  (lambda (c)
+    (or (is_alpha? c)
+      (or (is_digit? c)
+        (or (eq c "_") (eq c "-"))))))
+(bind parse_key
+  (lambda (text i0)
+    (bind ((i (skip_ws text i0)) (c (ch text (skip_ws text i0))))
+      (cond
+        ((eq c "\"") (parse_basic_string text i))
+        ((eq c "'") (parse_literal_string text i))
+        (else
+          (bind ((j (ref i)))
+            (do
+              (while (and (lt (deref j) (size text)) (key_char? (ch text (deref j))))
+                (set_ref j (int_add (deref j) 1)))
+              (if (eq (deref j) i)
+                (fail text i "expected a key")
+                (good (slice_str text i (deref j)) (deref j))))))))))
+
+; ── value dispatch ──────────────────────────────────────────────────────────
+(bind parse_value
+  (lambda (text i0)
+    (bind ((i (skip_ws text i0)) (c (ch text (skip_ws text i0))))
+      (cond
+        ((eq c "\"") (parse_basic_string text i))
+        ((eq c "'") (parse_literal_string text i))
+        ((eq c "[") (parse_array text i))
+        ((eq c "{") (parse_inline_table text i))
+        ((eq c "") (fail text i "expected a value"))
+        (else (parse_bare text i))))))
+
+(assoc T "value" parse_value)
+(assoc T "key" parse_key)
+
+; ── top-level document driver ───────────────────────────────────────────────
+; descend — follow/create the dotted path `segs` from the root map, returning
+; {ok: true, value: leaf-map} (the map to attach keys to) or {ok: false} when a
+; path segment is already bound to a NON-map scalar (a header colliding with an
+; earlier `key = scalar`). Intermediate maps are created on demand; a map is
+; mutated in place by assoc, so re-`get`-ing a segment yields that same map.
+(bind descend
+  (lambda (root segs)
+    (bind ((cur (ref root)) (k (ref 0)) (bad (ref false)))
+      (do
+        (while (and (not (deref bad)) (lt (deref k) (size segs)))
+          (bind ((seg (get segs (deref k))) (nxt (get (deref cur) seg null)))
+            (cond
+              ; absent — create an intermediate table
+              ((eq nxt null)
+                (do
+                  (assoc (deref cur) seg (map_of))
+                  (set_ref cur (get (deref cur) seg))
+                  (set_ref k (int_add (deref k) 1))))
+              ; present and a map — descend into it
+              ((eq (value_type nxt) "map")
+                (do
+                  (set_ref cur nxt)
+                  (set_ref k (int_add (deref k) 1))))
+              ; present but a scalar/list — a table header collides with it
+              (else (set_ref bad true)))))
+        (if (deref bad)
+          (assoc (map_of) "ok" false)
+          (assoc (map_of) "ok" true "value" (deref cur)))))))
+
+; parse_header — split a [table.header] interior [i0, iend) into dotted segments.
+(bind parse_header
+  (lambda (text i0 iend)
+    (bind ((segs (list_of)) (i (ref i0)) (res (ref null)))
+      (do
+        (while (and (eq (deref res) null) (lt (deref i) iend))
+          (bind ((s (skip_ws text (deref i))))
+            (if (ge s iend)
+              (set_ref res (fail text (deref i) "empty table key segment"))
+              (bind ((k (parse_key text s)))
+                (if (not (get k "ok" false))
+                  (set_ref res k)
+                  (do
+                    (append segs (get k "value"))
+                    (bind ((after (skip_ws text (get k "i" 0))))
+                      (cond
+                        ((ge after iend) (set_ref i iend))
+                        ((eq (ch text after) ".")
+                          (set_ref i (int_add after 1)))
+                        (else
+                          (set_ref res (fail text after "expected `.` or `]` in table header")))))))))))
+        (if (not (eq (deref res) null))
+          (deref res)
+          (if (eq (size segs) 0)
+            (fail text i0 "empty table header")
+            (good segs iend)))))))
+
+; toml_parse — TEXT -> {ok: true, value} | {ok: false, error}.
+(bind toml_parse
+  (lambda (raw)
+    (bind ((text (string_chars raw))
+           (root (map_of)) (cur (ref (map_of)))
+           (i (ref 0)) (res (ref null)))
+      (do
+        (set_ref cur root)
+        (while (and (eq (deref res) null) (lt (deref i) (size text)))
+          (bind ((s (skip_ws text (deref i))) (c (ch text (skip_ws text (deref i)))))
+            (cond
+              ; end of input
+              ((eq c "") (set_ref i (size text)))
+              ; blank line
+              ((eq c "\n") (set_ref i (int_add s 1)))
+              ; comment to end of line
+              ((eq c "#")
+                (bind ((j (ref s)))
+                  (do
+                    (while (and (lt (deref j) (size text)) (not (eq (ch text (deref j)) "\n")))
+                      (set_ref j (int_add (deref j) 1)))
+                    (set_ref i (deref j)))))
+              ; table header  [a.b.c]
+              ((eq c "[")
+                (bind ((close (ref (int_add s 1))))
+                  (do
+                    (while (and (lt (deref close) (size text))
+                                (and (not (eq (ch text (deref close)) "]"))
+                                     (not (eq (ch text (deref close)) "\n"))))
+                      (set_ref close (int_add (deref close) 1)))
+                    (if (or (ge (deref close) (size text)) (eq (ch text (deref close)) "\n"))
+                      (set_ref res (fail text s "unterminated table header"))
+                      (bind ((h (parse_header text (int_add s 1) (deref close))))
+                        (if (not (get h "ok" false))
+                          (set_ref res h)
+                          (bind ((d (descend root (get h "value"))))
+                            (if (not (get d "ok" false))
+                              (set_ref res
+                                (fail text s "table header collides with a non-table key"))
+                              (do
+                                (set_ref cur (get d "value"))
+                                (set_ref i (int_add (deref close) 1)))))))))))
+              ; key = value
+              (else
+                (bind ((k (parse_key text s)))
+                  (if (not (get k "ok" false))
+                    (set_ref res k)
+                    (bind ((eqp (skip_ws text (get k "i" 0))))
+                      (if (not (eq (ch text eqp) "="))
+                        (set_ref res (fail text eqp "expected `=` after key"))
+                        (bind ((v (parse_value text (int_add eqp 1))))
+                          (if (not (get v "ok" false))
+                            (set_ref res v)
+                            (bind ((after (skip_ws text (get v "i" 0))))
+                              (cond
+                                ((eq (ch text after) "#")
+                                  (do (assoc (deref cur) (get k "value") (get v "value"))
+                                      (set_ref i after)))
+                                ((or (ge after (size text)) (eq (ch text after) "\n"))
+                                  (do (assoc (deref cur) (get k "value") (get v "value"))
+                                      (set_ref i after)))
+                                (else
+                                  (set_ref res (fail text after "unexpected content after value")))))))))))))))
+        (if (not (eq (deref res) null))
+          (deref res)
+          (assoc (map_of) "ok" true "value" root))))))
+
+; ── emit ────────────────────────────────────────────────────────────────────
+; A canonical TOML document: scalar / array / inline-table keys of the current
+; table are written first, then each non-empty MAP-valued key is emitted as a
+; nested [header] sub-table (recursively, dotted). Lists are written inline.
+; Each char's escaped rendering is appended to a LOCAL list and joined once
+; (O(n)); the old per-char string_concat_many onto a growing `out` was O(n^2).
+; Each emitted piece is unchanged, so the escaped string is byte-identical.
+(bind emit_basic_string
+  (lambda (s)
+    (bind ((parts (list_of)) (cs (string_chars s)) (i (ref 0)))
+      (do
+        (while (lt (deref i) (size cs))
+          (bind ((c (get cs (deref i) "")))
+            (do
+              (append parts
+                (cond
+                  ((eq c "\"") "\\\"")
+                  ((eq c "\\") "\\\\")
+                  ((eq c "\n") "\\n")
+                  ((eq c "\t") "\\t")
+                  ((eq c "\r") "\\r")
+                  (else c)))
+              (set_ref i (int_add (deref i) 1)))))
+        (string_concat_many "\"" (sequence_join parts "") "\"")))))
+
+; emit_float — a float's TOML token. value_to_string renders a whole-valued
+; float without a fraction ("2.0" -> "2"), which would re-parse as an INT and
+; break the round-trip, so a ".0" is appended when the rendering carries no "."
+; or exponent (and is a finite number, not inf/nan).
+(bind emit_float
+  (lambda (v)
+    (bind ((s (value_to_string v)))
+      (if (or (string_contains s ".")
+            (or (string_contains s "e")
+              (or (string_contains s "E")
+                (or (string_contains s "n") (string_contains s "i")))))
+        s
+        (string_concat_many s ".0")))))
+
+; emit_scalar — a non-map, non-list value as a TOML RHS token.
+(bind emit_scalar
+  (lambda (v)
+    (bind ((t (value_type v)))
+      (cond
+        ((eq t "bool") (if v "true" "false"))
+        ((eq t "int") (int_to_string v))
+        ((eq t "float") (emit_float v))
+        ((eq t "string") (emit_basic_string v))
+        (else (emit_basic_string (value_to_string v)))))))
+
+; emit_key — a bare key if it is non-empty all-key-chars, else a quoted key.
+(bind emit_key
+  (lambda (k)
+    (bind ((cs (string_chars k)) (bare (ref true)) (i (ref 0)))
+      (do
+        (if (eq (size cs) 0) (set_ref bare false) null)
+        (while (lt (deref i) (size cs))
+          (do
+            (if (not (key_char? (get cs (deref i) ""))) (set_ref bare false) null)
+            (set_ref i (int_add (deref i) 1))))
+        (if (deref bare) k (emit_basic_string k))))))
+
+; emit_value_inline — a value usable on the RHS of `key =` (scalar, array, or
+; inline table). Arrays and inline tables are written in their inline forms.
+(bind emit_value_inline
+  (lambda (v)
+    (bind ((t (value_type v)))
+      (cond
+        ((eq t "list")
+          (bind ((parts (list_of)))
+            (do
+              (for x v (append parts (emit_value_inline x)))
+              (string_concat_many "[" (sequence_join parts ", ") "]"))))
+        ((eq t "map")
+          (bind ((parts (list_of)))
+            (do
+              (for k (map_keys v)
+                (append parts
+                  (string_concat_many (emit_key k) " = " (emit_value_inline (get v k)))))
+              (string_concat_many "{" (sequence_join parts ", ") "}"))))
+        (else (emit_scalar v))))))
+
+; header_string — "[a.b.c]" for a list of header segments.
+(bind header_string
+  (lambda (segs)
+    (bind ((parts (list_of)))
+      (do
+        (for s segs (append parts (emit_key s)))
+        (string_concat_many "[" (sequence_join parts ".") "]")))))
+
+; emit_table — write the scalar/array/inline keys of map `m` (prefix = the list
+; of header segments leading here; empty at the root), appending lines to
+; `lines`, then recurse into each non-empty MAP-valued key as a [header] block.
+(bind emit_table
+  (lambda (lines m prefix)
+    (do
+      ; first pass — every key whose value is NOT a non-empty sub-table
+      (for k (map_keys m)
+        (bind ((v (get m k)) (t (value_type v)))
+          (if (and (eq t "map") (gt (size v) 0))
+            null  ; a non-empty map is a sub-table; the second pass handles it
+            (append lines
+              (string_concat_many (emit_key k) " = " (emit_value_inline v))))))
+      ; second pass — each non-empty map-valued key becomes a [header] block
+      (for k (map_keys m)
+        (bind ((v (get m k)))
+          (if (and (eq (value_type v) "map") (gt (size v) 0))
+            (bind ((segs (append (sequence_slice prefix 0) k)))
+              (do
+                (if (gt (size lines) 0) (append lines "") null)
+                (append lines (header_string segs))
+                (emit_table lines v segs)))
+            null))))))
+
+; toml_emit — MAP -> canonical TOML text (list-accumulate + a single join).
+(bind toml_emit
+  (lambda (m)
+    (bind ((lines (list_of)))
+      (do
+        (emit_table lines m (list_of))
+        (sequence_join lines "\n")))))
+
+(export toml_parse toml_emit)

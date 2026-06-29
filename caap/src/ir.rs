@@ -12,7 +12,7 @@ use crate::source::SourceSpan;
 
 pub type NodeId = u32;
 
-/// Recursive literal data type mirroring Python's `IRLiteralData`.
+/// Recursive literal data type used by IR snapshots and runtime lowering.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum IrLiteralData {
     Null,
@@ -145,6 +145,22 @@ impl ExprSpec {
         }
     }
 }
+thread_local! {
+    static INTERN_POOL: std::cell::RefCell<std::collections::HashSet<Rc<str>>> = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+pub fn intern_string(s: &str) -> Rc<str> {
+    INTERN_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if let Some(existing) = pool.get(s) {
+            existing.clone()
+        } else {
+            let rc: Rc<str> = Rc::from(s);
+            pool.insert(rc.clone());
+            rc
+        }
+    })
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NameNode {
@@ -158,9 +174,10 @@ impl NameNode {
         if identifier.is_empty() {
             return Err(CaapError::ir("name node identifier must be non-empty"));
         }
+        let interned = intern_string(&identifier);
         Ok(Self {
             id,
-            identifier: Rc::from(identifier),
+            identifier: interned,
         })
     }
 }
@@ -181,12 +198,16 @@ impl LiteralNode {
 pub struct CallNode {
     pub id: NodeId,
     pub callee: NodeId,
-    pub args: Vec<NodeId>,
+    pub args: Rc<[NodeId]>,
 }
 
 impl CallNode {
     pub fn new(id: NodeId, callee: NodeId, args: Vec<NodeId>) -> Self {
-        Self { id, callee, args }
+        Self {
+            id,
+            callee,
+            args: args.into(),
+        }
     }
 }
 
@@ -216,6 +237,17 @@ impl Node {
             }
         }
     }
+
+    pub fn has_children(&self) -> bool {
+        matches!(self, Node::Call(_))
+    }
+
+    pub fn contains_child(&self, id: NodeId) -> bool {
+        match self {
+            Node::Name(_) | Node::Literal(_) => false,
+            Node::Call(n) => n.callee == id || n.args.contains(&id),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -228,5 +260,40 @@ mod tests {
         let cloned = node.clone();
         assert!(Rc::ptr_eq(&node.identifier, &cloned.identifier));
         assert_eq!(node.identifier.as_ref(), "shared");
+    }
+
+    #[test]
+    fn name_nodes_with_same_identifier_share_storage_interning() {
+        let node1 = NameNode::new(1, "shared_name").unwrap();
+        let node2 = NameNode::new(2, "shared_name").unwrap();
+        assert!(Rc::ptr_eq(&node1.identifier, &node2.identifier));
+        assert_eq!(node1.identifier.as_ref(), "shared_name");
+    }
+
+    // Minimal Semantic Kernel invariant — docs/principles.md #1 and the
+    // "Substrate ↔ policy boundary" section of docs/builtins.md: the IR is
+    // exactly Name | Literal | Call, and every language construct (if, lambda,
+    // match, …) is a `Call` whose callee names it. These exhaustive matches have
+    // no `_` arm, so adding a fourth node kind FAILS TO COMPILE — the kernel
+    // cannot grow a new primitive without a deliberate review here.
+    #[test]
+    fn ir_kernel_stays_name_literal_call_only() {
+        fn lock_node(node: &Node) {
+            match node {
+                Node::Name(_) => {}
+                Node::Literal(_) => {}
+                Node::Call(_) => {}
+            }
+        }
+        fn lock_expr(expr: &ExprSpec) {
+            match expr {
+                ExprSpec::Name(_) => {}
+                ExprSpec::Literal(_) => {}
+                ExprSpec::Call(_) => {}
+            }
+        }
+        // Exercise the locks so they participate in compilation.
+        lock_node(&Node::Literal(LiteralNode::new(0, IrLiteralData::Null)));
+        lock_expr(&ExprSpec::literal(IrLiteralData::Null));
     }
 }

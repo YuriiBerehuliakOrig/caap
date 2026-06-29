@@ -1,0 +1,5 @@
+; Fixture for test_analyze_weak_diag: a NORMAL kernel file with NO surface
+; header. surface_of_diag must report "absent" (read OK, no header) and the
+; compat surface_of must return null. Only its header is read as text; the file
+; is not loaded by the test.
+(int_add 40 2)

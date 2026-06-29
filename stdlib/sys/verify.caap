@@ -1,0 +1,143 @@
+; stdlib/sys/verify.caap — declare a sys facade and verify it vs caap-sys.
+;
+; A facade hand-declares its surface with READABLE, TYPED signatures:
+;   (op "println" (list_of (p "value" "any")) "null" "impure")
+; -> {name, params:[{name,type}], result, effect}
+;
+; verify_facade diffs that declaration against the runtime host-service catalog
+; (host_service_library_catalog) and throws on ANY drift:
+;   - a facade op the runtime does not provide,
+;   - an effect / return-type mismatch,
+;   - a param count / name / type mismatch,
+;   - a runtime op the facade forgot to declare (no silent omissions).
+; Pure: the caller (which holds `compiler`) passes the catalog in.
+(module stdlib.sys.verify)
+
+; p — one typed parameter:  (p "value" "string") -> {name, type}
+(bind p
+  (lambda (name type) (assoc (map_of) "name" name "type" type)))
+
+; op — one facade function, with a readable signature.
+;   name   : the function name
+;   params : (list_of (p …) …) — parameters in order
+;   result : the return type (a string, e.g. "null", "string|null")
+;   effect : "pure" | "impure" | "io"
+(bind op
+  (lambda (name params result effect)
+    (assoc (map_of)
+      "name" name "params" params "result" result "effect" effect)))
+
+(bind verify_facade
+  ; catalog  : (host_service_library_catalog lib phase) entries
+  ; declared : list of (op …) records from the facade
+  ; library  : the library name, for diagnostics
+  ;
+  ; Collects EVERY drift mismatch and reports them together: one verify run
+  ; surfaces all problems at once (an importer fixes the whole facade in a
+  ; single pass) rather than re-running to discover the next one. Each
+  ; individual message is verbatim what the first-failure version threw, so a
+  ; consumer matching on a particular drift string still matches; the combined
+  ; throw simply joins them. A clean facade still returns true and never throws.
+  (lambda (catalog declared library)
+    (bind (
+      (index (map_of))
+      (missing (map_of))
+      (errors (ref (list_of)))
+      (note! (lambda (msg) (set_ref errors (append (deref errors) msg))))
+      (where (lambda (name) (string_concat_many "sys facade " library ": \"" name "\" ")))
+    )
+      (do
+        (for entry catalog
+          (assoc index (get entry "public") entry))
+        ; each declared op must exist with a matching typed signature
+        (for d declared
+          (with_map d ((name "name") (params "params") (result "result") (effect "effect"))
+            (bind ((entry (get index name missing)))
+              (if (eq entry missing)
+                (note! (string_concat_many
+                  "sys facade " library ": declares \"" name
+                  "\", not provided by caap-sys"))
+                (with_map entry ((cat_effect "effect") (sig "signature"))
+                  (with_map sig ((cat_params "params") (cat_result "result"))
+                    (do
+                      (when (not (eq effect cat_effect))
+                        (note! (string_concat_many (where name)
+                          "effect " effect " != caap-sys " cat_effect)))
+                      (when (not (eq result cat_result))
+                        (note! (string_concat_many (where name)
+                          "returns " result " != caap-sys " cat_result)))
+                      ; param-by-param checks only when the arity matches (a
+                      ; positional diff against a different-length list is noise)
+                      (if (not (eq (size params) (size cat_params)))
+                        (note! (string_concat_many (where name)
+                          "takes " (int_to_string (size params))
+                          " params != caap-sys " (int_to_string (size cat_params))))
+                        (for i (sequence_range 0 (size params))
+                          (with_map (get params i) ((dn "name") (dt "type"))
+                            (with_map (get cat_params i) ((cn "name") (ct "type"))
+                              (do
+                                (when (not (eq dn cn))
+                                  (note! (string_concat_many (where name)
+                                    "param " (int_to_string i) " named " dn
+                                    " != caap-sys " cn)))
+                                (when (not (eq dt ct))
+                                  (note! (string_concat_many (where name)
+                                    "param \"" dn "\" type " dt
+                                    " != caap-sys " ct))))))))
+                      null)))))))
+        ; every caap-sys op must be declared by the facade
+        (for entry catalog
+          (bind ((nm (get entry "public")))
+            (unless (sequence_any declared (lambda (d) (eq (get d "name") nm)))
+              (note! (string_concat_many
+                "sys facade " library ": missing declaration for caap-sys op \""
+                nm "\"")))))
+        (bind ((found (deref errors)))
+          (if (eq (size found) 0)
+            true
+            (throw
+              (if (eq (size found) 1)
+                (get found 0)
+                ; join every mismatch into one bulleted report — each message
+                ; becomes its own bullet line and the lines are joined ONCE
+                ; (kernel sequence_map/sequence_join — no collections import at
+                ; this tier), instead of folding string_concat_many onto a
+                ; growing accumulator (which rescans the report every step).
+                (string_concat_many
+                  "sys facade " library ": "
+                  (int_to_string (size found)) " drift mismatches:"
+                  (sequence_join
+                    (sequence_map found
+                      (lambda (msg) (string_concat_many "\n  - " msg)))
+                    ""))))))))))
+
+; verify_sys — THE startup check: verify every facade in `sys_dir` against the
+; live caap-sys catalog. Facades are DISCOVERED, not listed: every `<lib>.caap`
+; in the directory that exports `ops` is verified against the `<lib>` catalog
+; (filename = library name). Adding a facade file is therefore impossible to
+; forget — there is no registration step to miss. Files without an `ops` export
+; (this one, for instance) are skipped.
+;   sys_dir : the directory holding the facade files (e.g. ".../stdlib/sys")
+;   ->      : true, or throws with the first drift found
+(bind verify_sys
+  (lambda (sys_dir)
+    (bind (
+      (load (get (ctfe_compiler_lookup_value compiler "stdlib.load") "load"))
+    )
+      (do
+        (for entry (ctfe_compiler_list_dir compiler sys_dir)
+          (with_map entry ((file? "is_file") (name "name") (path "path"))
+            (when (and file? (string_ends_with name ".caap"))
+              (bind (
+                (ops (get (load path) "ops"))
+                ; "io.caap" -> "io" (the host library this facade mirrors)
+                (library (string_slice name 0 (int_sub (size name) 5)))
+              )
+                (when (not (eq ops null))
+                  (verify_facade
+                    (host_service_library_catalog library "runtime")
+                    ops
+                    library))))))
+        true))))
+
+(export p op verify_facade verify_sys)

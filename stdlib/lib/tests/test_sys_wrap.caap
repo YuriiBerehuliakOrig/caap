@@ -1,0 +1,55 @@
+; stdlib/lib/tests/test_sys_wrap.caap — the sys facade GENERATOR (stdlib.sys.wrap).
+;
+; `make_facade "<lib>" ops` is what every sys facade (io/fs/os/process/net/time)
+; is built from: it files the typed surface with the type pass and returns a
+; `name -> wrapper` bundle, one entry per op. This test drives the generator on a
+; tiny synthetic op table — no host catalog, no grants — and pins its contract:
+;   - the bundle has EXACTLY one entry per declared op (no extras, no omissions);
+;   - with no grant registered every wrapper is a SELF-DESCRIBING throwing stub
+;     (declaration-only mode) — calling one names the missing grant, which is
+;     precisely how a facade behaves before boot/sys_grants.caap runs.
+; This is the same `op`/`p`/`make_facade` surface the real facades use, so it
+; doubles as executable documentation of the generator.
+
+;; @area: sys
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.sys.verify op p)
+(use stdlib.sys.wrap make_facade make_fn)
+
+(do
+  ; a two-op synthetic table — the shape a facade's `ops` export has.
+  (bind ((ops
+           (list_of
+             (op "alpha" (list_of (p "value" "string")) "null" "impure")
+             (op "beta"  (list_of)                      "int"  "pure"))))
+    ; "demo" has no grant registered (the runner never runs sys_grants), so this
+    ; exercises the declaration-only path: a real bundle of throwing stubs.
+    (bind ((bundle (make_facade "demo" ops)))
+      (do
+        ; one entry per op — nothing dropped, nothing invented
+        (assert_eq (size bundle) 2
+          "make_facade bundle has one entry per op")
+        ; every declared op is present — as a stub callable, NOT a silent null
+        (assert_true (not (eq (get bundle "alpha" "absent") null))
+          "declared op alpha is present as a stub callable (not null)")
+        (assert_true (not (eq (get bundle "beta" "absent") null))
+          "declared op beta is present as a stub callable (not null)")
+        ; an undeclared name is simply not in the bundle
+        (assert_eq (get bundle "gamma" "absent") "absent"
+          "an op not in the table is absent from the bundle")
+        ; calling an ungranted op raises a located capability error, never null
+        (assert_true
+          (try (do ((get bundle "alpha")) false)
+               (catch e (string_contains
+                          (if (eq (value_type e) "map")
+                            (get e "message" (value_to_string e))
+                            (value_to_string e))
+                          "requires a sys grant")))
+          "calling an ungranted op raises a 'requires a sys grant' error")
+        ; make_fn (the factory make_facade builds on) yields stubs, not nulls
+        (bind ((fn (make_fn "demo")))
+          (assert_true (not (eq (fn "alpha") null))
+            "make_fn with no grant yields a stub callable, not null"))
+        null))))

@@ -1,0 +1,4 @@
+; ur-intrusive probe: push the same (list,node) pair twice with no remove/pop.
+(defn ur_list_push_probe ((l i32) (n i32)) i32 0)
+(defn _probe_intrusive ((l i32) (n i32)) i32
+  (do (ur_list_push_probe l n) (ur_list_push_probe l n) 0))

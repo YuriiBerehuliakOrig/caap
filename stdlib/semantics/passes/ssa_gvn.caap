@@ -1,0 +1,246 @@
+; stdlib/semantics/passes/ssa_gvn.caap — SSA-based global value numbering (a
+; cross-control-flow CSE) as a whole-module TRANSFORM (module
+; stdlib.semantics.passes.ssa_gvn).
+;
+; ── Phase-2 unification: THIS module provides the `cse` transform at -O2/-O3 ──
+; `cse_unified_node` composes the cross-control GVN (ssa_gvn_node, below) with the
+; conservative spine CSE (cse.caap's cse_node), and `register!` installs it under the
+; name "cse". opt.caap's O2 loads THIS module for "cse" — there is no separate "ssa_gvn"
+; transform; the cross-control precision is folded into cse itself. cse.caap stays the
+; conservative core (this module wraps it); the import direction ssa_gvn -> cse is the
+; existing one, so no dependency cycle is introduced.
+;
+; ── what this buys over cse ───────────────────────────────────────────────────
+; cse (cse.caap) collects candidates ONLY along a pure-builtin SPINE: its walk stops
+; dead at any `if`/`bind`/`while`/`lambda`, so it never reuses a value across a
+; control-flow boundary. A pure expression computed once and recomputed inside a
+; later `if` arm or `while` body — though provably the SAME value — is missed.
+;
+; ssa_gvn recovers that by AVAILABLE-EXPRESSION value numbering: it walks the body
+; threading an `avail` map (pure-expr -> the in-scope name already holding it). A
+; `(bind "x" V …)` whose value V is a pure expression makes V AVAILABLE as x over the
+; binder's body; any later occurrence of V (in a nested `if`/`while`/`do`/call, where
+; x is lexically in scope) is replaced by `(sym x)`. Because flat single-assignment
+; binds ARE the availability sources, this is also the "flat-name promotion" — the
+; value space GVN reasons over is exactly the body's immutable bindings.
+;
+; ── on the SSA FORM (the ref-value win) ───────────────────────────────────────
+; On the raw IR a `(deref r)` is impure (cse_pure? excludes it — r may be rewritten),
+; so computations over ref VALUES are never numbered. So when the body is `supported?`
+; we first `to_ssa` it: there each ref read is a single-assignment version `(sym r__k)`
+; — a pure leaf — so a ref-value computation like `(int_add (deref r) 1)` becomes
+; `(int_add (sym r__k) 1)` and IS numbered/reused across control flow. We number over
+; the SSA form, then `from_ssa` back to executable IR. Unsupported bodies fall back to
+; numbering the raw IR (flat binds only — still sound, deref stays impure).
+;
+; ── soundness (the cardinal invariant) ───────────────────────────────────────
+; A value is keyed/reused ONLY when cse_pure? holds: a pure scalar-result builtin
+; expression over leaves — no deref, no effect, deterministic. Two structurally-equal
+; (node_eq) such expressions over the SAME in-scope names therefore hold the SAME
+; value, and the binding that defines the reused name lexically DOMINATES every reuse
+; site (it is in scope), so the name is always evaluated first with the same inputs —
+; reuse never changes a result, even for a partial pure op (int_div): if the binding
+; threw, its body — and the reuse site — is never reached. The ONE hazard is shadowing
+; (a free name of a keyed expr REBOUND between the binding and the reuse): we KILL every
+; avail entry whose key mentions a name as it is (re)bound (bind pairs) or captured
+; (lambda params), so a shadowed name never yields a stale reuse. A final guard rejects
+; any rewrite that introduces a free name absent from the input (a scope leak) — bail to
+; the verbatim body. Binder shapes we do not model precisely (catch/match/macro/try/for)
+; STOP the walk (left verbatim). Everything is a missed reuse, never a wrong one.
+(module stdlib.semantics.passes.ssa_gvn)
+
+(use stdlib.syntax.ast
+  call? name? literal? head_is? head_of args_of callee bind_pairs
+  name_of sym call mkbind walk)
+(use stdlib.syntax.ir node_eq free_names)
+(use stdlib.semantics.ssa to_ssa from_ssa supported? ssa_node hazardous?)
+(use stdlib.semantics.passes.cse cse_pure? cse_node)
+(use stdlib.semantics.passes.registry install_transform!)
+
+; AVAIL_CAP — bound the availability list length (linear node_eq search per pure node,
+; like cse's candidate list); once full we stop ADDING (older entries still reused).
+(bind AVAIL_CAP 256)
+
+; ── small set / name helpers ──────────────────────────────────────────────────
+; single_set — {name -> true}.
+(bind single_set (lambda (n) (assoc (map_of) n true)))
+; collect_names — the SET of every identifier appearing anywhere in `node` (used to
+; kill avail by a lambda's parameter list — params are exactly the names in arg0).
+(bind collect_names
+  (lambda (node)
+    (bind ((s (map_of)))
+      (do (walk node (lambda (n) (when (name? n) (assoc s (name_of n) true)))) s))))
+
+; ── avail operations ──────────────────────────────────────────────────────────
+; avail is a LIST of { "key": <pure expr node>, "name": <holder>, "free": <name->true> }.
+; The "free" set (the key's free names) is precomputed ONCE at add time so gvn_kill is
+; O(avail) per bind instead of recomputing free_names(key) — an O(avail·keysize·binds)
+; cost that dominated big forms.
+; names_set_of — the free names of `node` as a {name -> true} set.
+(bind names_set_of
+  (lambda (node) (bind ((s (map_of))) (do (for nm (free_names node) (assoc s nm true)) s))))
+; gvn_lookup — the holder name for a node structurally equal (node_eq) to a key, else
+; null. Linear scan, first (most-recent) match wins.
+(bind gvn_lookup
+  (lambda (avail node)
+    (bind ((hit (ref null)))
+      (do
+        (for e avail
+          (when (and (eq (deref hit) null) (node_eq (get e "key") node))
+            (set_ref hit (get e "name"))))
+        (deref hit)))))
+; gvn_kill — drop every entry whose KEY reads a name in `killset` (those keys are no
+; longer trustworthy — a name they read has been rebound/shadowed). Uses the cached
+; per-entry free set; killset is small (usually one name), so this is O(avail·|killset|).
+(bind gvn_kill
+  (lambda (avail killset)
+    (bind ((out (list_of)))
+      (do
+        (for e avail
+          (bind ((dead (ref false)) (fset (get e "free")))
+            (do
+              (for kn (map_keys killset)
+                (when (eq (get fset kn false) true) (set_ref dead true)))
+              (unless (deref dead) (append out e)))))
+        out))))
+; gvn_add — make `key` available as `name` (prepend), if key is a pure CALL and we are
+; under the cap. (A bare name/literal value is not worth numbering.)
+(bind gvn_add
+  (lambda (avail key name)
+    (if (and (call? key) (and (cse_pure? key) (lt (size avail) AVAIL_CAP)))
+      (bind ((out (list_of (assoc (map_of) "key" key "name" name "free" (names_set_of key)))))
+        (do (for e avail (append out e)) out))
+      avail)))
+
+; ── the value-numbering walk ──────────────────────────────────────────────────
+; gvn — rewrite `node` under availability `avail`, reusing any pure expression already
+; held by an in-scope name. Bottom-up: children are rewritten first, then a pure
+; rewritten node that matches an avail key is replaced by its holder name.
+(bind gvn
+  (lambda (self node avail)
+    (cond
+      ; leaf (name / literal): nothing to reuse or rewrite.
+      ((not (call? node)) node)
+
+      ; ── bind: let*-thread avail through the pairs, extend over the body ──
+      ; Each pair value sees the avail accumulated by prior pairs; binding a name
+      ; KILLS avail entries that read it (shadow), then (if the value is a pure call)
+      ; makes that value available under the new name for the rest + the body.
+      ((and (head_is? node "bind") (not (eq (bind_pairs node) null)))
+        (bind ((bp (bind_pairs node)) (pairs (get bp "pairs")) (body (get bp "body"))
+               (cur (ref avail)) (opairs (list_of)))
+          (do
+            (for p pairs
+              (bind ((n (get p "name")) (v2 (self self (get p "value") (deref cur))))
+                (do
+                  (set_ref cur (gvn_kill (deref cur) (single_set n)))
+                  (append opairs (assoc (map_of) "name" n "value" v2))
+                  (set_ref cur (gvn_add (deref cur) v2 n)))))
+            (bind ((obody (list_of)))
+              (do
+                (for b body (append obody (self self b (deref cur))))
+                (mkbind opairs obody))))))
+
+      ; ── lambda: kill avail by the parameter names (they shadow), recurse the body ──
+      ((head_is? node "lambda")
+        (bind ((as (args_of node)) (av2 (gvn_kill avail (collect_names (get as 0))))
+               (nargs (list_of (get as 0))) (i (ref 1)))
+          (do
+            (while (lt (deref i) (size as))
+              (do (append nargs (self self (get as (deref i)) av2))
+                  (set_ref i (int_add (deref i) 1))))
+            (call (callee node) nargs))))
+
+      ; ── binder shapes we do not model precisely: stop (leave verbatim) ──
+      ((or (head_is? node "catch") (or (head_is? node "match") (or (head_is? node "macro")
+           (or (head_is? node "try") (or (head_is? node "for") (head_is? node "letrec"))))))
+        node)
+
+      ; ── any other call (if / while / do / builtins / user calls): recurse into
+      ;    callee + args with the SAME avail (a conditional arm or loop body does not
+      ;    extend avail outward), then REUSE the whole node if it matches an available
+      ;    key. We do NOT re-check cse_pure? here: avail KEYS are only ever added for
+      ;    pure expressions (gvn_add gates on cse_pure?), so a node that node_eq's a key
+      ;    is itself pure by construction. Dropping the per-node cse_pure? — a full
+      ;    subtree walk at every call node, the O(n^2) cost — makes the walk O(n·avail),
+      ;    while avail-empty scopes (the common case) cost O(1) per node. ──
+      (else
+        (bind ((nc (self self (callee node) avail)) (na (list_of)))
+          (do
+            (for a (args_of node) (append na (self self a avail)))
+            (bind ((rebuilt (call nc na)))
+              (if (eq (size avail) 0)
+                rebuilt
+                (bind ((nm (gvn_lookup avail rebuilt)))
+                  (if (eq nm null) rebuilt (sym nm)))))))))))
+
+; ── scope-leak guard: reject a rewrite that frees a name absent from the input ─────
+; (Defence in depth — a correct reuse only ever replaces a subexpr by an in-scope
+; name, so it can never ADD a free name; if it somehow did, bail to the verbatim body.)
+(bind introduces_free_name?
+  (lambda (res body)
+    (bind ((orig (map_of)) (bad (ref false)))
+      (do
+        (for nm (free_names body) (assoc orig nm true))
+        (for nm (free_names res)
+          (unless (eq (get orig nm false) true) (set_ref bad true)))
+        (deref bad)))))
+
+; ── the public core: ssa_gvn over one form ───────────────────────────────────
+; ssa_gvn_node — value-number one IR node. When the body is `supported?` we number
+; over its SSA FORM (ref reads are reusable version leaves), then from_ssa; otherwise
+; we number the raw IR directly (flat binds only). Either way, bail to the verbatim
+; body if the result would free a name (a scope leak) — sound by construction.
+; has_ref_binder? — does `body` contain any `(ref …)` node? A promotable ref REQUIRES a
+; ref binder, so this is a precise NECESSARY condition for supported?: when false,
+; supported? is provably false and the SSA path is never taken — so we skip it (and the
+; promotable_refs escape-analysis walks of supported?/hazardous?/to_ssa) with ZERO change
+; in result. At -O2/-O3 this transform runs on EVERY located form, and the vast majority
+; (functions over flat binds, no ref cells) are ref-free — so this gate is the bulk of
+; the speedup.
+(bind has_ref_binder?
+  (lambda (body)
+    (bind ((hit (ref false)))
+      (do (walk body (lambda (n) (when (and (call? n) (head_is? n "ref")) (set_ref hit true))))
+          (deref hit)))))
+(bind ssa_gvn_node
+  (lambda (body)
+    (bind ((res
+             ; SSA path only when there is a ref binder AND supported? AND NOT hazardous?
+             ; — to_ssa value-miscompiles a `(deref r)`-bearing if in a value/tail
+             ; position (the from_ssa hazard), so on those bodies we number the RAW IR
+             ; instead (sound: deref stays impure, only flat binds are reused). The
+             ; has_ref_binder? pre-gate skips supported?/hazardous?/to_ssa on ref-free
+             ; forms (where supported? is provably false) — a pure speedup, no behaviour
+             ; change.
+             (if (and (has_ref_binder? body) (and (supported? body) (not (hazardous? body))))
+               (bind ((g (gvn gvn (ssa_node (to_ssa body)) (list_of))))
+                 (from_ssa (assoc (map_of) "node" g)))
+               (gvn gvn body (list_of)))))
+      (if (introduces_free_name? res body) body res))))
+
+; ── the UNIFIED cse node: cross-control GVN, then the conservative spine CSE ─────
+; cse_unified_node — the SSA-backed `cse` (Phase-2 unification). The COMPOSITION of the
+; two value-numberings, each behaviour-preserving, so the whole is:
+;   1. ssa_gvn_node — cross-control / SSA-form value numbering (reuses a value across an
+;      if/while/bind boundary, and ref-value computations on the SSA form);
+;   2. cse_node — the conservative pure-builtin-SPINE CSE, which hoists repeated maximal
+;      subexpressions within straight-line regions and may expose / clean up after GVN.
+; Running GVN first lets cse hoist over the names GVN introduced. The import direction
+; ssa_gvn -> cse already exists (for cse_pure?), so composing here needs no new edge and
+; no change to cse.caap (it stays the conservative core this module wraps).
+(bind cse_unified_node
+  (lambda (node) (cse_node (ssa_gvn_node node))))
+
+; ── transform entry + registration ───────────────────────────────────────────
+; run — rewrite every located form IN PLACE (the located protocol of cse/ccp).
+(bind run
+  (lambda (located)
+    (for f located (assoc f "node" (cse_unified_node (get f "node"))))))
+
+; register! — install the UNIFIED value numbering under the name "cse" (it SUPERSEDES
+; the conservative cse's registration; opt.caap's O2 loads THIS module for "cse").
+; Idempotent.
+(bind register! (lambda () (install_transform! "cse" run)))
+
+(export ssa_gvn_node cse_unified_node run register!)

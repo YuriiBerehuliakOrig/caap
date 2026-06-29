@@ -1,0 +1,183 @@
+; stdlib/semantics/types/records.caap — signature MARKERS and fn RECORDS (tier 4).
+;
+; The defn/struct/alias/enum/union forms leave inert tuple literals right next
+; to the binding they describe — the signature lives AT the name, nowhere else.
+; This module is the SINGLE READER of those marker layouts: `infer` and the
+; native/llvm/wasm kits all decode markers through these functions and never
+; re-parse a tuple or re-list the tag set themselves (the forms in boot/ are
+; the matching WRITERS — the only other place that names the `::…` tags). When
+; the marker layout changes, it changes HERE and at its writer, nowhere else.
+;   sig_marker     ["::defn_sig" name result effect pn pt …] -> fn record
+;   struct_marker  ["::struct" Name f1 t1 …]                 -> {name, fields}
+;   alias_marker   ["::alias" name target]                   -> {name, target}
+;   enum_marker    ["::enum" Name backing v0 val0 …]         -> {name, backing, variants}
+;   union_marker   ["::union" Name m0 t0 …]                  -> {name, members}
+;   ctor_record    a struct's make_<Name> constructor signature
+;   fn_record?     is an env entry a function signature?
+;   lambda_param_names  a lambda's params in both kernel shapes
+;
+; A parameter type in a "::defn_sig" is the type_text SPELLING, so a generic
+; type variable rides as an ordinary string ("list<T>"): the marker layout is
+; oblivious to A2 — only `infer` interprets variables at the call site.
+(module stdlib.semantics.types.records)
+
+(use stdlib.syntax.ast call? name? literal? callee head_of args_of name_of literal_of)
+(use stdlib.lib.collections.sequence pairs)
+(use stdlib.semantics.types.registry field)
+
+; the inert tag every type-declaring form leaves at the head of its marker
+; literal — the one place the set of marker kinds is enumerated.
+(bind marker_tags
+  (list_of "::defn_sig" "::struct" "::alias" "::enum" "::union"))
+
+; marker? — is `node` ANY inert type-pass marker literal? The shared
+; predicate so consumers (the native prep front-end, codegen) never re-list
+; the tag set.
+;   node : any node
+;   ->   : bool
+(bind marker?
+  (lambda (node)
+    (bind ((v (literal_of node)))
+      (and (not (eq v null))
+           (and (eq (value_type v) "tuple")
+                (and (gt (size v) 0)
+                     (not (eq (sequence_find marker_tags
+                                (lambda (tg) (eq (get v 0) tg)))
+                              null))))))))
+
+; sig_marker — parse a "::defn_sig" marker literal into a signature record.
+; Marker layout: ["::defn_sig" name result effect pn pt …] — slot 3 is the
+; DECLARED effect ("pure"/"impure", or "?" when the defn declared none).
+;   node : any node
+;   ->   : the {kind, params, result, declared_effect} record, plus "fname" — or null
+(bind sig_marker
+  (lambda (node)
+    (bind ((v (literal_of node)))
+      (if (and (not (eq v null))
+               (and (eq (value_type v) "tuple")
+                    (and (gt (size v) 3) (eq (get v 0) "::defn_sig"))))
+        (bind (
+          (params (list_of))
+          (eff (get v 3))
+        )
+          (do
+            (for pr (pairs (sequence_drop v 4))
+              (append params
+                (assoc (map_of)
+                  "name" (get pr 0) "type" (get pr 1))))
+            (assoc (map_of)
+              "kind" "fn"
+              "fname" (get v 1)
+              "result" (get v 2)
+              "declared_effect" (if (eq eff "?") null eff)
+              "params" params)))
+        null))))
+
+; alias_marker — parse a "::alias" marker literal: ["::alias" name target].
+;   node : any node
+;   ->   : {name, target} — or null
+(bind alias_marker
+  (lambda (node)
+    (bind ((v (literal_of node)))
+      (if (and (not (eq v null))
+               (and (eq (value_type v) "tuple")
+                    (and (eq (size v) 3) (eq (get v 0) "::alias"))))
+        (assoc (map_of) "name" (get v 1) "target" (get v 2))
+        null))))
+
+; union_marker — parse a "::union" marker: ["::union" Name m0 t0 m1 t1 …].
+;   node : any node
+;   ->   : {name, members:[{name, type}…]} — or null
+(bind union_marker
+  (lambda (node)
+    (bind ((v (literal_of node)))
+      (if (and (not (eq v null))
+               (and (eq (value_type v) "tuple")
+                    (and (gt (size v) 1) (eq (get v 0) "::union"))))
+        (bind ((members (list_of)))
+          (do
+            (for pr (pairs (sequence_drop v 2))
+              (append members
+                (assoc (map_of) "name" (get pr 0) "type" (get pr 1))))
+            (assoc (map_of) "name" (get v 1) "members" members)))
+        null))))
+
+; enum_marker — parse a "::enum" marker: ["::enum" Name backing v0 val0 …].
+;   node : any node
+;   ->   : {name, backing, variants:[{name, value}…]} — or null
+(bind enum_marker
+  (lambda (node)
+    (bind ((v (literal_of node)))
+      (if (and (not (eq v null))
+               (and (eq (value_type v) "tuple")
+                    (and (gt (size v) 2) (eq (get v 0) "::enum"))))
+        (bind ((variants (list_of)))
+          (do
+            (for pr (pairs (sequence_drop v 3))
+              (append variants
+                (assoc (map_of) "name" (get pr 0) "value" (get pr 1))))
+            (assoc (map_of)
+              "name" (get v 1) "backing" (get v 2)
+              "variants" variants)))
+        null))))
+
+; struct_marker — parse a "::struct" marker literal: ["::struct" Name f1 t1 …].
+;   node : any node
+;   ->   : {name, fields: [{name, type}…]} — or null
+(bind struct_marker
+  (lambda (node)
+    (bind ((v (literal_of node)))
+      (if (and (not (eq v null))
+               (and (eq (value_type v) "tuple")
+                    (and (gt (size v) 1) (eq (get v 0) "::struct"))))
+        (bind ((fields (list_of)))
+          (do
+            (for pr (pairs (sequence_drop v 2))
+              (append fields (field (get pr 0) (get pr 1))))
+            (assoc (map_of) "name" (get v 1) "fields" fields)))
+        null))))
+
+; ctor_record — the make_<Name> constructor's signature for a struct: the
+; fields, in order, are the parameters; the result is the struct type. The
+; constructor only builds a fresh map from its arguments, so it is pure by
+; construction ("effect" is set directly — never inferred from the body).
+;   sm : a struct_marker record
+;   -> : a {kind, fname, params, result, …} fn record
+(bind ctor_record
+  (lambda (sm)
+    (assoc (map_of)
+      "kind" "fn"
+      "fname" (string_concat_many "make_" (get sm "name"))
+      "result" (get sm "name")
+      "declared_effect" "pure"
+      "effect" "pure"
+      "params" (get sm "fields" (list_of)))))
+
+; fn_record? — is this env entry a function signature?
+(bind fn_record?
+  (lambda (e) (and (eq (value_type e) "map") (eq (get e "kind") "fn"))))
+
+; lambda_param_names — a lambda's parameter names; the kernel carries two
+; shapes (a call of names from built specs, a literal tuple of strings from
+; parsed source, null for zero params).
+(bind lambda_param_names
+  (lambda (params_node)
+    (bind ((out (list_of)))
+      (do
+        (cond
+          ((call? params_node)
+            (do
+              (when (name? (callee params_node))
+                (append out (head_of params_node)))
+              (for a (args_of params_node)
+                (when (name? a) (append out (name_of a))))))
+          ((literal? params_node)
+            (bind ((v (literal_of params_node)))
+              (when (not (eq v null))
+                (for s v
+                  (when (eq (value_type s) "string") (append out s))))))
+          (else null))
+        out))))
+
+(export marker? sig_marker alias_marker enum_marker union_marker struct_marker ctor_record fn_record?
+        lambda_param_names)

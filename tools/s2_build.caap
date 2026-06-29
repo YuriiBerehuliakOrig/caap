@@ -1,0 +1,47 @@
+;; tools/s2_build.caap — native build on stdlib's OWN backend (no stdlib-v1).
+;;
+;;   caap stdlib/bootstrap.caap tools/s2_build.caap FILE OUTPUT [DEBUG]
+;;
+;; The bare stdlib/bootstrap.caap is enough — the backend driver and LLVM emitter
+;; are load_module'd by name on demand, no native_emit leg needed. FILE is a
+;; directive-free stdlib native program; the binary is built via backend/driver
+;; compile_file (backend/emit/llvm + clang, linking the caap-sys-runtime staticlib when
+;; runtime symbols are referenced).
+;;
+;; DEBUG (the optional 3rd positional) opts into DWARF debug info — kept OUT of
+;; the flagless CLI as a tool argument (no -g): `debug` or `debug=line-tables`
+;; -> line tables; `debug=full` -> + locals/types; absent -> none
+;; (byte-identical to a non-debug build). Unknown DEBUG spellings are usage
+;; errors, so a typo never silently strips debug info. gdb/lldb can then set
+;; source-line breakpoints and show function-named backtraces.
+(bind (
+  (args (ctfe_compiler_lookup_value compiler "cli.args"))
+  ; load_module auto-loads stdlib.backend.driver and stdlib.backend.emit.llvm BY NAME,
+  ; so the bare stdlib/bootstrap.caap suffices — no native_emit leg required.
+  (compile_file
+    (get ((get (ctfe_compiler_lookup_value compiler "stdlib.load") "load_module")
+          "stdlib.backend.driver")
+         "compile_file" null))
+  ; the optional DEBUG positional -> a debug level ("none" | "line-tables" |
+  ; "full"). `debug` / `debug=line-tables` -> line-tables; `debug=full` -> full.
+  ; Plain `if` only — a tool program runs unexpanded (no `cond` macro in scope).
+  (debug_level
+    (bind ((a (get args 2 null)))
+      (if (eq a null) "none"
+        (if (or (eq a "debug") (eq a "debug=line-tables")) "line-tables"
+          (if (eq a "debug=full") "full"
+            (runtime_error "usage: caap stdlib/bootstrap.caap tools/s2_build.caap FILE OUTPUT [debug[=line-tables|full]]"))))))
+)
+  (do
+    (if (lt (size args) 2)
+      (runtime_error "usage: caap stdlib/bootstrap.caap tools/s2_build.caap FILE OUTPUT [debug[=line-tables|full]]"))
+    (if (gt (size args) 3)
+      (runtime_error "usage: caap stdlib/bootstrap.caap tools/s2_build.caap FILE OUTPUT [debug[=line-tables|full]]"))
+    (bind ((r (compile_file (get args 0 null) (get args 1 null) debug_level)))
+      (if (get r "ok" false)
+        0
+        (runtime_error
+          (string_concat_many "s2_build failed: "
+            (if (eq (get r "error" null) null)
+              (value_to_string (get r "diagnostics" null))
+              (get r "error" ""))))))))

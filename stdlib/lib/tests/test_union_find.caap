@@ -1,0 +1,86 @@
+; stdlib/lib/tests/test_union_find.caap — in-language tests for lib/collections/union_find.
+; NOTE on equality: the kernel `eq` compares lists by IDENTITY, so list/structure
+; results are inspected member-by-member (length + contains?) rather than with
+; `assert_eq`, which is reserved for scalars (ints/strings/bools).
+
+;; @area: collections
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.collections.union_find
+  uf_new uf_member? uf_make_set uf_find uf_union uf_connected? uf_count uf_sets)
+(use stdlib.lib.collections.sequence length contains? find)
+
+; find_component — the component in `comps` that contains element `n` (or null).
+(bind find_component
+  (lambda (comps n)
+    (find comps (lambda (c) (contains? c n)))))
+
+; connected? — the boolean half of uf_connected? (discards compression).
+(bind connected?
+  (lambda (uf a b) (get (uf_connected? uf a b) "value")))
+
+(do
+  ; ── empty / make_set basics ───────────────────────────────────────────────
+  (assert_eq (uf_count (uf_new)) 0 "fresh uf has 0 sets")
+  (bind ((u0 (uf_make_set (uf_make_set (uf_make_set (uf_make_set (uf_new)
+                "a") "b") "c") "d")))
+    (do
+      (assert_eq (uf_count u0) 4 "four singletons -> 4 sets")
+      (assert_true (uf_member? u0 "a") "a is a member")
+      (assert_true (not (uf_member? u0 "z")) "z is not a member")
+      ; make_set is idempotent: re-adding "a" changes neither count nor partition
+      (assert_eq (uf_count (uf_make_set u0 "a")) 4 "re-make_set is idempotent")
+
+      ; ── union(a,b) and union(c,d): two pairs -> 2 sets ────────────────────
+      (bind ((u1 (uf_union (uf_union u0 "a" "b") "c" "d")))
+        (do
+          (assert_eq (uf_count u1) 2 "union(a,b)+union(c,d) -> 2 sets")
+          (assert_true (connected? u1 "a" "b") "a connected to b")
+          (assert_true (connected? u1 "c" "d") "c connected to d")
+          (assert_true (not (connected? u1 "a" "c")) "a NOT connected to c")
+          (assert_true (not (connected? u1 "b" "d")) "b NOT connected to d")
+
+          ; ── union(b,c) bridges the two pairs -> 1 set ─────────────────────
+          (bind ((u2 (uf_union u1 "b" "c")))
+            (do
+              (assert_eq (uf_count u2) 1 "union(b,c) merges -> 1 set")
+              (assert_true (connected? u2 "a" "d") "a connected to d transitively")
+              (assert_true (connected? u2 "a" "c") "a connected to c")
+              (assert_true (connected? u2 "b" "d") "b connected to d")
+
+              ; uf_sets groups all four into a single component {a,b,c,d}
+              (bind ((comps (uf_sets u2)))
+                (do
+                  (assert_eq (length comps) 1 "one component remains")
+                  (bind ((comp (find_component comps "a")))
+                    (do
+                      (assert_eq (length comp) 4 "the component holds all four members")
+                      (assert_true (contains? comp "a") "component has a")
+                      (assert_true (contains? comp "b") "component has b")
+                      (assert_true (contains? comp "c") "component has c")
+                      (assert_true (contains? comp "d") "component has d")))))
+
+              ; ── uf_find idempotent root ───────────────────────────────────
+              ; the root of an element is stable across repeated finds (the
+              ; threaded compression must never change which set x belongs to)
+              (bind ((r1 (get (uf_find u2 "a") "root"))
+                     (u3 (get (uf_find u2 "a") "uf"))
+                     (r2 (get (uf_find u3 "a") "root")))
+                (do
+                  (assert_eq r1 r2 "uf_find root is idempotent")
+                  ; all four members resolve to that same single root
+                  (assert_eq (get (uf_find u2 "b") "root") r1 "b shares a's root")
+                  (assert_eq (get (uf_find u2 "c") "root") r1 "c shares a's root")
+                  (assert_eq (get (uf_find u2 "d") "root") r1 "d shares a's root")))))))
+
+      ; ── auto-make_set: find/union on unknown elements introduces them ─────
+      (bind ((uf_auto (uf_find (uf_new) "x")))
+        (do
+          (assert_eq (get uf_auto "root") "x" "find auto-makes x as its own root")
+          (assert_eq (uf_count (get uf_auto "uf")) 1 "auto-make leaves 1 set")))
+      (bind ((u_auto (uf_union (uf_new) "p" "q")))
+        (do
+          (assert_eq (uf_count u_auto) 1 "union auto-makes p,q then merges -> 1 set")
+          (assert_true (connected? u_auto "p" "q") "auto-made p,q are connected")))))
+  true)

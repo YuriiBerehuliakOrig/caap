@@ -1,0 +1,550 @@
+; stdlib/semantics/passes/pe.caap — binding-time specialization (module
+; stdlib.semantics.passes.pe). ROADMAP A1: the annotation + call-site layer over peval.
+;
+; The model: a function's parameters are STATIC (known at compile time) or
+; DYNAMIC (runtime). Two equivalent ways to annotate:
+;   - in source:  (static_params scale 0)   — a form (registered when pe loads)
+;                 declaring scale's param 0 static; expands to a "::static" marker
+;                 the pe transform reads, exactly like enum's "::enum".
+;   - as data:    (static! "scale" (list_of 0))   — the same, for tooling/tests.
+; A call whose static args are all literals is SPECIALIZED: it is redirected to a
+; named variant `f__<static-values>` whose body inlines those statics and is
+; partially evaluated, so a static parameter that drives a branch makes the
+; branch vanish. Specialization is POLYVARIANT and inter-procedural: each
+; distinct tuple of static values makes one variant (cached, shared across call
+; sites), and a variant redirects its OWN annotated calls — so recursion over a
+; decreasing static argument generates a finite chain and bottoms out.
+;
+;   (defn scale (factor x) (if (eq factor 1) x (int_mul factor x)))
+;   (static_params scale 0)
+;     (scale 1 y)  ->  (scale__i_1 y)   with  scale__i_1 = (lambda (x) x)
+;     (scale 3 y)  ->  (scale__i_3 y)   with  scale__i_3 = (lambda (x) (int_mul 3 x))
+;   (the "__i_1"/"__i_3" suffix is the kind-tagged static-value encoding from
+;    `key_part` below — an int 1 -> "i_1" — so the name is always a legal LLVM id.)
+;
+;   (defn pow (base n) (if (eq n 0) 1 (int_mul base (pow base (int_sub n 1)))))
+;   (static_params pow 1)
+;     (pow y 3) -> (pow__i_3 y); pow__i_3->pow__i_2->pow__i_1->pow__i_0=(lambda (base) 1)
+;
+; From-scratch counterpart of v1's binding-time / specialize toolchain:
+; annotations as a marker/data, specialization as a polyvariant worklist over
+; subst_safe + peval. The variant cache terminates; a non-decreasing static
+; recursion is a capped, named error, never a hang.
+(module stdlib.semantics.passes.pe)
+
+(use stdlib.syntax.ast
+  call? literal? head_of head_is? args_of arg name_of literal_of def_of items_of sym lit call calln lam eval_ir)
+(use stdlib.lib.collections.sequence any?)
+(use stdlib.lib.text.encoding hex_encode)
+(use stdlib.syntax.ir subst_safe transform names_used)
+(use stdlib.semantics.passes.peval peval_node)
+(use stdlib.expand define_form)
+(use stdlib.semantics.passes.registry install_transform! loc_of finding_at)
+
+; ── the (static_params name idx…) FORM → a "::static" marker literal ──────────
+; Registered when pe loads (opt-in syntax). Mirrors enum: a form emits an inert
+; marker the transform reads; it stays a harmless literal in the loaded module.
+(define_form "static_params" 2 -1
+  (lambda (_ctx node)
+    (bind ((args (args_of node)) (marker (list_of "::static")))
+      (do
+        (append marker (name_of (get args 0)))
+        (sequence_each (sequence_drop args 1)
+          (lambda (a) (append marker (literal_of a))))
+        (lit marker)))))
+
+; ── the (comptime name) FORM → a "::comptime" marker ────────────────────────
+; Marks a function as REQUIRED to fully evaluate at compile time: every call to
+; it must have all-static args and fold to a literal, else pe errors.
+(define_form "comptime" 1 1
+  (lambda (_ctx node)
+    (lit (list_of "::comptime" (name_of (arg node 0))))))
+
+; comptime_marker — read a ["::comptime" name] marker literal back: -> the
+; required-name, else null on any other node.
+(bind comptime_marker
+  (lambda (node)
+    (if (not (literal? node))
+      null
+      (bind ((v (literal_of node)))
+        (if (and (not (eq v null)) (eq (value_type v) "tuple")
+                 (gt (size v) 1) (eq (get v 0) "::comptime"))
+          (get v 1)
+          null)))))
+
+; read_comptime — the SET (name->true) of functions a module marks `comptime`.
+(bind read_comptime
+  (lambda (located)
+    (bind ((s (map_of)))
+      (do
+        (for f located
+          (bind ((cm (comptime_marker (get f "node"))))
+            (when (not (eq cm null)) (assoc s cm true))))
+        s))))
+
+; static_marker — parse a "::static" marker: ["::static" name idx0 idx1 …].
+(bind static_marker
+  (lambda (node)
+    (if (not (literal? node))
+      null
+      (bind ((v (literal_of node)))
+        (if (and (not (eq v null)) (eq (value_type v) "tuple")
+                 (gt (size v) 1) (eq (get v 0) "::static"))
+          (bind ((indices (list_of)))
+            (do
+              (sequence_each (sequence_range 2 (size v))
+                (lambda (i) (append indices (get v i))))
+              (assoc (map_of) "name" (get v 1) "indices" indices)))
+          null)))))
+
+; ── the data-API annotation (same model, for tooling/tests) ──────────────────
+; A process-global table `name -> static indices`, the data face of a
+; (static_params …) marker: a programmatic way (tooling, tests) to declare which
+; parameters are static. `run` merges it WITH the in-source markers (below), but
+; ONLY for a name THIS module actually defines (the def-presence gate below) — so
+; an annotation declared while tooling module A is loaded no longer bleeds into an
+; unrelated module B that lacks that function. For exact isolation when a name is
+; genuinely shared across modules, the MODULE-SCOPED table (static_in!) keys an
+; annotation by an explicit module tag, and `run` honors only the tag it is in.
+(bind statics (map_of))
+; static! — declare function `name`'s static parameter positions `indices` for
+; ANY module that defines `name` (the any-module/data face; def-presence-gated).
+(bind static! (lambda (name indices) (assoc statics name indices)))
+; static_of — the declared (any-module) static indices for `name`, else null.
+(bind static_of (lambda (name) (get statics name)))
+; clear! — empty the data-API table (test/REPL hygiene; markers are untouched).
+(bind clear! (lambda () (for k (map_keys statics) (map_delete statics k))))
+; ── module-scoped data API: annotations pinned to ONE module tag, so a name
+; shared across modules cannot cross-contaminate. A NESTED map
+; `module -> (name -> indices)` (no string-separator hazard). The tooling supplies
+; the module tag; `run` derives the current tag from the located forms' loc and
+; honors only the inner map matching it.
+(bind statics_mod (map_of))
+; static_in! — declare `name`'s static indices ONLY for module `module`.
+(bind static_in!
+  (lambda (module name indices)
+    (do
+      (when (eq (get statics_mod module) null) (assoc statics_mod module (map_of)))
+      (assoc (get statics_mod module) name indices))))
+; clear_in! — drop every module-scoped annotation for `module` (REPL/tooling
+; hygiene); a bare `clear!` leaves these untouched, so clear BOTH to fully reset.
+(bind clear_in! (lambda (module) (map_delete statics_mod module)))
+
+; read_static_markers — module-local annotations from in-source markers.
+(bind read_static_markers
+  (lambda (located)
+    (bind ((m (map_of)))
+      (do
+        (for f located
+          (bind ((sm (static_marker (get f "node"))))
+            (when (not (eq sm null))
+              (assoc m (get sm "name") (get sm "indices")))))
+        m))))
+
+; read_marker_locs — name -> the marker form's node, for LOCATING a diagnostic
+; on an invalid annotation (the marker is where the bad index was written).
+(bind read_marker_locs
+  (lambda (located)
+    (bind ((m (map_of)))
+      (do
+        (for f located
+          (bind ((sm (static_marker (get f "node"))))
+            (when (not (eq sm null))
+              (assoc m (get sm "name") (get f "node")))))
+        m))))
+
+; valid_index? — a static index must be a NON-NEGATIVE INT strictly less than
+; the target's arity, or it would index `params`/`args` out of range (a crash)
+; or silently misbehave. Returns true iff `i` is in [0, arity).
+(bind valid_index?
+  (lambda (i arity)
+    (and (eq (value_type i) "int") (and (ge i 0) (lt i arity)))))
+
+; validate_static_indices! — for every annotation that names a function THIS
+; module defines, check each declared static index is in range; a bad index is a
+; LOCATED hard error (never an out-of-range `get`). Annotations for names this
+; module does not define are skipped here (they are not merged — see the
+; def-presence gate in `run`). `loc_node_of` maps a name to the node to blame.
+(bind validate_static_indices!
+  (lambda (marks defs loc_node_of)
+    (for name (map_keys marks)
+      (bind ((d (get defs name)))
+        (when (not (eq d null))
+          (bind ((arity (size (get d "params" (list_of)))) (idxs (get marks name)))
+            (for i idxs
+              (when (not (valid_index? i arity))
+                (throw (finding_at "pe" (loc_of (loc_node_of name) "")
+                  (string_concat_many
+                    "static index " (value_to_string i) " for `" name
+                    "` is out of range (arity " (int_to_string arity)
+                    "); each index must be a non-negative int < arity")))))))))))
+
+; def_node — the binding node of a top-level definition, looking THROUGH the
+; `(do <sig-marker-literal> (bind name (lambda …)))` wrapper that `defn` emits.
+; A surface `(defn f …)` expands to that `do`; a hand-written/loader-internal
+; top-level def is already a bare `(bind name (lambda …))`. Either way this
+; returns the inner `(bind …)` so def_of can read it (else the node unchanged).
+;   node : a top-level form node
+;   ->   : the `(bind …)` node carrying the definition (possibly `node` itself)
+(bind def_node
+  (lambda (node)
+    (if (and (head_is? node "do") (gt (size (args_of node)) 1))
+      (bind ((last (arg node (int_sub (size (args_of node)) 1))))
+        (if (head_is? last "bind") last node))
+      node)))
+
+; param_names_of — the parameter NAME strings of a lambda's params node, reading
+; BOTH kernel shapes (like check.caap's param_names): a LITERAL tuple of strings
+; `["a" "b"]` (the `lam`/programmatic spelling) and a CALL of name nodes
+; `(a b)` (what `defn` emits for ≥1 params); a literal `null` (zero params) -> [].
+(bind param_names_of
+  (lambda (params_node)
+    (if (literal? params_node)
+      (bind ((v (literal_of params_node)))
+        (if (eq v null) (list_of) v))
+      (if (call? params_node)
+        (bind ((out (list_of)))
+          (do
+            (for it (items_of params_node)
+              (bind ((nm (name_of it))) (when (not (eq nm null)) (append out nm))))
+            out))
+        (list_of)))))
+
+; index_defs — name -> {params, body} for the module's top-level lambda defs.
+(bind index_defs
+  (lambda (located)
+    (bind ((idx (map_of)))
+      (do
+        (for f located
+          (bind ((d (def_of (def_node (get f "node")))))
+            (when (and (not (eq d null)) (head_is? (get d "value") "lambda"))
+              (assoc idx (get d "name")
+                (assoc (map_of)
+                  "params" (param_names_of (arg (get d "value") 0))
+                  "body" (arg (get d "value") 1)
+                  "lambda" (get d "value"))))))      ; the whole lambda, for fold
+        idx))))
+
+; module_tag_of — a per-module identity for scoping the data-API annotations: the
+; `loc` of the first non-synthesized located form (a file path in loader-driven
+; runs, the test's "loc" placeholder in unit tests). pe's own synthesized variants
+; carry "<pe>", so they are skipped. "" when nothing identifiable is present.
+(bind module_tag_of
+  (lambda (located)
+    (bind ((tag (ref "")))
+      (do
+        (for f located
+          (when (and (eq (deref tag) "")
+                     (not (eq (get f "loc" "") "<pe>"))
+                     (not (eq (get f "loc" "") "")))
+            (set_ref tag (get f "loc" ""))))
+        (deref tag)))))
+
+; statics_known? — every static-indexed argument is a literal.
+(bind statics_known?
+  (lambda (args indices)
+    (not (any? indices (lambda (i) (not (literal? (get args i))))))))
+
+; literal_positions — the argument indices that are literals (the auto-static set).
+(bind literal_positions
+  (lambda (args)
+    (bind ((out (list_of)))
+      (do
+        (for i (sequence_range 0 (size args))
+          (when (literal? (get args i)) (append out i)))
+        out))))
+
+; def_name — the name a `(bind "name" value …)` top-level form defines (seeing
+; through a `defn`-emitted `(do <marker> (bind …))` wrapper), else null.
+(bind def_name
+  (lambda (node) (bind ((d (def_of (def_node node)))) (if (eq d null) null (get d "name")))))
+
+; defs_order — the top-level function names in source order (the scope chain for
+; compile-time evaluation: a function sees the ones defined before it + itself).
+(bind defs_order
+  (lambda (located)
+    (bind ((out (list_of)))
+      (do
+        (for f located
+          (bind ((d (def_of (def_node (get f "node")))))
+            (when (and (not (eq d null)) (head_is? (get d "value") "lambda"))
+              (append out (get d "name")))))
+        out))))
+
+; scalar_val? — a compile-time result that is safe to embed as a literal.
+(bind scalar_val?
+  (lambda (v)
+    (bind ((t (value_type v)))
+      (or (eq t "int") (or (eq t "bool") (or (eq t "null")
+        (or (eq t "float") (eq t "string"))))))))
+
+; fold_static — COMPILE-TIME EVALUATION: wrap every top-level function in nested
+; binds (source order, so recursion/forward-helper calls resolve) around the
+; fully-static `call`, and eval it. -> (list_of value) when it reduces to a
+; scalar, else null (effectful/non-terminating-budget/non-scalar -> not folded).
+(bind fold_static
+  (lambda (defs order call)
+    (bind ((prog (ref call)) (i (ref (int_sub (size order) 1))))
+      (do
+        (while (ge (deref i) 0)
+          (bind ((nm (get order (deref i))))
+            (do
+              (set_ref prog (calln "bind"
+                (list_of (lit nm) (get (get defs nm) "lambda") (deref prog))))
+              (set_ref i (int_sub (deref i) 1)))))
+        (try
+          (bind ((r (eval_ir (deref prog))))
+            (if (scalar_val? r) (list_of r) null))
+          (catch _e null))))))
+
+; ── polyvariant specialization (POLYvariant: one named variant per distinct
+; tuple of static argument values, generated on demand and shared across call
+; sites). This is the inter-procedural + recursive core: a call to an annotated
+; fn with literal static args is REDIRECTED to a specialized variant `f__<vals>`,
+; whose body inlines those statics, partially evaluates, and redirects ITS OWN
+; annotated calls — so recursion over a decreasing static argument generates a
+; finite chain of variants and bottoms out (e.g. pow__i_3 -> pow__i_2 -> … -> pow__i_0
+; -> a constant). A variant cache makes each key once (terminating; sharing call
+; sites); non-decreasing static recursion is a capped, named error, not a hang.
+
+; not_in? / dynamic_of — the items NOT at the static indices (a call's dynamic
+; arguments, or a variant's dynamic parameters): the complement that survives
+; specialization (statics are inlined; these stay as runtime parameters/args).
+(bind not_in? (lambda (i idxs) (not (any? idxs (lambda (j) (eq j i))))))
+(bind dynamic_of
+  (lambda (items idxs)
+    (bind ((out (list_of)))
+      (do
+        (for i (sequence_range 0 (size items))
+          (when (not_in? i idxs) (append out (get items i))))
+        out))))
+
+; a string's UTF-8 bytes as one lowercase-hex run is the injective, always-legal
+; (identifier-safe) string encoding the key fragments below need — now shared
+; from stdlib.lib.text.encoding (`hex_encode`, imported above), which is the
+; byte-identical extraction of the hex helper this pass used to inline.
+; key_part — a single static literal value rendered as a TOTAL, INJECTIVE,
+; identifier-safe fragment, kind-tagged so values of different kinds (e.g. the
+; int 1 vs the string "1", or `true` vs the int 1) never collide and the result
+; always matches [A-Za-z_][A-Za-z0-9_]* (it is BOTH the cache key and the emitted
+; variant function NAME, which becomes an LLVM identifier):
+;   int    -> "i_<n>"   / "i_n<n>" for negatives   (e.g. 3 -> i_3, -1 -> i_n1)
+;   bool   -> "b_true" / "b_false"
+;   null   -> "n_null"
+;   float  -> "f_<hex-of-its-canonical-string>"     (".", "-", "e" all escaped)
+;   string -> "s<len>_<hex-of-its-utf8-bytes>"      (len disambiguates further)
+;   other  -> "x_<typetag>_<hex-of-value_to_string>" (statics are scalars, but
+;             stay total for any unexpected kind rather than emit an unsafe name)
+(bind key_part
+  (lambda (litnode)
+    (bind ((v (literal_of litnode)) (t (value_type v)))
+      (cond
+        ((eq t "int")
+          (if (lt v 0)
+            (string_concat_many "i_n" (int_to_string (int_sub 0 v)))
+            (string_concat_many "i_" (int_to_string v))))
+        ((eq t "bool") (if v "b_true" "b_false"))
+        ((eq t "null") "n_null")
+        ((eq t "float")
+          (string_concat_many "f_" (hex_encode (value_to_string v))))
+        ((eq t "string")
+          (string_concat_many "s" (int_to_string (size v)) "_" (hex_encode v)))
+        (else
+          (string_concat_many "x_" t "_" (hex_encode (value_to_string v))))))))
+; variant_key — the specialized variant's name: head + each static value's
+; `key_part` joined by "__" (e.g. (pow base 3), static idx 1 -> "pow__i_3"). The
+; cache key AND the emitted function name, so equal static tuples share one
+; variant; `key_part` keeps each part injective + a legal identifier.
+(bind variant_key
+  (lambda (name args idxs)
+    (bind ((parts (list_of name)))
+      (do (for i idxs (append parts (key_part (get args i)))) (sequence_join parts "__")))))
+
+; run — the transform entry: redirect every annotated literal-static call to a
+; specialized variant, partially evaluate, then materialize the variants the
+; redirections requested (to a fixpoint over the worklist).
+(bind run
+  (lambda (located)
+    (bind (
+      (defs (index_defs located))
+      (order (defs_order located))
+      (marks (read_static_markers located))
+      (marker_locs (read_marker_locs located))   ; name -> marker node (for diags)
+      (mod_tag (module_tag_of located))           ; this module's scoping identity
+      (required (read_comptime located))   ; names that MUST fold (comptime)
+      (cache (map_of))      ; key -> true (each variant generated once)
+      (worklist (list_of))  ; {name, key, idxs, args}
+      (variants (list_of))  ; generated `(bind <key> (lambda …))` located entries
+      ; request! — ensure a variant exists for this (fn, static values); returns
+      ; its name. A new key is queued for materialization.
+      (request!
+        (lambda (name args idxs)
+          (bind ((key (variant_key name args idxs)))
+            (do
+              (when (not (eq (get cache key false) true))
+                (do
+                  (assoc cache key true)
+                  (append worklist (assoc (map_of)
+                    "name" name "key" key "idxs" idxs "args" args))))
+              key))))
+      ; redirect — the PE rewrite over a tree: a call to a user function with
+      ; literal arguments is either EVALUATED to its result (fully static) or
+      ; SPECIALIZED to a polyvariant. Binding-time is auto (every literal arg is
+      ; static); an explicit (static_params …) annotation RESTRICTS the static
+      ; set to its indices (which must then all be literal).
+      (redirect
+        (lambda (node)
+          (transform node
+            (lambda (n)
+              (if (not (call? n))
+                null
+                (bind (
+                  (h (head_of n))
+                  (d (if (eq h null) null (get defs h)))
+                  (args (if (eq h null) (list_of) (args_of n)))
+                )
+                  (if (or (eq d null)
+                          (not (eq (size args) (size (get d "params" (list_of))))))
+                    null
+                    (bind (
+                      (ann (get marks h))
+                      (sidx (if (eq ann null)
+                              (literal_positions args)              ; auto
+                              (if (statics_known? args ann) ann null)))  ; annotated
+                    )
+                      (cond
+                        ; comptime: MUST fully evaluate to a literal, else error
+                        ((eq (get required h false) true)
+                          (if (eq (size (literal_positions args)) (size args))
+                            (bind ((folded (fold_static defs order n)))
+                              (if (not (eq folded null))
+                                (lit (get folded 0))
+                                (throw (string_concat_many
+                                  "pe: comptime `" h "` did not evaluate at compile time"))))
+                            (throw (string_concat_many
+                              "pe: comptime `" h "` requires all-static arguments"))))
+                        ((or (eq sidx null) (eq (size sidx) 0)) null)
+                        ; fully static -> compile-time evaluate to a literal
+                        ((eq (size sidx) (size args))
+                          (bind ((folded (fold_static defs order n)))
+                            (if (not (eq folded null))
+                              (lit (get folded 0))
+                              (call (sym (request! h args sidx))
+                                    (dynamic_of args sidx)))))
+                        ; mixed static/dynamic -> specialize to a variant
+                        (else
+                          (call (sym (request! h args sidx))
+                                (dynamic_of args sidx))))))))))))
+    )
+      (do
+        ; data-API annotations merge with the in-source markers, but ONLY for a
+        ; name THIS module defines — so a global `(static! "scale" …)` declared
+        ; while another module was loaded can no longer bleed into an unrelated
+        ; module that has no `scale` (the def-presence gate fixes the scope leak).
+        (for k (map_keys statics)
+          (when (not (eq (get defs k) null)) (assoc marks k (get statics k))))
+        ; module-scoped annotations: honor only the inner map pinned to THIS
+        ; module's tag (exact isolation when a name is shared across modules).
+        (bind ((scoped (get statics_mod mod_tag)))
+          (when (not (eq scoped null))
+            (for k (map_keys scoped) (assoc marks k (get scoped k)))))
+        ; validate every merged annotation's indices against the target arity
+        ; BEFORE any index is used (statics_known?/materialization); a bad index
+        ; is a located hard error, never an out-of-range crash. Blame the marker
+        ; node when there is one, else the def's lambda.
+        (validate_static_indices! marks defs
+          (lambda (name)
+            (bind ((mn (get marker_locs name)))
+              (if (not (eq mn null))
+                mn
+                (bind ((d (get defs name)))
+                  (if (eq d null) null (get d "lambda")))))))
+        ; redirect + partially evaluate every original form
+        (for f located
+          (assoc f "node" (peval_node (redirect (get f "node")))))
+        ; materialize requested variants (each may request more — recursion)
+        (bind ((steps (ref 0)))
+          (do
+            (while (and (gt (size worklist) 0) (lt (deref steps) 1000))
+              (bind ((w (get worklist 0)))
+                (do
+                  (list_remove_at worklist 0)
+                  (set_ref steps (int_add (deref steps) 1))
+                  (bind (
+                    (d (get defs (get w "name")))
+                    (params (get d "params"))
+                    (idxs (get w "idxs"))
+                    (args (get w "args"))
+                    (sub (map_of))
+                  )
+                    (do
+                      ; bind each static parameter to its literal value
+                      (for i idxs (assoc sub (get params i) (lit (literal_of (get args i)))))
+                      ; specialize: inline statics, peval, redirect inner calls
+                      (bind ((body (redirect (peval_node (subst_safe (get d "body") sub)))))
+                        ; emit a NAME-node binder `(bind <key> (lambda …))`: the
+                        ; kernel's top-level-definition shape (defines into the
+                        ; enclosing scope, visible to sibling forms — the call
+                        ; sites that redirect to it). A string-literal binder
+                        ; `(bind "key" …)` is NOT a valid bodyless top-level def
+                        ; (it needs pairs+body and binds in a child scope), so the
+                        ; variant would be unreachable at eval time.
+                        (append variants
+                          (assoc (map_of) "loc" "<pe>"
+                            "node" (calln "bind"
+                              (list_of (sym (get w "key"))
+                                (lam (dynamic_of params idxs) body)))))))))))
+            ; The cap tripped with work still pending: a runaway specialization
+            ; chain (almost always a static argument that does not strictly
+            ; decrease, so each variant requests a fresh deeper one forever). A
+            ; bare cap message leaves the author guessing which function — so name
+            ; the distinct functions still on the worklist and show one pending
+            ; variant key as the frontier to inspect. (The set of names is small:
+            ; the loop only stalls when ONE chain keeps re-requesting itself.)
+            (when (ge (deref steps) 1000)
+              (bind ((names (list_of)) (sample (ref "")))
+                (do
+                  (for w worklist
+                    (do
+                      (when (and (eq (deref sample) "") (not (eq (get w "key") null)))
+                        (set_ref sample (get w "key")))
+                      (when (not (any? names (lambda (nm) (eq nm (get w "name")))))
+                        (append names (get w "name")))))
+                  (throw (string_concat_many
+                    "pe: specialization did not terminate after 1000 variants "
+                    "(non-decreasing static recursion?); still specializing: "
+                    (if (eq (size names) 0) "?" (sequence_join names ", "))
+                    (if (eq (deref sample) "") ""
+                      (string_concat_many "; e.g. variant `" (deref sample) "`")))))))))
+        ; ── place + prune. Variants go in DEPENDENCY order (deepest first: a
+        ; variant is generated BEFORE the deeper ones it requests, so the
+        ; reversed worklist order is def-before-use) AHEAD of the forms that use
+        ; them. Then DCE: an annotated original whose every call was redirected
+        ; is unreferenced (its only mention was its own recursive body) and is
+        ; dropped. Rebuilt in place so the loader sees the reordered list.
+        (bind ((referenced (map_of)) (survivors (list_of)))
+          (do
+            (for v variants
+              (for nm (names_used (get v "node")) (assoc referenced nm true)))
+            (for f located
+              (bind ((dn (def_name (get f "node"))))
+                (for nm (names_used (get f "node"))
+                  (when (not (eq nm dn)) (assoc referenced nm true)))))
+            (for f located
+              (bind ((dn (def_name (get f "node"))))
+                (when (not (and (not (eq dn null))
+                                (not (eq (get marks dn) null))
+                                (not (eq (get referenced dn false) true))))
+                  (append survivors f))))
+            (while (gt (size located) 0) (list_remove_at located 0))
+            (bind ((i (ref (int_sub (size variants) 1))))
+              (while (ge (deref i) 0)
+                (do (append located (get variants (deref i)))
+                    (set_ref i (int_sub (deref i) 1)))))
+            (for f survivors (append located f))))
+        located))))
+
+; register! — install binding-time specialization as a load-time TRANSFORM.
+(bind register! (lambda () (install_transform! "pe" run)))
+
+(export static! static_of clear! static_in! clear_in! static_marker run register!)

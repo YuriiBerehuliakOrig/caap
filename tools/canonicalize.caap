@@ -1,0 +1,39 @@
+;; Canonical formatting as a program.
+;;
+;;   caap tools/bare.caap tools/canonicalize.caap FILE          print canonical text
+;;   caap tools/bare.caap tools/canonicalize.caap check FILE…   exit 1 if any file differs
+;;   caap tools/bare.caap tools/canonicalize.caap write FILE…   rewrite files in place
+;;
+;; NOTE: canonicalization drops comments — `write` refuses nothing and is
+;; intentionally explicit (a mode word, not a default).
+(bind (
+  (args (ctfe_compiler_lookup_value compiler "cli.args"))
+  (read_text (host_service_export "fs" "read_text" "compile_time"))
+  (write_text (host_service_export "fs" "write_text" "compile_time"))
+)
+  (do
+    (if (eq (size args) 0)
+      (runtime_error
+        "usage: caap tools/bare.caap tools/canonicalize.caap [check|write] FILE..."))
+    (bind ((mode (get args 0 null)))
+      (if (eq mode "check")
+        (bind ((changed (ref 0)))
+          (do
+            (sequence_each (sequence_drop args 1)
+              (lambda (path)
+                (bind ((source (read_text path)))
+                  (if (not (eq source (ctfe_source_canonicalize source)))
+                    (set_ref changed (int_add (deref changed) 1))))))
+            (deref changed)))
+        (if (eq mode "write")
+          (do
+            (sequence_each (sequence_drop args 1)
+              (lambda (path)
+                (bind (
+                  (source (read_text path))
+                  (canonical (ctfe_source_canonicalize source))
+                )
+                  (if (not (eq source canonical))
+                    (write_text path canonical)))))
+            null)
+          (ctfe_source_canonicalize (read_text mode)))))))

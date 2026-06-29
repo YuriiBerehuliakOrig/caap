@@ -1,0 +1,13 @@
+; stdlib/lib/tests/test_bimap.caap — smoke (salvaged module; full coverage TBD).
+
+;; @area: collections
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.collections.bimap bimap_new bimap_put bimap_get bimap_get_key)
+(do
+  (bind ((b (bimap_put (bimap_put (bimap_new) "a" 1) "b" 2)))
+    (do
+      (assert_eq (bimap_get b "a") 1 "forward a->1")
+      (assert_eq (bimap_get_key b 2) "b" "reverse 2->b")))
+  true)

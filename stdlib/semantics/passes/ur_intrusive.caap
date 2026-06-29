@@ -1,0 +1,75 @@
+; stdlib/semantics/passes/ur_intrusive.caap — INTRUSIVE-LIST double-insert pass
+; (module stdlib.semantics.passes.ur_intrusive).
+;
+; An intrusive node must be on a given list AT MOST ONCE: pushing it a second time
+; without an intervening remove makes the link field point into the wrong chain and
+; corrupts BOTH lists (a classic RTOS bug). urun guards this only at RUNTIME
+; (_ur_thread_resume no-ops an already-ready thread; ur_timer_activate checks the
+; active flag). This pass adds a STATIC check.
+;
+; SOUNDNESS over precision: a node legitimately lives in SEVERAL DIFFERENT lists at
+; once (a UR_THREAD is in ready + an object-wait + delayed simultaneously), so we
+; key on the (list, node) PAIR — same node into the SAME list twice — never on the
+; node alone. Pairs are compared by the rendered text of the list and node
+; argument expressions (a conservative syntactic identity; the platform's alias
+; analysis is field-INSENSITIVE and would collapse the distinct hooks, so it cannot
+; be used here without false positives). A pair pushed twice with NO remove of that
+; pair and NO pop of that list in the same function is reported. This never fires on
+; valid multi-list membership; it catches a genuine push;push of one pair.
+(module stdlib.semantics.passes.ur_intrusive)
+
+(use stdlib.syntax.ast call? head_of args_of arg walk)
+(use stdlib.syntax.render render)
+(use stdlib.semantics.passes.monomorph decode_defn)
+(use stdlib.semantics.passes.registry install_pass! note!)
+
+; classify a monomorphized ur_list call by its head prefix (the type/field args are
+; consumed into the mangled name, so the runtime args are list=arg0, node=arg1).
+(bind op_kind
+  (lambda (h)
+    (cond
+      ((eq h null) null)
+      ((string_starts_with h "ur_list_push") "push")     ; push + push_front
+      ((string_starts_with h "ur_list_remove") "remove")
+      ((string_starts_with h "ur_list_pop") "pop")
+      (else null))))
+
+(bind run
+  (lambda (located sink)
+    (for f located
+      (bind ((d (decode_defn (get f "node")))
+             (val (if (eq d null) null (get d "value"))))
+        (when (and (not (eq val null)) (call? val))
+          ; per function: count pushes per (list|node) pair, and the lists that are
+          ; removed-from / popped (which legitimately empty a pair).
+          (bind ((pushes (map_of)) (push_node (map_of)) (cleared (map_of)) (popped (map_of)))
+            (do
+              (walk val
+                (lambda (n)
+                  (when (call? n)
+                    (bind ((k (op_kind (head_of n))) (as (args_of n)))
+                      (cond
+                        ((and (eq k "push") (ge (size as) 2))
+                          (bind ((key (string_concat_many (render (get as 0)) " <| " (render (get as 1)))))
+                            (do (assoc pushes key (int_add (get pushes key 0) 1))
+                                (assoc push_node key n))))
+                        ((and (eq k "remove") (ge (size as) 2))
+                          (assoc cleared (string_concat_many (render (get as 0)) " <| " (render (get as 1))) true))
+                        ((and (eq k "pop") (ge (size as) 1))
+                          (assoc popped (render (get as 0)) true))
+                        (else null))))))
+              ; flag any pair pushed >= 2x with no remove of the pair and no pop of
+              ; the list (the list text is the prefix before " <| ").
+              (for key (map_keys pushes)
+                (when (ge (get pushes key 0) 2)
+                  (bind ((listtext (string_slice key 0 (string_find key " <| "))))
+                    (when (and (eq (get cleared key) null) (eq (get popped listtext) null))
+                      (note! sink "ur-intrusive" (get push_node key)
+                        (string_concat_many "`" (get d "name") "` pushes the same node onto "
+                          "the same intrusive list more than once with no intervening "
+                          "remove/pop — double insertion corrupts the list")))))))))))))
+
+(bind register!
+  (lambda () (install_pass! "ur-intrusive" (lambda (located sink) (run located sink)))))
+
+(export run register!)

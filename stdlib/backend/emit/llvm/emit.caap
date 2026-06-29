@@ -1,0 +1,469 @@
+; stdlib/backend/emit/llvm/emit.caap — function and module emission plus the public
+; entry points for the LLVM emitter (module stdlib.backend.emit.llvm.emit).
+;
+; emit_fn lowers one function definition to IR text; emit_core is the all-stdlib
+; backend that assembles the whole module (target policy, structs, declares,
+; globals, function bodies, and the DWARF metadata block); the emit_program/
+; emit_freestanding (+ _debug) entries are the public contract. It depends on the
+; debug, types, instructions, and lowering leaves.
+(module stdlib.backend.emit.llvm.emit)
+
+(use stdlib.backend.prep prep_units)
+; typed READERS over prep_units' flat program map — the strict accessors name
+; each codegen table (pairs/structs/unions/consts/externs/globals/…) so a forgotten
+; key fails LOUDLY at the read, not as a silent null mid-emit. Same backend tier,
+; imports nothing, so no cycle. (NB: emit_fn reads the LOCAL `pstate` accumulator,
+; NOT this map, so those stay raw `(get …)`.)
+(use stdlib.backend.program_accessors
+     program_pairs program_structs program_unions program_consts
+     program_externs program_globals program_global_arrays program_diagnostics)
+(use stdlib.syntax.ast args_of arg)
+(use stdlib.backend.codegen_common unsigned?)
+(use stdlib.backend.emit.llvm.debug
+     diag current_target dbg_new di_node! di_ref di_set_loc! di_type_ref
+     di_subprogram! di_local_param!)
+(use stdlib.backend.emit.llvm.types
+     render_t ptr_elem_of ll_of di_composite! ptr_cell)
+(use stdlib.backend.emit.llvm.instructions
+     fn_entry tmp! emit! alloca! need_declare!)
+(use stdlib.backend.emit.llvm.lowering lower)
+
+; emit_fn — one function definition as IR text lines.
+;   pair / entry / fns : the prep pair, its fn_entry, the call table
+;   prog               : shared program state (string globals, declares)
+;   dbg                : the debug context (inert when level is "none")
+;   composite?         : the Phase-2 composite-type builder (null = line-tables)
+(bind emit_fn
+  (lambda (pair entry fns prog dbg composite?)
+    (bind (
+      (st (assoc (map_of)
+            "n" (ref 0) "lines" (list_of) "allocas" (list_of)
+            "block" (ref "entry") "prog" prog "dbg" dbg
+            ; the composite-type builder (null under line-tables) — carried in
+            ; st so the bind handler can describe a struct/pointer local's type
+            "composite?" composite?))
+      ; the function's source line (from its value span); 0 when span-less. A
+      ; debug build builds the DISubprogram here so the body's DILocations can
+      ; scope to it and the define line can carry ` !dbg !SP`.
+      (fn_span (if (get dbg "on?") (ctfe_spec_span (get pair "value")) null))
+      (fn_line (if (eq fn_span null) 0 (get fn_span "start_line" 0)))
+      (sp_id (if (get dbg "on?")
+               (di_subprogram! dbg entry fn_line (get prog "structs" (map_of))
+                               composite?)
+               null))
+      (env (map_of))
+      (value (get pair "value"))
+      (pnames (get entry "pnames" (list_of)))
+      (ptypes (get entry "ptypes" (list_of)))
+      (ctypes (get entry "ctypes" (list_of)))
+      (header_params (list_of))
+    )
+      (do
+        ; a fresh function starts with no active instruction location (the
+        ; previous function's loc must not leak); the scope is this fn's SP.
+        (when (get dbg "on?") (set_ref (get dbg "loc") null))
+        ; program constants (enum variants, top-level int binds) are inlined:
+        ; each name resolves to an untyped int literal that adopts the
+        ; surrounding width at the use site
+        (sequence_each (map_keys (get prog "consts" (map_of)))
+          (lambda (cn)
+            (assoc env cn
+              (assoc (map_of)
+                "repr" (int_to_string (get (get prog "consts" (map_of)) cn))
+                "type" null "ct" null))))
+        ; program globals are visible in every function body as ref cells:
+        ; reads are (deref name), writes (set_ref name v) — same machinery
+        (sequence_each (map_keys (get prog "global_cells" (map_of)))
+          (lambda (gn)
+            (assoc env gn (get (get prog "global_cells" (map_of)) gn))))
+        (bind ((structs (get prog "structs" (map_of))))
+          (for i (sequence_range 0 (size pnames))
+            (bind ((pn (get pnames i)) (pt (get ptypes i))
+                   (ct (get ctypes i))
+                   (pelem (ptr_elem_of ct structs)))
+              (do
+                (append header_params (string_concat_many (render_t pt) " %" pn))
+                ; a pointer param (scalar OR struct) carries its element, so
+                ; deref/ptr_read/get reach it
+                (assoc env pn
+                  (if (not (eq pelem null))
+                    (ptr_cell (string_concat_many "%" pn) pelem structs)
+                    (assoc (map_of)
+                      "repr" (string_concat_many "%" pn)
+                      "type" pt "ct" ct)))))))
+        ; ── "full" debug: parameter locals ──────────────────────────────────
+        ; For each parameter, spill the SSA value to a DEBUG-ONLY alloca and
+        ; llvm.dbg.declare it as a !DILocalVariable(arg: N). The spill leaves the
+        ; codegen path untouched (the body still uses %pn); it only gives the
+        ; debugger a memory location for the parameter (DW_TAG_formal_parameter).
+        ; Constructors have a generated body and no user-visible params, so they
+        ; are skipped.
+        (when (and (get dbg "full?") (eq (get entry "ctor") null))
+          (bind ((structs (get prog "structs" (map_of))))
+            (do
+              (need_declare! st "llvm.dbg.declare"
+                "declare void @llvm.dbg.declare(metadata, metadata, metadata)")
+              ; the declare loc scopes to the function's opening line
+              (di_set_loc! dbg fn_line 0)
+              (for i (sequence_range 0 (size pnames))
+                (bind (
+                  (pn (get pnames i)) (pt (get ptypes i)) (ct (get ctypes i))
+                  (slot (string_concat_many "%" pn ".dbg"))
+                  (tref (di_type_ref dbg ct structs composite?))
+                  (var (di_local_param! dbg pn (int_add i 1) fn_line tref))
+                )
+                  (do
+                    (alloca! st (string_concat_many
+                      slot " = alloca " (render_t pt)))
+                    (emit! st (string_concat_many
+                      "store " (render_t pt) " %" pn ", ptr " slot))
+                    (emit! st (string_concat_many
+                      "call void @llvm.dbg.declare(metadata ptr " slot
+                      ", metadata " (di_ref var)
+                      ", metadata !DIExpression())"))))))))
+        (if (not (eq (get entry "ctor") null))
+          ; a struct constructor: pure insertvalue chain over the parameters
+          (bind ((slot (map_of)))
+            (do
+              (assoc slot "v" "undef")
+              (for i (sequence_range 0 (size pnames))
+                (bind ((r (tmp! st)))
+                  (do
+                    (emit! st (string_concat_many
+                      r " = insertvalue " (get entry "result" "?") " "
+                      (get slot "v" "?") ", "
+                      (render_t (get ptypes i)) " %" (get pnames i)
+                      ", " (int_to_string i)))
+                    (assoc slot "v" r))))
+              (emit! st (string_concat_many
+                "ret " (get entry "result" "?") " " (get slot "v" "?")))))
+        (bind ((slot (map_of)))
+          (do
+            (assoc slot "v" (assoc (map_of) "repr" "0" "type" null "ct" null))
+            (for k (sequence_range 1 (size (args_of value)))
+              (assoc slot "v" (lower lower (arg value k) st env fns)))
+            ; the result: widen main's narrower int to the i32 exit code
+            (bind (
+              (v (get slot "v"))
+              (want (get entry "result" "?"))
+              (vt (get v "type"))
+            )
+              (cond
+                ((or (eq vt null) (eq vt want))
+                  (emit! st (string_concat_many
+                    "ret " (render_t want) " " (get v "repr" "?"))))
+                ((and (eq (get entry "name") "main") (eq want "i32"))
+                  (bind ((r (tmp! st))
+                         (op (if (unsigned? (get v "ct" "i")) "zext" "sext")))
+                    (do
+                      (emit! st (string_concat_many
+                        r " = " op " " vt " " (get v "repr" "?") " to i32"))
+                      (emit! st (string_concat_many "ret i32 " r)))))
+                (else
+                  (throw (string_concat_many
+                    "native codegen: `" (get entry "name" "?")
+                    "` body is " vt ", declared " want))))))))
+        ; assemble: header, entry label, hoisted allocas, then the body
+        (bind ((out (list_of)))
+          (do
+            (append out
+              (string_concat_many
+                "define " (render_t (get entry "result" "?"))
+                " @" (get entry "name" "?")
+                "(" (sequence_join header_params ", ") ")"
+                ; a debug build attaches the function's DISubprogram to the
+                ; define line; with debug off this is "" and the line is
+                ; byte-identical to a non-debug build.
+                (if (and (get dbg "on?") (not (eq sp_id null)))
+                  (string_concat_many " !dbg !" (int_to_string sp_id))
+                  "")
+                " {"))
+            (append out "entry:")
+            (for a (get st "allocas" (list_of)) (append out a))
+            (for l (get st "lines" (list_of)) (append out l))
+            (append out "}")
+            (sequence_join out "\n")))))))
+
+; first_source_path — the source-file path of the first prep pair that carries
+; a span, or null (no real source: a synthesized/compile_ir program). The
+; DICompileUnit's file/dir derive from this; null means no debug info can be
+; emitted, so the build degrades cleanly to no-debug.
+(bind first_source_path
+  (lambda (prog)
+    (bind ((found (ref null)))
+      (do
+        (sequence_each (program_pairs prog)
+          (lambda (pair)
+            (when (eq (deref found) null)
+              (bind ((sp (ctfe_spec_span (get pair "value"))))
+                (when (and (not (eq sp null)) (not (eq (get sp "path") null)))
+                  (set_ref found (get sp "path")))))))
+        (deref found)))))
+
+; di_init! — build the fixed DWARF nodes (module flags, DICompileUnit, DIFile)
+; for a debug build whose source path is known. Returns true when debug info is
+; live (path resolved), false when it must degrade to no-debug (no source path).
+; Diagnostics: a missing source path is reported but NEVER fails the build.
+(bind di_init!
+  (lambda (dbg path diags)
+    (if (not (get dbg "on?")) false
+      (if (eq path null)
+        (do
+          (append diags
+            (diag (string_concat_many
+              "debug info requested (" (get dbg "level")
+              ") but the program has no source path (a synthesized program "
+              "carries no spans) — emitting without debug info")))
+          false)
+        (bind (
+          (base (string_last_segment path "/"))
+          ; the directory is the path minus the trailing "/<basename>"; "." when
+          ; the path is a bare filename (no slash)
+          (dir (if (eq base path) "."
+                 (string_slice path 0
+                   (int_sub (string_byte_length path)
+                            (int_add (string_byte_length base) 1)))))
+          (file (di_node! dbg
+                  (string_concat_many
+                    "!DIFile(filename: \"" base "\", directory: \"" dir "\")")))
+          (cu (di_node! dbg
+                (string_concat_many
+                  "distinct !DICompileUnit(language: DW_LANG_C, file: "
+                  (di_ref file)
+                  ", producer: \"CAAP\", isOptimized: false, "
+                  "runtimeVersion: 0, emissionKind: FullDebug)")))
+        )
+          (do
+            (set_ref (get dbg "file_id") file)
+            (set_ref (get dbg "cu_id") cu)
+            true))))))
+
+; emit_core — the all-stdlib backend. require_main distinguishes the two
+; entries: a HOSTED program needs `main` (its value becomes the process exit
+; code, widened to i32); a FREESTANDING module (an OS kernel) has its own
+; entry symbol (kmain/_start) and no exit-code contract — every function
+; lowers as declared, nothing is special-cased, and the object links
+; -ffreestanding -nostdlib.
+;   unit / require_main / debug_level -> {text: LLVM IR, diagnostics}
+; debug_level is "none" | "line-tables" | "full"; "none" (the default the
+; non-debug callers pass) is byte-identical to before.
+(bind emit_core
+  (lambda (unit require_main debug_level)
+    (bind (
+      (prog (prep_units unit))
+      (diags (program_diagnostics prog))
+      (fns (map_of))
+      (bodies (list_of))
+      (dbg (dbg_new debug_level))
+      (dbg_live (ref false))
+      (pstate (assoc (map_of)
+                "globals" (list_of) "n" (ref 0) "declares" (map_of)
+                "structs" (program_structs prog)
+                "unions" (program_unions prog)
+                "consts" (program_consts prog)
+                "global_cells" (map_of) "global_defs" (list_of)))
+      (structs (program_structs prog))
+    )
+      (do
+        (when (eq (size diags) 0)
+          (do
+            ; pass 0a: extern symbols -> call-table entries + `declare`
+            (for ext (program_externs prog)
+              (try
+                (bind (
+                  (sym (get ext "symbol"))
+                  (ptypes (list_of))
+                  (rt (ll_of (get ext "result") structs))
+                )
+                  (do
+                    (when (eq rt null)
+                      (throw (string_concat_many
+                        "native codegen: extern `" sym "` result type `"
+                        (get ext "result" "?") "` is not lowerable")))
+                    (for pr (get ext "params" (list_of))
+                      (bind ((lt_ (ll_of (get pr "type") structs)))
+                        (do
+                          (when (eq lt_ null)
+                            (throw (string_concat_many
+                              "native codegen: extern `" sym "` param type `"
+                              (get pr "type" "?") "` is not lowerable")))
+                          (append ptypes lt_))))
+                    (assoc fns sym
+                      (assoc (map_of)
+                        "name" sym "ptypes" ptypes "ctypes" (list_of)
+                        "result" rt "cresult" (get ext "result")))
+                    (assoc (get pstate "declares" (map_of))
+                      sym
+                      (string_concat_many
+                        "declare " (render_t rt) " @" sym "("
+                        (sequence_join
+                          (sequence_map ptypes (lambda (t) (render_t t)))
+                          ", ") ")"))))
+                (catch err (append diags (diag (value_to_string err))))))
+            ; pass 0b: program globals -> @name definition + a ref cell
+            (for g (program_globals prog)
+              (try
+                (bind (
+                  (gn (get g "name"))
+                  (lt_ (ll_of (get g "type") structs))
+                  (iv (get g "init"))
+                )
+                  (do
+                    (when (eq lt_ null)
+                      (throw (string_concat_many
+                        "native codegen: global `" gn "` type `"
+                        (get g "type" "?") "` is not lowerable")))
+                    (append (get pstate "global_defs")
+                      (string_concat_many
+                        "@" gn " = global " (render_t lt_) " "
+                        ; a pointer global: 0/null -> `null`, a fixed address ->
+                        ; an `inttoptr` constant (LLVM rejects a bare integer
+                        ; initialiser for a ptr). bools -> 0/1; an aggregate
+                        ; (struct) global -> `zeroinitializer` (its only literal
+                        ; init is 0, e.g. an empty `List<…>` head); else int.
+                        (cond
+                          ((eq lt_ "ptr")
+                            (if (or (eq iv null) (eq iv 0))
+                              "null"
+                              (string_concat_many
+                                "inttoptr (i64 " (int_to_string iv) " to ptr)")))
+                          ((not (eq (get structs (get g "type")) null)) "zeroinitializer")
+                          ((eq (value_type iv) "bool") (if iv "1" "0"))
+                          (else (int_to_string iv)))))
+                    (assoc (get pstate "global_cells" (map_of)) gn
+                      (assoc (map_of)
+                        "repr" (string_concat_many "@" gn) "type" "ptr"
+                        "elem" lt_ "elemct" (get g "type")
+                        ; ct = the element type (matching ptr_cell), so taking
+                        ; the cell as a value (`&global`) keeps its element type
+                        ; through a ref/deref.
+                        "ct" (get g "type")))))
+                (catch err (append diags (diag (value_to_string err))))))
+            ; pass 0c: global arrays -> @name = [N x T] zeroinitializer; the
+            ; name is a typed pointer to element 0 (decays like a C array)
+            (for ga (program_global_arrays prog)
+              (try
+                (bind (
+                  (gn (get ga "name"))
+                  (cnt (get ga "count"))
+                  (elem (get ga "elem"))
+                  (lt_ (ll_of elem structs))
+                )
+                  (do
+                    (when (or (eq cnt null) (not (eq (value_type cnt) "int")))
+                      (throw (string_concat_many
+                        "native codegen: global_array `" gn "` needs a literal length")))
+                    (when (le cnt 0)
+                      (throw (string_concat_many
+                        "native codegen: global_array `" gn "` length must be a positive integer")))
+                    (when (eq lt_ null)
+                      (throw (string_concat_many
+                        "native codegen: global_array `" gn "` element `"
+                        elem "` is not lowerable")))
+                    (append (get pstate "global_defs")
+                      (string_concat_many
+                        "@" gn " = global [" (int_to_string cnt) " x "
+                        (render_t lt_) "] zeroinitializer"))
+                    (assoc (get pstate "global_cells" (map_of)) gn
+                      (ptr_cell (string_concat_many "@" gn) elem structs))))
+                (catch err (append diags (diag (value_to_string err))))))
+            ; pass 1: the call table (typed signatures from the defn markers)
+            (for pair (program_pairs prog)
+              (try
+                (assoc fns (get pair "name")
+                       (fn_entry pair (get pstate "structs" (map_of))))
+                (catch err (append diags (diag (value_to_string err))))))
+            (when (and require_main (eq (get fns "main") null))
+              (append diags (diag "native codegen: no `main` function")))
+            ; debug info: build the fixed DWARF nodes (flags/CU/file) from the
+            ; program's source path. Degrades to no-debug (dbg_live false) when
+            ; there is no source path; never blocks the build.
+            (when (eq (size diags) 0)
+              (set_ref dbg_live
+                (di_init! dbg (first_source_path prog) diags)))
+            ; pass 2: lower each function (dbg inert unless dbg_live). The last
+            ; arg is the composite-type builder, supplied only under "full" (so
+            ; line-tables emit scalar basic types only).
+            (when (eq (size diags) 0)
+              (bind ((dbg2 (if (deref dbg_live) dbg (dbg_new "none")))
+                     (composite? (if (and (deref dbg_live) (get dbg "full?"))
+                                   di_composite! null)))
+                (for pair (program_pairs prog)
+                  (try
+                    (append bodies
+                      (emit_fn pair (get fns (get pair "name"))
+                               fns pstate dbg2 composite?))
+                    (catch err (append diags (diag (value_to_string err))))))))))
+        (assoc (map_of)
+          "text"
+          (if (eq (size diags) 0)
+            (bind ((parts (list_of "; generated by stdlib.backend.emit.llvm")))
+              (do
+                ; target policy: pin triple+datalayout for a cross build (a
+                ; Cortex-M ELF), or nothing at all for the host default
+                (when (not (eq (deref current_target) null))
+                  (do
+                    (append parts
+                      (string_concat_many "target datalayout = \""
+                        (get (deref current_target) "datalayout" "") "\""))
+                    (append parts
+                      (string_concat_many "target triple = \""
+                        (get (deref current_target) "triple" "") "\""))))
+                ; structs/declares maps iterate in INSERTION order (kernel
+                ; guarantee) — deterministic in source/codegen order, no sort
+                (for k (map_keys (get pstate "structs" (map_of)))
+                  (bind ((fts (list_of)))
+                    (do
+                      (for f (get (get pstate "structs" (map_of)) k (list_of))
+                        (append fts
+                          (render_t (ll_of (get f "type")
+                                           (get pstate "structs" (map_of))))))
+                      (append parts
+                        (string_concat_many
+                          "%" k " = type { " (sequence_join fts ", ") " }")))))
+                (for k (map_keys (get pstate "declares" (map_of)))
+                  (append parts
+                    (get (get pstate "declares" (map_of)) k "")))
+                (for g (get pstate "global_defs" (list_of)) (append parts g))
+                (for g (get pstate "globals" (list_of)) (append parts g))
+                (for b bodies (append parts b))
+                ; DWARF metadata block (only when debug info is live): the named
+                ; roots that wire it up, then every collected `!N = …` node.
+                ; clang -x ir preserves it into .debug_info — no -g needed.
+                (when (deref dbg_live)
+                  (bind ((flags (di_node! dbg
+                                  "!{i32 2, !\"Debug Info Version\", i32 3}")))
+                    (do
+                      (append parts
+                        (string_concat_many
+                          "!llvm.module.flags = !{" (di_ref flags) "}"))
+                      (append parts
+                        (string_concat_many
+                          "!llvm.dbg.cu = !{"
+                          (di_ref (deref (get dbg "cu_id"))) "}"))
+                      (for m (get dbg "meta" (list_of)) (append parts m)))))
+                (string_concat_many (sequence_join parts "\n\n") "\n")))
+            "")
+          "diagnostics" diags)))))
+
+; emit_program — hosted: requires `main`, its value is the i32 exit code. The
+; 1-arg form (the registered `stdlib.llvm.emit` value and the s2_emit EMITTER
+; path) defaults to NO debug info — byte-identical to before.
+(bind emit_program (lambda (unit) (emit_core unit true "none")))
+
+; emit_program_debug — the same, with an explicit debug level ("none" |
+; "line-tables" | "full"). The driver's debug build path calls THIS; "none"
+; reproduces emit_program exactly.
+(bind emit_program_debug
+  (lambda (unit debug_level) (emit_core unit true debug_level)))
+
+; emit_freestanding — an OS kernel object: no `main`, no exit-code contract.
+; Compile the text with `clang -ffreestanding -nostdlib -c`.
+(bind emit_freestanding (lambda (unit) (emit_core unit false "none")))
+
+; emit_freestanding_debug — freestanding with an explicit debug level.
+(bind emit_freestanding_debug
+  (lambda (unit debug_level) (emit_core unit false debug_level)))
+
+(export emit_fn emit_core emit_program emit_program_debug emit_freestanding
+        emit_freestanding_debug)

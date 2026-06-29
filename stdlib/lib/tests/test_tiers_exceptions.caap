@@ -1,0 +1,64 @@
+; stdlib/lib/tests/test_tiers_exceptions.caap — golden pin on the tier checker's
+; DOCUMENTED upward-edge allowlist (stdlib.semantics.passes.tiers/tier_exceptions).
+;
+; The cross-tier exceptions are the one place the layering invariant is bent on
+; purpose, so the set MUST stay small and reviewed. This test pins it: it asserts
+; the exported `tier_exceptions` set is EXACTLY this golden list (no more, no
+; fewer). Adding or removing an exception in tiers.caap without updating the
+; golden list below fails here — forcing a deliberate review of every inversion.
+
+;; @area: passes
+;; @kind: golden
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.tiers tier_exceptions)
+(use stdlib.lib.collections.sequence map contains? sort_by length all? join)
+
+(do
+  (bind (
+    ; the canonical key for an exception row: "src=>target_rank" (the same shape
+    ; tiers.caap folds into its lookup set, so this mirrors the live logic).
+    (key (lambda (row)
+      (string_concat_many (get row "src") "=>"
+        (int_to_string (get row "target_rank")))))
+    ; the GOLDEN set — every sanctioned upward edge, spelled out. Keep this in
+    ; sync with `tier_exceptions` in stdlib/semantics/passes/tiers.caap; a drift
+    ; in either direction is caught below.
+    (golden (list_of
+      "stdlib.analyze=>2"                 ; tier-0 analyze service -> syntax/lib (rank 2)
+      "stdlib.semantics.passes.derive=>4")) ; derive -> type registry (same-tier no-op, retained)
+    (actual (map tier_exceptions key))
+  )
+    (do
+      ; ── exact size: no exception silently appears or vanishes ──
+      (assert_eq (length actual) (length golden)
+        "tier_exceptions count matches the golden allowlist")
+
+      ; ── every golden edge is still sanctioned (none removed) ──
+      (assert_true (contains? actual "stdlib.analyze=>2")
+        "analyze -> syntax/lib (rank 2) exception is present")
+      (assert_true (contains? actual "stdlib.semantics.passes.derive=>4")
+        "derive -> types (rank 4) exception is present")
+
+      ; ── set equality both ways: actual ⊆ golden AND golden ⊆ actual, so a NEW
+      ; unreviewed exception (extra in `actual`) is rejected too ──
+      (assert_true
+        (all? actual (lambda (k) (contains? golden k)))
+        "no exception exists outside the golden allowlist")
+      (assert_true
+        (all? golden (lambda (k) (contains? actual k)))
+        "every golden allowlist entry is still in tier_exceptions")
+
+      ; ── each row is self-documenting: a non-empty `why` travels with the data ──
+      (assert_true
+        (all? tier_exceptions
+          (lambda (row) (gt (size (get row "why" "")) 0)))
+        "every tier_exceptions row carries a non-empty `why` justification")
+
+      ; ── ONE whole-set assertion: sort both key lists and compare them as a
+      ; single joined STRING (assert_eq is reference-equality for lists, so we
+      ; reduce to a scalar). This pins ORDER-independent content exactly — any
+      ; added, removed, or altered exception changes this string. ──
+      (assert_eq (join (sort_by actual (lambda (k) k)) "|")
+                 (join (sort_by golden (lambda (k) k)) "|")
+        "tier_exceptions key set equals the golden allowlist exactly"))))

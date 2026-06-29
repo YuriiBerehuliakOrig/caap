@@ -1,0 +1,462 @@
+; stdlib/semantics/passes/dead_store.caap — dead-STORE elimination as a whole-
+; module TRANSFORM (module stdlib.semantics.passes.dead_store).
+;
+; The store-level companion to dce's binding-level removal. Where dce drops a dead
+; `(bind …)`, this drops a dead `(set_ref r v)`: a write whose value is overwritten
+; by a LATER write to the same ref before anything reads it.
+;
+; ── PROVABLY-SOUND BY CONSTRUCTION: the straight-line case only ───────────────
+; Prior rounds tried to make a NAME-granular alias/liveness analysis sound by
+; stacking guards (simple/fresh/live_out/in-block scan). Adversarial verification
+; kept finding MISCOMPILES — value-flow aliases that slip the fresh guard, and
+; cross-block / lexical-SHADOWING liveness where a store live across a control-flow
+; edge (read on another if-arm, after a loop, or via an inner `(bind "r" …)` shadow
+; of a different cell) was wrongly removed. Block-granular liveness conflates a
+; name across distinct cells and across control flow, and no amount of refinement
+; closed every hole.
+;
+; So we DO NOT chase a perfect alias/liveness analysis. We restrict removal to the
+; textbook STRAIGHT-LINE case where neither aliasing nor any cross-block / control-
+; flow subtlety can arise — because there IS no control flow, no shadowing, and no
+; aliasing in the only shape we ever act on. A `(set_ref r v)` is removed ONLY when
+; ALL of the following hold:
+;
+;  1. STRAIGHT-LINE, SINGLE-BLOCK BODY. The store's enclosing body is ONE flat
+;     `(do s1 s2 … sn)` whose statements contain NO control flow: none of them is
+;     or contains `if`/`while`/`try`/`catch`/`match`/`lambda`/`bind`. A `bind`
+;     anywhere in the block is rejected too — that is the lexical-SHADOWING /
+;     nested-scope case (an inner `(bind "r" (ref …) …)` is a DIFFERENT cell), the
+;     exact shape every shadowing miscompile took. If the body is not such a flat
+;     straight-line `(do …)`, we remove NOTHING from it.
+;
+;  2. FRESH, NON-ALIASED LOCAL DESTINATION. `r` is bound by a DIRECTLY-ENCLOSING
+;     `(bind "r" (ref V) …)` whose body is this `(do …)`; it is a brand-new cell,
+;     not derived from any other value. And r stays `simple` (every occurrence of
+;     the name r in the body is a `(set_ref r …)` dest or a `(deref r)` arg, never
+;     aliased / passed / captured) AND `fresh` (every binding of r in the body is a
+;     literal `(ref V)`). These keep the long-standing alias/escape guards as
+;     defense-in-depth; with no control flow or shadowing in the block they can no
+;     longer be circumvented.
+;
+;  3. PURE & TOTAL VALUE. `v` is `pure_value?` — provably side-effect free AND
+;     total (cannot throw on ANY input/arity). The whitelist (`total_pure_heads`)
+;     is intentionally TINY: only `eq`/`ne`/`list_of` (plus literals and lambdas)
+;     are total on every input and every arity. Deleting a store whose value could
+;     throw or has an effect would suppress a throw / drop an effect — a miscompile.
+;
+;  4. KILLED IN-BLOCK BEFORE ANY READ. A LATER statement in the SAME flat `(do …)`
+;     is a `(set_ref r …)` whose value does not read r, and NO statement between
+;     this store and that killing write reads r in any way (`(deref r)` or any
+;     other occurrence). So nothing observes the value this store wrote.
+;
+;  5. NOT THE RESULT. The store is NOT the last statement of the `(do …)` —
+;     `set_ref` returns its written value, so dropping the final statement would
+;     change the block's result.
+;
+; Because the only shape we act on has no control flow, no nested scope (shadowing),
+; and no aliasing, the textbook "killed by a later store before any read" test is
+; exact here: there is no edge, arm, back-edge, handler, or shadow cell for the
+; killed value to leak across. Conservative on every ambiguity: a missed drop,
+; never a miscompile.
+;
+; SOUND BY CONSTRUCTION, opt-in (registered at -O3 via boot/opt.caap; not in the base
+; pipeline). It hardened over adversarial-verification rounds (fresh-allocation
+; requirement, try/catch bail, overflow-aware purity whitelist, the straight-line-`(do …)`
+; restriction, and the fix so `simple_refs`/`walk_simple` recurses into a COMPLEX arg0 of
+; a `deref`/`set_ref` — only a BARE NAME is a safe slot — so a ref aliased through e.g.
+; `(deref (cap r))` or read inside a complex `(set_ref <expr> …)` destination is tainted,
+; not skipped). A final 9-skeptic adversarial pass reproduced ZERO miscompiles. Soundness
+; rests on acting ONLY on the textbook straight-line `(do …)` shape (no control flow, no
+; nested scope, no aliasing) with a fresh non-escaping local and a pure+total value — so
+; the killed-before-read test is exact. CONSERVATIVE: a missed drop, never a miscompile. A
+; flow/alias-sensitive dead-store across control flow wants a real escape analysis / SSA.
+(module stdlib.semantics.passes.dead_store)
+
+(use stdlib.syntax.ast
+  call? name? literal? head_of head_is? args_of arg name_of sym lit call callee
+  bind_pairs)
+(use stdlib.lib.collections.sequence any?)
+(use stdlib.semantics.passes.registry install_transform!)
+
+; ── purity: what value is safe to delete along with its statement ────────────
+; total_pure_heads — heads that are pure (no effect) AND total (never throw on
+; ANY input — including ILL-TYPED args), so deleting a store whose value is built
+; from them drops no effect AND suppresses no error. This whitelist is the
+; soundness boundary, and the bar is TOTAL ON EVERY INPUT, not merely total on
+; well-typed input. CAAP is dynamically typed and most arithmetic/string/bitwise
+; primitives THROW on a type mismatch (or on overflow / out-of-range / odd arity),
+; so they are PARTIAL and a store of their value must NOT be silently dropped.
+; Empirically (each verified against the binary):
+;   - int_add/int_sub/int_mul/int_neg  THROW on i64 overflow                -> OUT
+;   - int_div/int_mod/int_shl/int_shr  THROW on /0, neg/oversized shift     -> OUT
+;   - int_and/int_or/int_xor/int_not   THROW on a non-int arg               -> OUT
+;   - lt/gt/le/ge                      THROW on a type mismatch             -> OUT
+;   - string_concat[_many]/int_to_string/string_* queries/slice/chars
+;                                      THROW on a non-string / bad range     -> OUT
+;   - map_of                           THROWS on odd (unpaired) arity        -> OUT
+;   - not                              THROWS on arity 0 or ≥2 (only 1 ok)   -> OUT
+; The ONLY heads total on every input AND every arity are eq / ne (structural —
+; return false on a type mismatch, total at arity 0/1/3+) and list_of (a variadic
+; constructor that never validates). Literals and lambdas (handled in `pure_total?`
+; directly) are likewise total. Everything else is kept (its store survives) — a
+; missed optimization, never a miscompile.
+(bind total_pure_heads
+  (bind ((m (map_of)))
+    (do
+      (for h (list_of "eq" "ne" "list_of")
+        (assoc m h true))
+      m)))
+
+; pure_total? — evaluating `node` has no effect and cannot throw, so a store of
+; it can be deleted when its destination is dead. A LITERAL and a LAMBDA-definition
+; are effect-free and total. A bare NAME is NOT total: reading an unbound name
+; THROWS (`unknown name`), and this syntactic pass cannot prove the name is in
+; scope — removing `(set_ref r ghost)` when `ghost` is free would turn a THROW into
+; a value, a miscompile. So a name is conservatively non-total (keep the store). A
+; call is OK only when its head is whitelisted and EVERY argument is itself
+; pure_total (so a buried effect/throw is never missed).
+(bind pure_total?
+  (lambda (self node)
+    (cond
+      ((literal? node) true)
+      ((not (call? node)) false)                    ; bare name: read may throw -> KEEP
+      ((head_is? node "lambda") true)               ; defining a lambda: effect-free
+      ((eq (get total_pure_heads (head_of node) false) true)
+        (not (any? (args_of node) (lambda (a) (not (self self a))))))
+      (else false))))
+(bind pure_value? (lambda (node) (pure_total? pure_total? node)))
+
+; ── alias/escape guard: which ref NAMES are safe to optimize ─────────────────
+; Name-based reasoning is blind to ref ALIASING (two names, one cell) and to
+; lambda CAPTURE (a deferred read through a captured name). `simple_refs` walks
+; the body ONCE and returns the set of names whose EVERY occurrence is a safe,
+; flow-visible ref access — the destination of a `(set_ref NAME …)` or the
+; argument of a `(deref NAME)` — and which never appear inside a lambda. Any
+; other occurrence taints the name (it may alias or be captured), and a tainted
+; name's stores are never removed. A name is "simple" iff it is SEEN and never
+; tainted.
+;
+; Implementation: a tree walk carrying `in_lambda?`. `seen`/`tainted` are name->
+; true maps. At a name node: inside a lambda -> taint; else the parent decides
+; whether this occurrence was a safe slot (set_ref-dest / deref-arg, handled by
+; the call cases) — a name reached here in any OTHER position is a bare use ->
+; taint. The call cases consume their safe-slot child WITHOUT walking it as a
+; bare name, recursing into the remaining children normally.
+(bind walk_simple
+  (lambda (self node seen tainted in_lambda)
+    (cond
+      ((name? node)
+        ; Reaching a name node means a BARE occurrence in a non-slot position: the
+        ; set_ref/deref cases consume their arg0 DEST without recursing into it, so
+        ; recursion only lands here for else-call args, a set_ref/deref VALUE, or a
+        ; lambda body — every one an alias/escape/capture. Taint unconditionally
+        ; (the `in_lambda` capture case is a strict subset of this). A name used
+        ; ONLY as a safe slot never reaches here, so simple refs stay simple.
+        (bind ((nm (name_of node)))
+          (when (not (eq nm null))
+            (do
+              (assoc seen nm true)
+              (assoc tainted nm true)))))
+      ((not (call? node)) null)
+      ((head_is? node "lambda")
+        ; descend into the lambda BODY with in_lambda = true; the param tuple is a
+        ; literal (no name nodes). Any ref name read/written inside is tainted.
+        (for a (args_of node) (self self a seen tainted true)))
+      ((head_is? node "set_ref")
+        ; (set_ref DEST v): arg0 is a safe write SLOT only when it is a BARE NAME —
+        ; record it as seen (so a write-only ref still counts as simple) but do NOT
+        ; taint it. A COMPLEX arg0 (e.g. `(set_ref (cap r) …)`, `(set_ref (do …
+        ; (deref r) …) …)`) is NOT a safe slot: it is an ARBITRARY expression
+        ; evaluated here, so a ref name reached through it may alias/escape (`(cap r)`
+        ; stashing the cell) OR be read in a place the straight-line read-detection
+        ; cannot see (a `(deref r)` buried in the dest). We therefore recurse into a
+        ; complex arg0 in ESCAPING mode (`true`), which taints EVERY ref name reachable
+        ; through it — even one in an inner safe slot — so its store is never removed.
+        ; Then recurse into the VALUE normally.
+        (do
+          (bind ((d (arg node 0)))
+            (when (not (eq d null))
+              (if (and (name? d) (not (eq (name_of d) null)))
+                (do
+                  (assoc seen (name_of d) true)
+                  (when in_lambda (assoc tainted (name_of d) true)))
+                (self self d seen tainted true))))
+          (bind ((v (arg node 1)))
+            (when (not (eq v null)) (self self v seen tainted in_lambda)))))
+      ((head_is? node "deref")
+        ; (deref DEST): arg0 is a safe read SLOT only when it is a BARE NAME — same
+        ; treatment as set_ref's dest. A COMPLEX arg0 (e.g. `(deref (cap r))`) is NOT
+        ; a safe slot: recurse into it in ESCAPING mode (`true`) so EVERY ref name
+        ; reachable through it gets tainted (a nested alias/escape can never be trusted).
+        (do
+          (bind ((d (arg node 0)))
+            (when (not (eq d null))
+              (if (and (name? d) (not (eq (name_of d) null)))
+                (do
+                  (assoc seen (name_of d) true)
+                  (when in_lambda (assoc tainted (name_of d) true)))
+                (self self d seen tainted true))))
+          ; deref has exactly one arg, but recurse defensively into any extras
+          (bind ((extra (sequence_range 1 (size (args_of node)))))
+            (for j extra (self self (get (args_of node) j) seen tainted in_lambda)))))
+      (else
+        ; any other call: the callee and every argument are ordinary positions —
+        ; a bare ref name appearing here may alias/escape, so recurse normally
+        ; (which taints it via the name-node case when in a non-slot position).
+        (do
+          (self self (callee node) seen tainted in_lambda)
+          (for a (args_of node) (self self a seen tainted in_lambda)))))))
+
+; simple_refs — the set of ref names safe to optimize in `body` (seen, untainted).
+(bind simple_refs
+  (lambda (body)
+    (bind ((seen (map_of)) (tainted (map_of)) (out (map_of)))
+      (do
+        (walk_simple walk_simple body seen tainted false)
+        (for nm (map_keys seen)
+          (when (not (eq (get tainted nm false) true)) (assoc out nm true)))
+        out))))
+
+; ── fresh-allocation guard: which ref NAMES hold a FRESHLY-ALLOCATED cell ─────
+; `simple_refs` is purely SYNTACTIC: it taints a name only when the NAME `r`
+; textually appears outside a safe slot or inside a lambda. It is BLIND to
+; VALUE-FLOW aliasing — a fresh name `r` bound to an expression that EVALUATES to
+; a pre-existing cell, e.g. `(bind "r" (deref outer) …)`, `(bind "r" (id c) …)`,
+; `(bind "r" (get m "k") …)`, `(bind "r" (getcell) …)`. There `r` appears only as
+; a `(set_ref r …)` dest, so it stays "simple", yet `r` and the original handle
+; denote the SAME runtime cell. `fresh_ref_names` is the sound under-approximation
+; that closes this: a name is FRESH only when EVERY binding of it in the body is a
+; DIRECT `(bind "r" (ref V) …)` literal allocation. We require a store's dest to be
+; BOTH simple AND fresh before removing it.
+;
+; Implementation: a tree walk. For each `bind` form, classify every pair's value:
+;   value is `(ref …)`  -> mark the name in `is_ref`
+;   value is anything else -> mark the name in `not_ref` (a possibly-aliasing bind)
+; fresh = is_ref names that are never in not_ref. We descend into pair VALUES and
+; the body so nested binds are covered too.
+(bind walk_fresh
+  (lambda (self node is_ref not_ref)
+    (cond
+      ((not (call? node)) null)
+      ((not (eq (bind_pairs node) null))
+        (bind ((bp (bind_pairs node)))
+          (do
+            (for p (get bp "pairs")
+              (bind ((nm (get p "name")) (v (get p "value")))
+                (do
+                  (if (and (call? v) (head_is? v "ref"))
+                    (assoc is_ref nm true)
+                    (assoc not_ref nm true))
+                  ; recurse into the bound value (it may itself contain binds)
+                  (when (not (eq v null)) (self self v is_ref not_ref)))))
+            (for b (get bp "body") (self self b is_ref not_ref)))))
+      ; flat name-node bind `(bind <name-node> v …)` — taint the binder name as
+      ; NOT a fresh allocation, then recurse into the value + remaining body forms.
+      ((and (head_is? node "bind")
+            (not (eq (arg node 0) null)) (name? (arg node 0))
+            (not (eq (name_of (arg node 0)) null)))
+        (do
+          (assoc not_ref (name_of (arg node 0)) true)
+          (bind ((rest (sequence_range 1 (size (args_of node)))))
+            (for j rest (self self (get (args_of node) j) is_ref not_ref)))))
+      (else
+        (do
+          (self self (callee node) is_ref not_ref)
+          (for a (args_of node) (self self a is_ref not_ref)))))))
+
+; fresh_ref_names — names whose EVERY binding in `body` is a literal `(ref …)`.
+(bind fresh_ref_names
+  (lambda (body)
+    (bind ((is_ref (map_of)) (not_ref (map_of)) (out (map_of)))
+      (do
+        (walk_fresh walk_fresh body is_ref not_ref)
+        (for nm (map_keys is_ref)
+          (when (not (eq (get not_ref nm false) true)) (assoc out nm true)))
+        out))))
+
+; ── straight-line guard: the whole soundness of the restricted pass ──────────
+; control_heads — the constructs whose presence in a statement block make it NOT
+; straight-line. `if`/`while`/`match` introduce control-flow edges (a store may be
+; read on another arm, after a loop, across a back-edge). `try`/`catch` add
+; exception edges the analysis never sees. `lambda` defers a read through a closure
+; capture. `bind` opens a NESTED SCOPE — an inner `(bind "r" …)` SHADOWS the name
+; with a DISTINCT cell, the exact shape of every shadowing miscompile. If a `(do …)`
+; block contains ANY of these (at any depth), we decline to touch it entirely.
+(bind control_heads
+  (bind ((m (map_of)))
+    (do
+      (for h (list_of "if" "while" "match" "try" "catch" "lambda" "bind")
+        (assoc m h true))
+      m)))
+
+; has_control? — does `node` contain (it or any descendant) a control-flow /
+; nested-scope construct from `control_heads`? A straight-line block has none.
+(bind has_control?
+  (lambda (self node)
+    (cond
+      ((not (call? node)) false)
+      ((eq (get control_heads (head_of node) false) true) true)
+      ((self self (callee node)) true)
+      (else (any? (args_of node) (lambda (a) (self self a)))))))
+
+; straight_line_do? — is `node` a flat single-block `(do s1 … sn)` with NO control
+; flow / nested scope anywhere inside? This is the ONLY body shape removal acts on.
+(bind straight_line_do?
+  (lambda (node)
+    (and (call? node) (head_is? node "do")
+         (not (has_control? has_control? node)))))
+
+; ── read detection inside a straight-line block ──────────────────────────────
+; reads_ref? — does `node` READ the ref name `r` anywhere? In a straight-line,
+; `simple` block every occurrence of r is either a `(set_ref r …)` DEST (a write,
+; not a read) or a `(deref r)` arg (a read). We conservatively count ANY occurrence
+; of the name r as a read EXCEPT the immediate destination slot of a `(set_ref r …)`
+; — that one is a write. (We still descend into a set_ref's VALUE, because the value
+; may read r.) Any bare name r in any other position counts as a read. Conservative:
+; if unsure, treat it as a read and keep the store.
+(bind reads_ref?
+  (lambda (self node r)
+    (cond
+      ((name? node) (eq (name_of node) r))
+      ((not (call? node)) false)
+      ((head_is? node "set_ref")
+        ; the DEST (arg 0) is a write slot, not a read; the VALUE (arg 1) may read r.
+        (bind ((v (arg node 1)))
+          (and (not (eq v null)) (self self v r))))
+      (else
+        (or (self self (callee node) r)
+            (any? (args_of node) (lambda (a) (self self a r))))))))
+
+; set_ref_to? — is `st` a `(set_ref r …)` writing the ref named `r`?
+(bind set_ref_to?
+  (lambda (st r)
+    (and (call? st) (head_is? st "set_ref")
+         (not (eq (arg st 0) null)) (name? (arg st 0))
+         (eq (name_of (arg st 0)) r))))
+
+; killed_before_read? — within the flat statement list `stmts`, scanning forward
+; from index `start` (the statement AFTER the candidate store), is the candidate
+; store to ref `r` KILLED by a later `(set_ref r …)` whose value does NOT read r,
+; with NO read of r in any statement between? Returns true only when such a killing
+; write is found before any read. (set_ref evaluates its value THEN writes, so a
+; killing write whose value reads r is NOT a kill — that read sees our value.)
+(bind killed_before_read?
+  (lambda (stmts start r)
+    (bind ((verdict (ref "scan")) (j (ref start)) (n (size stmts)))
+      (do
+        (while (and (eq (deref verdict) "scan") (lt (deref j) n))
+          (bind ((s (get stmts (deref j))))
+            (do
+              (if (set_ref_to? s r)
+                ; a write to r. If its VALUE reads r first, our store is LIVE.
+                (if (reads_ref? reads_ref? (arg s 1) r)
+                  (set_ref verdict "live")     ; killing write reads r -> live
+                  (set_ref verdict "killed"))  ; clean overwrite of r -> dead
+                ; not a write to r: any read of r here keeps our store alive.
+                (when (reads_ref? reads_ref? s r) (set_ref verdict "live")))
+              (set_ref j (int_add (deref j) 1)))))
+        (eq (deref verdict) "killed")))))
+
+; ── the rewrite ──────────────────────────────────────────────────────────────
+; rewrite_do — given the statement list of a straight-line `(do …)` and the set
+; `cands` of ref names that are removal candidates (directly-enclosing-bind-fresh,
+; simple, fresh), drop every NON-FINAL `(set_ref r v)` whose value is pure_total
+; and which is killed before any read by a later in-block write to r. Recurse into
+; each surviving statement via `rec` (so a dead store in a deeper straight-line bind
+; stays reachable — though a straight-line block has no inner binds, recursion is
+; harmless and keeps the walk uniform).
+(bind rewrite_do
+  (lambda (rec stmts cands)
+    (bind ((out (list_of)) (n (size stmts)))
+      (do
+        (for k (sequence_range 0 n)
+          (bind ((s (get stmts k)) (last? (eq k (int_sub n 1))))
+            (if (and (not last?) (call? s) (head_is? s "set_ref")
+                     (not (eq (arg s 0) null)) (name? (arg s 0))
+                     (eq (get cands (name_of (arg s 0)) false) true)
+                     (not (eq (arg s 1) null)) (pure_value? (arg s 1))
+                     (killed_before_read? stmts (int_add k 1) (name_of (arg s 0))))
+              null                                   ; drop a dead, killed store
+              (append out (rec s)))))
+        out))))
+
+; rewrite_tree — structural walk. At each canonical bind whose SINGLE body form is
+; a STRAIGHT-LINE `(do …)`, the removal candidates are the bind's own pairs bound
+; to a literal `(ref …)` AND that are simple AND fresh over the whole body — those
+; are the directly-enclosing freshly-allocated locals. We filter dead stores from
+; that `(do …)`, then rebuild. Everywhere else we just recurse (never removing),
+; so nested binds are reached, but a store is only ever dropped in the provably-
+; sound straight-line shape. `simple`/`fresh` are the alias/escape sets over the
+; TOP body (computed once); we intersect with the directly-enclosing fresh binders.
+(bind rewrite_tree
+  (lambda (self simple fresh node)
+    (cond
+      ((not (call? node)) node)
+      ; canonical bind: recurse into pair values; if its body is exactly one
+      ; straight-line (do …), filter that do for this bind's fresh-ref locals.
+      ((not (eq (bind_pairs node) null))
+        (bind ((bp (bind_pairs node)) (parts (list_of)) (body (get bp "body")))
+          (do
+            ; rebuild the pairs (recurse into each value)
+            (for p (get bp "pairs")
+              (do
+                (append parts (lit (get p "name")))
+                (append parts (self self simple fresh (get p "value")))))
+            ; the body: a single straight-line (do …) is the removal site.
+            (if (and (eq (size body) 1) (straight_line_do? (get body 0)))
+              (bind (
+                (the_do (get body 0))
+                ; candidates: pair names bound to a literal (ref …) here, AND
+                ; simple over the body, AND fresh over the body.
+                (cands (map_of))
+              )
+                (do
+                  (for p (get bp "pairs")
+                    (bind ((nm (get p "name")) (v (get p "value")))
+                      (when (and (call? v) (head_is? v "ref")
+                                 (eq (get simple nm false) true)
+                                 (eq (get fresh nm false) true))
+                        (assoc cands nm true))))
+                  (append parts
+                    (call (sym "do")
+                      (rewrite_do (lambda (s) (self self simple fresh s))
+                        (args_of the_do) cands)))))
+              ; not a straight-line do body: recurse without removing anything.
+              (for b body (append parts (self self simple fresh b))))
+            (call (sym "bind") parts))))
+      ; any other call: recurse into callee + args, removing nothing here.
+      (else
+        (bind ((out (list_of)))
+          (do
+            (for a (args_of node) (append out (self self simple fresh a)))
+            (call (self self simple fresh (callee node)) out)))))))
+
+; dead_store_node — remove dead stores from ONE body form. We compute the alias/
+; escape sets (`simple`, `fresh`) over the whole body ONCE, then structurally walk
+; it: at every directly-enclosing `(bind "r" (ref V) …)` whose body is a single
+; straight-line `(do …)`, we drop the pure, killed, non-final stores to its fresh
+; locals. If a body is not such a shape, NOTHING is removed from it. No control flow,
+; no nested scope (shadowing), and no aliasing exists in the only shape we act on,
+; so the result is provably behavior-preserving.
+(bind dead_store_node
+  (lambda (node)
+    (bind (
+      (simple (simple_refs node))
+      (fresh (fresh_ref_names node))
+    )
+      (rewrite_tree rewrite_tree simple fresh node))))
+
+; ── transform-pass plumbing (mirrors dce / constfold) ────────────────────────
+
+; run — the transform entry: rewrite every located form IN PLACE.
+(bind run
+  (lambda (located)
+    (for f located
+      (assoc f "node" (dead_store_node (get f "node"))))))
+
+; register! — install dead-store elimination as a load-time TRANSFORM.
+(bind register! (lambda () (install_transform! "dead_store" run)))
+
+; simple_refs + fresh_ref_names are the reusable promotability/escape primitives —
+; semantics/ssa.caap reuses them to decide which ref-cells may become SSA values.
+(export pure_value? dead_store_node run register! simple_refs fresh_ref_names)

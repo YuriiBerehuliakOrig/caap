@@ -1,0 +1,61 @@
+; stdlib/semantics/passes/ur_fastpath.caap — FAST-PATH / unconditional-block pass
+; (module stdlib.semantics.passes.ur_fastpath).
+;
+; A blocking service parks the caller ONLY when the resource is unavailable: the
+; suspend sits on the "else" of a `if resource-available { take it } else { block }`.
+; A _ur_thread_suspend_timed reached UNCONDITIONALLY — at conditional-depth 0, not
+; guarded by any branch — means the service blocks even when it could have
+; succeeded: a self-deadlock (a thread parks with the resource sitting right there,
+; and may never be woken). It is the kind of error a refactor introduces by hoisting
+; a suspend out of its guarding `if`. This pass makes "suspend only off the fast
+; path" a STATIC, build-time invariant.
+;
+; Model: walk each body tracking CONDITIONAL nesting depth — any branching form
+; (if / cond / match / when / unless / while) raises the depth for its children. A
+; _ur_thread_suspend_timed seen at depth 0 is flagged. `ur_thread_sleep` is exempt:
+; a tick delay legitimately ALWAYS parks (there is no resource to test).
+(module stdlib.semantics.passes.ur_fastpath)
+
+(use stdlib.syntax.ast call? head_of args_of walk)
+(use stdlib.semantics.passes.monomorph decode_defn)
+(use stdlib.semantics.passes.registry install_pass! note!)
+
+(bind suspend_head "_ur_thread_suspend_timed")
+
+; any form that introduces a conditional/looping context for its children.
+(bind conditional?
+  (lambda (h)
+    (or (eq h "if")
+        (or (eq h "cond")
+            (or (eq h "match")
+                (or (eq h "when")
+                    (or (eq h "unless") (eq h "while"))))))))
+
+; fp_walk — recurse, emitting a finding for a suspend at conditional-depth 0.
+; `self` is passed in for recursion (the pass language has no letrec).
+(bind fp_walk
+  (lambda (self node depth sink fname)
+    (when (call? node)
+      (bind ((h (head_of node)) (as (args_of node)))
+        (do
+          (when (and (eq h suspend_head) (le depth 0))
+            (note! sink "ur-fastpath" node
+              (string_concat_many "`" fname "` parks a thread unconditionally "
+                "(_ur_thread_suspend_timed at conditional-depth 0) — a blocking call must "
+                "sit on the resource-unavailable branch, never the fast path (self-deadlock)")))
+          (bind ((nd (if (conditional? h) (int_add depth 1) depth)))
+            (for a as (self self a nd sink fname))))))))
+
+(bind run
+  (lambda (located sink)
+    (for f located
+      (bind ((d (decode_defn (get f "node")))
+             (val (if (eq d null) null (get d "value")))
+             (nm (if (eq d null) "" (get d "name"))))
+        (when (and (not (eq val null)) (and (call? val) (not (eq nm "ur_thread_sleep"))))
+          (for a (args_of val) (fp_walk fp_walk a 0 sink nm)))))))
+
+(bind register!
+  (lambda () (install_pass! "ur-fastpath" (lambda (located sink) (run located sink)))))
+
+(export run register!)

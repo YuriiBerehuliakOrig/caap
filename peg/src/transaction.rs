@@ -1,6 +1,11 @@
+//! Transactional grammar editing (the `transaction` feature): apply a sequence
+//! of mutations to a working copy, then [`commit`](GrammarTransaction::commit)
+//! (validate + seal) or [`rollback`](GrammarTransaction::rollback) atomically.
+
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::error::ParseError;
 use crate::grammar::Grammar;
 use crate::mutation::{diff_grammars, GrammarDiff, MutationOutcome};
 use crate::validation::{validate_grammar, ValidationReport};
@@ -8,17 +13,32 @@ use crate::validation::{validate_grammar, ValidationReport};
 // ── Error ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+/// Why a transaction operation failed.
 pub enum TransactionError {
     #[error("transaction is already {0}; no further operations are allowed")]
+    /// The transaction was already committed or rolled back.
     AlreadyFinalized(String),
     #[error("grammar validation failed: {0}")]
+    /// Validation failed on commit.
     ValidationFailed(String),
     #[error("rule not found: {0}")]
+    /// A referenced rule does not exist.
     RuleNotFound(String),
     #[error("duplicate rule: {0}")]
+    /// A rule with that name already exists.
     DuplicateRule(String),
     #[error("cannot remove start rule: {0}")]
+    /// Attempted to remove the current start rule.
     ProtectedStartRule(String),
+    #[error("invalid rule source: {0}")]
+    /// Rule source failed to parse.
+    InvalidRuleSource(ParseError),
+    #[error("grammar version overflow: {0}")]
+    /// The grammar version counter overflowed.
+    VersionOverflow(ParseError),
+    #[error("transaction operation index overflow")]
+    /// The operation-log index overflowed.
+    OperationIndexOverflow,
 }
 
 // ── Operation log ──────────────────────────────────────────────────────────
@@ -26,8 +46,11 @@ pub enum TransactionError {
 /// A single mutation recorded in the transaction operation log.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransactionOp {
+    /// Sequential index in the operation log.
     pub index: usize,
+    /// The operation name.
     pub name: String,
+    /// String-rendered operation arguments.
     pub args: Vec<String>,
 }
 
@@ -89,18 +112,22 @@ impl GrammarTransaction {
         }
     }
 
+    /// Whether the transaction is still open.
     pub fn is_open(&self) -> bool {
         self.state == TxState::Open
     }
 
+    /// Whether the transaction was committed.
     pub fn is_committed(&self) -> bool {
         self.state == TxState::Committed
     }
 
+    /// Whether the transaction was rolled back.
     pub fn is_rolled_back(&self) -> bool {
         self.state == TxState::RolledBack
     }
 
+    /// The transaction state as a string.
     pub fn state_str(&self) -> &'static str {
         self.state.as_str()
     }
@@ -140,8 +167,15 @@ impl GrammarTransaction {
         if self.working.get_rule(name).is_some() {
             return Err(TransactionError::DuplicateRule(name.to_string()));
         }
-        self.working.set_rule(name, source);
-        self.record_op("add_rule", vec![name.to_string(), source.to_string()]);
+        let op_index = self.next_op_index()?;
+        self.working
+            .try_set_rule(name, source)
+            .map_err(grammar_mutation_error)?;
+        self.record_op_at(
+            op_index,
+            "add_rule",
+            vec![name.to_string(), source.to_string()],
+        );
         Ok(())
     }
 
@@ -151,8 +185,15 @@ impl GrammarTransaction {
         if self.working.get_rule(name).is_none() {
             return Err(TransactionError::RuleNotFound(name.to_string()));
         }
-        self.working.set_rule(name, source);
-        self.record_op("replace_rule", vec![name.to_string(), source.to_string()]);
+        let op_index = self.next_op_index()?;
+        self.working
+            .try_set_rule(name, source)
+            .map_err(grammar_mutation_error)?;
+        self.record_op_at(
+            op_index,
+            "replace_rule",
+            vec![name.to_string(), source.to_string()],
+        );
         Ok(())
     }
 
@@ -165,8 +206,11 @@ impl GrammarTransaction {
         if name == self.working.start_rule {
             return Err(TransactionError::ProtectedStartRule(name.to_string()));
         }
-        self.working.remove_rule(name);
-        self.record_op("remove_rule", vec![name.to_string()]);
+        let op_index = self.next_op_index()?;
+        self.working
+            .try_remove_rule(name)
+            .map_err(TransactionError::VersionOverflow)?;
+        self.record_op_at(op_index, "remove_rule", vec![name.to_string()]);
         Ok(())
     }
 
@@ -176,8 +220,13 @@ impl GrammarTransaction {
         if self.working.get_rule(name).is_none() {
             return Err(TransactionError::RuleNotFound(name.to_string()));
         }
+        let op_index = self.next_op_index()?;
+        self.working
+            .bump_version()
+            .map_err(TransactionError::VersionOverflow)?;
         self.working.start_rule = name.to_string();
-        self.record_op("set_start", vec![name.to_string()]);
+        self.working.clear_analysis_cache();
+        self.record_op_at(op_index, "set_start", vec![name.to_string()]);
         Ok(())
     }
 
@@ -189,8 +238,12 @@ impl GrammarTransaction {
         value: Value,
     ) -> Result<(), TransactionError> {
         self.ensure_open()?;
-        self.working.set_metadata_value(owner, key, value);
-        self.record_op(
+        let op_index = self.next_op_index()?;
+        self.working
+            .try_set_metadata_value(owner, key, value)
+            .map_err(TransactionError::VersionOverflow)?;
+        self.record_op_at(
+            op_index,
             "set_metadata_value",
             vec![owner.to_string(), key.to_string()],
         );
@@ -213,29 +266,16 @@ impl GrammarTransaction {
             }
         }
         let diff = diff_grammars(&self.base, &self.working);
+        self.working
+            .bump_version()
+            .map_err(TransactionError::VersionOverflow)?;
         self.working.seal();
-        self.working.version = self.working.version.saturating_add(1);
         self.state = TxState::Committed;
         Ok(MutationOutcome {
             grammar: self.working,
             diff,
             committed: true,
         })
-    }
-
-    /// Commit without running validation checks.
-    ///
-    /// Use when the caller guarantees grammar validity externally.
-    pub fn commit_unchecked(mut self) -> MutationOutcome {
-        let diff = diff_grammars(&self.base, &self.working);
-        self.working.seal();
-        self.working.version = self.working.version.saturating_add(1);
-        self.state = TxState::Committed;
-        MutationOutcome {
-            grammar: self.working,
-            diff,
-            committed: true,
-        }
     }
 
     /// Discard all changes and return the original base grammar.
@@ -256,15 +296,20 @@ impl GrammarTransaction {
     }
 
     /// Append operations from a committed child transaction into this log.
-    pub(crate) fn append_operations(&mut self, ops: &[TransactionOp]) {
+    pub(crate) fn append_operations(
+        &mut self,
+        ops: &[TransactionOp],
+    ) -> Result<(), TransactionError> {
         for op in ops {
-            self.op_index += 1;
+            let op_index = self.next_op_index()?;
             self.op_log.push(TransactionOp {
-                index: self.op_index,
+                index: op_index,
                 name: op.name.clone(),
                 args: op.args.clone(),
             });
+            self.op_index = op_index;
         }
+        Ok(())
     }
 
     // ── Helpers ────────────────────────────────────────────────────────
@@ -279,13 +324,27 @@ impl GrammarTransaction {
         }
     }
 
-    fn record_op(&mut self, name: &str, args: Vec<String>) {
-        self.op_index += 1;
+    fn next_op_index(&self) -> Result<usize, TransactionError> {
+        self.op_index
+            .checked_add(1)
+            .ok_or(TransactionError::OperationIndexOverflow)
+    }
+
+    fn record_op_at(&mut self, index: usize, name: &str, args: Vec<String>) {
+        self.op_index = index;
         self.op_log.push(TransactionOp {
-            index: self.op_index,
+            index,
             name: name.to_string(),
             args,
         });
+    }
+}
+
+fn grammar_mutation_error(error: ParseError) -> TransactionError {
+    if error.code.as_deref() == Some("grammar.version_overflow") {
+        TransactionError::VersionOverflow(error)
+    } else {
+        TransactionError::InvalidRuleSource(error)
     }
 }
 
@@ -297,7 +356,7 @@ mod tests {
     use crate::grammar::Grammar;
 
     fn base() -> Grammar {
-        Grammar::new("root <- 'x'").with_start_rule("root")
+        Grammar::trusted_new("root <- 'x'").with_start_rule("root")
     }
 
     #[test]
@@ -323,9 +382,38 @@ mod tests {
     fn replace_rule() {
         let mut tx = GrammarTransaction::new(&base());
         tx.replace_rule("root", "'z'").unwrap();
-        let outcome = tx.commit_unchecked();
+        let outcome = tx.commit().unwrap();
         assert_eq!(outcome.grammar.get_rule("root").unwrap().source, "'z'");
         assert!(!outcome.diff.changed_rules.is_empty());
+    }
+
+    #[test]
+    fn add_rule_rejects_invalid_source_without_recording_op() {
+        let mut tx = GrammarTransaction::new(&base());
+        let err = tx
+            .add_rule("bad", "[a")
+            .expect_err("invalid rule source is rejected");
+        let TransactionError::InvalidRuleSource(parse_error) = err else {
+            panic!("expected InvalidRuleSource");
+        };
+        assert!(parse_error.message.contains("unterminated character class"));
+        assert!(tx.current().get_rule("bad").is_none());
+        assert!(tx.operation_log().is_empty());
+    }
+
+    #[test]
+    fn add_rule_rejects_operation_index_overflow_without_mutating() {
+        let mut tx = GrammarTransaction::new(&base());
+        tx.op_index = usize::MAX;
+
+        let err = tx
+            .add_rule("overflow", "'y'")
+            .expect_err("operation index overflow is rejected");
+
+        assert!(matches!(err, TransactionError::OperationIndexOverflow));
+        assert!(tx.current().get_rule("overflow").is_none());
+        assert!(tx.operation_log().is_empty());
+        assert_eq!(tx.op_index, usize::MAX);
     }
 
     #[test]
@@ -339,10 +427,10 @@ mod tests {
 
     #[test]
     fn remove_rule() {
-        let g = Grammar::new("root <- 'x'\nextra <- 'y'").with_start_rule("root");
+        let g = Grammar::trusted_new("root <- 'x'\nextra <- 'y'").with_start_rule("root");
         let mut tx = GrammarTransaction::new(&g);
         tx.remove_rule("extra").unwrap();
-        let outcome = tx.commit_unchecked();
+        let outcome = tx.commit().unwrap();
         assert!(outcome.grammar.get_rule("extra").is_none());
         assert_eq!(outcome.diff.removed_rules, vec!["extra"]);
     }
@@ -358,10 +446,10 @@ mod tests {
 
     #[test]
     fn set_start_rule() {
-        let g = Grammar::new("root <- 'x'\nnew_start <- 'y'").with_start_rule("root");
+        let g = Grammar::trusted_new("root <- 'x'\nnew_start <- 'y'").with_start_rule("root");
         let mut tx = GrammarTransaction::new(&g);
         tx.set_start("new_start").unwrap();
-        let outcome = tx.commit_unchecked();
+        let outcome = tx.commit().unwrap();
         assert_eq!(outcome.grammar.start_rule, "new_start");
         assert!(outcome.diff.start_changed);
     }
@@ -389,7 +477,7 @@ mod tests {
     #[test]
     fn cannot_operate_after_commit() {
         let tx = GrammarTransaction::new(&base());
-        let _ = tx.commit_unchecked();
+        let _ = tx.commit().unwrap();
         // tx is consumed; Rust ownership prevents use-after-commit at compile time
     }
 
@@ -416,7 +504,7 @@ mod tests {
 
     #[test]
     fn strict_commit_fails_on_missing_ref() {
-        let g = Grammar::new("root <- missing_ref").with_start_rule("root");
+        let g = Grammar::trusted_new("root <- missing_ref").with_start_rule("root");
         let tx = GrammarTransaction::new(&g); // strict = true
         let err = tx.commit().unwrap_err();
         assert!(matches!(err, TransactionError::ValidationFailed(_)));
@@ -424,7 +512,7 @@ mod tests {
 
     #[test]
     fn non_strict_commit_succeeds_with_invalid_grammar() {
-        let g = Grammar::new("root <- missing_ref").with_start_rule("root");
+        let g = Grammar::trusted_new("root <- missing_ref").with_start_rule("root");
         let tx = GrammarTransaction::with_options(&g, false);
         let outcome = tx.commit().unwrap();
         assert!(outcome.committed);
@@ -445,7 +533,7 @@ mod tests {
         let mut tx = GrammarTransaction::new(&base());
         tx.set_metadata_value("root", "return_type", serde_json::json!("Expr"))
             .unwrap();
-        let outcome = tx.commit_unchecked();
+        let outcome = tx.commit().unwrap();
         let meta = outcome.grammar.metadata.get("root").expect("meta");
         assert_eq!(
             meta.get("return_type").and_then(|v| v.as_str()),

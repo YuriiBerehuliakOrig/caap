@@ -1,0 +1,29 @@
+; stdlib/lib/tests/test_crypto_legacy.caap — the legacy-digest facade resolves
+; and re-publishes the SAME sha1/md5 as stdlib.lib.crypto.digest. This pins that
+; importing the weak digests from their deliberately-conspicuous "legacy" home
+; works and computes the canonical known-answer vectors (RFC 3174 / RFC 1321).
+
+;; @area: crypto
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq)
+(use stdlib.lib.crypto.legacy sha1 md5)
+
+(do
+  ; ── SHA-1 (RFC 3174 examples) — re-exported through legacy ──
+  (assert_eq (sha1 "")
+    "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+    "legacy sha1 empty")
+  (assert_eq (sha1 "abc")
+    "a9993e364706816aba3e25717850c26c9cd0d89d"
+    "legacy sha1 abc")
+
+  ; ── MD5 (RFC 1321 test suite) — re-exported through legacy ──
+  (assert_eq (md5 "")
+    "d41d8cd98f00b204e9800998ecf8427e"
+    "legacy md5 empty")
+  (assert_eq (md5 "abc")
+    "900150983cd24fb0d6963f7d28e17f72"
+    "legacy md5 abc")
+
+  true)

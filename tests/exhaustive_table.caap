@@ -1,0 +1,8 @@
+; exhaustive_table — `string_repeat (string, int)` was in the old hand table,
+; but the type pass now reads EVERY builtin's signature from the kernel
+; vocabulary. `string_upcase` takes a string; passing an int is a certain
+; error that the auto-derived table catches.
+(module stdlib.fixtures.exhaustive_table)
+(defn bad ((n i32)) string
+  (string_upcase n))
+(export bad)

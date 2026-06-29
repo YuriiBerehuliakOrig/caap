@@ -1,0 +1,29 @@
+;; tools/s2_wasm.caap — WebAssembly (WAT) emission on stdlib's OWN wasm backend
+;; (the sibling of tools/s2_emit.caap, which emits LLVM IR).
+;;
+;;   caap <stdlib-bootstrap> tools/s2_wasm.caap FILE [module]
+;;
+;; Emits the WAT for FILE and returns it — the flagless CLI prints a string
+;; result to stdout (redirect to a .wat, then `wat2wasm`/`wasmtime` it). Default
+;; is the hosted backend (needs `main`, its value is the module result); pass
+;; "module" for the no-`main` library backend. The backend loads on demand via
+;; load_module, so only stdlib/bootstrap.caap is needed (no native_emit leg).
+(bind (
+  (args (ctfe_compiler_lookup_value compiler "cli.args"))
+)
+  (do
+    (if (eq (size args) 0)
+      (runtime_error "usage: caap <stdlib-bootstrap> tools/s2_wasm.caap FILE [module]"))
+    (bind (
+      (input (get args 0))
+      (mode (get args 1))
+      (api (ctfe_compiler_lookup_value compiler "stdlib.load"))
+      (wasm ((get api "load_module") "stdlib.backend.emit.wasm"))
+      (emit (if (eq mode "module")
+              (get wasm "emit_module")
+              (get wasm "emit_program")))
+      (res (emit (ctfe_compiler_load_surface_file_template compiler input)))
+    )
+      (if (gt (size (get res "diagnostics" (list_of))) 0)
+        (runtime_error (value_to_string (get res "diagnostics")))
+        (get res "text")))))

@@ -1,0 +1,109 @@
+; stdlib/lib/tests/test_divergence.caap — the reachability/divergence analysis
+; published by the type pass (infer's "diverges" fact) and CONSUMED by lint's
+; unreachable-code check. Mirrors test_match_check.caap: the type pass records a
+; per-form fact keyed by the form's source loc, and the consumer reads it back.
+;
+; Two halves:
+;   • CONSUMER contract — drive lint's `check` directly, simulating the type pass
+;     by publishing a "diverges" fact (exactly how match_check's test simulates
+;     the enum/union publish). Asserts the loc/key contract lint relies on.
+;   • PUBLISHER integration — run the REAL type pass (check_module_types) over a
+;     module whose helper always diverges, then assert it published the fact for
+;     a CALL to that helper, so lint flags the following form unreachable.
+
+;; @area: passes
+;; @kind: regression
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.lint check)
+(use stdlib.semantics.types.infer check_module_types)
+(use stdlib.semantics.passes.registry fact! fact_of)
+(use stdlib.syntax.ast sym lit calln call lam loc)
+(use stdlib.lib.collections.sequence any?)
+
+(do
+  (bind (
+    (has (lambda (fs n) (any? fs (lambda (f) (string_contains f n)))))
+    ; a spanned node: give a synthetic call a real source loc so the
+    ; loc-keyed fact channel can address it (the same idiom match_check's
+    ; test uses for spanned matches).
+    (spanned
+      (lambda (node line)
+        (ctfe_spec_with_span node
+          (map_of "start" 0 "end" 1 "start_line" line "start_col" 3
+                  "end_line" line "end_col" 9 "path" "divtest.caap"))))
+  )
+    (do
+      ; ── CONSUMER: a `do` whose first form is recorded as diverging — the form
+      ; AFTER it is unreachable. The fact is keyed by the diverging form's loc,
+      ; the cross-pass key infer publishes under. ──
+      (bind ((diverger (spanned (calln "loop_forever" (list_of)) 11))
+             (block (calln "do" (list_of diverger (calln "g" (list_of))))))
+        (do
+          (fact! "diverges" (loc diverger) true)
+          (assert_true (has (check block) "unreachable code after a diverging form")
+            "form after a call to a diverging function is flagged")))
+
+      ; ── CONSUMER: the SAME block without the fact is clean (the call is not
+      ; known to diverge, so nothing after it is dead). Proves the finding is
+      ; fact-driven, not structural. ──
+      (bind ((plain (spanned (calln "ordinary" (list_of)) 21))
+             (block (calln "do" (list_of plain (calln "g" (list_of))))))
+        (assert_eq (size (check block)) 0
+          "form after a NON-diverging call is clean"))
+
+      ; ── CONSUMER: a literal `throw`/`leave` still works with NO fact (the
+      ; syntactic check is preserved, so the pass works even without a type
+      ; pass). ──
+      (assert_true
+        (has (check (calln "do" (list_of
+               (calln "throw" (list_of (lit "boom")))
+               (calln "g" (list_of)))))
+             "unreachable code after a diverging form")
+        "form after a literal throw is flagged (no fact needed)")
+      (assert_true
+        (has (check (calln "do" (list_of
+               (calln "leave" (list_of (lit 0) (lit 1)))
+               (calln "g" (list_of)))))
+             "unreachable code after a diverging form")
+        "form after a literal leave is flagged (no fact needed)")
+
+      ; ── CONSUMER: the divergence terminates the block — no false finding when
+      ; the diverging form is LAST (nothing after it). ──
+      (bind ((d (spanned (calln "loop_forever" (list_of)) 41))
+             (block (calln "do" (list_of (calln "g" (list_of)) d))))
+        (do
+          (fact! "diverges" (loc d) true)
+          (assert_eq (size (check block)) 0
+            "a diverging form in tail position leaves nothing unreachable")))
+
+      ; ── PUBLISHER integration: run the REAL type pass over a module that
+      ; defines a helper whose body always diverges (an infinite `while true`
+      ; with a `throw` reachable nowhere normal), then CALLS it. The pass should
+      ; publish a "diverges" fact for the CALL, which lint then consumes. ──
+      ; helper:  (bind spin (lambda () (while true 0)))   — body diverges? a
+      ;          `while true` does NOT diverge (it may run zero times by the
+      ;          analysis's conservative model), so use an always-throwing helper.
+      ; helper:  (bind boom (lambda () (throw "x")))       — body diverges.
+      (bind (
+        (helper (calln "bind" (list_of (sym "boom")
+                  (lam (list_of) (calln "throw" (list_of (lit "x")))))))
+        (callsite (spanned (calln "boom" (list_of)) 71))
+        (located (list_of
+          (map_of "node" helper "loc" "divtest.caap:1:1")
+          (map_of "node" callsite "loc" "divtest.caap:71:3")))
+        (sink (list_of))
+      )
+        (do
+          ; walk the module: the helper's body diverges, so the call propagates
+          ; divergence and the wrapper publishes the fact keyed by the call loc.
+          (check_module_types located (map_of) sink)
+          (assert_eq (size sink) 0
+            "the diverging helper + its call type-check cleanly")
+          (assert_eq (fact_of "diverges" (loc callsite) null) true
+            "the type pass published a diverges fact for the call to boom")
+          ; and the consumer turns that fact into an unreachable finding
+          (bind ((block (calln "do" (list_of callsite (calln "after" (list_of))))))
+            (assert_true
+              (has (check block) "unreachable code after a diverging form")
+              "lint flags code after a call to the diverging helper")))))))

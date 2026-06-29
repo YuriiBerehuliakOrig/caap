@@ -1,0 +1,99 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  ur_port — the Cortex-M3 PORT layer: the CPU/board primitives the portable
+//  kernel builds on (module stdlib.urun.ur_port). The analogue of URun's
+//  ports/cortex_m3/* plus the board's low-level I/O. The irreducible
+//  instruction sequences (vector table, the PendSV context switch, the
+//  first-thread launch) live in ur_port_cortexm3.s and are reached as ordinary
+//  AAPCS symbols; here are the C-side primitives.
+// ═══════════════════════════════════════════════════════════════════════════
+(surface stdlib.frontend.clike stdlib.urun.ur_port)
+
+// ── Cortex-M3 register addresses + bit masks, as COMPILE-TIME constants ──────
+// Each `const` folds to a literal at load (CTFE) — no runtime computation — and
+// the const guard refuses to fold an impure expression, so an MMIO write can
+// never be silently constant-folded. Hex literals and `1 << n` shifts read as
+// the datasheet writes them; the two computed ones (PENDSVSET, XPSR_THUMB) still
+// fold at build time (`int_shl`), not at runtime.
+ICSR u32 const volatile = 0xE000ED04       // Interrupt Control/State register
+PENDSVSET u32 const = 1 << 28              // 0x10000000 — pend a PendSV
+UART0_DATA u32 const volatile = 0x40004000 // CMSDK UART0 UR data register
+SYST_CSR u32 const volatile = 0xE000E010   // SysTick control/status
+SYST_RVR u32 const volatile = 0xE000E014   // SysTick reload value
+SYST_CVR u32 const volatile = 0xE000E018   // SysTick current value
+SYST_ENABLE u32 const = 0x7                // ENABLE | TICKINT | CLKSOURCE
+XPSR_THUMB u32 const = 1 << 24             // 0x01000000 — xPSR T (thumb) bit
+
+// Critical section = interrupt masking (single-core mutual exclusion). On
+// Cortex-M this is PRIMASK via cpsid/cpsie — the existing `asm` primitive. Each
+// masking instruction carries a `~{memory}` clobber so the optimizer cannot move
+// a kernel-state load/store across the barrier (which would let an interrupt see
+// or race a half-updated critical section). Harmless at -O0; required at -Os.
+//
+// ur_disable/ur_restore unconditionally mask/UNMASK — they do NOT preserve the
+// prior PRIMASK, so they are only correct at the OUTERMOST level (interrupts
+// already enabled). Kept for the demo's top-level use.
+ur_disable () i32 export = { asm("cpsid i", "~{memory}", void) 0 }
+ur_restore () i32 export = { asm("cpsie i", "~{memory}", void) 0 }
+
+// NESTING-safe critical section: read PRIMASK, mask, do work, then RESTORE the
+// prior state instead of unconditionally re-enabling — correct when entered with
+// interrupts ALREADY masked (a nested critical section, or an ISR/SysTick
+// callback). Same `mrs/msr primask` mechanism as stdlib.bare.cpu, inlined so the
+// example stays self-contained. Internal kernel services use these.
+primask_read () u32 export = { asm("mrs $0, primask", "=r", u32) }
+primask_write (p u32) i32 export = { asm("msr primask, $0", "r,~{memory}", void, p) 0 }
+ur_interrupt_save () u32 export = {
+  prev u32 = primask_read()
+  asm("cpsid i", "~{memory}", void)
+  prev
+}
+ur_interrupt_restore (p u32) i32 export = { primask_write(p) 0 }
+
+// Request a context switch: set PendSV pending (ICSR.PENDSVSET, bit 28). With
+// interrupts masked it stays pending; the switch is taken the moment
+// ur_restore() unmasks. This is how the kernel preempts and how a blocking call
+// yields.
+ur_pend_switch () i32 export = {
+  ICSR = PENDSVSET
+  0
+}
+
+// Sleep the core until the next interrupt (WFI). The power-honest idle primitive:
+// the idle thread (and any spin-wait) should sleep on this rather than burn the
+// core at full power in a busy loop. SysTick still wakes it every tick. The asm is
+// volatile (a side-effecting hint), so the optimizer keeps it even at -Os.
+ur_wait_for_interrupt () i32 export = {
+  asm("wfi", "", void)
+  0
+}
+
+// Configure + start SysTick as the kernel tick. SYST_RVR (0xE000E014) = reload,
+// SYST_CVR (0xE000E018) = 0 (clear current), SYST_CSR (0xE000E010) = 7
+// (ENABLE | TICKINT | CLKSOURCE=core-clock). The SysTick exception then calls
+// _ur_timer_interrupt every `reload+1` core cycles (see the asm port).
+ur_systick_config (reload u32) i32 export = {
+  SYST_RVR = reload
+  SYST_CVR = 0
+  SYST_CSR = SYST_ENABLE
+  0
+}
+
+// Board UART0 (CMSDK on mps2-an385): write one byte to the UR data register.
+putc (ch u32) i32 export = {
+  UART0_DATA = ch
+  0
+}
+
+// Build a Cortex-M exception stack frame at the top of a thread's stack so the
+// first context switch "returns" (via exception-return) into `task_entry` in
+// thumb state. The 16-word frame is r4-r11 (software-saved) below the hardware
+// frame r0-r3,r12,lr,pc,xPSR; only lr, pc and xPSR need seeding. `lr` is seeded
+// to `exit_handler` (the thread-exit trampoline) so a thread that RETURNS from
+// its entry lands there and self-terminates, instead of `bx 0` → HardFault.
+_ur_build_stack (top u32, task_entry u32, exit_handler u32) u32 export = {
+  psp u32 = top - 64
+  ptr_write((psp + 52) as u32*, exit_handler | 1)      // lr = thread-exit trampoline (thumb)
+  ptr_write((psp + 56) as u32*, task_entry | 1)        // pc = entry | thumb bit
+  ptr_write((psp + 60) as u32*, XPSR_THUMB)            // xPSR with T bit set
+  psp
+}

@@ -1,0 +1,48 @@
+; stdlib/lib/tests/test_peval.caap — partial evaluation to a fixpoint.
+
+;; @area: passes
+;; @kind: regression
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.peval peval_node)
+(use stdlib.syntax.ast sym lit calln call lam literal? literal_of call?)
+
+(do
+  ; ── constant propagation + folding: (bind ((x 5)) (int_add x 1)) -> 6 ──
+  (assert_eq
+    (literal_of (peval_node
+      (calln "bind"
+        (list_of (lit "x") (lit 5) (calln "int_add" (list_of (sym "x") (lit 1)))))))
+    6
+    "propagate x=5 then fold to 6")
+
+  ; ── fold a condition, then drop the dead branch ──
+  (assert_eq
+    (literal_of (peval_node
+      (calln "if" (list_of (calln "lt" (list_of (lit 1) (lit 2)))
+                           (lit "a") (lit "b")))))
+    "a"
+    "(if (lt 1 2) a b) -> a")
+
+  ; ── beta + propagate + fold: ((lambda (x) (int_add x 1)) 5) -> 6 ──
+  (assert_eq
+    (literal_of (peval_node
+      (call (lam (list_of "x") (calln "int_add" (list_of (sym "x") (lit 1))))
+            (list_of (lit 5)))))
+    6
+    "immediately-applied lambda reduces and folds to 6")
+
+  ; ── multi-step fixpoint: (bind ((x 2) (y (int_mul x 3))) (int_add y 1)) -> 7 ──
+  (assert_eq
+    (literal_of (peval_node
+      (calln "bind"
+        (list_of (lit "x") (lit 2)
+                 (lit "y") (calln "int_mul" (list_of (sym "x") (lit 3)))
+                 (calln "int_add" (list_of (sym "y") (lit 1)))))))
+    7
+    "chained constants collapse across iterations to 7")
+
+  ; ── a free variable is preserved (nothing to fold) ──
+  (assert_true
+    (call? (peval_node (calln "int_add" (list_of (sym "n") (lit 1)))))
+    "(int_add n 1) with free n stays a call"))

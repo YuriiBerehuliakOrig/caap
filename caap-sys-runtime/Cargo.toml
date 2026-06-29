@@ -1,0 +1,24 @@
+[package]
+name = "caap-sys-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "CAAP system runtime library — io, fs, net, os, process, time, format."
+license = "Apache-2.0"
+
+# Plain rlib: the staticlib/cdylib link unit moved to ../caap-sys-runtime-ffi
+# (hash-less staticlib companions in deps/ poisoned rustdoc's transitive
+# doctest resolution for caap-core dependents — E0460/E0463).
+[lib]
+name = "caap_sys_runtime"
+
+[dependencies]
+libc = "0.2"
+serde_json = "1"
+tracing = "0.1"
+
+[build-dependencies]
+cbindgen = "0.27"
+
+[dev-dependencies]
+# dlopen/dlsym for the C-ABI boundary integration test (tests/c_abi_boundary.rs).
+libc = "0.2"

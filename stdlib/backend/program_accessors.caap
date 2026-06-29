@@ -1,0 +1,103 @@
+; stdlib/backend/program_accessors.caap — typed READERS over the prep_units
+; output map (the cross-backend "program" contract).
+;
+; prep_units (stdlib.backend.prep) hands every backend a plain string-keyed map
+; of codegen tables — `pairs`, `finals`, `structs`, `unions`, `consts`,
+; `externs`, `globals`, `global_arrays`, `diagnostics`, `name`. Read with a bare
+; `(get m "key")`, a typo or a stage that forgot to populate a key reads back as
+; null and corrupts the emitter SILENTLY, far from the mistake.
+;
+; This module is the loud, additive front door for that map. It does NOT import
+; prep (it operates ON the map a caller already holds), so it adds no tier edge
+; and no dependency cycle; prep stays the single producer. Two policies:
+;   program_field           — soft read with an explicit default (absence is OK)
+;   program_require_field!  — strict read; a missing key is a CERTAIN throw
+;                             naming the key, never a silent null.
+; The named readers below are the strict/soft pairing applied to the real
+; prep_units keys, so a backend reads `(program_pairs prog)` instead of guessing
+; the spelling of a string literal.
+;
+; This is codegen POLICY (a backend-tier helper), not a kernel concern: it adds
+; no node type and no builtin, only a discipline over an existing map shape.
+(module stdlib.backend.program_accessors)
+
+; program_field — a soft read: the value at `key`, or `default` when absent.
+; The honest spelling of `(get m key default)` for a field whose absence is
+; legitimate (an empty table, an optional `name`). Use program_require_field!
+; when absence is a contract violation, not a default.
+;   m       : a prep_units output map
+;   key     : the field name (a string)
+;   default : the value to return when the field is missing
+;   ->      : the field's value, or `default`
+(bind program_field
+  (lambda (m key default) (get m key default)))
+
+; program_require_field! — a strict read: the value at `key`, or a CERTAIN throw
+; naming the missing key. The contract a consumer asserts ("the producer must
+; have populated this"): a typo'd or unpopulated key fails loudly here, not as a
+; null three stages downstream. `contains` is the has-key test, so a key whose
+; value is legitimately null still reads back (only ABSENCE throws).
+;   m   : a prep_units output map
+;   key : the required field name (a string)
+;   ->  : the field's value (throws when the field is absent)
+(bind program_require_field!
+  (lambda (m key)
+    (if (contains m key)
+      (get m key)
+      (throw (string_concat_many
+        "program contract: missing required field `" key
+        "` (have: " (value_to_string (map_keys m)) ")")))))
+
+; ── named readers for the real prep_units keys ──────────────────────────────
+; The strict/soft pairing applied to each codegen table. The required readers
+; (pairs/finals/structs/unions/consts/externs/globals/global_arrays/diagnostics)
+; are fields prep_units ALWAYS emits — a missing one is a producer bug, so they
+; go through program_require_field!. `name` is optional (defaults to "program"
+; at the producer) so it reads softly.
+
+; program_name — the root module's name, or "program" when unset (the producer's
+; own default for an unnamed program).
+(bind program_name
+  (lambda (m) (program_field m "name" "program")))
+
+; program_pairs — function/struct bindings in source order (each {name, value,
+; sig|null, ctor_of|null}). Required.
+(bind program_pairs
+  (lambda (m) (program_require_field! m "pairs")))
+
+; program_finals — the program's final/top-level expressions. Required.
+(bind program_finals
+  (lambda (m) (program_require_field! m "finals")))
+
+; program_structs — the struct table (name -> field list). Required.
+(bind program_structs
+  (lambda (m) (program_require_field! m "structs")))
+
+; program_unions — the union table (name -> variant list). Required.
+(bind program_unions
+  (lambda (m) (program_require_field! m "unions")))
+
+; program_consts — the compile-time constant table (name -> int). Required.
+(bind program_consts
+  (lambda (m) (program_require_field! m "consts")))
+
+; program_externs — declared external symbols ([{symbol, …}]). Required.
+(bind program_externs
+  (lambda (m) (program_require_field! m "externs")))
+
+; program_globals — module-level scalar globals ([{name, …}]). Required.
+(bind program_globals
+  (lambda (m) (program_require_field! m "globals")))
+
+; program_global_arrays — module-level array globals ([{name, …}]). Required.
+(bind program_global_arrays
+  (lambda (m) (program_require_field! m "global_arrays")))
+
+; program_diagnostics — the program's collected diagnostics list. Required.
+(bind program_diagnostics
+  (lambda (m) (program_require_field! m "diagnostics")))
+
+(export program_field program_require_field!
+        program_name program_pairs program_finals program_structs
+        program_unions program_consts program_externs program_globals
+        program_global_arrays program_diagnostics)

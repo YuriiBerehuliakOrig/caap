@@ -1,0 +1,179 @@
+; stdlib/semantics/passes/derive.caap — the DERIVE registry (module
+; stdlib.semantics.passes.derive).
+;
+; Formalizes the runtime-derive pattern (the show! demo): a GENERATOR is a
+; function from a type's name + registry descriptor to a generated VALUE
+; (typically an eval_ir-compiled function). `derive_for` runs it lazily and
+; memoizes per (derive, type) — N calls over one type cost one generation,
+; exactly the per-type cache every derive was hand-rolling.
+;
+;   (register_derive! "show" (lambda (tname d) <build & eval a formatter>))
+;   ((derive_for "show" "Point") value)
+;
+; This is the registry sibling of semantics/passes/registry's fact store: a small
+; named table with register / lookup / observe (derives, derived?) / reset
+; (reset_derives!) surface, so tests and REPL sessions start from a clean slate.
+(module stdlib.semantics.passes.derive)
+
+(use stdlib.semantics.types.registry resolve)
+(use stdlib.lib.diag.error raise!)
+(use stdlib.syntax.ast sym lit calln lam eval_ir)
+
+(bind generators (map_of))  ; derive name -> generator (tname, descriptor) -> value
+(bind instances (map_of))   ; "derive\ntype" -> generated value (the memo cache)
+
+; instance_key — the memo-cache key for a (derive, type) pair. `\n` cannot
+; appear in either identifier, so the join is collision-free; the ONE place the
+; key shape is spelled, shared by derive_for and derived?.
+(bind instance_key
+  (lambda (name tname) (string_concat_many name "\n" tname)))
+
+; register_derive! — record a derive's generator. A second registration of the
+; same name is a certain protocol error (a derive is defined once).
+(bind register_derive!
+  (lambda (name gen)
+    (do
+      (when (contains generators name)
+        (raise! "stdlib.derive.duplicate"
+          (string_concat_many "derive `" name "` is already registered")
+          null))
+      (assoc generators name gen))))
+
+; derive_for — the (memoized) generated instance for `tname`.
+; Unknown derive or unknown type are certain protocol errors. Membership (not
+; null-of-value) decides the cache hit, so a derive whose generated value is
+; itself null is still cached after the first call (generated exactly once).
+(bind derive_for
+  (lambda (name tname)
+    (bind ((key (instance_key name tname)))
+      (if (contains instances key)
+        (get instances key)
+        (bind (
+          (gen (get generators name))
+          (d (resolve tname))
+        )
+          (do
+            (when (eq gen null)
+              (raise! "stdlib.derive.unknown"
+                (string_concat_many "no derive named `" name "`") null))
+            (when (eq d null)
+              (raise! "stdlib.derive.unknown_type"
+                (string_concat_many
+                  "derive `" name "`: unknown type `" tname "`") null))
+            (bind ((v (gen tname d)))
+              (do (assoc instances key v) v))))))))
+
+; derived? — has (derive, type) already been generated? (observability)
+(bind derived?
+  (lambda (name tname) (contains instances (instance_key name tname))))
+
+; derives — the names of every registered derive (observability: what generators
+; this session knows). Order is unspecified (map iteration).
+(bind derives (lambda () (map_keys generators)))
+
+; reset_derives! — drop every generator AND memoized instance (test / REPL
+; hygiene, the sibling of registry's clear_passes!). One call returns the
+; registry to empty.
+(bind reset_derives!
+  (lambda ()
+    (do
+      (for k (map_keys generators) (map_delete generators k))
+      (for k (map_keys instances) (map_delete instances k)))))
+
+; ── the standard derive battery ──────────────────────────────────────────────
+; Five concrete generators every struct descriptor can supply. Each gen takes a
+; type name + its registry descriptor and returns a COMPILED function (built as
+; IR, evaluated once via eval_ir, then memoized by `derive_for`). The struct
+; descriptor is `{kind:"struct", name, fields:[{name, type}…]}` (see
+; semantics/types/registry); the derivers read `fields` for the field-by-field
+; shape and otherwise lean on the kernel's STRUCTURAL value_* primitives, which
+; already do the right thing over the underlying map representation.
+
+; struct_fields — the field records of a struct descriptor (empty list for a
+; non-struct, so a deriver over, say, a primitive degrades to a trivial body
+; instead of throwing). The ONE place the descriptor shape is read.
+(bind struct_fields (lambda (d) (get d "fields" (list_of))))
+
+; gen_show — render a struct value as `TypeName{f1=<v1>, f2=<v2>}`. Each field's
+; value is rendered with the kernel's value_to_string (so nested data prints),
+; read out of the value map by field name. Generated:
+;   (lambda (s)
+;     (string_concat_many "TypeName{" "f1=" (value_to_string (get s "f1" null))
+;                         ", " "f2=" (value_to_string (get s "f2" null)) "}"))
+(bind gen_show
+  (lambda (tname d)
+    (bind ((parts (list_of)) (first (ref true)))
+      (do
+        (append parts (lit (string_concat_many tname "{")))
+        (for f (struct_fields d)
+          (do
+            (when (not (deref first)) (append parts (lit ", ")))
+            (set_ref first false)
+            (append parts (lit (string_concat_many (get f "name") "=")))
+            (append parts
+              (calln "value_to_string"
+                (list_of (calln "get"
+                  (list_of (sym "s") (lit (get f "name")) (lit null))))))))
+        (append parts (lit "}"))
+        (eval_ir (lam (list_of "s") (calln "string_concat_many" parts)))))))
+
+; gen_eq — structural equality of two struct values: (lambda (a b) (value_eq a b)).
+; value_eq compares maps by key SET structurally, exactly the field-wise equality
+; a hand-written Eq would spell. tname/descriptor are unused (the kernel head is
+; type-agnostic) but kept for the uniform generator signature.
+(bind gen_eq
+  (lambda (tname d)
+    (eval_ir (lam (list_of "a" "b")
+      (calln "value_eq" (list_of (sym "a") (sym "b")))))))
+
+; gen_compare — total structural order of two struct values:
+;   (lambda (a b) (value_compare a b))  -> -1 | 0 | +1
+; value_compare is a total order over any two values (0 exactly when value_eq),
+; so the generated Compare is consistent with the generated Eq by construction.
+(bind gen_compare
+  (lambda (tname d)
+    (eval_ir (lam (list_of "a" "b")
+      (calln "value_compare" (list_of (sym "a") (sym "b")))))))
+
+; gen_hash — structural hash of a struct value: (lambda (s) (value_hash s)).
+; value_eq-equal values hash equal, so the generated Hash agrees with Eq.
+(bind gen_hash
+  (lambda (tname d)
+    (eval_ir (lam (list_of "s")
+      (calln "value_hash" (list_of (sym "s")))))))
+
+; gen_clone — a SHALLOW field-by-field copy of a struct value, rebuilt as a fresh
+; map so mutating the clone never aliases the original's top level. Generated:
+;   (lambda (s) (assoc (map_of) "f1" (get s "f1" null) "f2" (get s "f2" null)))
+; (a fieldless struct clones to an empty map). Nested data is shared (shallow),
+; the standard Clone contract.
+(bind gen_clone
+  (lambda (tname d)
+    (bind ((args (list_of)))
+      (do
+        (append args (calln "map_of" (list_of)))
+        (for f (struct_fields d)
+          (do
+            (append args (lit (get f "name")))
+            (append args (calln "get"
+              (list_of (sym "s") (lit (get f "name")) (lit null))))))
+        (eval_ir (lam (list_of "s") (calln "assoc" args)))))))
+
+; register_battery! — install the five standard derives ("show" "eq" "compare"
+; "hash" "clone"). SKIPS any name already registered (so a project that hand-rolls
+; its own "show" keeps it, and a second call is a no-op), keeping it ADDITIVE and
+; idempotent rather than a duplicate-registration error.
+(bind register_battery!
+  (lambda ()
+    (do
+      (for pair (list_of
+                  (list_of "show" gen_show)
+                  (list_of "eq" gen_eq)
+                  (list_of "compare" gen_compare)
+                  (list_of "hash" gen_hash)
+                  (list_of "clone" gen_clone))
+        (when (eq (get generators (get pair 0)) null)
+          (register_derive! (get pair 0) (get pair 1)))))))
+
+(export register_derive! derive_for derived? derives reset_derives!
+        gen_show gen_eq gen_compare gen_hash gen_clone register_battery!)

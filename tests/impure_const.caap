@@ -1,0 +1,5 @@
+; tests/impure_const.caap — (const …) over an effectful expression;
+; the const form must refuse to fold it at expansion time.
+(module stdlib.fixtures.impure_const)
+(bind k (const (append (list_of) 1)))
+(export k)

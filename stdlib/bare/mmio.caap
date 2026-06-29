@@ -1,0 +1,96 @@
+; stdlib/bare/mmio.caap — typed register helpers over volatile_read/write
+; (module stdlib.bare.mmio).
+;
+; Memory-mapped I/O: read/write a hardware register that lives at a fixed
+; integer address. The kernel primitives `volatile_read`/`volatile_write` carry
+; an explicit width type (u8/u16/u32/u64); these wrappers pin one width each so
+; a driver reads `(mmio_write32 UART0_DATA ch)` instead of repeating the
+; `(volatile_write addr u32 ch)` triple at every register touch. A volatile
+; access is never reordered or elided by the backend (it lowers to LLVM
+; `load/store volatile`), which is exactly the contract a device register needs.
+;
+; SCOPE — these are NATIVE/clike-targeted helpers (the LLVM and WASM backends
+; lower `volatile_*`). They are inlined into a native program by the
+; backend prep path's `(use …)` mechanism; they are NOT loadable by the plain
+; eval loader (MMIO has no meaning in the CTFE sandbox, and `volatile_*` is a
+; native-only head). See stdlib/bare/README.md.
+;
+; The address is a plain int (a u32 on a 32-bit MCU; widen to u64 on a 64-bit
+; target). The width token (u8/u16/u32/u64) names the LLVM scalar to access; the
+; backend `inttoptr`s the address and emits a volatile load/store of that width.
+(module stdlib.bare.mmio)
+
+; ── reads — load a hardware register, returning its current value ────────────
+; mmio_read8/16/32/64 — read the register at `addr` as an unsigned word.
+;   addr : the register's integer address
+;   ->   : the register's current value, the named width
+(defn mmio_read8  ((addr u32)) u8  (volatile_read addr u8))
+(defn mmio_read16 ((addr u32)) u16 (volatile_read addr u16))
+(defn mmio_read32 ((addr u32)) u32 (volatile_read addr u32))
+(defn mmio_read64 ((addr u64)) u64 (volatile_read addr u64))
+
+; ── writes — store a value into a hardware register ──────────────────────────
+; mmio_write8/16/32/64 — store `val` into the register at `addr`. Returns 0 so
+; the helper is also usable as an expression (the clike surface needs a value).
+;   addr : the register's integer address
+;   val  : the value to store, the named width
+;   ->   : 0
+(defn mmio_write8  ((addr u32) (val u8))  i32 (mutation)
+  (do (volatile_write addr u8  val) 0))
+(defn mmio_write16 ((addr u32) (val u16)) i32 (mutation)
+  (do (volatile_write addr u16 val) 0))
+(defn mmio_write32 ((addr u32) (val u32)) i32 (mutation)
+  (do (volatile_write addr u32 val) 0))
+(defn mmio_write64 ((addr u64) (val u64)) i32 (mutation)
+  (do (volatile_write addr u64 val) 0))
+
+; ── read-modify-write — set / clear bits in a register in place ──────────────
+; mmio_set_bits8/16/32/64 / mmio_clear_bits8/16/32/64 — OR-in / AND-out the bits
+; of `mask` in the register of the named width at `addr`. Clearing inverts the
+; mask first (`int_xor mask ALL_ONES`, the all-ones value of THAT width) so the
+; AND keeps every other bit. NOTE: this is a plain (non-atomic) read-modify-write
+; — guard it with a critical section (stdlib.bare.critical) if an interrupt
+; handler may touch the same register concurrently.
+;   addr : the register's integer address
+;   mask : the bit mask to set / clear, the named width
+;   ->   : 0
+(defn mmio_set_bits8 ((addr u32) (mask u8)) i32 (mutation)
+  (do
+    (volatile_write addr u8 (int_or (volatile_read addr u8) mask))
+    0))
+(defn mmio_set_bits16 ((addr u32) (mask u16)) i32 (mutation)
+  (do
+    (volatile_write addr u16 (int_or (volatile_read addr u16) mask))
+    0))
+(defn mmio_set_bits32 ((addr u32) (mask u32)) i32 (mutation)
+  (do
+    (volatile_write addr u32 (int_or (volatile_read addr u32) mask))
+    0))
+(defn mmio_set_bits64 ((addr u64) (mask u64)) i32 (mutation)
+  (do
+    (volatile_write addr u64 (int_or (volatile_read addr u64) mask))
+    0))
+(defn mmio_clear_bits8 ((addr u32) (mask u8)) i32 (mutation)
+  (do
+    (volatile_write addr u8 (int_and (volatile_read addr u8) (int_xor mask 255)))
+    0))
+(defn mmio_clear_bits16 ((addr u32) (mask u16)) i32 (mutation)
+  (do
+    (volatile_write addr u16 (int_and (volatile_read addr u16) (int_xor mask 65535)))
+    0))
+(defn mmio_clear_bits32 ((addr u32) (mask u32)) i32 (mutation)
+  (do
+    (volatile_write addr u32 (int_and (volatile_read addr u32) (int_xor mask 4294967295)))
+    0))
+; 64-bit clear inverts with `int_not` (xor with all-ones at the operand's known
+; width): the u64 all-ones constant 0xFFFFFFFFFFFFFFFF does not fit a signed
+; literal, and int_not is the exact width-safe equivalent of the 8/16/32 xor.
+(defn mmio_clear_bits64 ((addr u64) (mask u64)) i32 (mutation)
+  (do
+    (volatile_write addr u64 (int_and (volatile_read addr u64) (int_not mask)))
+    0))
+
+(export mmio_read8 mmio_read16 mmio_read32 mmio_read64
+        mmio_write8 mmio_write16 mmio_write32 mmio_write64
+        mmio_set_bits8 mmio_set_bits16 mmio_set_bits32 mmio_set_bits64
+        mmio_clear_bits8 mmio_clear_bits16 mmio_clear_bits32 mmio_clear_bits64)

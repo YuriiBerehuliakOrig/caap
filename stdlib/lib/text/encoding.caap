@@ -1,0 +1,456 @@
+; stdlib/lib/text/encoding.caap — byte<->text codecs in pure CAAP.
+;
+;   hex_encode / hex_decode          — lowercase hex <-> bytes
+;   base64_encode / base64_decode    — standard base64 (with "=" padding)
+;   base64url_encode / base64url_decode — URL-safe alphabet ("-_"), no padding
+;   percent_encode / percent_decode  — RFC 3986 %XX URL encoding of a string
+;   ord / chr                        — one-char string <-> Unicode codepoint
+;   utf8_encode / utf8_decode        — string <-> list of byte ints (0..255)
+;
+; Every codec works over LISTS OF INTS (0..255). The kernel `string->bytes`
+; (UTF-8 encode) + `bytes_to_list` pair turns text into that list once; the
+; inverse `bytes_from_list` + `bytes->string` (validates UTF-8) turns a byte
+; list back into text. `*_encode` accept either a string OR a bytes value (a
+; string is UTF-8 encoded first); `*_decode` return bytes (use bytes->string to
+; read text out). Non-ASCII ord/chr mirror json.caap's hand-rolled UTF-8
+; encode/decode (no codepoint builtin exists in the kernel).
+(module stdlib.lib.text.encoding)
+
+(use stdlib.lib.collections.sequence each)
+(use stdlib.lib.diag.error raise!)
+; hex_digit_value lives in lib/text/char (rank-2, same tier; char does not import
+; encoding, so no cycle). It is byte-identical to the private copy this module
+; used to carry — value 0..15 of a hex digit, or -1 for any non-hex char.
+(use stdlib.lib.text.char hex_digit_value)
+
+; ── byte-list <-> value bridges ─────────────────────────────────────────────
+; to_byte_list — a string is UTF-8 encoded; a bytes value is taken as-is; any
+; other type is a protocol error (a codec only speaks bytes/text).
+(bind to_byte_list
+  (lambda (v)
+    (bind ((t (value_type v)))
+      (cond
+        ((eq t "string") (bytes_to_list (string->bytes v)))
+        ((eq t "bytes")  (bytes_to_list v))
+        (else
+          (raise! "stdlib.encoding.input"
+            (string_concat_many "expected a string or bytes, got `" t "`")
+            (assoc (map_of) "type" t)))))))
+
+; bytes_of — a byte list (0..255 ints) back into a kernel bytes value.
+(bind bytes_of (lambda (bl) (bytes_from_list bl)))
+
+; ── hex ─────────────────────────────────────────────────────────────────────
+(bind hex_alpha "0123456789abcdef")
+
+; hex_encode — bytes/string -> lowercase hex string (two digits per byte).
+; Each byte's two hex chars are appended to a LOCAL list, joined once at the end
+; (O(n)); the old per-byte string_concat_many onto a growing accumulator was
+; O(n^2). Output is byte-identical: the same two digits, in the same order.
+(bind hex_encode
+  (lambda (v)
+    (bind ((bl (to_byte_list v)) (parts (list_of)))
+      (do
+        (each bl
+          (lambda (b)
+            (do
+              (append parts (string_slice hex_alpha (int_shr b 4) (int_add (int_shr b 4) 1)))
+              (append parts (string_slice hex_alpha (int_and b 15) (int_add (int_and b 15) 1))))))
+        (sequence_join parts "")))))
+
+; hex_decode — a hex string -> bytes. Length must be even; each pair of digits
+; is one byte. A stray or non-hex digit is a protocol error.
+(bind hex_decode
+  (lambda (s)
+    (bind ((cs (string_chars s)) (n (size s)) (out (list_of)) (i (ref 0)))
+      (do
+        (if (not (eq (int_mod n 2) 0))
+          (raise! "stdlib.encoding.hex"
+            "hex string must have an even number of digits"
+            (assoc (map_of) "length" n))
+          null)
+        (while (lt (deref i) n)
+          (bind ((hi (hex_digit_value (get cs (deref i) "")))
+                 (lo (hex_digit_value (get cs (int_add (deref i) 1) ""))))
+            (do
+              (if (or (lt hi 0) (lt lo 0))
+                (raise! "stdlib.encoding.hex"
+                  "hex string contains a non-hex character"
+                  (assoc (map_of) "index" (deref i)))
+                null)
+              (append out (int_or (int_shl hi 4) lo))
+              (set_ref i (int_add (deref i) 2)))))
+        (bytes_of out)))))
+
+; ── base64 ──────────────────────────────────────────────────────────────────
+(bind base64_std "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+(bind base64_url "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+
+; b64_char — the alphabet character for a 6-bit value 0..63.
+(bind b64_char
+  (lambda (alpha v) (string_slice alpha v (int_add v 1))))
+
+; b64_encode_with — the standard 3-bytes->4-chars packing. `pad?` controls the
+; trailing "=" fill (true for standard base64, false for the URL variant). The
+; 1- and 2-byte tails emit "==" / "=" (or nothing when unpadded).
+; Each 4-char group is appended to a LOCAL list and joined once at the end (O(n))
+; rather than prepended onto a growing accumulator each step (O(n^2)). The bytes
+; emitted are unchanged, so the output string is byte-identical.
+(bind b64_encode_with
+  (lambda (alpha pad? v)
+    (bind ((bl (to_byte_list v)) (n (size bl))
+           (parts (list_of)) (i (ref 0)))
+      (do
+        (while (lt (deref i) n)
+          (bind ((b0 (get bl (deref i) 0))
+                 (rem (int_sub n (deref i)))
+                 (b1 (if (gt rem 1) (get bl (int_add (deref i) 1) 0) 0))
+                 (b2 (if (gt rem 2) (get bl (int_add (deref i) 2) 0) 0))
+                 (triple (int_or (int_or (int_shl b0 16) (int_shl b1 8)) b2)))
+            (do
+              (append parts
+                (string_concat_many
+                  (b64_char alpha (int_and (int_shr triple 18) 63))
+                  (b64_char alpha (int_and (int_shr triple 12) 63))
+                  ; third char exists only with >= 2 input bytes
+                  (if (gt rem 1)
+                    (b64_char alpha (int_and (int_shr triple 6) 63))
+                    (if pad? "=" ""))
+                  ; fourth char exists only with 3 input bytes
+                  (if (gt rem 2)
+                    (b64_char alpha (int_and triple 63))
+                    (if pad? "=" ""))))
+              (set_ref i (int_add (deref i) 3)))))
+        (sequence_join parts "")))))
+
+; b64_value — the 6-bit value of a base64 char in `alpha`, or -1 when absent.
+(bind b64_value
+  (lambda (alpha c)
+    (if (not (eq (size c) 1)) -1
+      (if (string_contains alpha c) (string_find alpha c) -1))))
+
+; b64_decode_with — decode a base64 string under `alpha`. Trailing "=" padding
+; is tolerated (and optional, so it round-trips the unpadded URL variant). Any
+; character outside the alphabet (other than "=") is a protocol error.
+(bind b64_decode_with
+  (lambda (alpha s)
+    (bind ((cs (string_chars s)) (out (list_of)) (vals (list_of))
+           (i (ref 0)) (n (size s)))
+      (do
+        ; gather the significant (non-"=") characters into 6-bit values
+        (while (lt (deref i) n)
+          (bind ((c (get cs (deref i) "")))
+            (do
+              (if (eq c "=")
+                null
+                (bind ((vv (b64_value alpha c)))
+                  (if (lt vv 0)
+                    (raise! "stdlib.encoding.base64"
+                      "base64 string contains an invalid character"
+                      (assoc (map_of) "index" (deref i)))
+                    (append vals vv))))
+              (set_ref i (int_add (deref i) 1)))))
+        ; a group of 4 six-bit values yields 3 bytes; a tail of 2 -> 1 byte,
+        ; a tail of 3 -> 2 bytes (a lone trailing value is malformed)
+        (bind ((m (size vals)) (k (ref 0)))
+          (do
+            (if (eq (int_mod m 4) 1)
+              (raise! "stdlib.encoding.base64"
+                "base64 string has an invalid length"
+                (assoc (map_of) "values" m))
+              null)
+            (while (lt (deref k) m)
+              (bind ((rem (int_sub m (deref k)))
+                     (v0 (get vals (deref k) 0))
+                     (v1 (if (gt rem 1) (get vals (int_add (deref k) 1) 0) 0))
+                     (v2 (if (gt rem 2) (get vals (int_add (deref k) 2) 0) 0))
+                     (v3 (if (gt rem 3) (get vals (int_add (deref k) 3) 0) 0))
+                     (triple (int_or (int_or (int_or
+                               (int_shl v0 18) (int_shl v1 12))
+                               (int_shl v2 6)) v3)))
+                (do
+                  (append out (int_and (int_shr triple 16) 255))
+                  (if (gt rem 2)
+                    (append out (int_and (int_shr triple 8) 255)) null)
+                  (if (gt rem 3)
+                    (append out (int_and triple 255)) null)
+                  (set_ref k (int_add (deref k) 4)))))
+            (bytes_of out)))))))
+
+(bind base64_encode    (lambda (v) (b64_encode_with base64_std true v)))
+(bind base64_decode    (lambda (s) (b64_decode_with base64_std s)))
+(bind base64url_encode (lambda (v) (b64_encode_with base64_url false v)))
+(bind base64url_decode (lambda (s) (b64_decode_with base64_url s)))
+
+; ── base32 (RFC 4648) ────────────────────────────────────────────────────────
+; The standard alphabet: A-Z then 2-7 (index 0..31). Encoding packs 5 input bytes
+; (40 bits) into 8 output chars (5 bits each); a short tail is "=" padded out to a
+; full 8-char block. Decoding reverses it (padding optional/tolerated).
+(bind base32_alpha "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
+
+; b32_char — the alphabet character for a 5-bit value 0..31.
+(bind b32_char
+  (lambda (v) (string_slice base32_alpha v (int_add v 1))))
+
+; b32_chars_for — how many of a block's 8 output chars are significant (not "=")
+; for a tail of `rem` input bytes (1->2, 2->4, 3->5, 4->7, 5+->8). This is
+; ceil(rem*8/5) capped at 8 — the RFC 4648 group sizes.
+(bind b32_chars_for
+  (lambda (rem)
+    (cond
+      ((eq rem 1) 2)
+      ((eq rem 2) 4)
+      ((eq rem 3) 5)
+      ((eq rem 4) 7)
+      (else 8))))
+
+; base32_encode — bytes/string -> RFC 4648 base32 string (uppercase, "=" padded).
+; Each 5-byte group becomes 8 chars; the bits not covered by a short tail come
+; from zero-fill bytes and are emitted as "=" instead of a char. Like the other
+; encoders, 8-char groups are appended to a LOCAL list and joined once (O(n)).
+(bind base32_encode
+  (lambda (v)
+    (bind ((bl (to_byte_list v)) (n (size bl))
+           (parts (list_of)) (i (ref 0)))
+      (do
+        (while (lt (deref i) n)
+          (bind ((rem (int_sub n (deref i)))
+                 (sig (b32_chars_for rem))
+                 (b0 (get bl (deref i) 0))
+                 (b1 (if (gt rem 1) (get bl (int_add (deref i) 1) 0) 0))
+                 (b2 (if (gt rem 2) (get bl (int_add (deref i) 2) 0) 0))
+                 (b3 (if (gt rem 3) (get bl (int_add (deref i) 3) 0) 0))
+                 (b4 (if (gt rem 4) (get bl (int_add (deref i) 4) 0) 0))
+                 ; the full 40-bit group, high byte first (b0 at bits 32..39)
+                 (grp (int_or (int_or (int_or (int_shl b0 32) (int_shl b1 24))
+                                      (int_or (int_shl b2 16) (int_shl b3 8))) b4))
+                 ; the eight 5-bit slices, high first (5*8 = 40 bits)
+                 (slices (list_of
+                           (int_and (int_shr grp 35) 31)
+                           (int_and (int_shr grp 30) 31)
+                           (int_and (int_shr grp 25) 31)
+                           (int_and (int_shr grp 20) 31)
+                           (int_and (int_shr grp 15) 31)
+                           (int_and (int_shr grp 10) 31)
+                           (int_and (int_shr grp 5) 31)
+                           (int_and grp 31)))
+                 (j (ref 0)))
+            (do
+              ; emit a char for each significant slice; the rest become "=" pad
+              (each slices
+                (lambda (sl)
+                  (do
+                    (append parts
+                      (if (lt (deref j) sig) (b32_char sl) "="))
+                    (set_ref j (int_add (deref j) 1)))))
+              (set_ref i (int_add (deref i) 5)))))
+        (sequence_join parts "")))))
+
+; b32_value — the 5-bit value of a base32 char (uppercase only, per RFC), or -1.
+(bind b32_value
+  (lambda (c)
+    (if (not (eq (size c) 1)) -1
+      (if (string_contains base32_alpha c) (string_find base32_alpha c) -1))))
+
+; b32_bytes_for — how many bytes a final block of `v` significant 5-bit values
+; decodes to (2->1, 4->2, 5->3, 7->4, 8->5); the inverse of b32_chars_for. A
+; tail of 1/3/6 five-bit values is impossible in a well-formed stream.
+(bind b32_bytes_for
+  (lambda (v)
+    (cond
+      ((ge v 8) 5)
+      ((ge v 7) 4)
+      ((ge v 5) 3)
+      ((ge v 4) 2)
+      (else 1))))
+
+; base32_decode — a base32 string -> bytes. Trailing "=" padding is tolerated and
+; optional. Any character outside the alphabet (other than "=") is an error.
+(bind base32_decode
+  (lambda (s)
+    (bind ((cs (string_chars s)) (out (list_of)) (vals (list_of))
+           (i (ref 0)) (n (size s)))
+      (do
+        ; gather the significant (non-"=") characters into 5-bit values
+        (while (lt (deref i) n)
+          (bind ((c (get cs (deref i) "")))
+            (do
+              (if (eq c "=")
+                null
+                (bind ((vv (b32_value c)))
+                  (if (lt vv 0)
+                    (raise! "stdlib.encoding.base32"
+                      "base32 string contains an invalid character"
+                      (assoc (map_of) "index" (deref i)))
+                    (append vals vv))))
+              (set_ref i (int_add (deref i) 1)))))
+        ; each block of 8 five-bit values yields 5 bytes; a short tail of
+        ; 2/4/5/7 yields 1/2/3/4 bytes (1/3/6 is malformed)
+        (bind ((m (size vals)) (k (ref 0)) (tailmod (int_mod m 8)))
+          (do
+            (if (or (eq tailmod 1) (or (eq tailmod 3) (eq tailmod 6)))
+              (raise! "stdlib.encoding.base32"
+                "base32 string has an invalid length"
+                (assoc (map_of) "values" m))
+              null)
+            (while (lt (deref k) m)
+              (bind ((rem (int_sub m (deref k)))
+                     (nbytes (b32_bytes_for rem))
+                     (v0 (get vals (deref k) 0))
+                     (v1 (if (gt rem 1) (get vals (int_add (deref k) 1) 0) 0))
+                     (v2 (if (gt rem 2) (get vals (int_add (deref k) 2) 0) 0))
+                     (v3 (if (gt rem 3) (get vals (int_add (deref k) 3) 0) 0))
+                     (v4 (if (gt rem 4) (get vals (int_add (deref k) 4) 0) 0))
+                     (v5 (if (gt rem 5) (get vals (int_add (deref k) 5) 0) 0))
+                     (v6 (if (gt rem 6) (get vals (int_add (deref k) 6) 0) 0))
+                     (v7 (if (gt rem 7) (get vals (int_add (deref k) 7) 0) 0))
+                     ; reassemble the 40-bit group, then slice bytes off the top
+                     (hi (int_or (int_or (int_or (int_shl v0 35) (int_shl v1 30))
+                                         (int_or (int_shl v2 25) (int_shl v3 20)))
+                                 (int_or (int_or (int_shl v4 15) (int_shl v5 10))
+                                         (int_or (int_shl v6 5) v7)))))
+                (do
+                  (append out (int_and (int_shr hi 32) 255))
+                  (if (gt nbytes 1)
+                    (append out (int_and (int_shr hi 24) 255)) null)
+                  (if (gt nbytes 2)
+                    (append out (int_and (int_shr hi 16) 255)) null)
+                  (if (gt nbytes 3)
+                    (append out (int_and (int_shr hi 8) 255)) null)
+                  (if (gt nbytes 4)
+                    (append out (int_and hi 255)) null)
+                  (set_ref k (int_add (deref k) 8)))))
+            (bytes_of out)))))))
+
+; ── percent (URL) encoding ──────────────────────────────────────────────────
+; unreserved? — an RFC 3986 unreserved byte: ALPHA / DIGIT / "-" / "." / "_" /
+; "~". Those pass through; every other byte becomes %XX (uppercase hex, the
+; canonical RFC form).
+(bind unreserved_set
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+(bind unreserved_byte?
+  (lambda (b)
+    (and (and (ge b 0) (le b 127))
+         (string_contains unreserved_set
+           (bytes->string (bytes_of (list_of b)))))))
+
+(bind hex_upper "0123456789ABCDEF")
+
+; percent_encode — STRING -> %XX-escaped string. The string is UTF-8 encoded
+; first, so a multi-byte character escapes to one %XX per byte.
+(bind percent_encode
+  (lambda (s)
+    (bind ((bl (to_byte_list s)) (parts (list_of)))
+      (do
+        ; each byte's rendering (a literal char or its %XX escape) is appended to
+        ; a LOCAL list and joined once (O(n)), not concatenated onto a growing
+        ; accumulator (O(n^2)); the per-byte output is unchanged so the result is
+        ; byte-identical.
+        (each bl
+          (lambda (b)
+            (append parts
+              (if (unreserved_byte? b)
+                (bytes->string (bytes_of (list_of b)))
+                (string_concat_many "%"
+                  (string_slice hex_upper (int_shr b 4) (int_add (int_shr b 4) 1))
+                  (string_slice hex_upper (int_and b 15) (int_add (int_and b 15) 1)))))))
+        (sequence_join parts "")))))
+
+; percent_decode — STRING -> decoded string. "%XX" sequences become their byte
+; (collected and UTF-8 decoded as a whole, so multi-byte chars rejoin); a "+"
+; is left literal (form encoding is not assumed). A truncated/invalid "%" is a
+; protocol error.
+(bind percent_decode
+  (lambda (s)
+    (bind ((cs (string_chars s)) (n (size s)) (out (list_of)) (i (ref 0)))
+      (do
+        (while (lt (deref i) n)
+          (bind ((c (get cs (deref i) "")))
+            (if (eq c "%")
+              (bind ((hi (hex_digit_value (get cs (int_add (deref i) 1) "")))
+                     (lo (hex_digit_value (get cs (int_add (deref i) 2) ""))))
+                (if (or (lt hi 0) (lt lo 0))
+                  (raise! "stdlib.encoding.percent"
+                    "invalid percent-escape (need two hex digits after `%`)"
+                    (assoc (map_of) "index" (deref i)))
+                  (do
+                    (append out (int_or (int_shl hi 4) lo))
+                    (set_ref i (int_add (deref i) 3)))))
+              ; a non-"%" character: append its own UTF-8 bytes verbatim
+              (do
+                (each (bytes_to_list (string->bytes c))
+                  (lambda (b) (append out b)))
+                (set_ref i (int_add (deref i) 1))))))
+        (bytes->string (bytes_of out))))))
+
+; ── ord / chr ───────────────────────────────────────────────────────────────
+; ord — the Unicode codepoint of a ONE-character string. The char's UTF-8 bytes
+; are decoded inline (ASCII is the single byte itself; 2/3/4-byte forms strip
+; the lead/continuation bits). A multi-character or empty string is an error.
+(bind ord
+  (lambda (c)
+    (if (not (eq (size c) 1))
+      (raise! "stdlib.encoding.ord"
+        "ord expects a one-character string"
+        (assoc (map_of) "length" (size c)))
+      (bind ((bl (bytes_to_list (string->bytes c))) (b0 (get bl 0 0)))
+        (cond
+          ((lt b0 128) b0)
+          ; 110xxxxx 10xxxxxx
+          ((lt b0 224)
+            (int_or (int_shl (int_and b0 31) 6)
+                    (int_and (get bl 1 0) 63)))
+          ; 1110xxxx 10xxxxxx 10xxxxxx
+          ((lt b0 240)
+            (int_or (int_or (int_shl (int_and b0 15) 12)
+                            (int_shl (int_and (get bl 1 0) 63) 6))
+                    (int_and (get bl 2 0) 63)))
+          ; 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+          (else
+            (int_or (int_or (int_or
+                      (int_shl (int_and b0 7) 18)
+                      (int_shl (int_and (get bl 1 0) 63) 12))
+                      (int_shl (int_and (get bl 2 0) 63) 6))
+                    (int_and (get bl 3 0) 63))))))))
+
+; chr — the one-character string for a Unicode codepoint (0..0x10FFFF, no
+; surrogates). Mirrors json.caap's codepoint_to_string UTF-8 hand-encoding.
+(bind chr
+  (lambda (cp)
+    (if (or (lt cp 0) (or (gt cp 1114111) (and (ge cp 55296) (le cp 57343))))
+      (raise! "stdlib.encoding.chr"
+        "chr expects a Unicode scalar value (0..0x10FFFF, no surrogates)"
+        (assoc (map_of) "codepoint" cp))
+      (bytes->string
+        (bytes_of
+          (cond
+            ((lt cp 128) (list_of cp))
+            ((lt cp 2048)
+              (list_of
+                (int_add 192 (int_div cp 64))
+                (int_add 128 (int_mod cp 64))))
+            ((lt cp 65536)
+              (list_of
+                (int_add 224 (int_div cp 4096))
+                (int_add 128 (int_mod (int_div cp 64) 64))
+                (int_add 128 (int_mod cp 64))))
+            (else
+              (list_of
+                (int_add 240 (int_div cp 262144))
+                (int_add 128 (int_mod (int_div cp 4096) 64))
+                (int_add 128 (int_mod (int_div cp 64) 64))
+                (int_add 128 (int_mod cp 64))))))))))
+
+; ── utf8 (explicit byte-list views) ─────────────────────────────────────────
+; utf8_encode — STRING -> list of byte ints (the UTF-8 octets).
+; utf8_decode — list of byte ints -> STRING (validates UTF-8 via bytes->string).
+(bind utf8_encode (lambda (s) (bytes_to_list (string->bytes s))))
+(bind utf8_decode (lambda (bl) (bytes->string (bytes_of bl))))
+
+(export
+  hex_encode hex_decode
+  base64_encode base64_decode base64url_encode base64url_decode
+  base32_encode base32_decode
+  percent_encode percent_decode
+  ord chr
+  utf8_encode utf8_decode)

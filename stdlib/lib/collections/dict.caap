@@ -1,0 +1,332 @@
+; stdlib/lib/collections/dict.caap — a hash map + hash set keyed by ARBITRARY
+; STRUCTURAL keys (module stdlib.lib.collections.dict).
+;
+; The kernel `map` and stdlib `set` (an element->true map) both restrict keys to
+; STRINGS — the map builtins key by kernel string. This module lifts that: keys
+; may be any value (int, list, map, struct, …). It buckets by the kernel
+; `value_hash` (structural hash → int) and resolves bucket collisions —
+; including two DISTINCT lists that are structurally equal — by `value_eq`
+; (structural equality). `value_eq`-equal keys therefore map to the same slot.
+;
+; Representation (a plain kernel map, so any code can inspect it without this
+; module): a `buckets` map from `int_to_string(value_hash key)` (a string, so a
+; legal kernel-map key) to a list of `[k v]` entry pairs — every entry whose key
+; hashes to that bucket, distinguished by `value_eq`. `to_map`/`of_map` bridge to
+; a string-keyed kernel map for interop (lossy when keys aren't already strings).
+;
+; Every operation is PURE (mirrors lib/collections/{set,result}): a derived dict
+; is a FRESH map; inputs are never mutated. Internal `out`/bucket accumulators
+; are the function's own fresh state, so mutating them stays effect-free.
+(module stdlib.lib.collections.dict)
+
+(use stdlib.lib.collections.sequence fold any? all?)
+
+; ── internal bucket helpers (private; not exported) ─────────────────────────
+
+; dict__bucket_key — the string bucket id for a structural key.
+;   k  : any value
+;   -> : int_to_string(value_hash(k)) — a legal kernel-map key
+(bind dict__bucket_key
+  (lambda (k) (int_to_string (value_hash k))))
+
+; dict__bucket — the entry list at `k`'s bucket (empty when the bucket is unused).
+;   d / k : a dict and a structural key
+;   ->    : a list of [k v] pairs (the kernel-map value, or an empty list)
+(bind dict__bucket
+  (lambda (d k) (get d (dict__bucket_key k) (list_of))))
+
+; dict__entry_value — scan a bucket's entry list for the value under `k`.
+;   entries : a list of [k v] pairs (one bucket)
+;   k       : the structural key sought
+;   default : returned when no entry's key is value_eq to `k`
+;   ->      : the matching value, else `default`
+(bind dict__entry_value
+  (lambda (entries k default)
+    (fold entries default
+      (lambda (acc e) (if (value_eq (get e 0) k) (get e 1) acc)))))
+
+; dict__bucket_has? — does a bucket hold an entry whose key is value_eq to `k`?
+;   entries : a list of [k v] pairs
+;   k       : the structural key sought
+;   ->      : bool
+(bind dict__bucket_has?
+  (lambda (entries k)
+    (any? entries (lambda (e) (value_eq (get e 0) k)))))
+
+; dict__bucket_without — a fresh entry list with any value_eq-to-`k` entry dropped.
+;   entries : a list of [k v] pairs
+;   k       : the structural key to remove
+;   ->      : a fresh list (entries untouched)
+(bind dict__bucket_without
+  (lambda (entries k)
+    (bind ((out (list_of)))
+      (do
+        (for e entries (unless (value_eq (get e 0) k) (append out e)))
+        out))))
+
+; dict__clone — a fresh copy of a dict's buckets (entry pairs are rebuilt, so the
+; source's bucket lists are never shared/mutated by later edits).
+;   d  : a dict
+;   -> : a fresh dict with the same entries
+(bind dict__clone
+  (lambda (d)
+    (bind ((out (map_of)))
+      (do
+        (for bk (map_keys d)
+          (bind ((fresh (list_of)))
+            (do
+              (for e (get d bk) (append fresh (list_of (get e 0) (get e 1))))
+              (assoc out bk fresh))))
+        out))))
+
+; ── dict: construction & queries ────────────────────────────────────────────
+
+; dict_new — a fresh empty dict.
+;   -> : an empty dict
+(bind dict_new (lambda () (map_of)))
+
+; dict_get — the value stored under structural key `k`, or `default`.
+;   d / k   : a dict and the structural key to look up
+;   default : returned when `k` is absent
+;   ->      : the value, else `default`
+(bind dict_get
+  (lambda (d k default)
+    (dict__entry_value (dict__bucket d k) k default)))
+
+; dict_has? — is structural key `k` present in `d`?
+;   d / k : a dict and a candidate key
+;   ->    : bool
+(bind dict_has?
+  (lambda (d k) (dict__bucket_has? (dict__bucket d k) k)))
+
+; dict_size — the number of entries (summed across all buckets).
+;   d  : a dict
+;   -> : int
+(bind dict_size
+  (lambda (d)
+    (fold (map_keys d) 0 (lambda (acc bk) (int_add acc (size (get d bk)))))))
+
+; dict_empty? — has `d` no entries?
+;   d  : a dict
+;   -> : bool
+(bind dict_empty? (lambda (d) (eq (dict_size d) 0)))
+
+; dict_keys — every key as a list (order unspecified).
+;   d  : a dict
+;   -> : a list of keys (arbitrary structural values)
+(bind dict_keys
+  (lambda (d)
+    (bind ((out (list_of)))
+      (do
+        (for bk (map_keys d) (for e (get d bk) (append out (get e 0))))
+        out))))
+
+; dict_values — every value as a list (parallel to dict_keys' order).
+;   d  : a dict
+;   -> : a list of values
+(bind dict_values
+  (lambda (d)
+    (bind ((out (list_of)))
+      (do
+        (for bk (map_keys d) (for e (get d bk) (append out (get e 1))))
+        out))))
+
+; dict_entries — the dict as a list of [k v] pairs (order unspecified).
+;   d  : a dict
+;   -> : a fresh list of 2-element [key value] lists
+(bind dict_entries
+  (lambda (d)
+    (bind ((out (list_of)))
+      (do
+        (for bk (map_keys d)
+          (for e (get d bk) (append out (list_of (get e 0) (get e 1)))))
+        out))))
+
+; ── dict: single-entry edits (pure) ─────────────────────────────────────────
+
+; dict_put — a fresh dict with `k`→`v` set (replacing any value_eq-keyed entry).
+;   d / k / v : a dict, the structural key, and the value to store
+;   ->        : a fresh dict (d untouched)
+(bind dict_put
+  (lambda (d k v)
+    (bind ((out (dict__clone d)) (bk (dict__bucket_key k))
+           (rest (dict__bucket_without (get out bk (list_of)) k)))
+      (do
+        (append rest (list_of k v))
+        (assoc out bk rest)
+        out))))
+
+; dict_del — a fresh dict with any value_eq-to-`k` entry removed.
+;   d / k : a dict and the structural key to drop
+;   ->    : a fresh dict (d untouched; a no-op when `k` is absent)
+(bind dict_del
+  (lambda (d k)
+    (bind ((out (dict__clone d)) (bk (dict__bucket_key k))
+           (rest (dict__bucket_without (get out bk (list_of)) k)))
+      (do
+        (if (eq (size rest) 0)
+          (when (contains out bk) (map_delete out bk))
+          (assoc out bk rest))
+        out))))
+
+; ── interop bridges (string keys for to_map/of_map) ─────────────────────────
+
+; dict_of_pairs — a dict from a list of [k v] pairs (later pairs win).
+;   pairs : a list of 2-element [key value] lists (keys may be structural)
+;   ->    : a fresh dict
+(bind dict_of_pairs
+  (lambda (pairs)
+    (fold pairs (map_of)
+      (lambda (acc e) (dict_put acc (get e 0) (get e 1))))))
+
+; to_map — a string-keyed kernel map of this dict (interop; LOSSY when keys are
+; not already strings, since kernel-map keys are strings).
+;   d  : a dict
+;   -> : a fresh kernel map
+(bind to_map
+  (lambda (d)
+    (bind ((out (map_of)))
+      (do
+        (for bk (map_keys d)
+          (for e (get d bk) (assoc out (get e 0) (get e 1))))
+        out))))
+
+; of_map — a dict from a string-keyed kernel map (the inverse of to_map for
+; already-string keys).
+;   m  : a kernel map
+;   -> : a fresh dict carrying the same entries
+(bind of_map
+  (lambda (m)
+    (fold (map_keys m) (map_of)
+      (lambda (acc k) (dict_put acc k (get m k))))))
+
+; ── dict: bulk transforms & folds (pure; each yields a fresh dict) ───────────
+
+; dict_update — apply `f` to the current value under `k` (or `default` when
+; absent), storing the result. (read-modify-write under one structural key)
+;   d / k     : a dict and the structural key to update
+;   f         : (current-or-default) -> value'
+;   default   : the value handed to `f` when `k` is absent
+;   ->        : a fresh dict with `k` -> (f current-or-default)  (d untouched)
+(bind dict_update
+  (lambda (d k f default)
+    (dict_put d k (f (dict_get d k default)))))
+
+; dict_merge — every entry of `a` then `b`; on a value_eq key clash, B WINS.
+;   a / b : two dicts
+;   ->    : a fresh dict (neither input mutated)
+(bind dict_merge
+  (lambda (a b)
+    (fold (dict_entries b) (dict__clone a)
+      (lambda (acc e) (dict_put acc (get e 0) (get e 1))))))
+
+; dict_map_vals — a fresh dict with each value replaced by `(f value)` (keys kept).
+;   d / f : a dict and (value) -> value'
+;   ->    : a fresh dict over the same keys
+(bind dict_map_vals
+  (lambda (d f)
+    (fold (dict_entries d) (map_of)
+      (lambda (acc e) (dict_put acc (get e 0) (f (get e 1)))))))
+
+; dict_filter — the entries whose [key value] satisfy `pred`.
+;   d / pred : a dict and (key value) -> bool
+;   ->       : a fresh dict of the kept entries
+(bind dict_filter
+  (lambda (d pred)
+    (fold (dict_entries d) (map_of)
+      (lambda (acc e)
+        (if (pred (get e 0) (get e 1)) (dict_put acc (get e 0) (get e 1)) acc)))))
+
+; dict_fold — fold `f` over the entries (order unspecified).
+;   d / init / f : a dict, a seed, and (acc key value) -> acc
+;   ->           : the final accumulator
+(bind dict_fold
+  (lambda (d init f)
+    (fold (dict_entries d) init
+      (lambda (acc e) (f acc (get e 0) (get e 1))))))
+
+; ── hash-set over arbitrary structural elements ─────────────────────────────
+; A hash-set is a dict whose values are all `true` — the keys carry the members.
+
+; hset_new — a fresh empty hash-set.
+;   -> : an empty hash-set
+(bind hset_new (lambda () (map_of)))
+
+; hset_of — a hash-set from a list of elements (value_eq duplicates collapse).
+;   xs : a list of elements (any structural values)
+;   -> : a fresh hash-set
+(bind hset_of
+  (lambda (xs)
+    (fold xs (map_of) (lambda (acc x) (dict_put acc x true)))))
+
+; hset_add — a fresh hash-set with `x` added.
+;   s / x : a hash-set and the element to add
+;   ->    : a fresh hash-set (s untouched)
+(bind hset_add (lambda (s x) (dict_put s x true)))
+
+; hset_has? — is `x` a member of `s`?
+;   s / x : a hash-set and a candidate element
+;   ->    : bool
+(bind hset_has? (lambda (s x) (dict_has? s x)))
+
+; hset_del — a fresh hash-set without `x`.
+;   s / x : a hash-set and the element to drop
+;   ->    : a fresh hash-set (s untouched)
+(bind hset_del (lambda (s x) (dict_del s x)))
+
+; hset_items — the elements as a list (order unspecified).
+;   s  : a hash-set
+;   -> : a list of elements
+(bind hset_items (lambda (s) (dict_keys s)))
+
+; hset_size — the number of elements.
+;   s  : a hash-set
+;   -> : int
+(bind hset_size (lambda (s) (dict_size s)))
+
+; hset_empty? — has `s` no elements?
+;   s  : a hash-set
+;   -> : bool
+(bind hset_empty? (lambda (s) (dict_empty? s)))
+
+; ── hash-set algebra over structural elements (pure; each yields a fresh set) ─
+; The structural-set algebra that lib/collections/set has for strings; here the
+; members may be ANY value (value_eq distinguishes them). Built only on the
+; hset_* surface (hset_add/hset_has?/hset_items).
+
+; hset_union — every element of `a` or `b`.
+;   a / b : two hash-sets
+;   ->    : a fresh hash-set
+(bind hset_union
+  (lambda (a b)
+    (fold (hset_items b) (dict__clone a) (lambda (acc x) (hset_add acc x)))))
+
+; hset_intersection — the elements in BOTH `a` and `b`.
+;   a / b : two hash-sets
+;   ->    : a fresh hash-set
+(bind hset_intersection
+  (lambda (a b)
+    (fold (hset_items a) (map_of)
+      (lambda (acc x) (if (hset_has? b x) (hset_add acc x) acc)))))
+
+; hset_difference — the elements of `a` that are NOT in `b`.
+;   a / b : two hash-sets
+;   ->    : a fresh hash-set
+(bind hset_difference
+  (lambda (a b)
+    (fold (hset_items a) (map_of)
+      (lambda (acc x) (if (hset_has? b x) acc (hset_add acc x))))))
+
+; hset_subset? — is every element of `a` also in `b`?
+;   a / b : two hash-sets
+;   ->    : bool (true when `a` is empty)
+(bind hset_subset?
+  (lambda (a b) (all? (hset_items a) (lambda (x) (hset_has? b x)))))
+
+(export dict_new dict_put dict_get dict_has? dict_del
+        dict_keys dict_values dict_size dict_empty? dict_entries
+        dict_of_pairs to_map of_map
+        dict_update dict_merge dict_map_vals dict_filter dict_fold
+        hset_new hset_of hset_add hset_has? hset_del
+        hset_items hset_size hset_empty?
+        hset_union hset_intersection hset_difference hset_subset?)

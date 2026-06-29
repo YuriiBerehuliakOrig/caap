@@ -1,0 +1,232 @@
+; stdlib/lib/tests/test_sorted.caap — in-language tests for lib/collections/sorted.
+
+;; @area: collections
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.collections.sorted
+     int_cmp invert_cmp
+     heap_new heap_push heap_pop heap_peek heap_size heap_from_list heapify heap_is_empty?
+     heap_replace heap_to_sorted_list max_heap_push max_heap_pop
+     queue_new enqueue dequeue queue_peek queue_size queue_is_empty?
+     stack_new push pop stack_peek stack_size stack_is_empty?
+     deque_new push_front push_back pop_front pop_back deque_size)
+(use stdlib.lib.core.equal deep_eq)
+
+(do
+  ; ── int_cmp ────────────────────────────────────────────────────────────────
+  (assert_true (lt (int_cmp 1 2) 0) "int_cmp a<b negative")
+  (assert_true (gt (int_cmp 5 2) 0) "int_cmp a>b positive")
+  (assert_eq   (int_cmp 3 3) 0       "int_cmp a==b zero")
+
+  ; ── min-heap: push 5,3,8,1 then pop four times -> ascending 1,3,5,8 ─────────
+  (assert_eq (heap_size (heap_new)) 0 "heap_new empty")
+  (assert_true (heap_is_empty? (heap_new)) "heap_is_empty? on new")
+  (bind (
+    (h0 (heap_new))
+    (h1 (heap_push h0 5 int_cmp))
+    (h2 (heap_push h1 3 int_cmp))
+    (h3 (heap_push h2 8 int_cmp))
+    (h4 (heap_push h3 1 int_cmp))
+  )
+    (do
+      (assert_eq (heap_size h4) 4 "heap holds four")
+      (assert_eq (heap_peek h4) 1 "heap_peek is the min")
+      ; pushes are pure: the earlier heaps are untouched
+      (assert_eq (heap_size h0) 0 "push leaves h0 empty")
+      (assert_eq (heap_size h1) 1 "push leaves h1 at one")
+      (bind ((p1 (heap_pop h4 int_cmp)))
+        (do
+          (assert_eq (get p1 "value") 1 "pop 1st = 1")
+          (bind ((p2 (heap_pop (get p1 "heap") int_cmp)))
+            (do
+              (assert_eq (get p2 "value") 3 "pop 2nd = 3")
+              (bind ((p3 (heap_pop (get p2 "heap") int_cmp)))
+                (do
+                  (assert_eq (get p3 "value") 5 "pop 3rd = 5")
+                  (bind ((p4 (heap_pop (get p3 "heap") int_cmp)))
+                    (do
+                      (assert_eq (get p4 "value") 8 "pop 4th = 8")
+                      (assert_eq (heap_size (get p4 "heap")) 0 "heap empty after four pops")
+                      ; pop is pure: h4 still holds all four
+                      (assert_eq (heap_size h4) 4 "pop leaves h4 intact")))))))))))
+
+  ; heap_from_list yields the same min-first ordering
+  (bind ((hf (heap_from_list (list_of 5 3 8 1 2) int_cmp)))
+    (do
+      (assert_eq (heap_size hf) 5 "heap_from_list size")
+      (assert_eq (heap_peek hf) 1 "heap_from_list min")
+      (bind ((a (heap_pop hf int_cmp)) )
+        (do
+          (assert_eq (get a "value") 1 "from_list pop 1")
+          (bind ((b (heap_pop (get a "heap") int_cmp)))
+            (assert_eq (get b "value") 2 "from_list pop 2"))))))
+
+  ; heapify (O(n) bottom-up) builds the same valid min-heap, input untouched
+  (bind ((src (list_of 5 3 8 1 2)) (hp (heapify src int_cmp)))
+    (do
+      (assert_eq (heap_size hp) 5 "heapify size")
+      (assert_eq (heap_peek hp) 1 "heapify min at the root")
+      (assert_eq (size src) 5 "heapify leaves the source list intact")
+      ; popping drains in ascending order, proving the heap property holds
+      (bind ((a (heap_pop hp int_cmp)))
+        (do
+          (assert_eq (get a "value") 1 "heapify pop 1")
+          (bind ((b (heap_pop (get a "heap") int_cmp)))
+            (do
+              (assert_eq (get b "value") 2 "heapify pop 2")
+              (bind ((c (heap_pop (get b "heap") int_cmp)))
+                (do
+                  (assert_eq (get c "value") 3 "heapify pop 3")
+                  (bind ((dd (heap_pop (get c "heap") int_cmp)))
+                    (do
+                      (assert_eq (get dd "value") 5 "heapify pop 5")
+                      (bind ((e (heap_pop (get dd "heap") int_cmp)))
+                        (assert_eq (get e "value") 8 "heapify pop 8"))))))))))))
+  (assert_eq (heap_size (heapify (list_of) int_cmp)) 0 "heapify of empty list is empty")
+
+  ; empty-pop is safe: value null, heap unchanged
+  (bind ((pe (heap_pop (heap_new) int_cmp)))
+    (do
+      (assert_eq (get pe "value") null "empty heap_pop value null")
+      (assert_eq (heap_size (get pe "heap")) 0 "empty heap_pop heap empty")))
+  (assert_eq (heap_peek (heap_new)) null "heap_peek empty -> null")
+
+  ; ── heap_replace: pop-then-push in one settle ──────────────────────────────
+  ; heap holds {1,3,5,8}; replace returns min 1 and a heap whose new min is 2
+  (bind ((h (heap_from_list (list_of 5 3 8 1) int_cmp)))
+    (do
+      (bind ((r (heap_replace h 2 int_cmp)))
+        (do
+          (assert_eq (get r "value") 1 "heap_replace returns the old min")
+          (assert_eq (heap_size (get r "heap")) 4 "heap_replace keeps the size")
+          (assert_eq (heap_peek (get r "heap")) 2 "heap_replace settles the new element (min now 2)")
+          (assert_eq (heap_size h) 4 "heap_replace did not mutate the input")))
+      ; replacing with a value larger than the rest leaves an old element as min
+      (bind ((r2 (heap_replace h 9 int_cmp)))
+        (do
+          (assert_eq (get r2 "value") 1 "heap_replace big: old min still 1")
+          (assert_eq (heap_peek (get r2 "heap")) 3 "heap_replace big: next min surfaces (3)")))))
+  ; heap_replace on an EMPTY heap is push-only: value null, heap = [x]
+  (bind ((re (heap_replace (heap_new) 7 int_cmp)))
+    (do
+      (assert_eq (get re "value") null "heap_replace empty: value null")
+      (assert_eq (heap_size (get re "heap")) 1 "heap_replace empty: heap is the singleton")
+      (assert_eq (heap_peek (get re "heap")) 7 "heap_replace empty: x is the min")))
+
+  ; ── heap_to_sorted_list: heapsort, ascending, input untouched ──────────────
+  (bind ((h (heap_from_list (list_of 5 3 8 1 2) int_cmp)))
+    (do
+      (assert_true (deep_eq (heap_to_sorted_list h int_cmp) (list_of 1 2 3 5 8))
+        "heap_to_sorted_list drains ascending")
+      (assert_eq (heap_size h) 5 "heap_to_sorted_list leaves the heap intact")))
+  (assert_true (deep_eq (heap_to_sorted_list (heap_new) int_cmp) (list_of))
+    "heap_to_sorted_list of empty heap is []")
+
+  ; ── max-heap convenience (inverted comparator) ─────────────────────────────
+  ; invert_cmp flips the order: the max becomes the inverted-min
+  (assert_true (gt ((invert_cmp int_cmp) 1 2) 0) "invert_cmp flips 1<2 to positive")
+  (bind (
+    (m0 (heap_new))
+    (m1 (max_heap_push m0 5 int_cmp))
+    (m2 (max_heap_push m1 3 int_cmp))
+    (m3 (max_heap_push m2 8 int_cmp))
+    (m4 (max_heap_push m3 1 int_cmp))
+  )
+    (do
+      (assert_eq (heap_size m4) 4 "max_heap holds four")
+      (bind ((p1 (max_heap_pop m4 int_cmp)))
+        (do
+          (assert_eq (get p1 "value") 8 "max_heap_pop 1st = 8 (the max)")
+          (bind ((p2 (max_heap_pop (get p1 "heap") int_cmp)))
+            (do
+              (assert_eq (get p2 "value") 5 "max_heap_pop 2nd = 5")
+              (bind ((p3 (max_heap_pop (get p2 "heap") int_cmp)))
+                (do
+                  (assert_eq (get p3 "value") 3 "max_heap_pop 3rd = 3")
+                  (bind ((p4 (max_heap_pop (get p3 "heap") int_cmp)))
+                    (assert_eq (get p4 "value") 1 "max_heap_pop 4th = 1 (the min, last out)"))))))))))
+  ; max-heap is just a heap under the inverted cmp: heap_to_sorted_list with the
+  ; inverted comparator drains descending
+  (bind ((mh (heap_from_list (list_of 5 3 8 1 2) (invert_cmp int_cmp))))
+    (assert_true (deep_eq (heap_to_sorted_list mh (invert_cmp int_cmp)) (list_of 8 5 3 2 1))
+      "inverted comparator drains descending"))
+
+  ; ── FIFO queue: enqueue 1,2,3 -> dequeue 1,2,3 ─────────────────────────────
+  (assert_true (queue_is_empty? (queue_new)) "queue_new empty")
+  (bind (
+    (q (enqueue (enqueue (enqueue (queue_new) 1) 2) 3))
+  )
+    (do
+      (assert_eq (queue_size q) 3 "queue size 3")
+      (assert_eq (queue_peek q) 1 "queue_peek = front")
+      (bind ((d1 (dequeue q)))
+        (do
+          (assert_eq (get d1 "value") 1 "dequeue 1st = 1 (FIFO)")
+          (assert_eq (queue_size q) 3 "dequeue leaves q intact")
+          (bind ((d2 (dequeue (get d1 "queue"))))
+            (do
+              (assert_eq (get d2 "value") 2 "dequeue 2nd = 2")
+              (bind ((d3 (dequeue (get d2 "queue"))))
+                (do
+                  (assert_eq (get d3 "value") 3 "dequeue 3rd = 3")
+                  (assert_eq (queue_size (get d3 "queue")) 0 "queue empty after three")))))))))
+  ; empty dequeue is safe
+  (bind ((de (dequeue (queue_new))))
+    (do
+      (assert_eq (get de "value") null "empty dequeue value null")
+      (assert_eq (queue_size (get de "queue")) 0 "empty dequeue queue empty")))
+  (assert_eq (queue_peek (queue_new)) null "queue_peek empty -> null")
+
+  ; ── LIFO stack: push 1,2,3 -> pop 3,2,1 ────────────────────────────────────
+  (assert_true (stack_is_empty? (stack_new)) "stack_new empty")
+  (bind (
+    (s (push (push (push (stack_new) 1) 2) 3))
+  )
+    (do
+      (assert_eq (stack_size s) 3 "stack size 3")
+      (assert_eq (stack_peek s) 3 "stack_peek = top")
+      (bind ((p1 (pop s)))
+        (do
+          (assert_eq (get p1 "value") 3 "pop 1st = 3 (LIFO)")
+          (assert_eq (stack_size s) 3 "pop leaves s intact")
+          (bind ((p2 (pop (get p1 "stack"))))
+            (do
+              (assert_eq (get p2 "value") 2 "pop 2nd = 2")
+              (bind ((p3 (pop (get p2 "stack"))))
+                (do
+                  (assert_eq (get p3 "value") 1 "pop 3rd = 1")
+                  (assert_eq (stack_size (get p3 "stack")) 0 "stack empty after three")))))))))
+  ; empty pop is safe
+  (bind ((spe (pop (stack_new))))
+    (do
+      (assert_eq (get spe "value") null "empty stack pop value null")
+      (assert_eq (stack_size (get spe "stack")) 0 "empty stack pop stack empty")))
+  (assert_eq (stack_peek (stack_new)) null "stack_peek empty -> null")
+
+  ; ── deque: both ends ───────────────────────────────────────────────────────
+  ; push_back 1, push_back 2 -> [1 2]; push_front 0 -> [0 1 2]
+  (bind (
+    (d (push_front (push_back (push_back (deque_new) 1) 2) 0))
+  )
+    (do
+      (assert_eq (deque_size d) 3 "deque size 3")
+      (bind ((f (pop_front d)))
+        (do
+          (assert_eq (get f "value") 0 "pop_front = 0")
+          (assert_eq (deque_size d) 3 "pop_front leaves d intact")
+          (bind ((b (pop_back (get f "deque"))))
+            (do
+              (assert_eq (get b "value") 2 "pop_back = 2")
+              (assert_eq (deque_size (get b "deque")) 1 "deque has one left")
+              (bind ((m (pop_front (get b "deque"))))
+                (assert_eq (get m "value") 1 "remaining element = 1"))))))))
+  ; empty deque pops are safe at both ends
+  (bind ((ef (pop_front (deque_new))) (eb (pop_back (deque_new))))
+    (do
+      (assert_eq (get ef "value") null "empty pop_front value null")
+      (assert_eq (get eb "value") null "empty pop_back value null")
+      (assert_eq (deque_size (get ef "deque")) 0 "empty pop_front deque empty")
+      (assert_eq (deque_size (get eb "deque")) 0 "empty pop_back deque empty")))
+
+  true)

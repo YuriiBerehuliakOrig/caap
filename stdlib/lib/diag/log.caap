@@ -1,0 +1,192 @@
+; stdlib/lib/diag/log.caap — leveled structured logging (module stdlib.lib.diag.log).
+;
+; The diag tier already has a THROWN-error shape (lib/diag/error) and a non-throwing
+; *findings bag* (lib/diag/bag). This is the third diagnostic channel: an ordered,
+; *streaming* log — leveled records routed to a pluggable sink, the way a build or a
+; long-running pass narrates progress without accumulating everything in memory.
+;
+; Everything here is pure data + a sink callback, so the module stays in the lib tier
+; (it must NOT depend on `sys` — that would invert the tier ranks). A *sink* is any
+; `(lambda (record) …)`; the record is a tagged map:
+;
+;   {"level"      <int 0..4>,            ; trace<debug<info<warn<error
+;    "level_name" "trace"|…|"error",
+;    "message"    <string>,
+;    "fields"     [[k v] …]}            ; ordered context pairs (logfmt order)
+;
+; A *logger* threads a minimum level + a sink + accumulated context fields:
+;
+;   {"log" true, "min" <int>, "sink" <fn>, "fields" [[k v] …]}
+;
+; `with_field` returns a NEW logger (the parent is never mutated — context is layered,
+; not shared). Two renderers ship: `render_line` (logfmt: `level=info msg="…" k=v`) and
+; `render_jsonl` (one compact JSON object per line). A stderr sink is intentionally left
+; to the caller, who owns the `sys.io` capability: `(lambda (rec) (eprintln (render_line rec)))`.
+(module stdlib.lib.diag.log)
+
+(use stdlib.lib.text.json json_stringify)
+(use stdlib.lib.collections.sequence concat)
+(use stdlib.lib.text.format format)
+
+; ── levels ──────────────────────────────────────────────────────────────────
+
+; level_value — the ordinal for a level name; unknown names map to info (2).
+(bind level_value
+  (lambda (name)
+    (if (eq name "trace") 0
+    (if (eq name "debug") 1
+    (if (eq name "info")  2
+    (if (eq name "warn")  3
+    (if (eq name "error") 4
+        2)))))))
+
+; level_name — the canonical name for an ordinal; out-of-range maps to "info".
+(bind level_name
+  (lambda (v)
+    (if (eq v 0) "trace"
+    (if (eq v 1) "debug"
+    (if (eq v 2) "info"
+    (if (eq v 3) "warn"
+    (if (eq v 4) "error"
+        "info")))))))
+
+; ── loggers ───────────────────────────────────────────────────────────────────
+
+; make_logger — a logger emitting at or above `min_level` (a level NAME) to `sink`.
+(bind make_logger
+  (lambda (min_level sink)
+    (assoc (map_of)
+      "log" true
+      "min" (level_value min_level)
+      "sink" sink
+      "fields" (list_of))))
+
+; with_field — a NEW logger carrying an extra context field `k = v`. Rebuilt from a
+;   fresh map (assoc mutates in place), so the parent logger is genuinely unchanged.
+(bind with_field
+  (lambda (lg k v)
+    (assoc (map_of)
+      "log" true
+      "min" (get lg "min" 2)
+      "sink" (get lg "sink")
+      "fields" (concat (get lg "fields" (list_of)) (list_of (list_of k v))))))
+
+; with_min — a NEW logger whose threshold is raised/lowered to `min_level` (a name).
+;   Rebuilt from a fresh map for the same reason `with_field` is.
+(bind with_min
+  (lambda (lg min_level)
+    (assoc (map_of)
+      "log" true
+      "min" (level_value min_level)
+      "sink" (get lg "sink")
+      "fields" (get lg "fields" (list_of)))))
+
+; ── records + emit ────────────────────────────────────────────────────────────
+
+; make_record — the tagged record for an emitted line (level is an ordinal).
+(bind make_record
+  (lambda (level message fields)
+    (assoc (map_of)
+      "level" level
+      "level_name" (level_name level)
+      "message" message
+      "fields" fields)))
+
+; log_at — emit `message` at ordinal `level` IF it meets the logger threshold;
+;          routes a record to the sink. Returns the logger (for threading).
+(bind log_at
+  (lambda (lg level message)
+    (if (lt level (get lg "min" 2))
+        lg
+        (do
+          ((get lg "sink") (make_record level message (get lg "fields")))
+          lg))))
+
+; level-named convenience emitters.
+(bind log_trace (lambda (lg m) (log_at lg 0 m)))
+(bind log_debug (lambda (lg m) (log_at lg 1 m)))
+(bind log_info  (lambda (lg m) (log_at lg 2 m)))
+(bind log_warn  (lambda (lg m) (log_at lg 3 m)))
+(bind log_error (lambda (lg m) (log_at lg 4 m)))
+
+; ── renderers ─────────────────────────────────────────────────────────────────
+
+; render one `[k v]` field as logfmt `k=<json v>` (so strings are quoted/escaped).
+(bind log_field_logfmt
+  (lambda (p) (sequence_join (list_of (get p 0) "=" (json_stringify (get p 1))) "")))
+
+; render_line — logfmt: `level=info msg="…" k1=v1 k2=v2` (deterministic field order).
+(bind render_line
+  (lambda (rec)
+    (bind ((lname (get rec "level_name" "info"))
+           (msg   (json_stringify (get rec "message" "")))
+           (fs    (get rec "fields" (list_of))))
+      (if (eq (size fs) 0)
+          (sequence_join (list_of "level=" lname " msg=" msg) "")
+          (sequence_join
+            (list_of "level=" lname " msg=" msg " "
+                     (sequence_join (sequence_map fs log_field_logfmt) " "))
+            "")))))
+
+; render one `[k v]` field as a leading-comma JSON member `,"k":<json v>`.
+(bind log_field_json
+  (lambda (p) (sequence_join (list_of ",\"" (get p 0) "\":" (json_stringify (get p 1))) "")))
+
+; render_jsonl — one compact JSON object: {"level":"info","msg":"…","k":v}.
+(bind render_jsonl
+  (lambda (rec)
+    (bind ((fs (get rec "fields" (list_of))))
+      (sequence_join
+        (list_of "{\"level\":" (json_stringify (get rec "level_name" "info"))
+                 ",\"msg\":"   (json_stringify (get rec "message" ""))
+                 (sequence_join (sequence_map fs log_field_json) "")
+                 "}")
+        ""))))
+
+; ── sinks ─────────────────────────────────────────────────────────────────────
+
+; make_memory_sink — an in-memory sink that renders each record with `renderer`
+;   and accumulates the strings. Returns {"sink" <fn>, "lines" <()->list>}.
+(bind make_memory_sink
+  (lambda (renderer)
+    (bind ((cell (ref (list_of))))
+      (assoc (map_of)
+        "sink"  (lambda (rec) (do (append (deref cell) (renderer rec)) null))
+        "lines" (lambda () (deref cell))))))
+
+; ── formatted message + bulk fields (convenience over the primitives above) ───
+
+; logf — emit a FORMATTED message: render `template` against `args` with
+; lib/text/format's `format` (the {} / {0} / {name} substitution language), then
+; route the result through `log_at` at ordinal `level`. The threshold check is
+; `log_at`'s, so a below-threshold line costs only the format render; the logger
+; is returned for threading. `args` is a list (positional/indexed) or a map
+; (named), exactly as `format` expects.
+;   lg       : a logger
+;   level    : the level ORDINAL (0..4; see level_value / make_record)
+;   template : a format template string
+;   args     : the substitution list or map
+;   ->       : the logger (for threading)
+(bind logf
+  (lambda (lg level template args)
+    (log_at lg level (format template args))))
+
+; with_fields — a NEW logger carrying every `[k v]` pair in `pairs` as an added
+; context field, applied left-to-right (so later pairs render after earlier
+; ones). It is the bulk form of `with_field`: each pair is layered through the
+; same immutable `with_field`, so the parent logger is genuinely unchanged and an
+; empty `pairs` list returns an equivalent logger.
+;   lg    : a logger
+;   pairs : a list of [k v] pairs (each a 2-element list)
+;   ->    : a NEW logger with all the fields added
+(bind with_fields
+  (lambda (lg pairs)
+    (sequence_fold_left pairs lg
+      (lambda (acc p) (with_field acc (get p 0) (get p 1))))))
+
+(export level_value level_name
+        make_logger with_field with_min
+        make_record log_at log_trace log_debug log_info log_warn log_error
+        render_line render_jsonl
+        make_memory_sink
+        logf with_fields)

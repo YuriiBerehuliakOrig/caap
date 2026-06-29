@@ -1,0 +1,90 @@
+; stdlib/lib/tests/test_program_accessors.caap — the strict/soft readers over a
+; prep_units output map (stdlib.backend.program_accessors). These pin the loud
+; contract: a present field reads through, a missing required field THROWS
+; (naming the key) instead of decaying to a silent null. The sample map mirrors
+; the real prep_units key set without importing prep (the helpers operate on the
+; map, not the producer).
+
+;; @area: backend
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true assert_throws)
+(use stdlib.backend.program_accessors
+     program_field program_require_field!
+     program_name program_pairs program_finals program_structs
+     program_unions program_consts program_externs program_globals
+     program_global_arrays program_diagnostics)
+
+(do
+  ; a sample program map shaped like prep_units' output. Each aggregate field is
+  ; bound ONCE and the SAME object stored in the map, so a reader is asserted by
+  ; OBJECT IDENTITY (kernel `eq` is identity for aggregates) — that is exactly
+  ; what a reader does: hand back the stored reference, not a copy. A reader that
+  ; returned a neighbour's value would be a different object and fail.
+  (bind ((v_pairs   (list_of "p1" "p2"))
+         (v_finals  (list_of "f1"))
+         (v_structs (map_of "Node" (list_of)))
+         (v_unions  (map_of "U" (list_of)))
+         (v_consts  (map_of "K" 7))
+         (v_externs (list_of "malloc"))
+         (v_globals (list_of "g1"))
+         (v_garrays (list_of "ga1"))
+         (v_diags   (list_of))
+         (prog (map_of
+                 "name"          "demo"
+                 "pairs"         v_pairs
+                 "finals"        v_finals
+                 "structs"       v_structs
+                 "unions"        v_unions
+                 "consts"        v_consts
+                 "externs"       v_externs
+                 "globals"       v_globals
+                 "global_arrays" v_garrays
+                 "diagnostics"   v_diags)))
+    (do
+      ; ── program_field — a soft read with an explicit default ──
+      (assert_eq (program_field prog "name" "fallback") "demo"
+        "program_field returns a present field")
+      (assert_eq (program_field prog "missing" "fallback") "fallback"
+        "program_field returns the default for an absent field")
+      (assert_eq (program_field prog "missing" null) null
+        "program_field honours a null default")
+
+      ; ── program_require_field! — strict; present reads, absent throws ──
+      (assert_eq (program_require_field! prog "pairs") v_pairs
+        "program_require_field! returns a present required field")
+      (assert_throws (lambda () (program_require_field! prog "no_such_key"))
+        "program_require_field! throws on a missing key")
+      ; the throw NAMES the missing key (a located, actionable message)
+      (assert_true
+        (string_contains
+          (value_to_string
+            (try (do (program_require_field! prog "no_such_key") "NO_THROW")
+              (catch e e)))
+          "no_such_key")
+        "the missing-field throw names the offending key")
+      ; a key whose VALUE is null still reads back (only ABSENCE throws)
+      (assert_eq (program_require_field! (map_of "k" null) "k") null
+        "program_require_field! returns a present null value, not a throw")
+
+      ; ── named readers return the right field (asserted by identity) ──
+      (assert_eq (program_name prog)          "demo"     "program_name")
+      (assert_eq (program_pairs prog)         v_pairs    "program_pairs")
+      (assert_eq (program_finals prog)        v_finals   "program_finals")
+      (assert_eq (program_structs prog)       v_structs  "program_structs")
+      (assert_eq (program_unions prog)        v_unions   "program_unions")
+      (assert_eq (program_consts prog)        v_consts   "program_consts")
+      (assert_eq (program_externs prog)       v_externs  "program_externs")
+      (assert_eq (program_globals prog)       v_globals  "program_globals")
+      (assert_eq (program_global_arrays prog) v_garrays  "program_global_arrays")
+      (assert_eq (program_diagnostics prog)   v_diags    "program_diagnostics")
+
+      ; ── program_name softly defaults on an unnamed program ──
+      (assert_eq (program_name (map_of)) "program"
+        "program_name defaults to \"program\" when unset")
+
+      ; ── a required reader on a producer that forgot the key THROWS ──
+      ; (the whole point: a partial map fails loudly at the reader, not as a
+      ; null three stages downstream)
+      (assert_throws (lambda () (program_pairs (map_of "name" "x")))
+        "a required reader throws when its key is absent"))))

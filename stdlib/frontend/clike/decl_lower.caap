@@ -1,0 +1,396 @@
+; stdlib/frontend/clike/decl_lower.caap - top-level declaration lowering.
+;
+; The declaration registry itself lives in clike/decls.caap. This leaf owns the
+; built-in declaration hooks, classification, attribute scanning, and core kind
+; registration behind the public facade.
+(module stdlib.frontend.clike.decl_lower)
+
+(use stdlib.frontend.clike.ast sym lit call calln literal_of)
+(use stdlib.frontend.clike.sequence map prepend sequence_drop)
+(use stdlib.frontend.clike.tokens
+     tval titems tsym? tnum? tlist? tloc stamp oops split_commas split_commas_types)
+(use stdlib.frontend.clike.sem_tokens st_emit! sem_params)
+(use stdlib.frontend.clike.meta
+     scan_meta_until_line same_line?)
+(use stdlib.frontend.clike.state
+     local_types value_types field_types fn_rets local_globals local_global_arrays
+     local_consts local_volatile_consts local_enums local_enum_variants)
+(use stdlib.frontend.clike.expr
+     parse_expr lower_block read_type param_spec type_known? ident_tok?
+     resolve_type_head)
+(use stdlib.frontend.clike.decls
+     register_decl_kind! register_attribute! register_decl_classifier!
+     attr? kind_word? kind_hint kind_lower classify_decl_kind validate_attrs)
+
+(bind decl_attr? (lambda (name) (attr? name)))
+
+; ── functions ───────────────────────────────────────────────────────────────
+; scan_decl_attrs — from `pos`, consume the POSTFIX declaration attributes that
+; sit between a declaration's type/return and its `=`. An attribute is ANY token
+; registered in `decl_attrs` (export/const/extern/user attrs); they are NOT
+; hardcoded here. Order-free. Returns a BAG: each consumed attribute as a key
+; (`(get bag "export")` -> true) plus "i" = the position past the attrs.
+(bind scan_decl_attrs
+  (lambda (toks pos)
+    (scan_meta_until_line toks pos (get toks (int_sub pos 1))
+      (lambda (tk) (tsym? tk "="))
+      (lambda (tk) (st_emit! tk "keyword" (list_of))))))
+
+(bind decl_head_end
+  (lambda (toks pos)
+    (bind ((p (ref pos)) (anchor (get toks pos)) (done (ref false)))
+      (do
+        (while (and (not (deref done)) (lt (deref p) (size toks)))
+          (bind ((tk (get toks (deref p))))
+            (cond
+              ((tsym? tk "=") (set_ref done true))
+              ((same_line? anchor tk) (set_ref p (int_add (deref p) 1)))
+              (else (set_ref done true)))))
+        (deref p)))))
+
+; lower_fndef — a paren-headed top-level declaration from the token cursor:
+;   NAME (PARAMS) RET [export] = { BODY }   -> a function (defn)
+;   NAME (PARAMS) RET [export]              -> an EXTERN (a bodyless foreign
+;                                              symbol: an asm shim / linker symbol)
+; The discriminator is the presence of `= { body }`. Reading the params, return
+; type and postfix `export` is shared (read ONCE here) — the caller no longer
+; needs a separate extern probe. Returns {spec, i, export}.
+(bind lower_fndef
+  (lambda (toks i)
+    (bind (
+      (n (get toks i))
+      (ps (get toks (int_add i 1)))
+      (rti (read_type toks (int_add i 2)))      ; the return type (may be `*T`)
+      (rtname (get rti "name"))
+      (attrs (scan_decl_attrs toks (get rti "i")))   ; optional postfix `export`
+      (apos (get attrs "i"))                    ; first token past the signature
+      (export? (get attrs "export"))
+    )
+      (do
+        (unless (and (tsym? n null) (tlist? ps "paren"))
+          (oops "expected `name (params) type [export] [= { body }]`" n))
+        (st_emit! n "function" (list_of "declaration"))
+        (assoc (fn_rets) (tval n) rtname)   ; return type, for typing a call result
+
+        ; emit each parameter NAME (parameter+declaration) and arm sem_params, so a
+        ; body USE of a parameter classifies as `parameter` — purely from the
+        ; parser's own signature, for both functions and externs.
+        (set_ref sem_params
+          (bind ((pset (map_of)))
+            (do
+              (for grp (split_commas_types (titems ps))
+                (when (and (ge (size grp) 1) (tsym? (get grp 0) null))
+                  (do
+                    (assoc pset (tval (get grp 0)) true)
+                    (st_emit! (get grp 0) "parameter" (list_of "declaration")))))
+              pset)))
+        (bind ((pspecs (map (split_commas_types (titems ps)) param_spec))
+               (_pa (for p pspecs
+                      (validate_attrs (get p "attrs") "param" (get p "token"))))
+               (params (map pspecs (lambda (p) (get p "spec"))))
+               ; record each param's name->type (from the SAME read_type param_spec ran)
+               (_vt (for p pspecs (assoc (value_types) (get p "name") (get p "type")))))
+          (if (tsym? (get toks apos) "=")
+            ; FUNCTION — `= { body }`.
+            (bind ((blk (get toks (int_add apos 1))))
+              (do
+                (unless (tlist? blk "brace")
+                  (oops "expected `{ body }` after `=`" n))
+                (bind ((body (lower_block lower_block (titems blk) (map_of) null true)))
+                  (assoc (map_of)
+                    "spec"
+                    (stamp
+                    (if (eq (size params) 0)
+                      ; zero-arity, but still a TYPED defn so the result type
+                      ; rides the type pass (e.g. when it returns ptr_<Struct>).
+                      (calln "defn"
+                        (prepend (sym (tval n))
+                          (prepend (lit null)
+                            (prepend (sym rtname) body))))
+                      (calln "defn"
+                        (prepend (sym (tval n))
+                          (prepend (call (get params 0) (sequence_drop params 1))
+                            (prepend (sym rtname) body)))))
+                    n)
+                    "i" (int_add apos 2)
+                    "export" export?))))
+            ; EXTERN — bodyless. Param/result meta are registry-checked (`void`
+            ; is allowed as a result). -> (extern name params ret)
+            (do
+              (unless (or (eq rtname "void") (type_known? rtname))
+                (throw (string_concat_many
+                  "clike: " (tloc n) "unknown result type `"
+                  rtname "` in extern `" (tval n) "`")))
+              (assoc (map_of)
+                "spec"
+                (stamp
+                  (calln "extern"
+                    (list_of (sym (tval n))
+                      ; () is the canonical empty arg list (list_of)
+                      (if (eq (size params) 0)
+                        (calln "list_of" (list_of))
+                        (call (get params 0) (sequence_drop params 1)))
+                      (sym rtname)))
+                  n)
+                "i" apos
+                "export" export?))))))))
+
+; ── named-item classifier ───────────────────────────────────────────────────
+; node_export? — did this declaration carry the postfix `export` attribute?
+(bind node_export? (lambda (node) (get (get node "attrs") "export")))
+
+; ── core attribute validators (encode the previous positional rules exactly) ─
+(register_attribute! "export" (lambda (an kind attrs name) null))   ; valid on all
+(register_attribute! "const"
+  (lambda (an kind attrs name)
+    (do
+      (unless (eq kind "const")
+        (oops "`const` is only valid on a typed value declaration" name))
+      (when (get attrs "mut")
+        (oops "a `const` declaration cannot also be `mut`" name)))))
+(register_attribute! "mut"
+  (lambda (an kind attrs name)
+    (unless (or (eq kind "global") (eq kind "local"))
+      (oops "`mut` is only valid on a mutable value declaration" name))))
+(register_attribute! "extern"
+  (lambda (an kind attrs name)
+    (unless (eq kind "extern")
+      (oops "`extern` is only valid on a bodyless function signature" name))))
+(register_attribute! "volatile"
+  (lambda (an kind attrs name)
+    (unless (eq kind "const")
+      (oops "`volatile` is only valid on a const address declaration" name))))
+
+; ── core declaration-kind lowering hooks (the lifted dispatch arms) ──────────
+; ctx = {out, pub, toks, saw_main}; per-file symbols live in clike_file_state.
+; Each hook emits its kernel surface form + registers + returns the cursor just
+; past the declaration — byte-identical to the previous inline arms.
+(bind lower_struct
+  (lambda (node ctx)
+    (bind ((t (get node "name")) (body (get node "body"))
+           (out (get ctx "out")) (pub (get ctx "pub"))
+           (fields (list_of)) (fnames (list_of)))
+      (do
+        (unless (tlist? body "brace")
+          (oops "expected `name struct [export] = { fields }`" t))
+        (st_emit! t "type" (list_of "declaration"))
+        (for grp (split_commas_types (titems body))
+          (bind ((p (param_spec grp)))
+            (do (validate_attrs (get p "attrs") "field" (get p "token"))
+                (st_emit! (get grp 0) "property" (list_of "declaration"))
+                (append fnames (get p "name"))
+                (append fields (get p "spec"))
+                ; Struct.field -> type, so `a->field` can be typed as a pointer
+                (assoc (field_types)
+                  (string_concat_many (tval t) "." (get p "name")) (get p "type")))))
+        (assoc (local_types) (tval t) fnames)
+        (when (node_export? node)
+          (do (append pub (tval t))
+              (append pub (string_concat_many "make_" (tval t)))))
+        (append out (stamp (calln "struct" (prepend (sym (tval t)) fields)) t))
+        (get node "end_i")))))
+(bind lower_enum
+  (lambda (node ctx)
+    (bind ((t (get node "name")) (body (get node "body"))
+           (out (get ctx "out")) (pub (get ctx "pub")) (variants (list_of)))
+      (do
+        (unless (tlist? body "brace")
+          (oops "expected `name enum [export] = { variants }`" t))
+        (st_emit! t "type" (list_of "declaration"))
+        (for grp (split_commas (titems body))
+          (do
+            (st_emit! (get grp 0) "enumMember" (list_of "declaration"))
+            (assoc (local_enum_variants) (tval (get grp 0)) true)
+            (if (and (gt (size grp) 2) (tsym? (get grp 1) "="))
+              (do
+                (unless (tnum? (get grp 2))
+                  (oops (string_concat_many "enum variant `" (tval (get grp 0))
+                    "` value must be an integer literal") (get grp 0)))
+                (append variants
+                  (calln (tval (get grp 0)) (list_of (lit (tval (get grp 2)))))))
+              (append variants (sym (tval (get grp 0)))))))
+        (assoc (local_types) (tval t) (list_of))
+        (assoc (local_enums) (tval t) true)
+        (when (node_export? node)
+          (do (append pub (tval t))
+              (for grp (split_commas (titems body)) (append pub (tval (get grp 0))))))
+        (append out (stamp (calln "enum" (prepend (sym (tval t)) variants)) t))
+        (get node "end_i")))))
+(bind lower_const
+  (lambda (node ctx)
+    (bind ((t (get node "name")) (tyi (get node "tyi")) (eqpos (get node "eqpos"))
+           (attrs (get node "attrs")) (toks (get ctx "toks")) (pub (get ctx "pub"))
+           (tyname (get tyi "name")))
+      (do
+        (st_emit! t "variable" (list_of "readonly" "declaration"))
+        (unless (type_known? tyname)
+          (throw (string_concat_many "clike: " (tloc t) "unknown type `"
+            tyname "` in const `" (tval t) "`")))
+        (unless (tsym? (get toks eqpos) "=")
+          (oops (string_concat_many "expected `" (tval t) " " tyname
+            " const = EXPR`") t))
+        (bind ((r (parse_expr toks (int_add eqpos 1) (map_of))))
+          (do
+            (assoc (local_consts) (tval t) (get r "spec"))
+            (when (get attrs "volatile")
+              (assoc (local_volatile_consts) (tval t)
+                (assoc (map_of)
+                  "addr" (get r "spec")
+                  "type" tyname)))
+            (when (node_export? node) (append pub (tval t)))
+            (get r "i")))))))
+(bind lower_bss_array
+  (lambda (node ctx)
+    (bind ((t (get node "name")) (tyi (get node "tyi")) (eqpos (get node "eqpos"))
+           (out (get ctx "out")) (pub (get ctx "pub")))
+      (do
+        (unless (type_known? (get tyi "elem"))
+          (throw (string_concat_many "clike: " (tloc t) "unknown element type `"
+            (get tyi "elem") "` in array `" (tval t) "`")))
+        (assoc (local_global_arrays) (tval t) true)
+        ; an array global DECAYS to a pointer-to-element on use, so type it that
+        ; way — `pool + i` / `pool as …` then resolve as pointer ops.
+        (assoc (value_types) (tval t) (string_concat_many "ptr_" (get tyi "elem")))
+        (when (node_export? node) (append pub (tval t)))
+        (append out (stamp (calln "global_array"
+          (list_of (sym (tval t)) (lit (get tyi "count")) (sym (get tyi "elem")))) t))
+        eqpos))))
+(bind lower_global
+  (lambda (node ctx)
+    (bind ((t (get node "name")) (tyi (get node "tyi")) (eqpos (get node "eqpos"))
+           (mutable (get node "mut")) (toks (get ctx "toks"))
+           (out (get ctx "out")) (pub (get ctx "pub"))
+           (tyname (get tyi "name"))
+           (vt (get toks (int_add eqpos 1))) (pt (get toks (int_add eqpos 2))))
+      (do
+        (st_emit! t "variable" (list_of "declaration"))
+        (unless (tsym? (get toks eqpos) "=")
+          (oops (string_concat_many "expected `name [mut] type = value` for global `"
+            (tval t) "`") t))
+        (unless (type_known? tyname)
+          (throw (string_concat_many "clike: " (tloc t) "unknown type `" tyname
+            "` in global `" (tval t) "`")))
+        (assoc (value_types) (tval t) tyname)   ; global name -> type
+        (if (and (tsym? vt "array") (tlist? pt "paren"))
+          ; legacy: `name elem = array(N)`
+          (bind ((items (titems pt)))
+            (do
+              (unless (and (eq (size items) 1) (tnum? (get items 0)))
+                (oops "expected `array(N)` with a literal length" (get items 0)))
+              (assoc (local_global_arrays) (tval t) true)
+              (when (node_export? node) (append pub (tval t)))
+              (append out (stamp (calln "global_array"
+                (list_of (sym (tval t)) (lit (tval (get items 0))) (sym tyname))) t))
+              (int_add eqpos 3)))
+          (bind ((r (parse_expr toks (int_add eqpos 1) (map_of))))
+            (do
+              (when (eq (literal_of (get r "spec")) null)
+                (oops (string_concat_many "global `" (tval t) "` initializer must be a "
+                  "literal constant (the native backend stores it directly); initialize "
+                  "it inside a function instead") t))
+              (assoc (local_globals) (tval t) (if mutable "mut" "const"))
+              (when (node_export? node) (append pub (tval t)))
+              (append out (stamp (calln "global"
+                (list_of (sym (tval t)) (sym tyname) (get r "spec"))) t))
+              (get r "i"))))))))
+; function | extern: delegate to the unchanged lower_fndef (it reads params /
+; return / postfix attrs / the `={body}`-vs-bodyless discriminator from the cursor).
+(bind lower_fn_extern
+  (lambda (node ctx)
+    (bind ((f (lower_fndef (get ctx "toks") (get node "i0"))))
+      (do
+        (when (tsym? (get node "name") "main") (set_ref (get ctx "saw_main") 1))
+        (when (get f "export" false) (append (get ctx "pub") (tval (get node "name"))))
+        (append (get ctx "out") (get f "spec"))
+        (get f "i")))))
+
+; ── register the core kinds (the SAME path a user library would use) ─────────
+(register_decl_kind! "struct"   "struct"   lower_struct     true)
+(register_decl_kind! "type"     "struct"   lower_struct     true)   ; legacy alias
+(register_decl_kind! "enum"     "enum"     lower_enum       true)
+(register_decl_kind! "function" "function" lower_fn_extern  false)
+(register_decl_kind! "extern"   "extern"   lower_fn_extern  false)
+(register_decl_kind! "global"   "global"   lower_global     false)
+(register_decl_kind! "const"    "const"    lower_const      false)
+(register_decl_kind! "bss_array" "bss_array" lower_bss_array false)
+
+(register_decl_classifier! "kind-word" 10
+  (lambda (node)
+    (if (eq (get node "shape") "kind-word")
+      (kind_hint (tval (get node "kind_token")))
+      null)))
+(register_decl_classifier! "signature" 20
+  (lambda (node)
+    (if (eq (get node "shape") "signature")
+      (if (get node "has_body") "function" "extern")
+      null)))
+(register_decl_classifier! "typed-value" 30
+  (lambda (node)
+    (if (eq (get node "shape") "typed-value")
+      (cond ((get (get node "attrs") "const") "const")
+            ((get (get node "tyi") "array" false) "bss_array")
+            (else "global"))
+      null)))
+
+; ── classify_named: parse the generic NamedItem + pick its kind + validate ───
+; Produces a node {name, i0, kind, attrs, …} whose hook reads the original tokens.
+(bind classify_named
+  (lambda (toks i)
+    (bind ((t (get toks i)) (nx (get toks (int_add i 1))))
+      (cond
+        ; KIND-WORD: NAME <kw> [attrs] = { body }   (struct/type/enum/user)
+        ((kind_word? nx)
+          (bind ((attrs (scan_decl_attrs toks (int_add i 2)))
+                 (eqpos (get attrs "i"))
+                 (body (get toks (int_add eqpos 1))))
+            (do
+              (unless (tsym? (get toks eqpos) "=")
+                (oops (string_concat_many "expected `name " (tval nx)
+                  " [attrs] = { … }`") t))
+              (bind ((node (assoc (map_of)
+                            "shape" "kind-word" "name" t "i0" i
+                            "kind_token" nx "attrs" attrs
+                            "body" body "end_i" (int_add eqpos 2)))
+                     (kind (classify_decl_kind node)))
+                (do
+                  (validate_attrs attrs kind t)
+                  (assoc node "kind" kind))))))
+        ; SIGNATURE: NAME (params) RET [attrs] [= {body}]   -> function | extern
+        ((tlist? nx "paren")
+          (bind ((rti (read_type toks (int_add i 2)))
+                 (attrs (scan_decl_attrs toks (get rti "i")))
+                 (has_body (tsym? (get toks (get attrs "i")) "=")))
+            (do
+              (bind ((node (assoc (map_of)
+                            "shape" "signature" "name" t "i0" i
+                            "rti" rti "attrs" attrs "has_body" has_body))
+                     (kind (classify_decl_kind node)))
+                (do
+                  (validate_attrs attrs kind t)
+                  (assoc node "kind" kind))))))
+        ; TYPE-LED: NAME [metadata...] type [metadata...] [= EXPR]
+        ((or (and (tsym? nx null) (decl_attr? (tval nx))) (ident_tok? nx))
+          (bind ((eqpos (decl_head_end toks (int_add i 1)))
+                 (head (resolve_type_head toks (int_add i 1) eqpos))
+                 (tyi (get head "type"))
+                 (attrs2 (get head "attrs")))
+            (do
+              (assoc attrs2 "i" eqpos)
+              (do
+                (bind ((node (assoc (map_of)
+                              "shape" "typed-value" "name" t "i0" i
+                              "attrs" attrs2 "mut" (get attrs2 "mut")
+                              "tyi" tyi "eqpos" eqpos))
+                       (kind (classify_decl_kind node)))
+                  (do
+                    (validate_attrs attrs2 kind t)
+                    (assoc node "kind" kind)))))))
+        ((tsym? nx "=")
+          (oops "expected a type spelling in declaration head" nx))
+        (else (oops "expected a declaration (a name + kind / type / signature)" t))))))
+; lower_named — uniform dispatch: the classified kind is always a decl_kinds key.
+(bind lower_named
+  (lambda (node ctx)
+    ((kind_lower (get node "kind")) node ctx)))
+
+(export classify_named lower_named scan_decl_attrs lower_fndef)

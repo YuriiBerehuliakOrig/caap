@@ -1,0 +1,359 @@
+; stdlib/lib/text/url.caap — URL/URI parse, build, and query-string codec.
+;
+;   url_parse  (s)      -> map {scheme host port path query fragment userinfo}
+;   url_build  (parts)  -> URL string (the inverse of url_parse over its outputs)
+;   query_parse (qs)    -> ordered list of [key value] pairs (percent-DECODED)
+;   query_build (pairs) -> "k1=v1&k2=v2" (percent-ENCODED keys + values)
+;   url_join   (base rel) -> resolve a relative reference against a base URL
+;
+; This is a pragmatic generic-URI parser (the "scheme://userinfo@host:port/path
+; ?query#fragment" shape), not a full RFC 3986 grammar. It handles the common
+; cases: an absent scheme, an absent userinfo, an absent port, an absent query,
+; an absent fragment, and a scheme with no authority (e.g. "mailto:a@b").
+;
+; ── url_parse output contract ────────────────────────────────────────────────
+; The result is always a map with all seven keys present. A MISSING component is
+; the empty string "" (never null), so callers never need a null guard:
+;   scheme   — lowercased scheme without the trailing ":" ("https"); "" if none.
+;   userinfo — the "user:pass" before "@" in the authority; "" if none.
+;   host     — the host (registered name or IP); "" if there is no authority.
+;   port     — the port digits as a STRING ("8080"); "" if none. (A string, not
+;              an int, so an absent port is "" and the value round-trips exactly.)
+;   path     — the path, INCLUDING its leading "/" when present ("/p/q"); "" if
+;              none. For an authority URL with no path this is "".
+;   query    — the raw query string WITHOUT the leading "?" ("x=1&y=2"); "" if
+;              none. Use query_parse to split it into decoded pairs.
+;   fragment — the fragment WITHOUT the leading "#" ("frag"); "" if none.
+;
+; Components are kept RAW (still percent-encoded) — url_parse does not decode the
+; path/query/fragment, because where a delimiter is significant vs literal is the
+; caller's policy. Use percent_decode / query_parse to decode the pieces you need.
+(module stdlib.lib.text.url)
+
+(use stdlib.lib.text.encoding percent_encode percent_decode)
+(use stdlib.lib.collections.sequence each)
+
+; ── small string helpers (kernel string_* directly; no string.caap dep) ──────
+; idx_of — first index of `needle` in `s`, or -1 on a miss (string_find -> null).
+(bind idx_of
+  (lambda (s needle)
+    (bind ((at (string_find s needle)))
+      (if (eq at null) -1 at))))
+
+; has? — true when `s` contains `needle`.
+(bind has? (lambda (s needle) (string_contains s needle)))
+
+; slice_from — `s` from index `i` to its end.
+(bind slice_from (lambda (s i) (string_slice s i (size s))))
+
+; rindex — index of the LAST occurrence of a 1-char `needle` in `s`, or -1.
+; (Used for "@" in an authority and the port ":": the LAST one delimits.)
+(bind rindex
+  (lambda (s needle)
+    (bind ((cs (string_chars s)) (n (size s)) (found (ref -1)) (i (ref 0)))
+      (do
+        (while (lt (deref i) n)
+          (do
+            (if (eq (get cs (deref i) "") needle)
+              (set_ref found (deref i)) null)
+            (set_ref i (int_add (deref i) 1))))
+        (deref found)))))
+
+; scheme? — a valid URI scheme: ALPHA followed by ALPHA / DIGIT / "+" / "-" / ".".
+; (RFC 3986 §3.1.) An empty string is not a scheme.
+(bind scheme_head "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+(bind scheme_tail "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+-.")
+(bind scheme?
+  (lambda (s)
+    (if (eq (size s) 0) false
+      (bind ((cs (string_chars s)) (ok (ref true)) (i (ref 1)) (n (size s)))
+        (do
+          (if (has? scheme_head (get cs 0 "")) null (set_ref ok false))
+          (while (and (deref ok) (lt (deref i) n))
+            (do
+              (if (has? scheme_tail (get cs (deref i) "")) null (set_ref ok false))
+              (set_ref i (int_add (deref i) 1))))
+          (deref ok))))))
+
+; host_port_colon — the index of the port-delimiter ":" in a "host[:port]", or
+; -1. A bracketed IPv6 host ("[::1]:8080") may contain ":" inside the brackets,
+; so only a ":" AFTER the closing "]" counts; an unbracketed host uses its LAST
+; ":". This keeps "[::1]" whole and still splits "[::1]:8080".
+(bind host_port_colon
+  (lambda (hostport)
+    (if (string_starts_with hostport "[")
+      (bind ((close (idx_of hostport "]")))
+        (if (lt close 0) -1
+          (bind ((after (slice_from hostport (int_add close 1))))
+            (if (string_starts_with after ":") (int_add close 1) -1))))
+      (rindex hostport ":"))))
+
+; ── url_parse ────────────────────────────────────────────────────────────────
+; Strategy (left to right, peeling the END components first so a delimiter that
+; appears later cannot be mistaken for one in an earlier component — e.g. a "?"
+; inside a fragment, or a "/" inside a query):
+;   1. split off the fragment at the FIRST "#"
+;   2. split off the query at the FIRST "?" (in the pre-fragment part)
+;   3. take the scheme at the FIRST ":" *iff* it is a valid scheme and the ":"
+;      precedes the first "/" (so "a/b:c" has no scheme)
+;   4. if what remains starts with "//", it is an authority; parse
+;      userinfo@host:port, and the rest is the path
+;   5. otherwise the remainder is the path (opaque/relative form)
+(bind url_parse
+  (lambda (s)
+    (bind ((scheme (ref "")) (userinfo (ref "")) (host (ref ""))
+           (port (ref "")) (path (ref "")) (query (ref "")) (fragment (ref ""))
+           (rest (ref s)))
+      (do
+        ; 1. fragment — everything after the FIRST "#"
+        (bind ((h (idx_of (deref rest) "#")))
+          (if (lt h 0) null
+            (do
+              (set_ref fragment (slice_from (deref rest) (int_add h 1)))
+              (set_ref rest (string_slice (deref rest) 0 h)))))
+        ; 2. query — everything after the FIRST "?"
+        (bind ((q (idx_of (deref rest) "?")))
+          (if (lt q 0) null
+            (do
+              (set_ref query (slice_from (deref rest) (int_add q 1)))
+              (set_ref rest (string_slice (deref rest) 0 q)))))
+        ; 3. scheme — a leading "<scheme>:" whose ":" comes before any "/".
+        (bind ((c (idx_of (deref rest) ":"))
+               (sl (idx_of (deref rest) "/")))
+          (if (and (ge c 1) (or (lt sl 0) (lt c sl)))
+            (bind ((cand (string_slice (deref rest) 0 c)))
+              (if (scheme? cand)
+                (do
+                  (set_ref scheme (string_downcase cand))
+                  (set_ref rest (slice_from (deref rest) (int_add c 1))))
+                null))
+            null))
+        ; 4/5. authority vs opaque path
+        (if (string_starts_with (deref rest) "//")
+          ; "//authority[/path]" — authority is up to the next "/" (or end)
+          (bind ((auth_and_path (slice_from (deref rest) 2))
+                 (ps (idx_of auth_and_path "/"))
+                 (authority (if (lt ps 0) auth_and_path
+                              (string_slice auth_and_path 0 ps)))
+                 (pth (if (lt ps 0) "" (slice_from auth_and_path ps))))
+            (do
+              (set_ref path pth)
+              ; userinfo — before the LAST "@" in the authority
+              (bind ((at (rindex authority "@"))
+                     (hostport (if (lt at 0) authority
+                                 (slice_from authority (int_add at 1)))))
+                (do
+                  (if (lt at 0) null
+                    (set_ref userinfo (string_slice authority 0 at)))
+                  ; host:port — split at the port ":" (IPv6-aware)
+                  (bind ((cp (host_port_colon hostport)))
+                    (if (lt cp 0)
+                      (set_ref host hostport)
+                      (do
+                        (set_ref host (string_slice hostport 0 cp))
+                        (set_ref port (slice_from hostport (int_add cp 1))))))))))
+          ; no authority: the remainder is the (opaque) path
+          (set_ref path (deref rest)))
+        (assoc (map_of)
+          "scheme"   (deref scheme)
+          "userinfo" (deref userinfo)
+          "host"     (deref host)
+          "port"     (deref port)
+          "path"     (deref path)
+          "query"    (deref query)
+          "fragment" (deref fragment))))))
+
+; ── url_build ────────────────────────────────────────────────────────────────
+; Reassemble a URL string from a parts map (the inverse of url_parse over the
+; round-trippable subset). A missing/empty key is omitted with its delimiter:
+;   scheme   -> "scheme:" prefix (only when non-empty)
+;   userinfo/host/port -> "//[userinfo@]host[:port]" authority (only when host
+;                         is non-empty, OR userinfo/port force an empty-host one)
+;   path     -> appended as-is (already carries its own leading "/")
+;   query    -> "?query"  (only when non-empty)
+;   fragment -> "#fragment" (only when non-empty)
+; url_build(url_parse(u)) reproduces `u` for every canonical URL (no redundant
+; delimiters, host present whenever there is an authority).
+(bind url_build
+  (lambda (parts)
+    (bind ((scheme   (get parts "scheme" ""))
+           (userinfo (get parts "userinfo" ""))
+           (host     (get parts "host" ""))
+           (port     (get parts "port" ""))
+           (path     (get parts "path" ""))
+           (query    (get parts "query" ""))
+           (fragment (get parts "fragment" ""))
+           (out (list_of)))
+      (do
+        (if (eq scheme "") null
+          (do (append out scheme) (append out ":")))
+        ; an authority exists when there is a host (or userinfo/port that imply
+        ; one). Emit "//" + [userinfo "@"] host [":" port].
+        (if (or (not (eq host "")) (or (not (eq userinfo "")) (not (eq port ""))))
+          (do
+            (append out "//")
+            (if (eq userinfo "") null (do (append out userinfo) (append out "@")))
+            (append out host)
+            (if (eq port "") null (do (append out ":") (append out port))))
+          null)
+        (if (eq path "") null (append out path))
+        (if (eq query "") null (do (append out "?") (append out query)))
+        (if (eq fragment "") null (do (append out "#") (append out fragment)))
+        (sequence_join out "")))))
+
+; ── query strings ────────────────────────────────────────────────────────────
+; query_parse — split "k1=v1&k2=v2" into an ordered list of [key value] pairs,
+; percent-DECODING each key and value. Rules:
+;   - pairs are separated by "&" (an empty pair, e.g. a trailing "&", is skipped);
+;   - within a pair, the FIRST "=" splits key from value; a later "=" stays in
+;     the value ("a=b=c" -> key "a", value "b=c");
+;   - a pair with no "=" ("flag") yields [flag ""] (an empty value);
+;   - an empty value ("a=") yields [a ""].
+; An empty input yields an empty list. This is RFC-3986 percent decoding (a "+"
+; is left literal, NOT turned into a space — see query_build's note).
+(bind query_parse
+  (lambda (qs)
+    (bind ((out (list_of)))
+      (do
+        (if (eq qs "") null
+          (each (string_split qs "&")
+            (lambda (pair)
+              (if (eq pair "") null
+                (bind ((eqi (idx_of pair "=")))
+                  (if (lt eqi 0)
+                    ; no "=" — a bare key with an empty value
+                    (append out (list_of (percent_decode pair) ""))
+                    (append out
+                      (list_of
+                        (percent_decode (string_slice pair 0 eqi))
+                        (percent_decode (slice_from pair (int_add eqi 1)))))))))))
+        out))))
+
+; query_build — render an ordered list of [key value] pairs into "k1=v1&k2=v2",
+; percent-ENCODING each key and value. Each element is a 2-list [key value].
+; ENCODING CHOICE: a space becomes %20 (RFC 3986 percent-encoding), NOT "+"
+; (which is application/x-www-form-urlencoded). This is the exact inverse of
+; query_parse, so query_parse(query_build(pairs)) round-trips. An empty list
+; yields "". A value-less pair should be passed as [key ""] -> "key=".
+(bind query_build
+  (lambda (pairs)
+    (bind ((parts (list_of)))
+      (do
+        (each pairs
+          (lambda (pair)
+            (append parts
+              (string_concat_many
+                (percent_encode (get pair 0 ""))
+                "="
+                (percent_encode (get pair 1 ""))))))
+        (sequence_join parts "&")))))
+
+; ── url_join helpers (defined before url_join — the loader resolves top-level
+;     names eagerly, so a callee must precede its caller) ─────────────────────
+; merge_path — RFC 3986 §5.2.3: a relative path is appended to the base's
+; DIRECTORY (everything up to and including its last "/"). If the base path has
+; no "/", the relative path replaces it.
+(bind merge_path
+  (lambda (base_path rel_path)
+    (bind ((cut (rindex base_path "/")))
+      (if (lt cut 0)
+        rel_path
+        (string_concat_many (string_slice base_path 0 (int_add cut 1)) rel_path)))))
+
+; remove_dot_segments — RFC 3986 §5.2.4: collapse "." and ".." segments. We split
+; on "/", walk the segments onto an output stack ("." drops, ".." pops, anything
+; else pushes), and rejoin — preserving a leading "/" (absolute) and a trailing
+; "/" (a directory). A pragmatic implementation that covers the common forms.
+; (No `pop` builtin exists, so a ".." removes the last element with
+; list_remove_at at the final index.)
+(bind remove_dot_segments
+  (lambda (p)
+    (if (eq p "") ""
+      (bind ((abs? (string_starts_with p "/"))
+             ; RFC §5.2.4: a path that ENDS in a dot-segment ("/." or "/..", or a
+             ; bare "." / "..") denotes a directory, so the result keeps a
+             ; trailing "/" even though the input has none.
+             (trail? (or (string_ends_with p "/")
+                     (or (string_ends_with p "/.")
+                     (or (string_ends_with p "/..")
+                     (or (eq p ".") (eq p ".."))))))
+             (segs (string_split p "/"))
+             (stack (list_of)))
+        (do
+          (each segs
+            (lambda (seg)
+              (cond
+                ((or (eq seg "") (eq seg ".")) null)
+                ((eq seg "..")
+                  (if (gt (size stack) 0)
+                    (list_remove_at stack (int_sub (size stack) 1)) null))
+                (else (append stack seg)))))
+          (bind ((joined (sequence_join stack "/")))
+            (string_concat_many
+              (if abs? "/" "")
+              joined
+              (if (and trail? (gt (size stack) 0)) "/" ""))))))))
+
+; ── url_join ─────────────────────────────────────────────────────────────────
+; Resolve a relative reference `rel` against an absolute-ish `base` (a pragmatic
+; subset of RFC 3986 §5.2 — enough for the common cases):
+;   - `rel` empty ""                 -> `base` unchanged;
+;   - `rel` with a scheme            -> `rel` unchanged (it is already absolute);
+;   - `rel` starting "//"            -> base scheme + rel authority/path;
+;   - `rel` starting "/"             -> base scheme+authority + rel (abs path);
+;   - `rel` starting "?"             -> base minus query/fragment + rel query;
+;   - `rel` starting "#"             -> base minus fragment + rel fragment;
+;   - otherwise (a relative path)    -> merge rel onto the base's directory and
+;                                       remove "." / ".." segments.
+; Every path-bearing branch normalizes "." / ".." via remove_dot_segments.
+; The merged path's "."/".." are normalized (remove_dot_segments). The result is
+; rebuilt with url_build, so the authority/scheme of `base` are preserved.
+(bind url_join
+  (lambda (base rel)
+    (bind ((b (url_parse base)) (r (url_parse rel)))
+      (cond
+        ; an empty reference resolves to the base unchanged (RFC §5.2.2: empty
+        ; R.path keeps Base.path AND Base.query) — return `base` verbatim
+        ((eq rel "") base)
+        ; rel is absolute (has a scheme): it wins outright
+        ((not (eq (get r "scheme" "") "")) rel)
+        ; rel has its own authority ("//host/..."): keep base scheme only,
+        ; normalizing the relative path's "." / ".." segments (RFC §5.2.4)
+        ((string_starts_with rel "//")
+          (url_build (assoc r
+            "scheme" (get b "scheme" "")
+            "path" (remove_dot_segments (get r "path" "")))))
+        ; rel is an absolute path ("/p")
+        ((string_starts_with rel "/")
+          (url_build (assoc (map_of)
+            "scheme" (get b "scheme" "") "userinfo" (get b "userinfo" "")
+            "host" (get b "host" "") "port" (get b "port" "")
+            "path" (remove_dot_segments (get r "path" ""))
+            "query" (get r "query" "") "fragment" (get r "fragment" ""))))
+        ; rel is query-only ("?q") — replace base query (drop base fragment)
+        ((string_starts_with rel "?")
+          (url_build (assoc (map_of)
+            "scheme" (get b "scheme" "") "userinfo" (get b "userinfo" "")
+            "host" (get b "host" "") "port" (get b "port" "")
+            "path" (get b "path" "")
+            "query" (get r "query" "") "fragment" (get r "fragment" ""))))
+        ; rel is fragment-only ("#f") — replace base fragment
+        ((string_starts_with rel "#")
+          (url_build (assoc (map_of)
+            "scheme" (get b "scheme" "") "userinfo" (get b "userinfo" "")
+            "host" (get b "host" "") "port" (get b "port" "")
+            "path" (get b "path" "") "query" (get b "query" "")
+            "fragment" (get r "fragment" ""))))
+        ; otherwise a relative path: merge onto base directory
+        (else
+          (url_build (assoc (map_of)
+            "scheme" (get b "scheme" "") "userinfo" (get b "userinfo" "")
+            "host" (get b "host" "") "port" (get b "port" "")
+            "path" (remove_dot_segments
+                     (merge_path (get b "path" "") (get r "path" "")))
+            "query" (get r "query" "") "fragment" (get r "fragment" ""))))))))
+
+(export
+  url_parse url_build
+  query_parse query_build
+  url_join)

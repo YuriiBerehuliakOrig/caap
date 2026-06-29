@@ -1,0 +1,7 @@
+; uses_plus — written in the project vocabulary: `plus` is NOT a kernel name,
+; so without the lower_plus transform this module FAILS its load (unknown
+; name); with it, the rewrite lands before the gate and f() = 42.
+(module stdlib.fixtures.uses_plus)
+(defn f () int
+  (plus 40 2))
+(export f)

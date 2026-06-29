@@ -1,0 +1,2 @@
+; ur-norec probe: a self-recursive defn — unbounded stack growth.
+(defn _probe_norec ((n i32)) i32 (_probe_norec n))

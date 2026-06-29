@@ -1,0 +1,759 @@
+; stdlib/backend/prep.caap — the codegen FRONT-END shared by every backend.
+;
+; It runs the SAME front-end the loader runs (expand -> run_transforms -> gate
+; = check + type + run_passes) but, instead of evaluating, it flattens a
+; stdlib program into ONE translation unit and hands the backend a STRUCTURED
+; description of it. The split is deliberate: this file owns the language-level
+; work (inlining, expansion, the codegen tables, the pre-codegen gate); each
+; backend (backend/emit/llvm, backend/emit/wasm) owns only the target-level work (LLVM IR / WAT
+; text). Two entry points serve the two consumer shapes:
+;
+;   prep_units   — the STRUCTURED program (a map of codegen tables). The LLVM
+;                  and WASM emitters consume THIS; it is the load-bearing
+;                  contract of this file (see the schema below).
+;   prep_program — the kernel-SOURCE artifact: the structured program rendered
+;                  back to pure-kernel text, in the single-translation-unit
+;                  shape the compatibility/debug/inspection path expects:
+;
+;                    (module "<name>")
+;                    (bind <name> <int>)            ; one per compile-time const
+;                    (bind ((f (lambda …)) … (main (lambda () …)))
+;                      <final expression>)
+;
+; Both INLINE the root's (use …) dependencies (resolved through the loader's
+; name->path machinery, each module once, into one flat namespace with
+; collision detection), so the merged unit is self-contained. The kernel-text
+; path additionally feeds the in-process native runtime: the loader evaluates
+; the rendered text, and main's value becomes the process exit code. (extern /
+; global / global_array have no kernel-text spelling — those programs MUST take
+; the LLVM backend; prep_program rejects them with a diagnostic.)
+;
+; ── prep_units output schema (the cross-backend contract; keep STABLE) ───────
+; Changing any field shape here breaks backend/emit/llvm AND backend/emit/wasm in lockstep.
+;   name          : the root module's name (string; "program" if unset)
+;   pairs         : function/struct bindings, in source order. Each is
+;                   {name, value, sig|null, ctor_of|null}:
+;                     value   = the binding's EXPANDED value spec (a lambda)
+;                     sig     = the defn's parsed signature record (the typed
+;                               ABI) — null for non-defn binds / constructors
+;                     ctor_of = the struct name when `value` is that struct's
+;                               constructor — null otherwise
+;   finals        : the root's trailing top-level expression specs (the program
+;                   "body"; empty for a dependency or a library)
+;   structs       : name -> field list [{name, type}…] (also one synthetic
+;                   single-field entry per union, see below)
+;   unions        : name -> member list [{name, type}…] (overlap at offset 0)
+;   consts        : name -> int value — compile-time constants (enum variants,
+;                   top-level int binds) inlined at use sites by both backends
+;   externs       : [{symbol, params:[{name, type}…], result}] — external
+;                   symbols (asm stubs / linker symbols); calls lower to `call`
+;   globals       : [{name, type, init}] — mutable program globals (ref cells)
+;   global_arrays : [{name, count, elem}] — zero-initialized BSS arrays
+;   diagnostics   : [{code, severity, message, node_name, path}] — when
+;                   non-empty the program is REJECTED; backends emit nothing
+(module stdlib.backend.prep)
+
+(import stdlib.expand ex)
+(import stdlib.load loader_api)
+(use stdlib.syntax.render render)
+(use stdlib.lib.collections.sequence find max_by)
+(use stdlib.syntax.ir match_node)
+(use stdlib.semantics.types.records marker? sig_marker struct_marker union_marker)
+(use stdlib.syntax.ast call? name? literal? string_lit? head_of callee args_of arg
+     name_of literal_of bind_pairs sym calln)
+; native operation/type vocabulary — the single declarative source. backend/native_meta no
+; longer hand-keeps these lists; the gate's scope derives from native_meta (which
+; the LLVM/WAT emitters also consume, so the three can no longer drift).
+(use stdlib.backend.native_meta head_names type_names native_type?)
+; growable string builder — assemble (below) builds the merged kernel-source text
+; by pushing fragments then joining ONCE, instead of repeated string_concat_many
+; into a ref (O(n²)). Rank-2 (lower tier), so the import is legal.
+(use stdlib.lib.text.buffer buf_new push_str to_string)
+(use stdlib.semantics.passes.preresolve register_preresolve! set_program_globals!)
+(use stdlib.semantics.passes.monomorph register_monomorph!)
+(use stdlib.semantics.passes.struct_monomorph register_struct_monomorph! set_struct_globals!)
+; the unified compile-session context (audit #1) — the target/strict profile cells
+; below are OWNED by the session, so a single session_reset! restores the host
+; defaults instead of needing the scattered clear_target_ptr_bytes!/clear_strict!.
+(use stdlib.semantics.session session_cell! session_cell_owned!)
+; the compiler-registry key ABI (audit #13/#11) — prep's gate! runs the SAME three
+; loader phases (check -> type -> passes) by hand; instead of re-spelling the raw
+; registry keys (which silently mirrors the loader's), it looks them up by the
+; canonical named constants from the contract, so the keys cannot drift apart. The
+; phase SET itself is the loader's `gate_phases` (boot/gate.caap), the single source.
+(use stdlib.boot.registry_contract key_check key_types key_passes)
+; the typed prep_units READERS (audit #4) — prep_program reads back the program
+; map it just built (name/pairs/finals/consts + the extern/global tables) for the
+; CLI emitter; these are keys prep_units ALWAYS emits, so the strict readers
+; return the IDENTICAL value while naming the contract at the call site instead
+; of re-spelling the string keys. (program_accessors is same-tier backend and
+; does NOT import prep, so no cycle.)
+(use stdlib.backend.program_accessors
+     program_name program_pairs program_finals program_consts
+     program_externs program_globals program_global_arrays program_diagnostics)
+
+; ── scalar helpers + emitter diagnostic ──────────────────────────────────────
+; diag — one emitter diagnostic in the CLI's expected shape.
+;   message : what went wrong
+(bind diag
+  (lambda (message)
+    (assoc (map_of)
+      "code" "stdlib.native.error"
+      "severity" "error"
+      "message" message
+      "node_name" "<native-prep>"
+      "path" "<input>")))
+
+; ── target pointer size (the one target-DEPENDENT scalar) ────────────────────
+; Every scalar width below is target-independent EXCEPT a pointer: it is 8
+; bytes on a 64-bit target (x86_64/aarch64/…) and 4 on a 32-bit one
+; (armv7/thumb/wasm32/…). target_ptr_bytes is the ACTIVE pointer size; the
+; default is 8 (the host), so a plain hosted build is byte-identical to before.
+; backend/emit/llvm's set_target!/clear_target! push the cross-target value in/out via
+; the accessors below (it already depends on this module), so prep stays the
+; single owner of the value scalar_bytes reads — no import cycle, no second
+; source of truth.
+; target_ptr_bytes is single-owner (prep is the only writer), so it claims the
+; cell via session_cell_owned! to surface an accidental name collision (audit #31).
+(bind target_ptr_bytes (session_cell_owned! "backend.prep" "backend.prep.target_ptr_bytes" (lambda () 8)))
+; set_target_ptr_bytes! — pin the active pointer size (4 or 8). Driven by
+; backend/emit/llvm when a cross target is set; a no-op spelling for the hosted path.
+(bind set_target_ptr_bytes! (lambda (n) (set_ref target_ptr_bytes n)))
+; clear_target_ptr_bytes! — restore the host default (8).
+(bind clear_target_ptr_bytes! (lambda () (set_ref target_ptr_bytes 8)))
+; target_pointer_bytes — the active pointer size in bytes (the reader).
+(bind target_pointer_bytes (lambda () (deref target_ptr_bytes)))
+
+; strict_mode — the opt-in STRICT native profile (audit #5). OFF by default, so a
+; build's behavior is unchanged unless a tool/driver pins it (set_strict!) around
+; an emit, exactly like target_ptr_bytes. When ON, gate! additionally rejects a
+; declared type token that resolves to no known native type / program type — the
+; silent path where the backend would lower an unknown type to a null IR type.
+(bind strict_mode (session_cell! "backend.prep.strict_mode" (lambda () false)))
+; set_strict! / clear_strict! — pin / unpin the strict profile (a tool sets it
+; before an emit and clears it after, in BOTH the success and the throw paths).
+(bind set_strict! (lambda () (set_ref strict_mode true)))
+(bind clear_strict! (lambda () (set_ref strict_mode false)))
+; strict? — is the strict profile active for this emit?
+(bind strict? (lambda () (deref strict_mode)))
+
+; native_context — the eval-vs-native flag bridging prep to the bare-import gate
+; (audit #26, the #15 tier-bridge pattern). A native program LEGITIMATELY
+; `(use stdlib.bare.…)`s the native-only wrappers (the LLVM/WASM backend knows the
+; volatile_*/asm/atomic_* heads); the default bare gate must NOT flag them. prep's
+; PRIMARY protection is structural: it inlines its dependencies via
+; `ctfe_compiler_load_surface_file_template` (visit_unit), bypassing the loader's
+; bare-gate hook entirely. This cell is the belt-and-suspenders SECOND guard: prep
+; SETS it true around its gate and the gate (stdlib.semantics.passes.bare_gate)
+; reads the SAME cell to SKIP — so if bare_gate is ever ALSO reached on the native
+; path (e.g. registered into the passes registry run_passes calls), it defers there
+; too. A plain session_cell! — intentionally namespace-SHARED (like strict_mode),
+; so no owner is declared; default false, so an ordinary eval load is gated as before.
+(bind native_context (session_cell! "backend.prep.native_context" (lambda () false)))
+; with_native_context! — run `thunk` with the native-context flag set, restoring it
+; afterwards in BOTH the success and the throw paths (so a gate that raises does not
+; leave the flag stuck true and silence the bare gate for the rest of the session).
+; Saves+restores the PRIOR value (nesting-safe), mirroring set_strict!/clear_strict!.
+(bind with_native_context!
+  (lambda (thunk)
+    (bind ((prior (deref native_context)))
+      (do
+        (set_ref native_context true)
+        (try
+          (bind ((r (thunk))) (do (set_ref native_context prior) r))
+          (catch e (do (set_ref native_context prior) (throw e))))))))
+
+; scalar_bytes — the storage size IN BYTES of a scalar or pointer type name,
+; or null when the name is not one (a struct, an unknown spelling). Used to
+; size a union to its widest member (and pick that member's type, hence its
+; natural alignment). Unions overlap ONLY scalars/pointers, so these exact
+; sizes are enough — no alignment/padding guesswork. A pointer's size follows
+; the active target (target_pointer_bytes; 8 by default); every other width is
+; target-independent. A null result is how `classify` detects a union member it
+; cannot lay out.
+;   t  : a type name (e.g. "u32", "ptr_Node")
+;   -> : 1 | 2 | 4 | 8 | null
+(bind scalar_bytes
+  (lambda (t)
+    (cond
+      ((or (eq t "i8") (or (eq t "u8") (eq t "bool"))) 1)
+      ((or (eq t "i16") (eq t "u16")) 2)
+      ((or (eq t "i32") (or (eq t "u32") (or (eq t "int") (eq t "f32")))) 4)
+      ((or (eq t "i64") (or (eq t "u64") (or (eq t "uptr") (eq t "f64")))) 8)
+      ((string_starts_with t "ptr") (target_pointer_bytes))
+      (else null))))
+
+; ── form classification: expanded form -> codegen tables ─────────────────────
+; defn_shape — the match pattern a defn/struct EXPANDS to: a marker (the inert
+; sig/struct record) followed by the actual binding. `(defn …)` and
+; `(struct …)` both lower to `(do <marker> (bind <name> <value>))`; the `?…`
+; holes capture the three parts for defn_pair.
+(bind defn_shape
+  (calln "do" (list_of (sym "?marker")
+                       (calln "bind" (list_of (sym "?name") (sym "?value"))))))
+
+; defn_pair — read an expanded defn/struct form via defn_shape, or null when
+; `node` is some OTHER shape (a plain bind, an enum's marker-led do, an inert
+; literal — classify routes those itself). When it matches, the result is the
+; binding plus the two markers' decoded payloads:
+;   {name, value, sig, struct} where
+;     name   : the bound identifier (string)
+;     value  : the binding's value spec (the lambda for a defn / constructor)
+;     sig    : the defn's parsed signature record — null for a `struct`
+;              constructor (which has no defn signature)
+;     struct : the parsed struct declaration {name, fields} — null for a defn
+;   (exactly one of sig/struct is non-null; the marker says which.) classify
+;   turns this into a `pairs` entry — `struct` non-null is what makes the entry
+;   a constructor and records the field layout.
+(bind defn_pair
+  (lambda (node)
+    (bind ((b (match_node defn_shape node)))
+      (if (or (eq b null)
+              (or (not (marker? (get b "?marker")))
+                  (eq (name_of (get b "?name")) null)))
+        null
+        (assoc (map_of)
+          "name" (name_of (get b "?name"))
+          "value" (get b "?value")
+          "sig" (sig_marker (get b "?marker"))
+          "struct" (struct_marker (get b "?marker")))))))
+
+; collide! — the ONE collision guard of the merged translation unit's flat
+; namespace. Inlining many modules into one namespace can make two definitions
+; share a name; a silent shadow would change behaviour, so flag a name already
+; defined by a DIFFERENT module (a re-bind by the SAME module — e.g. the loader
+; re-emitting one def — is harmless and stays quiet), then record this definer
+; in `seen` so the next clash is caught. Both add_pair! (function/struct pairs)
+; and bind_one! (consts) route through it, so the whole flat namespace is one
+; check. Appends a diagnostic on conflict; always updates `seen`.
+;   acc   : the prep accumulator ({seen: name->label, diags, …})
+;   label : the module currently defining `name` (its diagnostic label)
+;   name  : the binding name being claimed
+(bind collide!
+  (lambda (acc label name)
+    (bind ((prev (get (get acc "seen") name)))
+      (do
+        (when (and (not (eq prev null)) (not (eq prev label)))
+          (append (get acc "diags")
+            (diag (string_concat_many
+              "native prep: `" name "` is defined by both "
+              prev " and " label))))
+        (assoc (get acc "seen") name label)))))
+
+; add_pair! — file one (name, value) binding into the program.
+;   acc / label : the program accumulator and the defining module's label
+;   name / value: the binding
+(bind add_pair!
+  (lambda (acc label name value sig ctor_of)
+    (do
+      (collide! acc label name)
+      (append (get acc "pairs")
+        (assoc (map_of)
+          "name" name "value" value "sig" sig "ctor_of" ctor_of)))))
+
+; classify — sort one EXPANDED form into the program being built: function
+; pairs go to the accumulator, trailing expressions to finals (root program
+; only — a DEPENDENCY's top-level expression has no place in the merged
+; unit, so it is a certain error). Handles the defn/struct shape, marker-only
+; dos (type declarations — dropped), the frontend's canonical merged bind
+; (recursing into its swallowed body), and the plain flat bind.
+;   self / node  : recursion idiom and the expanded form
+;   label / root?: the defining module's label; finals allowed only when root
+;   acc          : {pairs, seen, finals, diags, …}
+; bind_one! — file ONE (name, value) binding: an int-literal value is a
+; compile-time CONSTANT (inlined at use sites — enum variants, top-level
+; consts), anything else a function/struct pair. Constants share the one flat
+; namespace, so a name defined by two DIFFERENT modules is a collision — the
+; same `seen` guard add_pair! uses.
+(bind bind_one!
+  (lambda (acc label name value sig ctor_of)
+    (if (and (literal? value)
+             (eq (value_type (literal_of value)) "int"))
+      (do
+        (collide! acc label name)
+        (assoc (get acc "consts") name (literal_of value)))
+      (add_pair! acc label name value sig ctor_of))))
+
+(bind classify
+  (lambda (self node label root? acc)
+    (cond
+      ; inert literals (an alias's null tail, a stray marker) — nothing to emit
+      ((literal? node) null)
+      (else
+        (bind ((p (defn_pair node)))
+          (cond
+            ((not (eq p null))
+              (do
+                ; a struct declaration also records its field layout for the
+                ; backends (the constructor pair points back at it)
+                (when_let (sm (get p "struct"))
+                  (assoc (get acc "structs")
+                    (get sm "name") (get sm "fields" (list_of))))
+                (add_pair! acc label (get p "name") (get p "value")
+                           (get p "sig")
+                           (bind ((sm (get p "struct")))
+                             (if (eq sm null) null (get sm "name"))))))
+            ; a union declaration: register it as a struct of ONE field whose
+            ; type is the largest member's (reuses all the struct plumbing —
+            ; %Name, ptr_Name, alloca, type emission — with that member's
+            ; natural alignment), while the member→type table drives
+            ; (union_field …) reinterpretation at offset 0
+            ((and (eq (head_of node) "do")
+                  (and (gt (size (args_of node)) 0)
+                       (not (eq (union_marker (arg node 0)) null))))
+              (bind (
+                (um (union_marker (arg node 0)))
+                (members (get um "members" (list_of)))
+                (bad_m (find members
+                         (lambda (m) (eq (scalar_bytes (get m "type")) null))))
+              )
+                (if (not (eq bad_m null))
+                  (append (get acc "diags")
+                    (diag (string_concat_many
+                      "native prep: union `" (get um "name")
+                      "` member type `" (get bad_m "type")
+                      "` must be a scalar or pointer")))
+                  ; the storage is the LARGEST member's own type, so the union
+                  ; gets that member's natural alignment (a [N x i8] byte
+                  ; buffer would be align-1 and trap unaligned loads on ARM)
+                  (bind ((widest (max_by members
+                                   (lambda (m) (scalar_bytes (get m "type"))))))
+                    (do
+                      (assoc (get acc "structs") (get um "name")
+                        (list_of (assoc (map_of) "name" "__storage"
+                          "type" (get widest "type" "u8"))))
+                      (assoc (get acc "unions") (get um "name")
+                        members))))))
+            ; a marker-led do (alias / enum): drop the marker, classify the
+            ; rest — enum's variant binds become program constants
+            ((and (eq (head_of node) "do")
+                  (and (gt (size (args_of node)) 0) (marker? (arg node 0))))
+              (for k (sequence_range 1 (size (args_of node)))
+                (self self (get (args_of node) k) label root? acc)))
+            ; canonical merged bind: ["n1" v1 … body…] (decomposed by the
+            ; single reader, lib/ast bind_pairs)
+            ((and (eq (head_of node) "bind") (string_lit? (arg node 0)))
+              (bind ((bp (bind_pairs node)))
+                (do
+                  (for p (get bp "pairs" (list_of))
+                    (bind_one! acc label (get p "name")
+                               (get p "value") null null))
+                  (for b (get bp "body" (list_of))
+                    (self self b label root? acc)))))
+            ; plain flat bind: (bind name value body…)
+            ((and (eq (head_of node) "bind") (name? (arg node 0)))
+              (do
+                (bind_one! acc label (name_of (arg node 0)) (arg node 1) null null)
+                (for k (sequence_range 2 (size (args_of node)))
+                  (self self (get (args_of node) k) label root? acc))))
+            (root? (append (get acc "finals") node))
+            (else
+              (append (get acc "diags")
+                (diag (string_concat_many
+                  "native prep: dependency " label
+                  " has a top-level expression — only function bindings"
+                  " compile into the merged unit"))))))))))
+
+; ── assemble: codegen tables -> pure-kernel source text ──────────────────────
+; assemble — render the prepped program back to ONE pure-kernel source string
+; (the kernel-text artifact: `(module …)` + the const binds + the merged
+; `(bind (…pairs…) <final>)`). Each pair/final is rendered ONCE via lib/render
+; (no string-splicing of code). The trailing expression collapses to "0" (no
+; finals — a library), the lone final, or a `(do …)` over several.
+;   name   : the module name for the `(module …)` line
+;   pairs  : the function/struct bindings (each {name, value} is rendered)
+;   finals : the root's trailing expression specs (the program body)
+;   consts : the compile-time constant table (enum variants, top-level consts),
+;            emitted as ordinary kernel binds the kernel-source path folds
+;   ->     : the rendered kernel-source text
+(bind assemble
+  (lambda (name pairs finals consts)
+    (bind (
+      (final_text
+        (cond
+          ((eq (size finals) 0) "0")
+          ((eq (size finals) 1) (render (get finals 0)))
+          (else
+            (bind ((t (buf_new)))
+              (do
+                (push_str t "(do")
+                (for f finals
+                  (do (push_str t " ") (push_str t (render f))))
+                (push_str t ")")
+                (to_string t))))))
+      (out (buf_new))
+    )
+      (do
+        (push_str out "(module ")
+        (push_str out "\"")
+        (push_str out name)
+        (push_str out "\")\n")
+        ; constants first: ordinary kernel binds the kernel-source path folds.
+        ; map_keys preserves INSERTION order (kernel guarantee), so the
+        ; rendered artifact is deterministic in source order — no sort needed.
+        (for cn (map_keys consts)
+          (do
+            (push_str out "(bind ")
+            (push_str out cn)
+            (push_str out " ")
+            (push_str out (int_to_string (get consts cn)))
+            (push_str out ")\n")))
+        (if (eq (size pairs) 0)
+          (do (push_str out final_text) (push_str out "\n"))
+          (do
+            (push_str out "(bind (\n")
+            (for p pairs
+              (do
+                (push_str out "  (")
+                (push_str out (get p "name" "?"))
+                (push_str out " ")
+                (push_str out (render (get p "value")))
+                (push_str out ")\n")))
+            (push_str out ")\n  ")
+            (push_str out final_text)
+            (push_str out ")\n")))
+        (to_string out)))))
+
+; ── visit_unit: fold modules in, inlining (use …) dependencies ───────────────
+; visit_unit — fold one module's top-level forms into the program. A `use`
+; directive INLINES the dependency: its source file resolves through the
+; loader's name->path machinery (declare/declare_root/discover must cover
+; it), loads as a unit, and its bindings join the same flat namespace —
+; each module once (diamonds and cycles terminate via `visited`).
+;   self   : itself
+;   unit   : the loaded (sugared) unit
+;   label  : the module's label for diagnostics ("<program>" for the root)
+;   root?  : only the root may carry trailing expressions / set the name
+;   acc    : {pairs, seen, finals, diags, visited, st}
+(bind visit_unit
+  (lambda (self unit label root? acc)
+    (bind ((expand (get ex "expand")) (diags (get acc "diags")))
+      (for form (ctfe_unit_top_level_forms unit)
+        (bind ((spec (ctfe_node_to_spec form)))
+          (case (head_of spec)
+            ("module"
+              (when (and root? (name? (arg spec 0)))
+                (assoc (get acc "st") "name" (name_of (arg spec 0)))))
+            ("export" null) ; no meaning in a merged native unit
+            ("import"
+              (append diags
+                (diag "native prep does not support (import …) — use (use …)")))
+            ("re_export"
+              (append diags
+                (diag "native prep does not support (re_export …)")))
+            ("extern"
+              ; (extern symbol ((p ty)…) ret) — an external symbol (asm stub,
+              ; linker symbol); calls to it lower to `call @symbol`
+              (bind (
+                (sym (name_of (arg spec 0)))
+                (plist (arg spec 1))
+                (params (list_of))
+              )
+                (do
+                  (when (call? plist)
+                    (for clause (bind ((its (list_of (callee plist))))
+                                  (do (for a (args_of plist) (append its a)) its))
+                      (when (and (call? clause) (name? (callee clause)))
+                        (append params
+                          (assoc (map_of)
+                            "name" (head_of clause)
+                            "type" (name_of (arg clause 0)))))))
+                  (append (get acc "externs")
+                    (assoc (map_of)
+                      "symbol" sym "params" params
+                      "result" (name_of (arg spec 2)))))))
+            ("global"
+              ; (global name ty init) — a mutable program global; in function
+              ; bodies the name is a ref cell (deref/set_ref reach it). The init
+              ; MUST be a literal (the backend stores it directly); a non-literal
+              ; would lower to a null init, so flag it with a NAMED diagnostic
+              ; here rather than emit a silently-wrong global. (The clike surface
+              ; already rejects this located; this guards other front-ends.)
+              (bind ((init_v (literal_of (arg spec 2))))
+                (if (eq init_v null)
+                  (append (get acc "diags")
+                    (diag (string_concat_many
+                      "native prep: global `" (name_of (arg spec 0))
+                      "` initializer must be a literal constant")))
+                  (append (get acc "globals")
+                    (assoc (map_of)
+                      "name" (name_of (arg spec 0))
+                      "type" (name_of (arg spec 1))
+                      "init" init_v)))))
+            ("global_array"
+              ; (global_array name N elem) — a zero-initialized BSS array; in
+              ; function bodies the name is a typed pointer to element 0
+              (append (get acc "global_arrays")
+                (assoc (map_of)
+                  "name" (name_of (arg spec 0))
+                  "count" (literal_of (arg spec 1))
+                  "elem" (name_of (arg spec 2)))))
+            ("use"
+              (bind ((modname (if (name? (arg spec 0))
+                                (name_of (arg spec 0)) null)))
+                (cond
+                  ((eq modname null)
+                    (append diags (diag "native prep: malformed (use …)")))
+                  ; diamonds/cycles: every module joins the unit once
+                  ((not (eq (get (get acc "visited") modname) null))
+                    null)
+                  (else
+                    (do
+                      (assoc (get acc "visited") modname true)
+                      (bind ((path ((get loader_api "module_path") modname)))
+                        (if (eq path null)
+                          (append diags
+                            (diag (string_concat_many
+                              "native prep: cannot resolve module `" modname
+                              "` to a source file (declare a root first)")))
+                          (self self
+                            (ctfe_compiler_load_surface_file_template
+                              compiler path)
+                            modname false acc))))))))
+            (else
+              (try
+                (bind ((e (expand spec)))
+                  ; collect the EXPANDED form (markers intact). Transforms rewrite
+                  ; it in place; classify (run AFTER transforms) then builds the
+                  ; codegen tables from the transformed form — so the transform
+                  ; passes feed codegen, exactly as the loader rewrites BEFORE its
+                  ; gate. label/root ride along for that deferred classify.
+                  (append (get acc "expanded")
+                    (assoc (map_of)
+                      "node" e
+                      "label" label
+                      "root" root?
+                      "loc" (bind ((sp (ctfe_unit_node_span unit (ctfe_node_id form))))
+                              (if (eq sp null) label
+                                (string_concat_many
+                                  (get sp "path" "?") ":"
+                                  (int_to_string (get sp "start_line" 0)) ":"
+                                  (int_to_string (get sp "start_col" 0))))))))
+                (catch err
+                  (append diags (diag (value_to_string err))))))))))))
+
+; ── the pre-codegen gate: native vocabulary + checker/type/passes ────────────
+; native_vocab — heads the LLVM/WASM backends understand but the kernel does NOT
+; (so the semantic checker, which knows only the kernel vocabulary, would
+; otherwise flag them as unknown names). Seeded into the checker's base scope for
+; the pre-codegen gate. Derived from the single source `native_meta.native_heads`
+; (this was a hand-kept list — one of the three places that had to agree).
+(bind native_vocab head_names)
+
+; type_tokens — type NAMES that appear as bare-name ARGUMENTS to native heads
+; (e.g. `u32` in (cast x u32), `void` in (asm … void), the element type in
+; int_to_ptr/volatile_read/array_local). The checker would read them as value
+; references, so they are seeded into scope too. (defn parameter/result types
+; live inside the inert sig marker, not as bare names, so they never trip it.)
+; Derived from `native_meta.native_types` (the same single source).
+(bind type_tokens type_names)
+
+; gate_strict_types! — the strict native profile's extra check (audit #5): every
+; DECLARED type token must resolve to a known native type, a program struct/union,
+; or a pointer (`ptr` / `ptr_<T>`). A type the backend cannot lower would otherwise
+; become a null IR type SILENTLY (ll_type/w_type return null); here it is a located
+; diagnostic instead. Only the easily-named declaration surface is walked here
+; (struct/union fields, externs, globals, BSS arrays); bare type tokens in
+; expression position are already caught by the unknown-name check in gate!.
+;   acc : the prep accumulator (its diags list is appended to)
+(bind gate_strict_types!
+  (lambda (acc)
+    (bind (
+      (structs (get acc "structs" (map_of)))
+      (unions  (get acc "unions" (map_of)))
+      (type_ok? (lambda (t)
+        (or (native_type? t)
+            (or (contains structs t)
+                (or (contains unions t) (string_starts_with t "ptr"))))))
+      (chk (lambda (t where)
+        (if (type_ok? t)
+          null
+          (append (get acc "diags") (diag (string_concat_many
+            "strict native profile: unknown type `" (value_to_string t) "` in " where))))))
+    )
+      (do
+        (for sn (map_keys structs)
+          (for f (get structs sn)
+            (chk (get f "type")
+              (string_concat_many "field `" (get f "name") "` of struct `" sn "`"))))
+        (for un (map_keys unions)
+          (for m (get unions un)
+            (chk (get m "type")
+              (string_concat_many "member `" (get m "name") "` of union `" un "`"))))
+        (for ex (get acc "externs" (list_of))
+          (do
+            (for pp (get ex "params" (list_of))
+              (chk (get pp "type")
+                (string_concat_many "a param of extern `" (get ex "symbol") "`")))
+            (chk (get ex "result")
+              (string_concat_many "the result of extern `" (get ex "symbol") "`"))))
+        (for g (get acc "globals" (list_of))
+          (chk (get g "type") (string_concat_many "global `" (get g "name") "`")))
+        (for ga (get acc "global_arrays" (list_of))
+          (chk (get ga "elem") (string_concat_many "array `" (get ga "name") "`")))))))
+
+; gate! — run the semantic checker + type pass over a program's EXPANDED
+; forms BEFORE codegen, so a native build rejects the same unknown-name /
+; arity / type errors the loader does, located — not as a cryptic
+; "codegen: unsupported …". Native-only heads and every top-level name are
+; seeded into scope so they are not mistaken for typos. When the strict profile
+; is pinned (set_strict!), it also runs gate_strict_types!.
+;   acc : the prep accumulator (its diags list is appended to)
+(bind gate!
+  (lambda (acc)
+    (bind (
+      (chk (ctfe_compiler_lookup_value compiler key_check null))
+      (ti  (ctfe_compiler_lookup_value compiler key_types null))
+      (scope0 (map_of))
+      (sink (list_of))
+      (expanded (get acc "expanded" (list_of)))
+    )
+      (do
+        (sequence_each native_vocab (lambda (h) (assoc scope0 h true)))
+        (sequence_each type_tokens (lambda (h) (assoc scope0 h true)))
+        ; program struct/union names are also type tokens (ptr_<Struct>, etc.)
+        (for sn (map_keys (get acc "structs" (map_of))) (assoc scope0 sn true))
+        (for un (map_keys (get acc "unions" (map_of)))  (assoc scope0 un true))
+        (for p  (get acc "pairs" (list_of))         (assoc scope0 (get p "name") true))
+        (for cn (map_keys (get acc "consts" (map_of))) (assoc scope0 cn true))
+        (for g  (get acc "globals" (list_of))       (assoc scope0 (get g "name") true))
+        (for ga (get acc "global_arrays" (list_of)) (assoc scope0 (get ga "name") true))
+        (for ex (get acc "externs" (list_of))       (assoc scope0 (get ex "symbol") true))
+        (when_let (cf (if (eq chk null) null (get chk "check_forms")))
+          (cf expanded scope0 sink))
+        (when_let (cmt (if (eq ti null) null (get ti "check_module_types")))
+          (cmt expanded (map_of) sink))
+        ; USER analysis passes (lint, match-check, borrow, naming, …) — the SAME
+        ; registry entry the loader runs, so a native build reports exactly the
+        ; same findings. A no-op when no passes kit is loaded.
+        (bind ((pk (ctfe_compiler_lookup_value compiler key_passes null)))
+          (when_let (rp (if (eq pk null) null (get pk "run_passes")))
+            (rp expanded sink)))
+        ; the checker/type pass/analyses append located STRING findings; wrap
+        ; each as a diagnostic map (the CLI emitter shape)
+        (for m sink (append (get acc "diags") (diag m)))
+        ; the opt-in strict profile's extra type-resolution check (a no-op when
+        ; not pinned), appended to the same diags list
+        (if (strict?) (gate_strict_types! acc) null)))))
+
+; ── entry points: prep_units (structured) / prep_program (kernel text) ───────
+; prep_units — the STRUCTURED program: root + inlined dependencies flattened
+; into one unit, run through the standard front-end (transform -> classify ->
+; gate), BEFORE any rendering. The backend chooses how to consume it: assemble
+; (kernel source text, for the compatibility/debug path) or an emitter
+; (backend/emit/llvm, backend/emit/wasm) lowering the codegen tables to target text.
+;   unit : the loaded (sugared) root unit; (use …) dependencies are inlined
+;   ->   : the codegen tables — see the "prep_units output schema" block at the
+;          top of this file (name, pairs, finals, structs, unions, consts,
+;          externs, globals, global_arrays, diagnostics). KEEP STABLE: both
+;          emitters read these field shapes.
+(bind prep_units
+  (lambda (unit)
+    (bind (
+      (acc (assoc (map_of)
+             "pairs" (list_of)
+             "seen" (map_of)
+             "finals" (list_of)
+             "diags" (list_of)
+             "visited" (map_of)
+             "structs" (map_of)
+             "unions" (map_of)
+             "consts" (map_of)
+             "externs" (list_of)
+             "globals" (list_of)
+             "global_arrays" (list_of)
+             "expanded" (list_of)
+             "st" (map_of)))
+    )
+      (do
+        (assoc (get acc "st") "name" "program")
+        (visit_unit visit_unit unit "<program>" true acc)
+        ; THE STANDARD FRONT-END — identical to the loader's, differing only in
+        ; the final step (codegen here, eval there). The loader does: expand ->
+        ; run_transforms -> gate (check + type + run_passes). We mirror it:
+        (when (eq (size (get acc "diags" (list_of))) 0)
+          (do
+            ; 0. publish the program globals' declared types to the argument-
+            ;    inference pass: a `(global …)` is folded into `acc.globals` by
+            ;    visit_unit and never enters the expanded stream, so preresolve
+            ;    cannot see it from `located` — without this, a generic call on a
+            ;    global receiver (`ur_list_push(&ur_ready_head, …)`) cannot deduce
+            ;    its type/field. Set before the transforms read it.
+            (set_program_globals! (get acc "globals" (list_of)))
+            ; the struct monomorph rewrites those globals' generic type spellings
+            ; (`List<TH&nxt>` -> `List__TH__nxt`) in place, so the global cell lowers.
+            (set_struct_globals! (get acc "globals" (list_of)))
+            ; 1. transform passes rewrite the expanded forms IN PLACE (the same
+            ;    registry entry the loader calls, BEFORE anything reads them).
+            (bind ((pk (ctfe_compiler_lookup_value compiler key_passes null)))
+              (when_let (rt (if (eq pk null) null (get pk "run_transforms")))
+                (rt (get acc "expanded"))))
+            ; 2. classify the (transformed) forms into the codegen tables, so
+            ;    transforms feed codegen and the gate's scope is seeded.
+            (for entry (get acc "expanded")
+              (classify classify (get entry "node") (get entry "label")
+                        (get entry "root") acc))
+            ; 3. the gate: semantic checker + type pass + analysis passes. Run it
+            ;    inside the native-context (audit #26): a native program legitimately
+            ;    inlines stdlib.bare.* wrappers here, so the bare-import gate (which
+            ;    the passes registry / loader runs) must SKIP — never flag — them.
+            ;    with_native_context! restores the flag on BOTH the success and the
+            ;    throw path, so a raising gate never leaves it stuck on.
+            (with_native_context! (lambda () (gate! acc)))))
+        (assoc (map_of)
+          "name" (get (get acc "st") "name" "program")
+          "pairs" (get acc "pairs")
+          "finals" (get acc "finals")
+          "structs" (get acc "structs")
+          "unions" (get acc "unions")
+          "consts" (get acc "consts")
+          "externs" (get acc "externs")
+          "globals" (get acc "globals")
+          "global_arrays" (get acc "global_arrays")
+          "diagnostics" (get acc "diags"))))))
+
+; prep_program — the CLI emitter body: unit -> {text, diagnostics}.
+;   unit : the loaded (sugared) root unit; (use …) dependencies are inlined
+;   ->   : {text: pure-kernel source, diagnostics: [{severity, message, …}]}
+(bind prep_program
+  (lambda (unit)
+    (bind (
+      (prog (prep_units unit))
+      (diags (program_diagnostics prog))
+    )
+      (do
+        ; extern/global are LLVM-specific — the kernel-text path cannot
+        ; carry them; route such programs through the own LLVM backend
+        (when (or (gt (size (program_externs prog)) 0)
+                  (or (gt (size (program_globals prog)) 0)
+                      (gt (size (program_global_arrays prog)) 0)))
+          (append diags
+            (diag "native prep (kernel-text): extern/global/global_array need the LLVM backend (stdlib.llvm.emit)")))
+        (assoc (map_of)
+          "text"
+          (if (eq (size diags) 0)
+            (assemble
+              (program_name prog)
+              (program_pairs prog)
+              (program_finals prog)
+              (program_consts prog))
+            "")
+          "diagnostics" diags)))))
+
+; Native generics: register the monomorphization transform when the native
+; backend loads, so EVERY native codegen entry (the driver, native_emit, the
+; emit_own_llvm test harness) specializes explicitly-instantiated generics
+; before the gate — not only the native_emit leg. A no-op for non-generic
+; programs; never reached on the eval-only path (prep is native-only).
+; argument inference runs FIRST — it prepends deduced `type` args to under-applied
+; generic calls, reconstructing the explicit form the monomorph specializes.
+(register_preresolve!)
+(register_monomorph!)
+; struct-monomorph runs AFTER the function monomorph (registered second →
+; append-ordered second), so operation signatures' `List<T,lf>` have already
+; become concrete `List<UR_THREAD,…>` spellings it can specialize.
+(register_struct_monomorph!)
+
+(export prep_program prep_units
+        target_pointer_bytes set_target_ptr_bytes! clear_target_ptr_bytes!
+        set_strict! clear_strict! strict?)

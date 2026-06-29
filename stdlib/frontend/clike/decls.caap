@@ -1,0 +1,65 @@
+; stdlib/frontend/clike/decls.caap - declaration-kind and attribute registries.
+;
+; Internal leaf behind stdlib.frontend.clike. Lowering hooks are still supplied
+; by the facade because they mutate the facade's program-lowering context.
+(module stdlib.frontend.clike.decls)
+
+(use stdlib.frontend.clike.tokens tval tsym? oops)
+(use stdlib.frontend.clike.meta meta_token meta_internal?)
+
+(bind decl_kinds (map_of))
+(bind decl_attrs (map_of))
+(bind decl_classifiers (list_of))
+
+(bind register_decl_kind!
+  (lambda (name hint lower word?)
+    (assoc decl_kinds name
+      (assoc (map_of) "hint" hint "lower" lower "word" word?))))
+
+(bind register_attribute!
+  (lambda (name validate)
+    (assoc decl_attrs name (assoc (map_of) "validate" validate))))
+
+(bind register_decl_classifier!
+  (lambda (name priority classify)
+    (append decl_classifiers
+      (assoc (map_of) "name" name "priority" priority "classify" classify))))
+
+(bind attr?
+  (lambda (name) (contains decl_attrs name)))
+
+(bind kind_word?
+  (lambda (tk) (and (tsym? tk null)
+                    (and (contains decl_kinds (tval tk))
+                         (get (get decl_kinds (tval tk)) "word" false)))))
+
+(bind kind_hint
+  (lambda (name) (get (get decl_kinds name) "hint")))
+
+(bind kind_lower
+  (lambda (name) (get (get decl_kinds name) "lower")))
+
+(bind classify_decl_kind
+  (lambda (node)
+    (bind ((best (ref null)) (bestp (ref 1000000)))
+      (do
+        (for row decl_classifiers
+          (bind ((k ((get row "classify") node)))
+            (when (and (not (eq k null)) (lt (get row "priority") (deref bestp)))
+              (do
+                (set_ref best k)
+                (set_ref bestp (get row "priority"))))))
+        (deref best)))))
+
+(bind validate_attrs
+  (lambda (attrs kind name)
+    (for an (map_keys attrs)
+      (unless (meta_internal? an)
+        (bind ((row (get decl_attrs an null)))
+          (if (eq row null)
+            (oops (string_concat_many "unknown clike metadata `" an "`")
+                  (meta_token attrs an name))
+            ((get row "validate") an kind attrs name)))))))
+
+(export register_decl_kind! register_attribute! register_decl_classifier!
+        attr? kind_word? kind_hint kind_lower classify_decl_kind validate_attrs)

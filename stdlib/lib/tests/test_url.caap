@@ -1,0 +1,161 @@
+; stdlib/lib/tests/test_url.caap — in-language tests for lib/text/url.
+
+;; @area: text
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.text.url
+  url_parse url_build
+  query_parse query_build
+  url_join)
+
+; assert_list — structural list/pair equality (value_eq), reusing assert_true.
+; (`eq`/`assert_eq` are IDENTITY for lists; use value_eq for structural compare.)
+(bind assert_list
+  (lambda (actual expected label) (assert_true (value_eq actual expected) label)))
+
+(do
+  ; ── url_parse: the full canonical shape ────────────────────────────────────
+  (bind ((u (url_parse "https://u@example.com:8080/p/q?x=1&y=2#frag")))
+    (do
+      (assert_eq (get u "scheme")   "https"       "parse scheme")
+      (assert_eq (get u "userinfo") "u"           "parse userinfo")
+      (assert_eq (get u "host")     "example.com" "parse host")
+      (assert_eq (get u "port")     "8080"        "parse port")
+      (assert_eq (get u "path")     "/p/q"        "parse path")
+      (assert_eq (get u "query")    "x=1&y=2"     "parse query")
+      (assert_eq (get u "fragment") "frag"        "parse fragment")))
+
+  ; ── url_parse: no scheme (protocol-relative authority) ─────────────────────
+  (bind ((u (url_parse "//example.com/a")))
+    (do
+      (assert_eq (get u "scheme") ""            "no-scheme: scheme empty")
+      (assert_eq (get u "host")   "example.com" "no-scheme: host")
+      (assert_eq (get u "path")   "/a"          "no-scheme: path")))
+
+  ; ── url_parse: no port, no query, no fragment ──────────────────────────────
+  (bind ((u (url_parse "http://host/path")))
+    (do
+      (assert_eq (get u "scheme")   "http" "no-port: scheme")
+      (assert_eq (get u "host")     "host" "no-port: host")
+      (assert_eq (get u "port")     ""     "no-port: port empty")
+      (assert_eq (get u "path")     "/path" "no-port: path")
+      (assert_eq (get u "query")    ""     "no-port: query empty")
+      (assert_eq (get u "fragment") ""     "no-port: fragment empty")))
+
+  ; ── url_parse: bare host (no path) ─────────────────────────────────────────
+  (bind ((u (url_parse "http://host")))
+    (do
+      (assert_eq (get u "host") "host" "bare host: host")
+      (assert_eq (get u "path") ""     "bare host: empty path")))
+
+  ; ── url_parse: scheme with no authority (opaque, e.g. mailto) ──────────────
+  (bind ((u (url_parse "mailto:a@b.com")))
+    (do
+      (assert_eq (get u "scheme") "mailto"  "opaque: scheme")
+      (assert_eq (get u "host")   ""        "opaque: no host")
+      (assert_eq (get u "path")   "a@b.com" "opaque: path holds the rest")))
+
+  ; ── url_parse: relative path only (no scheme, no authority) ────────────────
+  (bind ((u (url_parse "a/b/c?k=v")))
+    (do
+      (assert_eq (get u "scheme") ""      "relative: no scheme")
+      (assert_eq (get u "host")   ""      "relative: no host")
+      (assert_eq (get u "path")   "a/b/c" "relative: path")
+      (assert_eq (get u "query")  "k=v"   "relative: query")))
+
+  ; ── url_parse: fragment may contain "?" / query may contain "/" ────────────
+  (bind ((u (url_parse "http://h/p?a=1/2#x?y")))
+    (do
+      (assert_eq (get u "query")    "a=1/2" "delimiter: query keeps internal /")
+      (assert_eq (get u "fragment") "x?y"   "delimiter: fragment keeps internal ?")))
+
+  ; ── url_parse: scheme is lowercased ────────────────────────────────────────
+  (assert_eq (get (url_parse "HTTPS://h/") "scheme") "https" "scheme lowercased")
+
+  ; ── url_parse: IPv6 host keeps brackets, splits port after "]" ─────────────
+  (bind ((u (url_parse "http://[::1]:9000/x")))
+    (do
+      (assert_eq (get u "host") "[::1]" "ipv6: bracketed host whole")
+      (assert_eq (get u "port") "9000"  "ipv6: port after ]")))
+
+  ; ── url_build: round-trip over the round-trippable subset ──────────────────
+  (bind ((canon "https://u@example.com:8080/p/q?x=1&y=2#frag"))
+    (assert_eq (url_build (url_parse canon)) canon "round-trip canonical"))
+  (assert_eq (url_build (url_parse "http://host/path")) "http://host/path"
+    "round-trip no-port")
+  (assert_eq (url_build (url_parse "//example.com/a")) "//example.com/a"
+    "round-trip no-scheme")
+  (assert_eq (url_build (url_parse "mailto:a@b.com")) "mailto:a@b.com"
+    "round-trip opaque")
+  (assert_eq (url_build (url_parse "http://host")) "http://host"
+    "round-trip bare host")
+
+  ; ── url_build: from a hand-built parts map ─────────────────────────────────
+  (assert_eq
+    (url_build (assoc (map_of)
+      "scheme" "ftp" "host" "files.example" "port" "21" "path" "/pub"))
+    "ftp://files.example:21/pub" "build from map")
+
+  ; ── query_parse ────────────────────────────────────────────────────────────
+  (assert_list (query_parse "x=1&y=2")
+    (list_of (list_of "x" "1") (list_of "y" "2")) "query_parse two pairs")
+  (assert_list (query_parse "") (list_of) "query_parse empty string")
+  ; empty value, missing "=", and a later "=" stays in the value
+  (assert_list (query_parse "a=&b&c=1=2")
+    (list_of (list_of "a" "") (list_of "b" "") (list_of "c" "1=2"))
+    "query_parse empty/missing/extra =")
+  ; a trailing "&" yields no empty pair
+  (assert_list (query_parse "a=1&")
+    (list_of (list_of "a" "1")) "query_parse trailing & skipped")
+  ; percent-decoding of key and value ("a%20b" -> "a b")
+  (assert_list (query_parse "a%20b=c%2Bd")
+    (list_of (list_of "a b" "c+d")) "query_parse percent-decodes")
+
+  ; ── query_build ────────────────────────────────────────────────────────────
+  (assert_eq
+    (query_build (list_of (list_of "x" "1") (list_of "y" "2")))
+    "x=1&y=2" "query_build two pairs")
+  (assert_eq (query_build (list_of)) "" "query_build empty")
+  ; space becomes %20 (percent-encoding, not "+"); "+" itself becomes %2B
+  (assert_eq
+    (query_build (list_of (list_of "a b" "c+d")))
+    "a%20b=c%2Bd" "query_build percent-encodes space as %20")
+  (assert_eq
+    (query_build (list_of (list_of "k" "")))
+    "k=" "query_build empty value keeps =")
+
+  ; ── query round-trip (parse∘build) ─────────────────────────────────────────
+  (bind ((pairs (list_of (list_of "name" "a b") (list_of "tag" "x&y") (list_of "z" ""))))
+    (assert_list (query_parse (query_build pairs)) pairs "query round-trip"))
+
+  ; ── url_join ───────────────────────────────────────────────────────────────
+  ; absolute relative wins outright
+  (assert_eq (url_join "http://a/b/c" "https://x/y") "https://x/y"
+    "join: absolute rel wins")
+  ; absolute path replaces the base path
+  (assert_eq (url_join "http://a/b/c" "/d") "http://a/d" "join: absolute path")
+  ; protocol-relative keeps the base scheme
+  (assert_eq (url_join "http://a/b" "//x/y") "http://x/y" "join: //authority")
+  ; query-only reference
+  (assert_eq (url_join "http://a/b?old" "?new") "http://a/b?new" "join: query-only")
+  ; fragment-only reference
+  (assert_eq (url_join "http://a/b#old" "#new") "http://a/b#new" "join: fragment-only")
+  ; relative path merges onto the base directory
+  (assert_eq (url_join "http://a/b/c" "d") "http://a/b/d" "join: relative path merge")
+  ; ".." pops a segment of the merged path
+  (assert_eq (url_join "http://a/b/c" "../d") "http://a/d" "join: ../ pops a segment")
+  ; "." drops
+  (assert_eq (url_join "http://a/b/c" "./d") "http://a/b/d" "join: ./ current dir")
+  ; a ref ending in ".." denotes a directory: the result keeps a trailing "/"
+  (assert_eq (url_join "http://h/a/b/c" "..") "http://h/a/" "join: trailing .. keeps /")
+  (assert_eq (url_join "http://h/a/b/c" ".") "http://h/a/b/" "join: trailing . keeps /")
+  ; a protocol-relative ref's dot segments are normalized too
+  (assert_eq (url_join "http://a" "//x/p/../q") "http://x/q" "join: // normalizes path")
+  ; an empty reference resolves to the base unchanged (query preserved)
+  (assert_eq (url_join "http://a/b/c?q=1" "") "http://a/b/c?q=1" "join: empty rel keeps base")
+
+  ; ── remove_dot_segments edge: more ".." than segments underflows to root ────
+  (assert_eq (url_join "http://h/a" "/x/../../y") "http://h/y" "join: .. underflow")
+
+  true)

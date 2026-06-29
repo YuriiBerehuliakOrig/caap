@@ -1,0 +1,6 @@
+; the element type flows OUT of the container: get on (list string) yields
+; string, and feeding it to int_add is a certain error.
+(module stdlib.fixtures.generics_bad_elem)
+(defn first_plus ((xs (list string))) int
+  (int_add (get xs 0 null) 1))
+(export first_plus)

@@ -1,0 +1,484 @@
+; stdlib/semantics/passes/registry.caap — USER-DEFINED load-time passes (module
+; stdlib.semantics.passes.registry).
+;
+; The loader's pre-eval pipeline is expand → check → typecheck; this kit adds
+; the user's seat at that table: register a pass and EVERY subsequently loaded
+; module is walked by it, with findings failing the load exactly like the
+; built-in phases (same located protocol, same sink).
+;
+; Division of labour (one mechanism per granularity, no overlap):
+;   per-head rewrites   — define_form (forms ARE compile-time functions)
+;   whole-module rewrites — transform passes (register_transform!, below)
+;   analyses            — passes: read-only walks that report findings
+;
+; A pass is a plain function (located sink) -> null:
+;   located : [{node, loc}] the module's EXPANDED top-level forms, in order
+;   sink    : append located finding strings ("path:line:col: message")
+; The loader looks this module up BY NAME on each load (the same late-binding
+; idiom it uses for the type pass) — sessions that never load the kit pay
+; nothing.
+;
+; ── ordering (opt-in; append-order by default) ──────────────────────────────
+; A pass that consumes another's output must run AFTER it (alias → borrow; the
+; constfold/simplify/dce folders → peval). Plain `register_pass!`/
+; `register_transform!` stay append-order — what the original two-step pipeline
+; always did. To DECLARE an ordering, register with a deps map via the `_with!`
+; constructors (or `install_*_with!`):
+;   (register_pass_with! "borrow" run (deps_of (list_of) (list_of) (list_of "alias")))
+; A deps map has three OPTIONAL name lists (each defaults to empty):
+;   after    : run after these (a soft hint — a named pass that isn't installed
+;              simply imposes no edge)
+;   before   : run before these (the mirror of `after`, declared from the other
+;              side)
+;   requires : like `after`, but the named pass MUST be installed — a declared
+;              dependency that is absent is a misconfiguration and fails loudly
+; Just before a run, `run_passes`/`run_transforms` topologically order the
+; registry from these edges. The sort is STABLE: with no edges at all it is the
+; identity (registration order preserved), so the default stays append-order
+; byte-for-byte. A genuine cycle is a hard, named error.
+;
+; ── facts (cross-pass communication) ────────────────────────────────────────
+; An analysis records what it learned; a later pass (or codegen driver) reads
+; it back. Two flavours over ONE store (so a typed writer and a soft reader
+; interoperate):
+;   fact!/fact_of            — soft: a miss yields the supplied default (null).
+;                              The original, zero-ceremony channel.
+;   fact_typed!/fact_typed_of — typed: declare a namespace's schema once with
+;                              `fact_schema!`, then writes are key/value-checked
+;                              and a read of an ABSENT key THROWS instead of
+;                              silently returning null (a typed contract: the
+;                              consumer asserts the producer ran).
+(module stdlib.semantics.passes.registry)
+
+(use stdlib.syntax.ast loc_or)
+; the unified compile-session context (audit #1) — registers the fact store's
+; clear_passes! as a session reset hook (below), so one session_reset! resets it.
+(use stdlib.semantics.session session_register!)
+
+(bind registry (list_of))    ; analyses
+(bind transforms (list_of))  ; whole-module rewrites
+(bind facts (map_of))        ; cross-pass facts: namespace -> key -> value
+(bind schemas (map_of))      ; typed-fact schemas: namespace -> {key, value}
+
+; loc_of — a node's "path:line:col" (sub-expression precision), or the
+; fallback. Re-exported from lib/ast (the one reader of node spans) so pass
+; authors keep a stable name here.
+(bind loc_of loc_or)
+
+; ── shared pass-authoring helpers (one definition, every pass uses it) ───────
+
+; finding_at — the located finding string from a pre-computed location:
+; "tag: loc: msg" (loc omitted when "").
+(bind finding_at
+  (lambda (tag at msg)
+    (string_concat_many tag ": "
+      (if (eq at "") "" (string_concat_many at ": ")) msg)))
+
+; finding — the same, taking a NODE (its loc via lib/ast). The shape every
+; analysis builds.
+(bind finding (lambda (tag node msg) (finding_at tag (loc_of node "") msg)))
+
+; note! — append a `finding` to a sink (the append-form most passes want).
+(bind note!
+  (lambda (sink tag node msg) (append sink (finding tag node msg))))
+
+; ignored? — the intentional-unused convention: a leading-underscore name
+; (`_x`) opts out of unused / shadow / dead findings.
+(bind ignored?
+  (lambda (nm)
+    (and (not (eq nm null)) (gt (size nm) 0) (eq (string_slice nm 0 1) "_"))))
+
+; ── ordering: dependency declarations ───────────────────────────────────────
+
+; deps_of — a pass's ordering edges, packaged for the `_with!` constructors.
+; Each argument is a name LIST (any may be empty); see the module header for
+; the after/before/requires contract.
+;   after / before / requires : [name…]
+;   -> : a deps map
+(bind deps_of
+  (lambda (after before requires)
+    (assoc (map_of) "after" after "before" before "requires" requires)))
+
+; no_deps — the empty edge set (what plain `register_*!` use): append-order.
+(bind no_deps (deps_of (list_of) (list_of) (list_of)))
+
+; entry_of — one registry record: its name, runner and (normalised) edges.
+(bind entry_of
+  (lambda (name run deps)
+    (assoc (map_of)
+      "name" name "run" run
+      "after"    (get deps "after"    (list_of))
+      "before"   (get deps "before"   (list_of))
+      "requires" (get deps "requires" (list_of)))))
+
+; register_pass! — add a pass to the pipeline (runs on every later load).
+;   name : the pass's name (appears in its failure findings)
+;   run  : (located sink) -> null
+; Append-order: ordering edges are empty. Use `register_pass_with!` to declare
+; after/before/requires.
+(bind register_pass!
+  (lambda (name run)
+    (append registry (entry_of name run no_deps))))
+
+; register_pass_with! — `register_pass!` plus an ordering `deps` map (deps_of).
+(bind register_pass_with!
+  (lambda (name run deps)
+    (append registry (entry_of name run deps))))
+
+; unregister_pass! / unregister_transform! — remove ONE entry by name
+; (hygiene for REPL/tooling).
+(bind unregister_in!
+  (lambda (reg name)
+    (bind ((i (ref 0)) (found (ref false)))
+      (do
+        (while (lt (deref i) (size reg))
+          (if (eq (get (get reg (deref i)) "name") name)
+            (do (list_remove_at reg (deref i)) (set_ref found true))
+            (set_ref i (int_add (deref i) 1))))
+        (deref found)))))
+(bind unregister_pass!
+  (lambda (name) (unregister_in! registry name)))
+(bind unregister_transform!
+  (lambda (name) (unregister_in! transforms name)))
+
+; clear_passes! — empty both registries AND the fact store (incl. schemas):
+; tests / REPL hygiene — one call returns the loader to its built-in pipeline.
+(bind clear_passes!
+  (lambda ()
+    (do
+      (while (gt (size registry) 0) (list_remove_at registry 0))
+      (while (gt (size transforms) 0) (list_remove_at transforms 0))
+      (for ns (map_keys facts) (map_delete facts ns))
+      (for ns (map_keys schemas) (map_delete schemas ns)))))
+
+; Register the pass registry + fact store with the unified compile-session (audit
+; #1): a single session_reset! now also empties the registries/facts/schemas, so a
+; fresh compile no longer needs a separate manual clear_passes! call. clear_passes!
+; itself stays for targeted REPL/test hygiene.
+(session_register! "semantics.passes" clear_passes!)
+
+; ── ordering: the topological scheduler ─────────────────────────────────────
+; ordered — the entries of `reg` in an order that honours every after/before/
+; requires edge, falling back to registration order. STABLE Kahn: scan in
+; registration order and emit the first entry whose `after`-deps are all
+; emitted; with no edges this is the identity. Dangling after/before names
+; (a soft hint at an uninstalled pass) impose no edge; a missing `requires`
+; target, or a cycle, is a hard named error.
+;   reg  : the registry or transforms list
+;   kind : "pass" | "transform" (for the error message)
+;   ->   : a freshly ordered list of the same entries
+(bind ordered
+  (lambda (reg kind)
+    (bind (
+        ; present? — is `name` an entry in `reg`?
+        (present?
+          (lambda (name)
+            (bind ((hit (ref false)))
+              (do
+                (for e reg (when (eq (get e "name") name) (set_ref hit true)))
+                (deref hit)))))
+        ; deps_after — the full set of names entry `e` must follow: its own
+        ; `after` ∪ `requires`, plus every entry whose `before` names `e`.
+        (deps_after
+          (lambda (e)
+            (bind ((acc (list_of)))
+              (do
+                (for a (get e "after"    (list_of)) (append acc a))
+                (for r (get e "requires" (list_of))
+                  (do
+                    (when (not (present? r))
+                      (throw (string_concat_many
+                        kind " `" (get e "name" "?")
+                        "` requires `" r "`, which is not installed")))
+                    (append acc r)))
+                (for o reg
+                  (when (contains (get o "before" (list_of)) (get e "name"))
+                    (append acc (get o "name"))))
+                acc))))
+        (out   (list_of))
+        (done  (map_of)))          ; name -> true once emitted
+      (do
+        ; Each round emits every entry whose `after`-deps are already out; loop
+        ; until all are placed. A round that emits NOTHING while entries remain
+        ; means a cycle. (out only ever grows with real entries, so its size is
+        ; the exact "still pending" gauge — and the guard stops at completion,
+        ; never spinning a spurious empty round.)
+        (while (lt (size out) (size reg))
+          (bind ((progress (ref false)))
+            (do
+              (for e reg
+                (when (eq (get done (get e "name") false) false)
+                  (bind ((ready (ref true)))
+                    (do
+                      (for d (deps_after e)
+                        ; only edges to a PRESENT, not-yet-emitted entry block
+                        (when (and (present? d)
+                                   (eq (get done d false) false))
+                          (set_ref ready false)))
+                      (when (deref ready)
+                        (do
+                          (append out e)
+                          (assoc done (get e "name") true)
+                          (set_ref progress true)))))))
+              (when (not (deref progress))
+                (bind ((stuck (list_of)))
+                  (do
+                    (for e reg
+                      (when (eq (get done (get e "name") false) false)
+                        (append stuck (get e "name"))))
+                    (throw (string_concat_many
+                      kind " ordering has a cycle among: "
+                      (sequence_join stuck ", ")))))))))
+        out))))
+
+; ── read-only introspection (tooling / REPL / tests) ────────────────────────
+; The registries above are append-only mutated through register_*!/unregister_*!;
+; these expose them WITHOUT mutation. `*_names` is registration order (what the
+; pipeline did before ordering); `*_order` is the resolved topological order
+; `run_passes`/`run_transforms` actually run (after honoring after/before/
+; requires). With no ordering edges the two coincide (the default append-order).
+
+; names_of — the registered names of a registry list, in registration order.
+(bind names_of
+  (lambda (reg)
+    (bind ((out (list_of)))
+      (do (for e reg (append out (get e "name"))) out))))
+
+; order_names_of — the names of `reg` in resolved topological order (the order a
+; run would use); raises the same misconfiguration/cycle errors `ordered` does.
+(bind order_names_of
+  (lambda (reg kind) (names_of (ordered reg kind))))
+
+; list_passes / list_transforms — the registered analysis / transform names in
+; REGISTRATION order (read-only).
+(bind list_passes (lambda () (names_of registry)))
+(bind list_transforms (lambda () (names_of transforms)))
+
+; list_pass_order / list_transform_order — the same names in RESOLVED topological
+; order (what a run executes). Throws on an ordering misconfiguration/cycle.
+(bind list_pass_order (lambda () (order_names_of registry "pass")))
+(bind list_transform_order (lambda () (order_names_of transforms "transform")))
+
+; ── the fact store: how passes COMMUNICATE ──────────────────────────────────
+; An analysis records what it learned; a later pass (or codegen driver) reads
+; it back — namespaced key/value, session-lived, cleared with clear_passes!.
+;   (fact! "myproj.effects" "f" "pure")  …  (fact_of "myproj.effects" "f" null)
+
+(bind fact!
+  (lambda (ns key value)
+    (do
+      (when (eq (get facts ns) null) (assoc facts ns (map_of)))
+      (assoc (get facts ns) key value))))
+
+(bind fact_of
+  (lambda (ns key default)
+    (bind ((m (get facts ns)))
+      (if (eq m null) default (get m key default)))))
+
+; facts_of — a namespace's whole table (iterate what an analysis produced).
+(bind facts_of
+  (lambda (ns) (get facts ns (map_of))))
+
+; ── typed facts: a schema-checked channel ───────────────────────────────────
+; The soft store above never complains: a typo'd namespace, a wrong-typed
+; value, or a read before the producer ran all read back as the default. When a
+; producer/consumer pair want a CONTRACT, declare the namespace's schema and
+; use the typed accessors — same backing store, so soft readers still see the
+; values.
+
+; fact_schema! — declare a namespace's key and value `value_type` tags (see the
+; kernel's `value_type`: "int" "string" "bool" "list" "map" …). Idempotent.
+;   ns       : the fact namespace
+;   key_ty   : the required `value_type` of every key   (e.g. "string")
+;   value_ty : the required `value_type` of every value (e.g. "bool")
+(bind fact_schema!
+  (lambda (ns key_ty value_ty)
+    (assoc schemas ns (assoc (map_of) "key" key_ty "value" value_ty))))
+
+; schema_of — the declared schema for a namespace, or null. (A typed write/read
+; on an undeclared namespace is an error: declare it first.)
+(bind schema_of (lambda (ns) (get schemas ns null)))
+
+; check_type! — assert `v`'s `value_type` is `want`, else a located-style throw
+; naming the namespace and role ("key"/"value"). Internal to the typed channel.
+(bind check_type!
+  (lambda (ns role want v)
+    (bind ((got (value_type v)))
+      (when (not (eq got want))
+        (throw (string_concat_many
+          "fact_typed `" ns "`: " role " must be " want ", got " got))))))
+
+; fact_typed! — a schema-checked write. Throws on an undeclared namespace or a
+; key/value whose type does not match the schema; otherwise identical to fact!.
+(bind fact_typed!
+  (lambda (ns key value)
+    (bind ((s (schema_of ns)))
+      (do
+        (when (eq s null)
+          (throw (string_concat_many
+            "fact_typed `" ns "`: no schema — call fact_schema! first")))
+        (check_type! ns "key"   (get s "key")   key)
+        (check_type! ns "value" (get s "value") value)
+        (fact! ns key value)))))
+
+; fact_typed_of — a schema-checked read. Throws on an undeclared namespace OR a
+; MISSING key (the typed contract: the consumer asserts the producer recorded
+; it). Use `fact_of` when absence is legitimately a default, not an error.
+(bind fact_typed_of
+  (lambda (ns key)
+    (bind ((s (schema_of ns)))
+      (do
+        (when (eq s null)
+          (throw (string_concat_many
+            "fact_typed `" ns "`: no schema — call fact_schema! first")))
+        (bind ((m (get facts ns)))
+          (if (or (eq m null) (not (contains m key)))
+            (throw (string_concat_many
+              "fact_typed `" ns "`: no fact for key `" (value_to_string key) "`"))
+            (get m key)))))))
+
+; fact_typed? — non-throwing existence test for a typed key (the guard a
+; consumer uses before committing to `fact_typed_of`). False on an undeclared
+; namespace too.
+(bind fact_typed?
+  (lambda (ns key)
+    (bind ((m (get facts ns)))
+      (and (not (eq (schema_of ns) null))
+           (not (eq m null))
+           (contains m key)))))
+
+; ── per-run fact scope (audit #8) ───────────────────────────────────────────
+; The fact store above is SESSION-lived: facts from a previous load survive into
+; the next, so two independent analysis pipelines in one session can contaminate
+; each other and a caller must remember to clear_passes!. with_pass_run gives a
+; RUN scope without changing that default (the global store + clear_passes! stay
+; for compatibility/debug, exactly as before).
+
+; facts_snapshot — a 2-level deep COPY of a fact-store map ({ns -> {key -> value}}
+; — the shape of both `facts` and `schemas`), so a captured run's facts/schemas do
+; not alias the mutable live store.
+(bind facts_snapshot
+  (lambda (store)
+    (bind ((out (map_of)))
+      (do
+        (for ns (map_keys store)
+          (bind ((inner (get store ns)) (copy (map_of)))
+            (do
+              (for k (map_keys inner) (assoc copy k (get inner k)))
+              (assoc out ns copy))))
+        out))))
+
+; restore_store! — empty `store` then copy `snap` back into it (the inverse of
+; the clear that begins a run). Internal to with_pass_run.
+(bind restore_store!
+  (lambda (store snap)
+    (do
+      (for ns (map_keys store) (map_delete store ns))
+      (for ns (map_keys snap)
+        (bind ((inner (get snap ns)) (copy (map_of)))
+          (do
+            (for k (map_keys inner) (assoc copy k (get inner k)))
+            (assoc store ns copy)))))))
+
+; with_pass_run — run `thunk` in an ISOLATED fact/schema scope. The live
+; facts+schemas are snapshot and CLEARED, so a previous run's facts cannot leak
+; IN; `thunk` runs against the fresh store (passes communicate within the run as
+; before); then the run's facts are captured and the outer snapshot is RESTORED, so
+; the run's facts cannot leak OUT. Returns {value, facts} — the thunk's result and
+; a copy of the facts the run produced — so a tool/test runs independent analysis
+; pipelines with NO manual clear and no cross-run contamination. Nestable.
+(bind with_pass_run
+  (lambda (thunk)
+    (bind (
+      (saved_facts   (facts_snapshot facts))
+      (saved_schemas (facts_snapshot schemas))
+    )
+      (do
+        (for ns (map_keys facts)   (map_delete facts ns))
+        (for ns (map_keys schemas) (map_delete schemas ns))
+        (bind (
+          (value    (thunk))
+          (produced (facts_snapshot facts))
+        )
+          (do
+            (restore_store! facts   saved_facts)
+            (restore_store! schemas saved_schemas)
+            (assoc (map_of) "value" value "facts" produced)))))))
+
+; run_passes — the loader's entry: topologically order the registry, then run
+; every pass over a module's located forms. A pass that ITSELF crashes becomes
+; a located finding — a broken pass must fail the load loudly, never silently
+; pass it. (An ordering misconfiguration — missing `requires`, a cycle — is
+; raised by `ordered` before any pass runs.)
+;   located / sink : the module's forms and findings list
+(bind run_passes
+  (lambda (located sink)
+    (for p (ordered registry "pass")
+      (try ((get p "run") located sink)
+        (catch e
+          (append sink
+            (string_concat_many
+              "pass `" (get p "name" "?") "` failed: "
+              (value_to_string e))))))))
+
+; ── transform passes ────────────────────────────────────────────────────────
+; Whole-module REWRITES, the granularity define_form (per-head) cannot cover:
+; instrumenters, lowerings of project-local vocabularies, module-wide
+; optimizations. A transform runs after expansion and BEFORE the check gate —
+; what gets checked is exactly what gets evaluated.
+;
+; A transform is (located) -> null and rewrites IN PLACE: for each entry
+; (assoc f "node" <new tree>) — lib/ir's pure transform/rewrite compute the
+; new tree, the entry swap is the only mutation.
+
+; register_transform! — add a whole-module rewrite (runs on every later load).
+; Append-order; declare ordering with `register_transform_with!`.
+(bind register_transform!
+  (lambda (name run)
+    (append transforms (entry_of name run no_deps))))
+
+; register_transform_with! — `register_transform!` plus an ordering `deps` map.
+(bind register_transform_with!
+  (lambda (name run deps)
+    (append transforms (entry_of name run deps))))
+
+; run_transforms — the loader's entry. Orders the transforms, then runs them.
+; A crashing transform is a HARD, named error: rewriting half a module and
+; continuing would evaluate wrong code.
+(bind run_transforms
+  (lambda (located)
+    (for p (ordered transforms "transform")
+      (try ((get p "run") located)
+        (catch e
+          (throw (string_concat_many
+            "transform `" (get p "name" "?") "` failed: "
+            (value_to_string e))))))))
+
+; install_pass! / install_transform! — idempotent (re)installation: unregister
+; any same-named entry, then register. The one call every pass's `register!`
+; needs, instead of re-deriving the registry handle and doing the two-step dance.
+(bind install_pass!
+  (lambda (name run) (do (unregister_pass! name) (register_pass! name run))))
+(bind install_transform!
+  (lambda (name run) (do (unregister_transform! name) (register_transform! name run))))
+
+; install_pass_with! / install_transform_with! — the ordering-aware idempotent
+; installers (the `_with!` siblings of the two above).
+(bind install_pass_with!
+  (lambda (name run deps)
+    (do (unregister_pass! name) (register_pass_with! name run deps))))
+(bind install_transform_with!
+  (lambda (name run deps)
+    (do (unregister_transform! name) (register_transform_with! name run deps))))
+
+(export register_pass! register_pass_with!
+        unregister_pass! unregister_transform!
+        install_pass! install_pass_with!
+        install_transform! install_transform_with!
+        clear_passes! run_passes loc_of finding finding_at note! ignored?
+        register_transform! register_transform_with! run_transforms
+        deps_of no_deps entry_of ordered
+        list_passes list_transforms list_pass_order list_transform_order
+        fact! fact_of facts_of
+        fact_schema! schema_of fact_typed! fact_typed_of fact_typed?
+        with_pass_run facts_snapshot)

@@ -1,0 +1,423 @@
+; stdlib/lib/tests/test_ssa.caap — the ROUND-TRIP correctness gate for the SSA form-
+; transform substrate (stdlib.semantics.ssa). SSA is a FORM of the one 3-node IR, so
+; every case is driven over hand-built closed IR (ast builders) and proves the CARDINAL
+; invariant by EVALUATION:
+;     eval_ir(from_ssa(to_ssa(body))) == eval_ir(body)
+; PLUS, per case: no `__phi__` head survives `from_ssa` (the destructed form is
+; executable), and to_ssa's output is genuinely single-assignment for the promoted
+; refs (each version name is bound exactly once). The round-trip suite is THE gate; a
+; wrong rename/merge/loop-handling is a miscompile, so the negative cases (escaping ref
+; left alone, unsupported body = identity) matter as much as the positive ones.
+
+;; @area: passes
+;; @kind: regression
+;; @slow: true
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.ssa
+  to_ssa from_ssa supported? ssa_supported? is_ssa_form?
+  ssa_node ssa_view ssa_phis ssa_version_def ssa_version_uses ssa_versions
+  promotable_refs)
+(use stdlib.syntax.ast
+  sym lit calln call eval_ir walk head_is? call? name? name_of arg args_of head_of)
+(use stdlib.syntax.ir node_eq)
+
+(do
+  (bind (
+    ; ── IR builders (the closed bodies under test) ──
+    (setr (lambda (r v) (calln "set_ref" (list_of (sym r) v))))   ; (set_ref r v)
+    (drf  (lambda (r)   (calln "deref" (list_of (sym r)))))        ; (deref r)
+    (mkref (lambda (v)  (calln "ref" (list_of v))))                ; (ref v)
+    ; (bind "r" (ref V) BODY) — a single fresh-ref binder over a body
+    (refbind
+      (lambda (r v body)
+        (calln "bind" (list_of (lit r) (mkref v) body))))
+
+    ; ── observation helpers ──
+    (run (lambda (b) (eval_ir b)))
+    ; round-trip — to_ssa then from_ssa; the executable destructed node.
+    (round_trip (lambda (b) (from_ssa (to_ssa b))))
+    ; count of __phi__ heads anywhere in a node (must be 0 after from_ssa).
+    (count_phi
+      (lambda (node)
+        (bind ((c (ref 0)))
+          (do
+            (walk node (lambda (n) (when (and (call? n) (head_is? n "__phi__"))
+                                     (set_ref c (int_add (deref c) 1)))))
+            (deref c)))))
+    ; count of bind-pair occurrences of a given version NAME (single-assignment check:
+    ; each r__k version must be bound exactly once in the SSA-form node).
+    (count_bind_of
+      (lambda (node nm)
+        (bind ((c (ref 0)))
+          (do
+            (walk node
+              (lambda (n)
+                (when (and (call? n) (head_is? n "bind"))
+                  (bind ((as (args_of n)) (i (ref 0)))
+                    (do
+                      (while (lt (int_add (deref i) 1) (size as))
+                        (do
+                          (bind ((a0 (get as (deref i))))
+                            (when (and (eq (syntax_kind a0) "literal")
+                                       (eq (syntax_literal_value a0) nm))
+                              (set_ref c (int_add (deref c) 1))))
+                          (set_ref i (int_add (deref i) 2)))))))))
+            (deref c)))))
+
+    ; rt_check — the core gate for ONE supported body: assert round-trip eval-
+    ; equivalence (value_eq for non-scalars), no surviving __phi__, and that to_ssa
+    ; produced an SSA form (is_ssa_form? on the node when a φ was created, else just
+    ; supported). Returns the to_ssa wrapper for further structural assertions.
+    (rt_check
+      (lambda (body want msg)
+        (bind (
+          (before (run body))
+          (w (to_ssa body))
+          (after (run (from_ssa w)))
+        )
+          (do
+            (assert_true (value_eq before want) msg)
+            (assert_true (value_eq after before) msg)
+            (assert_eq (count_phi (from_ssa w)) 0 msg)
+            w))))
+  )
+    (do
+      ; ════════════════════════════════════════════════════════════════════
+      ; 0. supported? / promotable_refs — the gate's classifier
+      ; ════════════════════════════════════════════════════════════════════
+      ; a fresh, simple, straight-line ref is promotable + supported.
+      (bind (
+        (sl (refbind "r" (lit 0)
+              (calln "do" (list_of (setr "r" (lit 1)) (setr "r" (lit 2)) (drf "r")))))
+      )
+        (do
+          (assert_true (supported? sl) "straight-line ref body is supported")
+          (assert_true (eq (get (promotable_refs sl) "r" false) true)
+            "the straight-line ref r is promotable")))
+      ; a body with NO ref has nothing to SSA -> not supported (bail to identity).
+      (assert_true (not (supported? (calln "do" (list_of (lit 1) (lit 2)))))
+        "a ref-free body is not supported (nothing to promote)")
+      ; a body with a bail head (match) -> not supported.
+      (assert_true (not (supported?
+                          (refbind "r" (lit 0)
+                            (calln "match" (list_of (drf "r")
+                              (call (sym "else") (list_of (lit 1))))))))
+        "a body containing match is not supported (bail)")
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 1. STRAIGHT-LINE
+      ;    (bind "r" (ref 0) (do (set_ref r 1) (set_ref r 2) (deref r))) -> 2
+      ;    Both stores SSA into versions; the deref reads the last version.
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (body (refbind "r" (lit 0)
+                (calln "do" (list_of (setr "r" (lit 1)) (setr "r" (lit 2)) (drf "r")))))
+        (w (rt_check body 2 "straight-line: round-trips, evals 2"))
+        (node (ssa_node w))
+      )
+        (do
+          ; single-assignment: r__0, r__1, r__2 each bound exactly once.
+          (assert_eq (count_bind_of node "r__0") 1 "straight-line: r__0 bound once")
+          (assert_eq (count_bind_of node "r__1") 1 "straight-line: r__1 bound once")
+          (assert_eq (count_bind_of node "r__2") 1 "straight-line: r__2 bound once")
+          ; the version defs are recorded in the view.
+          (assert_true (ge (size (ssa_versions w)) 3)
+            "straight-line: at least 3 versions recorded (r__0/1/2)")))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 2. IF-MERGE (both c=true and c=false)
+      ;    (bind "c" <bool> (bind "r" (ref 0)
+      ;       (do (if c (set_ref r 5) (set_ref r 7)) (deref r))))
+      ;    A φ merges r=5 / r=7; from_ssa folds it into the if's value.
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (mk_if_merge
+          (lambda (cval)
+            (calln "bind"
+              (list_of (lit "c") (lit cval)
+                (refbind "r" (lit 0)
+                  (calln "do"
+                    (list_of
+                      (calln "if" (list_of (sym "c") (setr "r" (lit 5)) (setr "r" (lit 7))))
+                      (drf "r"))))))))
+      )
+        (do
+          ; c=true -> 5
+          (bind (
+            (body (mk_if_merge true))
+            (w (rt_check body 5 "if-merge c=true: round-trips, evals 5"))
+          )
+            (do
+              ; the SSA form has a φ merging the two arm versions.
+              (assert_true (is_ssa_form? (ssa_node w))
+                "if-merge: the SSA-form node has an explicit φ")
+              (assert_eq (size (ssa_phis w)) 1
+                "if-merge: exactly one φ recorded")))
+          ; c=false -> 7
+          (rt_check (mk_if_merge false) 7 "if-merge c=false: round-trips, evals 7")))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 3. IF-MERGE-CONST — both arms write the SAME const 5.
+      ;    (bind "c" <bool> (bind "r" (ref 0)
+      ;       (do (if c (set_ref r 5) (set_ref r 5)) (deref r)))) -> 5
+      ;    Asserts the SSA form HAS a φ merging two const-5 versions (so ssa_ccp can
+      ;    later fold it to 5 regardless of c).
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (body (calln "bind"
+                (list_of (lit "c") (lit true)
+                  (refbind "r" (lit 0)
+                    (calln "do"
+                      (list_of
+                        (calln "if" (list_of (sym "c") (setr "r" (lit 5)) (setr "r" (lit 5))))
+                        (drf "r")))))))
+        (w (rt_check body 5 "if-merge-const: round-trips, evals 5"))
+      )
+        (do
+          (assert_true (is_ssa_form? (ssa_node w))
+            "if-merge-const: the SSA form has a φ merging the two const-5 versions")
+          (assert_eq (size (ssa_phis w)) 1
+            "if-merge-const: exactly one φ recorded (the const merge ssa_ccp folds)")
+          ; the φ's two incoming versions both have defining value (lit 5).
+          (bind ((p (get (ssa_phis w) 0)) (args (get (get (ssa_phis w) 0) "args")))
+            (do
+              (assert_eq (size args) 2 "if-merge-const: the φ has two incoming versions")
+              (bind (
+                (d0 (ssa_version_def w (get args 0)))
+                (d1 (ssa_version_def w (get args 1)))
+              )
+                (do
+                  (assert_true (and (not (eq d0 null)) (eq (syntax_literal_value d0) 5))
+                    "if-merge-const: incoming version 0 defined as const 5")
+                  (assert_true (and (not (eq d1 null)) (eq (syntax_literal_value d1) 5))
+                    "if-merge-const: incoming version 1 defined as const 5")))))))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 4. WHILE-LOOP — loop-carried r is KEPT AS A REF.
+      ;    (bind "r" (ref 0)
+      ;       (do (while (lt (deref r) 3) (set_ref r (int_add (deref r) 1))) (deref r)))
+      ;    -> 3. r is written in the loop body (loop-carried), so it stays a ref;
+      ;    to_ssa is identity on it; round-trips, evals 3.
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (body (refbind "r" (lit 0)
+                (calln "do"
+                  (list_of
+                    (calln "while"
+                      (list_of
+                        (calln "lt" (list_of (drf "r") (lit 3)))
+                        (setr "r" (calln "int_add" (list_of (drf "r") (lit 1))))))
+                    (drf "r")))))
+      )
+        (do
+          (assert_eq (run body) 3 "while-loop: original evals 3")
+          ; r is loop-carried -> NOT promotable -> body unsupported (no other ref).
+          (assert_true (not (eq (get (promotable_refs body) "r" false) true))
+            "while-loop: loop-carried r is NOT promotable (kept as a ref)")
+          (assert_true (not (supported? body))
+            "while-loop: a body whose only ref is loop-carried is unsupported (identity)")
+          ; round-trips by identity, still evals 3.
+          (bind ((rt (round_trip body)))
+            (do
+              (assert_eq (run rt) 3 "while-loop: round-trips, evals 3 (loop ref kept)")
+              (assert_eq (count_phi rt) 0 "while-loop: no φ in the destructed form")
+              (assert_true (node_eq rt body)
+                "while-loop: unsupported body round-trips by identity (node_eq)")))))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 5. NESTED IF / WHILE — a straight-line+if ref alongside a separate loop ref.
+      ;    (bind "r" (ref 0) (bind "i" (ref 0)
+      ;       (do (if true (set_ref r 10) (set_ref r 20))
+      ;           (while (lt (deref i) 2) (set_ref i (int_add (deref i) 1)))
+      ;           (int_add (deref r) (deref i)))))  -> 10 + 2 = 12
+      ;    r is promoted (if-merge SSA); i is loop-carried (kept as a ref). The whole
+      ;    body round-trips and evals 12.
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (body (refbind "r" (lit 0)
+                (refbind "i" (lit 0)
+                  (calln "do"
+                    (list_of
+                      (calln "if" (list_of (lit true) (setr "r" (lit 10)) (setr "r" (lit 20))))
+                      (calln "while"
+                        (list_of (calln "lt" (list_of (drf "i") (lit 2)))
+                          (setr "i" (calln "int_add" (list_of (drf "i") (lit 1))))))
+                      (calln "int_add" (list_of (drf "r") (drf "i"))))))))
+        (w (rt_check body 12 "nested if/while: round-trips, evals 12"))
+      )
+        (do
+          ; r is promotable, i is loop-carried (not promotable).
+          (assert_true (eq (get (promotable_refs body) "r" false) true)
+            "nested: r (straight-line+if) is promotable")
+          (assert_true (not (eq (get (promotable_refs body) "i" false) true))
+            "nested: i (loop-carried) is NOT promotable (kept as a ref)")
+          ; the SSA form has the r-merge φ; i stays a ref (set_ref i survives).
+          (assert_true (is_ssa_form? (ssa_node w))
+            "nested: the SSA form carries r's if-merge φ")
+          (bind ((sets (ref 0)))
+            (do
+              (walk (ssa_node w)
+                (lambda (n) (when (and (call? n) (head_is? n "set_ref")
+                                       (name? (arg n 0)) (eq (name_of (arg n 0)) "i"))
+                              (set_ref sets (int_add (deref sets) 1)))))
+              (assert_true (gt (deref sets) 0)
+                "nested: the loop ref i keeps its (set_ref i …) (re-materialized loop ref)")))))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 6. ESCAPING REF — r passed to a CALL (escapes) -> NOT promoted; to_ssa/from_ssa
+      ;    is node_eq to the input (identity).
+      ;    (bind "r" (ref 0) (do (set_ref r 1) (escape r) (deref r)))
+      ;    `r` appears as a bare call arg -> not simple -> not promotable -> identity.
+      ;    We use `id` (a real total fn) as the escaping call so the body still evals.
+      ;    (bind "id" (lambda (x) x) (bind "r" (ref 0)
+      ;       (do (set_ref r 1) (id r) (deref r))))  -> 1
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (body (calln "bind"
+                (list_of (lit "id") (call (sym "lambda") (list_of (lit (list_of "x")) (sym "x")))
+                  (refbind "r" (lit 0)
+                    (calln "do"
+                      (list_of (setr "r" (lit 1)) (calln "id" (list_of (sym "r"))) (drf "r")))))))
+      )
+        (do
+          (assert_eq (run body) 1 "escaping-ref: original evals 1")
+          ; r escapes (bare arg to id) -> not simple -> not promotable.
+          (assert_true (not (eq (get (promotable_refs body) "r" false) true))
+            "escaping-ref: r passed to a call is NOT promotable (escapes)")
+          (assert_true (not (supported? body))
+            "escaping-ref: an escaping-only-ref body is unsupported (identity)")
+          (bind ((rt (round_trip body)))
+            (do
+              (assert_true (node_eq rt body)
+                "escaping-ref: from_ssa(to_ssa(body)) is node_eq to the input (identity)")
+              (assert_eq (run rt) 1 "escaping-ref: round-trips, evals 1")))))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 7. BAIL — a body with match/try is identity.
+      ;    (bind "r" (ref 0) (do (set_ref r 1) (try (deref r) (catch e 9))))
+      ;    contains try/catch -> bail -> identity. Evals 1 (no throw).
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (body (refbind "r" (lit 0)
+                (calln "do"
+                  (list_of (setr "r" (lit 1))
+                    (calln "try"
+                      (list_of (drf "r")
+                        (call (sym "catch") (list_of (sym "e") (lit 9)))))))))
+      )
+        (do
+          (assert_eq (run body) 1 "bail(try): original evals 1")
+          (assert_true (not (supported? body))
+            "bail(try): a body containing try/catch is unsupported")
+          (bind ((rt (round_trip body)))
+            (do
+              (assert_true (node_eq rt body)
+                "bail(try): from_ssa(to_ssa(body)) is node_eq to the input (identity)")
+              (assert_eq (run rt) 1 "bail(try): round-trips, evals 1")
+              (assert_eq (count_phi rt) 0 "bail(try): no φ introduced")))))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 8. IF-MERGE INTO A LATER USE — the merged version flows into arithmetic.
+      ;    (bind "c" false (bind "r" (ref 1)
+      ;       (do (if c (set_ref r 5) (set_ref r 7)) (int_add (deref r) 100)))) -> 107
+      ;    Confirms the φ-merged version is correctly read by a downstream consumer.
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (body (calln "bind"
+                (list_of (lit "c") (lit false)
+                  (refbind "r" (lit 1)
+                    (calln "do"
+                      (list_of
+                        (calln "if" (list_of (sym "c") (setr "r" (lit 5)) (setr "r" (lit 7))))
+                        (calln "int_add" (list_of (drf "r") (lit 100)))))))))
+      )
+        (do
+          (rt_check body 107 "if-merge-into-use c=false: round-trips, evals 107")))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 9. ONE-ARM-WRITES IF — only the then-arm writes r; the else-arm leaves r at
+      ;    the entry version. This is still a divergence (then=r__1, else=r__0), so a
+      ;    φ merges them. c=false must read the ENTRY value (the else does not write).
+      ;    (bind "c" false (bind "r" (ref 3)
+      ;       (do (if c (set_ref r 9) 0) (deref r)))) -> 3 (else keeps r=3)
+      ;    (bind "c" true  ...)                         -> 9 (then writes r=9)
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (mk_one_arm
+          (lambda (cval)
+            (calln "bind"
+              (list_of (lit "c") (lit cval)
+                (refbind "r" (lit 3)
+                  (calln "do"
+                    (list_of
+                      (calln "if" (list_of (sym "c") (setr "r" (lit 9)) (lit 0)))
+                      (drf "r"))))))))
+      )
+        (do
+          (rt_check (mk_one_arm false) 3 "one-arm-if c=false: else keeps entry r=3")
+          (rt_check (mk_one_arm true)  9 "one-arm-if c=true: then writes r=9")))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 10. NEITHER-ARM-WRITES IF — neither arm touches r; no merge needed, the
+      ;    version is unchanged after the if. No φ created.
+      ;    (bind "c" true (bind "r" (ref 4)
+      ;       (do (if c 1 2) (deref r)))) -> 4
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (body (calln "bind"
+                (list_of (lit "c") (lit true)
+                  (refbind "r" (lit 4)
+                    (calln "do"
+                      (list_of (calln "if" (list_of (sym "c") (lit 1) (lit 2))) (drf "r")))))))
+        (w (rt_check body 4 "neither-arm-if: round-trips, evals 4"))
+      )
+        (do
+          (assert_eq (size (ssa_phis w)) 0
+            "neither-arm-if: no φ (r untouched by either arm)")))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 11. SEQUENTIAL IF-MERGES — two if-merges in a row, each a φ; the second reads
+      ;    the first's merged version.
+      ;    (bind "c" true (bind "d" false (bind "r" (ref 0)
+      ;       (do (if c (set_ref r 1) (set_ref r 2))
+      ;           (if d (set_ref r (int_add (deref r) 10)) (set_ref r (int_add (deref r) 20)))
+      ;           (deref r)))))  -> c=true:r=1, d=false:r=1+20=21
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (body (calln "bind"
+                (list_of (lit "c") (lit true) (lit "d") (lit false)
+                  (refbind "r" (lit 0)
+                    (calln "do"
+                      (list_of
+                        (calln "if" (list_of (sym "c") (setr "r" (lit 1)) (setr "r" (lit 2))))
+                        (calln "if" (list_of (sym "d")
+                          (setr "r" (calln "int_add" (list_of (drf "r") (lit 10))))
+                          (setr "r" (calln "int_add" (list_of (drf "r") (lit 20))))))
+                        (drf "r")))))))
+        (w (rt_check body 21 "sequential-if-merges: round-trips, evals 21"))
+      )
+        (do
+          (assert_eq (size (ssa_phis w)) 2
+            "sequential-if-merges: two φ recorded (one per merge)")))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 12. USE-DEF VIEW — version uses are recorded. In the straight-line case the
+      ;    final (deref r) is a use of the last version; assert the view exposes it.
+      ;    (bind "r" (ref 0) (do (set_ref r 1) (set_ref r 2) (deref r)))
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (body (refbind "r" (lit 0)
+                (calln "do" (list_of (setr "r" (lit 1)) (setr "r" (lit 2)) (drf "r")))))
+        (w (to_ssa body))
+      )
+        (do
+          ; r__2 is the last version; the trailing deref is its use.
+          (assert_true (gt (size (ssa_version_uses w "r__2")) 0)
+            "use-def: the last version r__2 has a recorded use (the trailing deref)")
+          ; r__1's def is the literal 1; r__2's def is the literal 2.
+          (bind ((d1 (ssa_version_def w "r__1")) (d2 (ssa_version_def w "r__2")))
+            (do
+              (assert_true (and (not (eq d1 null)) (eq (syntax_literal_value d1) 1))
+                "use-def: r__1 defined as 1")
+              (assert_true (and (not (eq d2 null)) (eq (syntax_literal_value d2) 2))
+                "use-def: r__2 defined as 2"))))))))

@@ -1,0 +1,407 @@
+; stdlib/lib/tests/test_clike.caap — the C-like surface lowerer
+; (stdlib.frontend.clike), focused on ARRAYS: 1-D regression, MULTI-DIMENSIONAL
+; flat lowering, and the `a[i]` subscript sugar (read + store).
+;
+; The kit is pulled in with `use` (which loads + registers it — it is a tier-5
+; kit, not bootstrap-resident); each case lowers a small clike PROGRAM and
+; renders the resulting stdlib forms to source text, then asserts on the forms
+; the lowerer emits.
+; Multi-dimensional arrays lower as ONE flat row-major buffer (the native
+; backend's array_local/global_array take a scalar/struct element name — there
+; is no `[N x [M x T]]` spelling), so a 2-D `[2][3]` declares a flat buffer of
+; 6 and decays to one element pointer; `a[k]` indexes it in element units. This
+; doubles as executable documentation of that contract.
+
+;; @area: frontend
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_true)
+; `use` LOADS each module (the kit registers itself) and binds the entry — the
+; kit is a tier-5 kit, not part of the bootstrap, so it must be pulled in here.
+(use stdlib.frontend.clike lower_program analyze_program
+     register_decl_kind! register_attribute!
+     register_statement! register_infix_op!)
+(use stdlib.frontend.clike.ast calln)
+(use stdlib.frontend.clike.tokens tsym?)
+(use stdlib.syntax.render render_program)
+
+(do
+  (bind (
+    ; lower — clike TEXT -> rendered stdlib source (throws the lowerer's
+    ; located error on failure, so a bad case fails the test by name).
+    (lower
+      (lambda (text)
+        (bind ((r (lower_program text)))
+          (if (get r "ok" false)
+            (render_program (get r "forms" (list_of)))
+            (throw (string_concat_many "clike lowering failed: "
+                     (value_to_string (get r "error" "?"))))))))
+    ; lower_err — the located error STRING of a deliberately-bad program (throws
+    ; if the program unexpectedly lowered clean).
+    (lower_err
+      (lambda (text)
+        (bind ((r (lower_program text)))
+          (if (get r "ok" false)
+            (throw (string_concat_many
+              "expected a clike error, but it lowered: " (value_to_string r)))
+            (value_to_string (get r "error" "?"))))))
+    (has (lambda (s needle) (string_contains s needle)))
+  )
+    (do
+      ; ── file-state isolation: one lowering/analyzer run must not leak local
+      ;    declarations into the next source file. ──
+      (bind ((_ (lower "Leaky struct = { x i32 }\nmain () i32 = { 0 }")))
+        (assert_true
+          (has (lower_err "demo () i32 = { x Leaky = 0 x }")
+               "unknown type `Leaky`")
+          "local struct types reset between lower_program calls"))
+
+      (bind ((_ (lower "g mut i32 = 1\nmain () i32 = { g }")))
+        (assert_true
+          (has (lower_err "main () i32 = { g = 2 0 }")
+               "cannot assign to `g`")
+          "global mutability state resets between lower_program calls"))
+
+      (bind ((_ (analyze_program
+                  "Tmp struct = { x i32 }\nmain () i32 = { 0 }"
+                  "tmp.clike")))
+        (assert_true
+          (has (lower_err "demo () i32 = { y Tmp = 0 y }")
+               "unknown type `Tmp`")
+          "analyze_program leaves no local type state behind"))
+
+      ; ── 1-D array regression: a stack buffer decays to an element pointer ──
+      ; `xs i32[4]` -> (bind xs (array_local 4 i32)); a use stays a bare name.
+      (bind ((s (lower
+                  "demo () i32 = { xs i32[4] xs[0] = 7 xs[0] }")))
+        (do
+          (assert_true (has s "(array_local 4 i32)")
+            "1-D local array lowers to a [4 x i32] stack buffer")
+          (assert_true (has s "(ptr_write (ptr_add xs 0) 7)")
+            "a[i] = v stores through the decayed element pointer")
+          (assert_true (has s "(ptr_read (ptr_add xs 0))")
+            "a[i] reads through the decayed element pointer")))
+
+      ; ── 2-D array: a flat row-major buffer of N*M, ONE decay pointer ──
+      ; `grid i32[2][3]` -> a flat [6 x i32]; the caller indexes `i*3 + j`.
+      (bind ((s (lower
+                  "demo () i32 = { grid i32[2][3] grid[1*3 + 2] = 9 grid[5] }")))
+        (do
+          (assert_true (has s "(array_local 6 i32)")
+            "2-D `i32[2][3]` lowers to a flat [6 x i32] buffer (2*3)")
+          ; the row-major offset `1*3 + 2` is the user's own arithmetic,
+          ; lowered verbatim into the single ptr_add of the store.
+          (assert_true (has s "(ptr_write (ptr_add grid (int_add (int_mul 1 3) 2)) 9)")
+            "2-D store indexes the flat buffer at the row-major offset")))
+
+      ; ── 3-D array: the flat product chains across every dimension ──
+      (bind ((s (lower "demo () i32 = { v u8[2][3][4] v[0] }")))
+        (assert_true (has s "(array_local 24 u8)")
+          "3-D `u8[2][3][4]` flattens to [24 x u8] (2*3*4)"))
+
+      ; ── multi-dimensional GLOBAL array: same flat lowering ──
+      ; `table u32[4][4]` -> (global_array table 16 u32); a use is a bare name.
+      (bind ((s (lower
+                  "table u32[4][4]\n\nfetch (i i32) u32 = { table[i] }")))
+        (do
+          (assert_true (has s "(global_array table 16 u32)")
+            "multi-dim global array flattens to a 16-element BSS buffer")
+          (assert_true (has s "(ptr_read (ptr_add table i))")
+            "a global array name decays — a subscript indexes it directly")))
+
+      ; ── subscript on a function POINTER param (no decl) reads through it ──
+      (bind ((s (lower
+                  "sum (buf ptr_u32, n i32) u32 = { buf[0] }")))
+        (assert_true (has s "(ptr_read (ptr_add buf 0))")
+          "a pointer parameter subscripts like an array"))
+      (bind ((s (lower
+                  "demo (self List<UR_THREAD, ur_thread_suspend_next>*) i32 = { 0 }")))
+        (assert_true (has s "(self ptr_List<UR_THREAD&ur_thread_suspend_next>)")
+          "a generic type followed by `*` survives the generic operator lexer"))
+      (bind ((s (lower "demo (pp u32**) i32 = { 0 }")))
+        (assert_true (has s "(pp ptr_ptr_u32)")
+          "a run token `**` in type position reads as two pointer suffixes"))
+      (assert_true
+        (has (lower_err "demo (x List<u32>>) i32 = { 0 }")
+             "expected `*` after `>` in type spelling")
+        "`>>` in a type head is diagnosed in the type parser, not the grammar")
+      (assert_true
+        (has (lower_err "demo (x List<u32>=) i32 = { 0 }")
+             "expected `*` after `>` in type spelling")
+        "`>=` in a type head is diagnosed in the type parser, not the grammar")
+
+      ; ── an array PARAMETER decays to a pointer in the signature ──
+      (bind ((s (lower
+                  "fill (xs i32[8]) i32 = { xs[0] = 1 0 }")))
+        (assert_true (has s "(xs ptr_i32)")
+          "an array param `i32[8]` decays to a ptr_i32 in the signature"))
+
+      ; ── error: a zero / negative dimension is rejected, located ──
+      (assert_true
+        (has (lower_err "demo () i32 = { xs i32[0] 0 }")
+             "array length must be a positive integer")
+        "a zero-length array dimension is a located error")
+
+      ; ── error: a non-literal length is still rejected (backend needs a
+      ;    literal count) — the message stays the same for every dimension ──
+      (assert_true
+        (has (lower_err "demo () i32 = { n i32 = 4 xs i32[n] 0 }")
+             "expected `[N]` with a literal length")
+        "a non-literal array length is rejected")
+
+      ; ── error: a CHAINED subscript is rejected (a multi-dim array is one flat
+      ;    buffer — index `a[i*M + j]`, never `a[i][j]`). Both the READ side
+      ;    (expression position) and the STORE side give a located error, so the
+      ;    flat-buffer contract can't be silently violated. ──
+      (assert_true
+        (has (lower_err "demo () i32 = { g i32[2][3] g[0][1] }")
+             "chained subscript `a[i][j]` is not supported")
+        "a chained subscript READ is rejected, located")
+      (assert_true
+        (has (lower_err "demo () i32 = { g i32[2][3] g[0][1] = 7 0 }")
+             "chained subscript `a[i][j] = …` is not supported")
+        "a chained subscript STORE is rejected, located")
+
+      ; ── error: a module global initializer must be a LITERAL (the native
+      ;    backend stores it directly); a non-literal expression is rejected
+      ;    located at the surface (audit #6). ──
+      (assert_true
+        (has (lower_err "count i32 = (1 + 2)\nmain () i32 = { 0 }")
+             "must be a literal constant")
+        "a non-literal global initializer is rejected, located")
+
+      ; ── operators (Tier-1 ergonomics): logical (&& || !), bitwise
+      ;    (| & ^ << >> ~), and hex/binary integer literals. Each desugars to an
+      ;    existing kernel builtin (int_and/or/xor/not/shl/shr) or the
+      ;    short-circuit and/or special forms — no new IR, C precedence. ──
+      ; && / || / ! are short-circuit and the native backend has no and/or/not
+      ; head, so they desugar to `if` (a && b -> (if a b false), a || b ->
+      ; (if a true b), !e -> (if e false true)) — matching the eval and/or
+      ; truthiness while staying native-lowerable.
+      (bind ((s (lower "demo (a i32, b i32, c i32) i32 = { a || b && c }")))
+        (assert_true (has s "(if a true (if b c false))")
+          "|| looser than && (C precedence); both desugar to short-circuit if"))
+      (bind ((s (lower "demo (a i32) i32 = { !a }")))
+        (assert_true (has s "(if a false true)") "!e desugars to (if e false true)"))
+      (bind ((s (lower "demo (a i32, b i32, c i32) i32 = { a | b & c }")))
+        (assert_true (has s "(int_or a (int_and b c))")
+          "& binds tighter than | (C precedence), via int_and/int_or"))
+      (bind ((s (lower "demo (a i32, b i32) i32 = { a ^ b }")))
+        (assert_true (has s "(int_xor a b)") "^ desugars to int_xor"))
+      (bind ((s (lower "demo (a i32, b i32) i32 = { a << b }")))
+        (assert_true (has s "(int_shl a b)") "<< desugars to int_shl"))
+      (bind ((s (lower "demo (a i32, b i32) i32 = { a >> b }")))
+        (assert_true (has s "(int_shr a b)") ">> desugars to int_shr"))
+      (bind ((s (lower "demo (a i32) i32 = { ~a }")))
+        (assert_true (has s "(int_not a)") "~e desugars to int_not"))
+      (bind ((s (lower "demo (r i32, m i32) i32 = { (r & m) == 0 }")))
+        (assert_true (has s "(eq (int_and r m) 0)")
+          "parenthesized (r & m) reads as bitwise-and, then == on the result"))
+      ; address-of `&name` stays a PREFIX operator — adding infix `&` must not
+      ; break it (position disambiguates, like prefix `*` vs infix multiply).
+      (bind ((s (lower "demo (x i32) i32 = { id(&x) }")))
+        (assert_true (has s "(id x)") "&name is still address-of, not bitwise-and"))
+      ; hex / binary integer literals fold to their value at lower time.
+      (bind ((s (lower "demo () u32 = { 0xE000ED04 }")))
+        (assert_true (has s "3758157060") "0x.. hex literal folds to its value"))
+      (bind ((s (lower "demo () i32 = { 0b1010 }")))
+        (assert_true (has s "10") "0b.. binary literal folds to its value"))
+      (assert_true
+        (has (lower_err "demo () i32 = { 0x }")
+             "invalid numeric literal `0x`")
+        "a radix prefix without digits is rejected in expression semantics")
+      (assert_true
+        (has (lower_err "demo () i32 = { 0xZZ }")
+             "invalid numeric literal `0xZZ`")
+        "invalid hex digits are rejected in expression semantics")
+      (assert_true
+        (has (lower_err "demo () i32 = { 0b102 }")
+             "invalid numeric literal `0b102`")
+        "invalid binary digits are rejected in expression semantics")
+      (assert_true
+        (has (lower_err "demo () i32 = { 1abc }")
+             "invalid numeric literal `1abc`")
+        "digit-leading non-radix atoms are rejected in expression semantics")
+      (bind ((s (lower "demo () i32 = { 1 << 28 }")))
+        (assert_true (has s "(int_shl 1 28)")
+          "a shift in const position stays foldable (int_shl)"))
+
+      ; ── `const volatile` MMIO addresses: the const still folds to an immediate
+      ;    on reads/calls, but a statement assignment to the name lowers to an
+      ;    explicit volatile_write. Only plain `=` is allowed; compound update
+      ;    would need a volatile read-modify-write, which clike does not spell yet.
+      (bind ((s (lower
+                  "REG u32 const volatile = 0x40004000\ndemo (v u32) i32 = { REG = v 0 }")))
+        (assert_true (has s "(volatile_write 1073758208 u32 v)")
+          "assignment to a const volatile address lowers to volatile_write"))
+      (bind ((s (lower
+                  "REG u32 const volatile = 0x40004000\nMASK u32 const = 1 << 2\ndemo () i32 = { REG = MASK 0 }")))
+        (assert_true (has s "(volatile_write 1073758208 u32 (const (int_shl 1 2)))")
+          "ordinary consts remain folded values when written to a volatile address"))
+      (assert_true
+        (has (lower_err "MASK u32 const = 1\ndemo () i32 = { MASK = 2 0 }")
+             "cannot assign to `MASK`")
+        "plain const declarations are still not writable")
+      (assert_true
+        (has (lower_err
+               "REG u32 const volatile = 0x40004000\ndemo () i32 = { REG += 1 0 }")
+             "volatile register assignment supports only `=`")
+        "compound assignment to a volatile address is rejected")
+
+      ; ── control flow (Tier-2 ergonomics): `else if` chains and `return` guards.
+      ;    Both lower to plain nested if/else — native-safe, since the LLVM
+      ;    backend has no block/leave for a non-local exit. ──
+      (bind ((s (lower "demo (a i32) i32 = { if a == 1 { 10 } else if a == 2 { 20 } else { 30 } }")))
+        (assert_true (has s "(if (eq a 1) 10 (if (eq a 2) 20 30))")
+          "an else-if chain nests into one if/else"))
+      ; a guard `if cond { return E }` folds the REST of the block into the else.
+      (bind ((s (lower "demo (a i32, b i32) i32 = { if a == 0 || b == 0 { return 13 } a * b }")))
+        (assert_true (has s "(if (if (eq a 0) true (eq b 0)) 13 (int_mul a b))")
+          "a return guard folds the remaining statements into the else"))
+      ; a guard's trailing statements after it stay in scope (the else branch).
+      (bind ((s (lower "demo (a i32) i32 = { if a == 0 { return 1 } w u32 = a * 2 w }")))
+        (assert_true (has s "(if (eq a 0) 1 (do (bind w (int_mul a 2)) w))")
+          "statements after a guard become the else block"))
+      (bind ((s (lower "demo () i32 = { return 7 }")))
+        (assert_true (has s "7") "a trailing `return E` is the block's value"))
+      ; a return that is neither a guard nor a block's final statement is rejected
+      ; (it would need a non-local exit the native backend cannot emit).
+      (assert_true
+        (has (lower_err "demo (a i32) i32 = { return a a }")
+             "only supported as a guard")
+        "a non-tail, non-guard return is a located error")
+
+      ; ── compound assignment `x OP= e` -> `x = x OP e`, plus `x++`/`x--`. Works
+      ;    on a mut cell and a pointer field; native-safe (plain int ops +
+      ;    set_ref / ptr_write). ──
+      (bind ((s (lower "demo () i32 = { k mut i32 = 0 k += 5 k }")))
+        (assert_true (has s "(set_ref k (int_add (deref k) 5))")
+          "x += e desugars to x = x + e"))
+      (bind ((s (lower "demo () i32 = { k mut i32 = 0 k++ k }")))
+        (assert_true (has s "(set_ref k (int_add (deref k) 1))")
+          "x++ increments the cell by 1"))
+      (bind ((s (lower "demo () i32 = { k mut i32 = 8 k <<= 2 k }")))
+        (assert_true (has s "(set_ref k (int_shl (deref k) 2))")
+          "x <<= n maps to int_shl"))
+      (bind ((s (lower "C struct = { n u32 }\nf (c C*) i32 = { c->n += 1 c->n }")))
+        (assert_true
+          (has s "(ptr_write (field_ptr c \"n\") (int_add (ptr_read (field_ptr c \"n\")) 1))")
+          "a pointer field compound reads then writes the field"))
+
+      ; ── `EXPR as T` — a postfix type cast desugaring to (cast EXPR T), the same
+      ;    builtin the native backend lowers. Binds tighter than the binary
+      ;    operators (Rust-like). `T` may carry pointer modifiers. ──
+      (bind ((s (lower "demo (a i32) u32 = { a as u32 }")))
+        (assert_true (has s "(cast a u32)") "EXPR as T desugars to (cast EXPR T)"))
+      (bind ((s (lower "demo (a i32, b i32) u32 = { a + b as u32 }")))
+        (assert_true (has s "(int_add a (cast b u32))")
+          "`as` binds tighter than + : a + b as u32 = a + (b as u32)"))
+      (bind ((s (lower "demo (p i32) i32 = { ptr_to_int(p as u8*) }")))
+        (assert_true (has s "(int_to_ptr p u8)")
+          "as T* (cast TO a pointer) reinterprets an int address via int_to_ptr"))
+      (bind ((s (lower "demo (p u32*) u32 = { p as u32 }")))
+        (assert_true (has s "(cast (ptr_to_int p) u32)")
+          "as integer from a pointer operand lowers through ptr_to_int"))
+
+      ; ── a BODYLESS `name (params) ret` (no `= { body }`) is an EXTERN — a
+      ;    foreign symbol (asm shim / linker symbol), shared with the function
+      ;    form (both read params/return/`export` once via lower_fndef). ──
+      (bind ((s (lower "shim (a u32) i32")))
+        (assert_true (has s "(extern shim ((a u32)) i32)")
+          "a bodyless decl lowers to (extern …), not (defn …)"))
+      (bind ((s (lower "sink () void")))
+        (assert_true (has s "(extern sink (list_of) void)")
+          "a void-returning extern with no params"))
+
+      ; ── the GENERIC named-item path: declaration kinds (struct/enum/extern/…)
+      ;    and attributes (export/const/mut/extern) are registry-driven, so a
+      ;    postfix `extern` attribute selects the extern kind, and a user library
+      ;    can register a NEW kind/attribute with no core grammar edit. ──
+      (bind ((s (lower "puts (s u8*) i32 extern")))
+        (assert_true (has s "(extern puts ((s ptr_u8)) i32)")
+          "a postfix `extern` attribute selects the extern kind"))
+      (do
+        (register_decl_kind! "record" "struct" null true)         ; user kind -> struct
+        (register_attribute! "packed" (lambda (an kind attrs name) null))  ; user attr
+        (bind ((s (lower "P record packed = { a i32 }")))
+          (assert_true (has s "(struct P (a i32))")
+            "a user-registered kind `record` lowers as a struct, `packed` accepted")))
+
+      ; ── metadata is parsed generically, then validated after the declaration /
+      ;    local / param / field shape is known. Unknown metadata should fail with
+      ;    a metadata error, not a misleading shape parse error. Registered
+      ;    metadata can be inert and accepted across scopes without parser edits.
+      (assert_true
+        (has (lower_err "X u32 mystery = 1\nmain () i32 = { 0 }")
+             "unknown clike metadata `mystery`")
+        "unknown top-level metadata is a late validation error")
+      (assert_true
+        (has (lower_err "X = 1\nmain () i32 = { 0 }")
+             "expected a type spelling in declaration head")
+        "a declaration head without a type candidate is a located type-head error")
+      (assert_true
+        (has (lower_err "X mystery u32 = 1\nmain () i32 = { 0 }")
+             "unknown clike metadata `mystery`")
+        "unknown prefix top-level metadata is a late validation error")
+      (assert_true
+        (has (lower_err "demo () i32 = { x i32 mystery = 1 x }")
+             "unknown clike metadata `mystery`")
+        "unknown local metadata is a late validation error")
+      (assert_true
+        (has (lower_err "demo () i32 = { x mystery i32 = 1 x }")
+             "unknown clike metadata `mystery`")
+        "unknown prefix local metadata is a late validation error")
+      (assert_true
+        (has (lower_err "demo (x i32 mystery) i32 = { x }")
+             "unknown clike metadata `mystery`")
+        "unknown param metadata is a late validation error")
+      (assert_true
+        (has (lower_err "demo (x mystery i32) i32 = { x }")
+             "unknown clike metadata `mystery`")
+        "unknown prefix param metadata is a late validation error")
+      (assert_true
+        (has (lower_err "S struct = { x i32 mystery }\nmain () i32 = { 0 }")
+             "unknown clike metadata `mystery`")
+        "unknown field metadata is a late validation error")
+      (assert_true
+        (has (lower_err "S struct = { x mystery i32 }\nmain () i32 = { 0 }")
+             "unknown clike metadata `mystery`")
+        "unknown prefix field metadata is a late validation error")
+      (do
+        (register_attribute! "meta_ok" (lambda (an kind attrs name) null))
+        (bind ((s (lower
+                    "S struct = { x meta_ok i32 }\nG meta_ok u32 = 1\ndemo (p meta_ok i32) i32 = { x meta_ok i32 = p x }")))
+          (do
+            (assert_true (has s "(struct S (x i32))")
+              "registered field metadata is accepted without changing field lowering")
+            (assert_true (has s "(global G u32 1)")
+              "registered top-level metadata is accepted without changing global lowering")
+            (assert_true (has s "(p i32)")
+              "registered param metadata is accepted without changing signature lowering")
+            (assert_true (has s "(bind x p)")
+              "registered local metadata is accepted without changing local lowering"))))
+
+      ; ── statements and infix operators are registry-backed extension seams.
+      (do
+        (register_statement! "twice" 95
+          (lambda (S self toks i env brk tail?) (tsym? (get toks i) "twice"))
+          (lambda (S self toks i env brk tail? out)
+            (bind ((r ((get S "parse_expr") toks (int_add i 1) env)))
+              (do
+                (append out (calln "int_add" (list_of (get r "spec") (get r "spec"))))
+                (get r "i")))))
+        (bind ((s (lower "demo () i32 = { twice 21 }")))
+          (assert_true (has s "(int_add 21 21)")
+            "a registered statement handler can lower without editing block dispatch")))
+      (do
+        (register_infix_op! "add" "%%" "int_add")
+        (bind ((s (lower "demo (a i32, b i32) i32 = { a %% b }")))
+          (assert_true (has s "(int_add a b)")
+            "a registered infix operator can lower without editing the grammar regex")))
+
+      ; ── eval=native parity note: the flat buffer + ptr_add indexing is the
+      ;    SAME shape native_array.caap uses, so an eval run and a native build
+      ;    agree (the lowerer emits only array_local/global_array/ptr_* — heads
+      ;    both the evaluator and the LLVM/native backend implement). ──
+
+      null)))

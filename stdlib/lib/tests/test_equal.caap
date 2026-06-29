@@ -1,0 +1,81 @@
+; stdlib/lib/test_equal.caap — in-language tests for lib/equal.
+
+;; @area: core
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_true assert_eq)
+(use stdlib.lib.core.equal deep_eq deep_ne deep_compare structural_hash
+     deep_eq_by compare_by)
+
+; scalars defer to kernel eq
+(assert_true (deep_eq 42 42) "int eq")
+(assert_true (deep_ne 42 43) "int ne")
+(assert_true (deep_eq "hi" "hi") "string eq")
+
+; lists structurally — kernel eq would say false for distinct lists
+(assert_true (deep_eq (list_of 1 2 3) (list_of 1 2 3)) "list eq by contents")
+(assert_true (deep_ne (list_of 1 2) (list_of 1 2 3)) "list ne by length")
+(assert_true (deep_ne (list_of 1 2 3) (list_of 1 9 3)) "list ne by element")
+
+; nested lists
+(assert_true
+  (deep_eq (list_of 1 (list_of 2 3)) (list_of 1 (list_of 2 3)))
+  "nested list eq")
+
+; maps by key set + values
+(assert_true
+  (deep_eq (assoc (map_of) "a" 1 "b" 2) (assoc (map_of) "b" 2 "a" 1))
+  "map eq regardless of insertion order")
+(assert_true
+  (deep_ne (assoc (map_of) "a" 1) (assoc (map_of) "a" 2))
+  "map ne by value")
+(assert_true
+  (deep_ne (assoc (map_of) "a" 1) (assoc (map_of) "a" 1 "b" 2))
+  "map ne by key set")
+
+; mismatched value types
+(assert_true (deep_ne 1 "1") "int vs string ne")
+
+; deep_compare — a total order (-1 / 0 / 1), consistent with deep_eq
+(assert_eq (deep_compare 1 2) -1 "deep_compare lt")
+(assert_eq (deep_compare 2 2) 0 "deep_compare eq")
+(assert_eq (deep_compare 3 2) 1 "deep_compare gt")
+(assert_eq (deep_compare "a" "b") -1 "deep_compare strings")
+(assert_eq (deep_compare (list_of 1 2) (list_of 1 3)) -1 "deep_compare lists lexicographic")
+(assert_eq (deep_compare (list_of 1 2) (list_of 1 2)) 0 "deep_compare equal lists")
+; 0 exactly when deep_eq — structural maps compare equal regardless of order
+(assert_eq (deep_compare (assoc (map_of) "a" 1 "b" 2) (assoc (map_of) "b" 2 "a" 1)) 0
+  "deep_compare map order-independent")
+
+; structural_hash — deep_eq-equal values hash equal, regardless of construction
+(assert_true (eq (structural_hash (list_of 1 2 3)) (structural_hash (list_of 1 2 3)))
+  "structural_hash stable on equal lists")
+(assert_true (eq (structural_hash (assoc (map_of) "a" 1 "b" 2))
+                 (structural_hash (assoc (map_of) "b" 2 "a" 1)))
+  "structural_hash folds map order-independently")
+(assert_true (ne (structural_hash (list_of 1 2)) (structural_hash (list_of 1 2 3)))
+  "structural_hash differs for different lists")
+
+; deep_eq_by — equality of projections. Records that differ only outside the
+; projected key compare equal; differing on the key compares unequal.
+(bind id_of (lambda (p) (get p "id")))
+(assert_true
+  (deep_eq_by id_of (assoc (map_of) "id" 7 "name" "a") (assoc (map_of) "id" 7 "name" "b"))
+  "deep_eq_by: same id, different name -> equal")
+(assert_true
+  (not (deep_eq_by id_of (assoc (map_of) "id" 7) (assoc (map_of) "id" 8)))
+  "deep_eq_by: different id -> unequal")
+; projections may themselves be aggregates (deep, not identity)
+(assert_true
+  (deep_eq_by (lambda (p) (get p "tags"))
+    (assoc (map_of) "tags" (list_of 1 2)) (assoc (map_of) "tags" (list_of 1 2)))
+  "deep_eq_by: equal list projections compare deep")
+
+; compare_by — total order on projections (-1 / 0 / 1).
+(bind age_of (lambda (p) (get p "age")))
+(assert_eq (compare_by age_of (assoc (map_of) "age" 20) (assoc (map_of) "age" 30)) -1
+  "compare_by: 20 < 30")
+(assert_eq (compare_by age_of (assoc (map_of) "age" 30) (assoc (map_of) "age" 30)) 0
+  "compare_by: equal ages")
+(assert_eq (compare_by age_of (assoc (map_of) "age" 40) (assoc (map_of) "age" 30)) 1
+  "compare_by: 40 > 30")

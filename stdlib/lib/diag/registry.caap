@@ -1,0 +1,245 @@
+; stdlib/lib/diag/registry.caap — the diagnostic-code registry
+; (module stdlib.lib.diag.registry).
+;
+; Every diagnostic the tower emits carries a CODE; this registry gives each
+; code one documented home: a summary for tooling (LSP hovers, error
+; explainers) and a stable inventory (`codes`). Producers register at load;
+; unknown codes are not an error — `describe` simply returns null.
+;
+; ── Code shape & namespacing ────────────────────────────────────────────────
+; A code is a string KEY. Two flavours coexist, both stored in the one table:
+;
+;   - a DOTTED code — the historical form the tower already speaks
+;     ("stdlib.json.encode", "caap.eval"). `register_code!` keeps documenting
+;     these verbatim, unchanged.
+;   - an OWNED code — `owner:code`, registered with `register_owned!`. The
+;     `owner` (a module/producer name) is a NAMESPACE: two producers may each
+;     register a bare `parse` ("a:parse" and "b:parse") with no collision, and
+;     a reader of "a:parse" sees exactly a's summary. `qualify` spells the key
+;     and `owner_of`/`local_of` split it back, so the `:` is named in one place.
+;
+; ── Collision detection ─────────────────────────────────────────────────────
+; Registering the SAME key is idempotent ONLY when the summary matches — a
+; module may load twice and re-document its codes harmlessly. Re-registering a
+; key with a DIFFERENT summary is a certain bug (two owners silently fighting
+; over one code) and raises the protocol error "stdlib.diag.duplicate". This
+; is the sibling of semantics/passes/derive's duplicate guard.
+(module stdlib.lib.diag.registry)
+
+(use stdlib.lib.diag.error raise!)
+
+; The registry stores, per key, a RECORD map (not a bare summary string):
+;   {"summary"   <string>,            ; the one-line documentation (required)
+;    "severity"  "error"|"warning"|"info"|"hint",  ; the default severity
+;    "category"  <string>,            ; a coarse grouping ("syntax", "type", …)
+;    "explainer" <string>,            ; a longer multi-line explanation, or ""
+;    "help_url"  <string>}            ; a docs link, or ""
+; `describe` still returns just the summary STRING (the historical contract every
+; consumer — e.g. lib/diag/bag's render — already speaks); `describe_full` and
+; the field accessors expose the rest. The 2-arg `register_code!`/`register_owned!`
+; keep their exact old shape, filling the extra fields with sensible defaults.
+(bind registry (map_of))           ; code key -> record map
+
+; qualify — the owned-code key for `code` under `owner` ("owner:code").
+; The ONE place the namespace separator is spelled; `owner_of`/`local_of` undo
+; it. A `:` is not expected inside `owner`; if one appears, `owner_of` reports
+; the segment before the FIRST `:` (the namespace), `local_of` the remainder.
+;   owner / code : the producer/namespace and its local code
+;   ->           : "owner:code"
+(bind qualify
+  (lambda (owner code) (string_concat_many owner ":" code)))
+
+; owner_of — the namespace of a key, or null when it is an unqualified (dotted
+; or bare) code. ("a:parse") -> "a"; ("caap.eval") -> null.
+(bind owner_of
+  (lambda (key)
+    (bind ((parts (string_split key ":")))
+      (if (gt (size parts) 1) (get parts 0) null))))
+
+; local_of — the local code of a key with the namespace removed, or the key
+; itself when unqualified. ("a:parse") -> "parse"; ("caap.eval") -> "caap.eval".
+(bind local_of
+  (lambda (key)
+    (bind ((i (string_find key ":")))
+      (if (eq i null) key (string_slice key (int_add i 1) (size key))))))
+
+; make_record — assemble a registry record from its fields. The summary is
+; required; severity defaults to "error" (the common case for a diagnostic id),
+; and category/explainer/help_url default to "" (absent, but always present as a
+; key so the accessors stay total).
+(bind make_record
+  (lambda (summary severity category explainer help_url)
+    (assoc (map_of)
+      "summary" summary
+      "severity" severity
+      "category" category
+      "explainer" explainer
+      "help_url" help_url)))
+
+; record! — the shared registration core (used by all public entry points).
+; Idempotent when the FULL record matches; a conflicting record (any differing
+; field) for an existing key is a certain protocol error. Returns the registry
+; (so callers can chain).
+;   key / rec : the full code key and its record map
+(bind record!
+  (lambda (key rec)
+    (do
+      (if (contains registry key)
+        ; the WHOLE record must match (value_eq) — re-documenting a code with any
+        ; differing field (summary OR severity/category/explainer/help_url) is a
+        ; conflict, so the message says "different record", not "different
+        ; summary"; the data payload carries both records for the reader.
+        (when (not (value_eq (get registry key) rec))
+          (raise! "stdlib.diag.duplicate"
+            (string_concat_many
+              "diagnostic code \"" key "\" is already registered with a "
+              "different record")
+            (assoc (map_of) "code" key
+              "existing" (get registry key) "incoming" rec)))
+        (assoc registry key rec))
+      registry)))
+
+; register_code! — document one diagnostic code under its full key.
+; Backward-compatible: same 2-arg shape and return as before, now also
+; rejecting a conflicting re-registration of the same key. The default severity
+; is "error"; category/explainer/help_url are left empty (use the *_full form to
+; set them).
+;   code / summary : the dotted code and its documentation
+(defn register_code! ((code string) (summary string)) map
+  (record! code (make_record summary "error" "" "" "")))
+
+; register_code_full! — document a code with its full record: a default
+; severity, a category, a longer explainer, and a help URL. Same collision
+; discipline and return as register_code!.
+;   code / summary / severity / category / explainer / help_url : the record fields
+(defn register_code_full!
+    ((code string) (summary string) (severity string)
+     (category string) (explainer string) (help_url string)) map
+  (record! code (make_record summary severity category explainer help_url)))
+
+; register_owned! — document `code` in `owner`'s namespace ("owner:code").
+; The qualified-key sibling of register_code!: same collision discipline, same
+; return. Read it back with (describe (qualify owner code)).
+;   owner / code / summary : the namespace, its local code, and the documentation
+(defn register_owned! ((owner string) (code string) (summary string)) map
+  (record! (qualify owner code) (make_record summary "error" "" "" "")))
+
+; register_owned_full! — the full-record sibling of register_owned!, writing
+; under "owner:code". Same collision discipline and return.
+;   owner / code / summary / severity / category / explainer / help_url
+(defn register_owned_full!
+    ((owner string) (code string) (summary string) (severity string)
+     (category string) (explainer string) (help_url string)) map
+  (record! (qualify owner code)
+    (make_record summary severity category explainer help_url)))
+
+; describe — the summary documented for `key`, or null when `key` is unknown.
+; Accepts either flavour of key verbatim: a dotted code, or a qualified
+; "owner:code" (compose it with `qualify`). UNCHANGED contract: a STRING summary
+; (extracted from the record), so existing consumers (lib/diag/bag's render) read
+; exactly the same value as before.
+(bind describe
+  (lambda (key)
+    (bind ((rec (get registry key)))
+      (if (eq rec null) null (get rec "summary")))))
+
+; describe_full — the whole record for `key` (summary + severity + category +
+; explainer + help_url), or null when `key` is unknown.
+(bind describe_full (lambda (key) (get registry key)))
+
+; ── per-field accessors (total: a default when the key is unknown) ───────────
+
+; severity_of — the default severity for `key` ("error" when no record sets one,
+; or for an unknown key — so a caller always has a usable severity).
+(bind severity_of
+  (lambda (key)
+    (bind ((rec (get registry key)))
+      (if (eq rec null) "error" (get rec "severity" "error")))))
+
+; category_of — the category for `key`, or "" when unset/unknown.
+(bind category_of
+  (lambda (key)
+    (bind ((rec (get registry key)))
+      (if (eq rec null) "" (get rec "category" "")))))
+
+; explainer_of — the longer explanation for `key`, or "" when unset/unknown.
+(bind explainer_of
+  (lambda (key)
+    (bind ((rec (get registry key)))
+      (if (eq rec null) "" (get rec "explainer" "")))))
+
+; help_url_of — the docs link for `key`, or "" when unset/unknown.
+(bind help_url_of
+  (lambda (key)
+    (bind ((rec (get registry key)))
+      (if (eq rec null) "" (get rec "help_url" "")))))
+
+; codes — every registered code key (the stable inventory). Order is
+; unspecified (map iteration); both dotted and "owner:code" keys appear.
+(bind codes (lambda () (map_keys registry)))
+
+; the tower's own codes, registered at the source of truth
+(register_code! "stdlib.native.error"
+  "native prep: the codegen front-end rejected the program")
+(register_code! "stdlib.llvm.error"
+  "own LLVM backend: an unsupported construct reached lowering")
+(register_code! "stdlib.json.encode"
+  "json_stringify met a value with no JSON representation")
+; the code that record! actually raises on a conflict — documented with the FULL
+; record (category + explainer) so describe_full/explainer_of on the real
+; collision id surface the discipline, not just a terse summary.
+(register_code_full! "stdlib.diag.duplicate"
+  "a diagnostic code was re-registered with a conflicting record"
+  "error" "diag"
+  (string_concat_many
+    "Registering the same code key with a different record is a certain bug "
+    "(two owners fighting over one id). Qualify owned codes with register_owned! "
+    "so each producer keeps its own namespace.")
+  "")
+(register_code! "caap.eval"
+  "a kernel evaluation error, normalized by stdlib.lib.diag.error as_error")
+(register_code! "caap.thrown"
+  "a thrown non-protocol value, normalized by as_error")
+
+; ── reload hygiene + filtered queries ─────────────────────────────────────────
+
+; clear! — drop EVERY registered code, returning the registry to empty. The
+; table is emptied IN PLACE (map_delete over its keys) so `registry` keeps its
+; identity — the sibling of lib/project's clear_projects!. After this, a fresh
+; load re-registers cleanly: a producer may re-document its codes without the
+; duplicate guard firing on a stale record. This drops the tower's own
+; pre-registered codes too (they are restored only by re-loading this module),
+; so it is a reload primitive, not a runtime query. Returns null.
+;   -> : null
+(bind clear!
+  (lambda ()
+    (do
+      (for k (map_keys registry) (map_delete registry k))
+      null)))
+
+; codes_by_category — every registered code key whose category is `cat`. A
+; coarse filtered view of the inventory (cf. `codes`), built over the same
+; total `category_of`, so an unset/empty category is matched by passing "".
+; Order is unspecified (map iteration).
+;   cat : the category to match ("syntax", "type", "diag", …)
+;   ->  : the list of matching code keys
+(bind codes_by_category
+  (lambda (cat)
+    (sequence_filter (codes) (lambda (k) (eq (category_of k) cat)))))
+
+; codes_by_owner — every registered OWNED code key in `owner`'s namespace
+; ("owner:code"); dotted/bare codes (whose `owner_of` is null) never match.
+; The owner-scoped slice of the inventory, built over the same `owner_of` that
+; `register_owned!` writes through. Order is unspecified (map iteration).
+;   owner : the namespace to match
+;   ->    : the list of "owner:code" keys owned by `owner`
+(bind codes_by_owner
+  (lambda (owner)
+    (sequence_filter (codes) (lambda (k) (eq (owner_of k) owner)))))
+
+(export register_code! register_code_full!
+        register_owned! register_owned_full!
+        describe describe_full
+        severity_of category_of explainer_of help_url_of
+        codes qualify owner_of local_of
+        clear! codes_by_category codes_by_owner)

@@ -1,19 +1,44 @@
 [package]
-name = "caap-peg-port"
+name = "caap-peg"
 version = "0.1.0"
 edition = "2021"
-description = "Work-in-progress Rust port of CAAP's PEG module."
-license = "MIT OR Apache-2.0"
+rust-version = "1.82"
+description = "A packrat PEG parser with left-recursion, incremental reparsing, error recovery, a host-driver protocol, and typed extraction."
+license = "Apache-2.0"
+repository = "https://github.com/YuriiBerehuliakOrig/caap"
+readme = "README.md"
+keywords = ["peg", "parser", "parsing", "grammar", "incremental"]
+categories = ["parsing", "parser-implementations"]
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
+# Grow the native stack on demand in the recursive-descent chokepoint
+# (parser_engine::parse_expr) — same approach as caap-core's evaluator — so
+# deeply nested input is bounded by the max_depth policy, not thread stack size.
+stacker = "0.1"
 serde_json = "1.0"
 thiserror = "1.0"
 regex = "1.11"
-lru = "0.12"
+# Used to compute the exact byte extent a regex terminal *examines* (where its
+# automaton dies), the soundness datum for incremental subtree reuse.
+regex-automata = "0.4"
+smallvec = "1.13"
+# `#[derive(FromParseValue)]`, behind the `derive` feature.
+caap-peg-derive = { version = "0.1", path = "../peg-derive", optional = true }
+
+[features]
+# Optional heavyweight subsystems, off by default to keep the everyday surface
+# and default build lean. Enable explicitly when needed.
+default = []
+# `#[derive(FromParseValue)]` for typed extraction (pulls in the proc-macro crate).
+derive = ["dep:caap-peg-derive"]
+# Error-recovery parsing: `PEGParser::recover_parse` and the `recovery` module.
+recovery = []
+# Transactional grammar editing: the `transaction` / `transaction_stack` modules.
+transaction = []
 
 [lib]
-name = "caap_peg_port"
+name = "caap_peg"
 path = "src/lib.rs"
 
 [[bench]]
@@ -22,3 +47,6 @@ harness = false
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+pprof = { version = "0.13", features = ["flamegraph", "criterion"] }
+# Randomised panic-safety / round-trip property tests (stable; runs in `cargo test`).
+proptest = "1"

@@ -1,0 +1,300 @@
+; stdlib/lib/prop.caap — richer assertions + property/randomized testing
+; (module stdlib.lib.prop).
+;
+; Builds on stdlib.lib.test's failure convention EXACTLY: an assertion throws a
+; "FAIL: <label> …" message on failure and returns null on success, so several
+; may sit in one `do` block and a caught throw is the test runner's failure
+; signal. This module adds the assertions test.caap omits (negation, nil,
+; approx-equality, membership, throw/error expectation) plus seedable random
+; generators and a `forall` property-runner with best-effort shrinking.
+;
+; The random draws are NO LONGER a private PRNG — they reuse stdlib.lib.random's
+; pure, seedable, functional generator (the deterministic LCG the rest of the
+; stdlib draws from; no dependency on sys.rand / a host entropy source). Each
+; generator threads rng state through the {"value" …, "rng" next} result maps
+; random returns, so a fixed seed still reproduces a fixed sequence — the
+; determinism `forall` relies on. The thin gen_* wrappers below adapt random's
+; half-open conventions to the INCLUSIVE [lo, hi] / [0, maxlen] shapes prop's
+; properties expect; `new_rng` is random's `make_rng`.
+(module stdlib.lib.prop)
+
+(use stdlib.lib.diag.error error? error_code)
+(use stdlib.lib.random make_rng next_range next_bool)
+
+; ════ richer assertions (mirror stdlib.lib.test's message style) ══════════════
+
+; fail! — throw the standard "FAIL: <label> <detail>" message (the one place the
+; prefix and spacing are defined, so every assertion below reads identically).
+;   label  : the case name (as in test.caap)
+;   detail : the parenthesised "(expected …, got …)" tail (already formatted)
+(bind fail!
+  (lambda (label detail)
+    (throw (string_concat_many "FAIL: " label " " detail))))
+
+; assert_false — pass when `cond` is falsy; else throw a labelled FAIL.
+;   cond / label : the value asserted falsy / the case name
+;   ->           : null on success (throws on failure)
+(bind assert_false
+  (lambda (cond label)
+    (if cond
+      (fail! label (string_concat_many "(expected falsy, got " (value_to_string cond) ")"))
+      null)))
+
+; assert_ne — pass when `a` is NOT structurally equal to `b`; else throw.
+; Uses value_eq (structural), so two equal-but-distinct lists/maps count as
+; equal (the negation a test usually wants).
+;   a / b / label : the two values / the case name
+;   ->            : null on success (throws on failure)
+(bind assert_ne
+  (lambda (a b label)
+    (if (value_eq a b)
+      (fail! label (string_concat_many "(expected != " (value_to_string b)
+        ", got " (value_to_string a) ")"))
+      null)))
+
+; assert_nil — pass when `x` is null; else throw a labelled FAIL.
+;   x / label : the value asserted null / the case name
+;   ->        : null on success (throws on failure)
+(bind assert_nil
+  (lambda (x label)
+    (if (eq x null)
+      null
+      (fail! label (string_concat_many "(expected nil, got " (value_to_string x) ")")))))
+
+; assert_approx — pass when |a - b| <= eps; else throw. For floats (uses
+; float_abs on the difference); the message shows both values and the tolerance.
+;   a / b / eps / label : the values, the tolerance, the case name
+;   ->                  : null on success (throws on failure)
+(bind assert_approx
+  (lambda (a b eps label)
+    (if (le (float_abs (float_sub a b)) eps)
+      null
+      (fail! label (string_concat_many "(expected " (value_to_string b)
+        " +/- " (value_to_string eps) ", got " (value_to_string a) ")")))))
+
+; assert_contains — pass when `coll` contains `x`; else throw.
+;   - string coll : substring check (string_contains; x is a substring)
+;   - list coll   : membership by structural equality (value_eq)
+;   coll / x / label : the collection, the sought element, the case name
+;   ->               : null on success (throws on failure)
+(bind assert_contains
+  (lambda (coll x label)
+    (bind ((ok
+            (if (eq (value_type coll) "string")
+              (string_contains coll x)
+              (sequence_any coll (lambda (e) (value_eq e x))))))
+      (if ok
+        null
+        (fail! label (string_concat_many "(expected to contain " (value_to_string x)
+          ", got " (value_to_string coll) ")"))))))
+
+; assert_throws — pass when calling `thunk` (a 0-arg lambda) throws; else throw.
+; The thunk is run inside try/catch; a caught value (thrown OR an evaluation
+; error) is success, so this is the positive form of "expect a failure".
+;   thunk / label : the 0-arg producer, the case name
+;   ->            : null on success (throws when the thunk did NOT throw)
+(bind assert_throws
+  (lambda (thunk label)
+    (bind ((threw (try (do (thunk) false) (catch e true))))
+      (if threw
+        null
+        (fail! label "(expected the thunk to throw, but it returned normally)")))))
+
+; assert_error — pass when `thunk` throws a protocol error whose error_code is
+; `code`; else throw. A non-throw, a thrown non-error, or a mismatched code all
+; fail (the message names the wanted vs. produced code). The catch result is
+; boxed in a ref so a thrown null is distinguishable from "did not throw".
+;   thunk / code / label : the 0-arg producer, the expected error_code, the name
+;   ->                   : null on success (throws otherwise)
+(bind assert_error
+  (lambda (thunk code label)
+    (bind ((caught (try (do (thunk) (ref "__no_throw__"))
+                        (catch e (ref e)))))
+      (bind ((v (deref caught)))
+        (cond
+          ((eq v "__no_throw__")
+            (fail! label "(expected an error throw, but the thunk returned normally)"))
+          ((not (error? v))
+            (fail! label (string_concat_many "(expected a protocol error with code "
+              (value_to_string code) ", got a non-error throw " (value_to_string v) ")")))
+          ((not (eq (error_code v) code))
+            (fail! label (string_concat_many "(expected error code " (value_to_string code)
+              ", got " (value_to_string (error_code v)) ")")))
+          (else null))))))
+
+; ════ seedable random generators (over stdlib.lib.random) ═════════════════════
+; These thin wrappers reuse random's pure, functional LCG instead of a private
+; one. State is random's rng state (an int); each generator returns the same
+; {"value" …, "rng" next} result map random uses, so a fixed seed reproduces a
+; fixed sequence — the determinism `forall` relies on. The wrappers translate
+; random's half-open ranges into the INCLUSIVE shapes prop's properties expect.
+
+; new_rng — a fresh rng state from an integer seed. Just random's make_rng (which
+; scrambles the seed once so nearby seeds yield well-separated streams).
+;   seed : the starting seed
+;   ->   : an rng state (a bare int)
+(bind new_rng
+  (lambda (seed) (make_rng seed)))
+
+; gen_int — a random int in the INCLUSIVE range [lo, hi].
+; random's next_range is half-open [lo, hi); adding 1 to `hi` makes it inclusive.
+; A collapsed range (hi <= lo) yields `lo` (next_range returns lo for an empty
+; span), matching the old point-range behaviour.
+;   rng / lo / hi : the state, the (inclusive) bounds
+;   ->            : {"value" <int in [lo,hi]>, "rng" <next state>}
+(bind gen_int
+  (lambda (rng lo hi)
+    (next_range rng lo (int_add hi 1))))
+
+; gen_bool — a random bool. Just random's next_bool (a fair coin flip).
+;   rng : the state
+;   ->  : {"value" <bool>, "rng" <next state>}
+(bind gen_bool
+  (lambda (rng)
+    (next_bool rng)))
+
+; gen_alphabet — the pool gen_string draws characters from (lowercase ascii), as
+; a list of 1-char strings (there is no codepoint→char builtin, so a string is
+; assembled by indexing this pool and joining).
+(bind gen_alphabet (string_chars "abcdefghijklmnopqrstuvwxyz"))
+
+; gen_string — a random lowercase-ascii string of length in [0, maxlen].
+;   rng / maxlen : the state, the maximum length (>= 0)
+;   ->           : {"value" <string>, "rng" <next state>}
+(bind gen_string
+  (lambda (rng maxlen)
+    (bind ((lenr (gen_int rng 0 maxlen))
+           (n (get lenr "value"))
+           (st (ref (get lenr "rng")))
+           (chars (list_of))
+           (hi (int_sub (size gen_alphabet) 1)))
+      (do
+        (sequence_each (sequence_range 0 n)
+          (lambda (_i)
+            (bind ((cr (gen_int (deref st) 0 hi)))
+              (do
+                (set_ref st (get cr "rng"))
+                (append chars (get gen_alphabet (get cr "value")))))))
+        (assoc (map_of)
+          "value" (sequence_join chars "")
+          "rng" (deref st))))))
+
+; gen_list — a random list of length in [0, maxlen], each element produced by
+; `elem_gen` (an (rng)->{value,rng} generator like the ones above).
+;   rng / elem_gen / maxlen : the state, the per-element generator, the max length
+;   ->                      : {"value" <list>, "rng" <next state>}
+(bind gen_list
+  (lambda (rng elem_gen maxlen)
+    (bind ((lenr (gen_int rng 0 maxlen))
+           (n (get lenr "value"))
+           (st (ref (get lenr "rng")))
+           (out (list_of)))
+      (do
+        (sequence_each (sequence_range 0 n)
+          (lambda (_i)
+            (bind ((er (elem_gen (deref st))))
+              (do
+                (set_ref st (get er "rng"))
+                (append out (get er "value"))))))
+        (assoc (map_of) "value" out "rng" (deref st))))))
+
+; ════ the property runner ═════════════════════════════════════════════════════
+
+; shrink_candidates — best-effort smaller values to retry once a counterexample
+; is found, so the reported case is closer to minimal:
+;   - int  : retry toward 0 (halve magnitude, then 0)
+;   - list : retry with a strictly shorter prefix (drop the last element)
+;   - else : no shrinks
+;   v  : the failing value
+;   -> : a list of candidate smaller values (possibly empty)
+(bind shrink_candidates
+  (lambda (v)
+    (cond
+      ((eq (value_type v) "int")
+        (if (eq v 0)
+          (list_of)
+          (bind ((half (int_div v 2)))
+            (if (eq half 0) (list_of 0) (list_of half 0)))))
+      ((eq (value_type v) "list")
+        (if (eq (size v) 0)
+          (list_of)
+          (list_of (sequence_take v (int_sub (size v) 1)))))
+      (else (list_of)))))
+
+; shrink — given a failing value and the predicate, repeatedly try the shrink
+; candidates and keep the smallest that STILL fails, so the thrown message names
+; a near-minimal counterexample. Best-effort and bounded: each accepted
+; candidate is strictly smaller, so the loop terminates.
+;   value / predicate : the original counterexample, the property
+;   ->                : a (still-failing) value no larger than `value`
+(bind shrink
+  (lambda (value predicate)
+    (bind ((best (ref value)) (progress (ref true)))
+      (do
+        (while (deref progress)
+          (do
+            (set_ref progress false)
+            (sequence_each (shrink_candidates (deref best))
+              (lambda (cand)
+                (if (deref progress)
+                  null    ; already took a smaller candidate this round
+                  (bind ((still_fails
+                          (try (not (predicate cand)) (catch e true))))
+                    (if still_fails
+                      (do (set_ref best cand) (set_ref progress true))
+                      null)))))))
+        (deref best)))))
+
+; default_seed — the seed `forall` uses when the caller supplies none. Pinned so
+; the 3-arg form stays fully reproducible run to run (its historical behaviour).
+(bind default_seed 1)
+
+; forall_seed — run `count` randomized cases of `predicate` over values from
+; `gen` (an (rng)->{value,rng} generator), starting from the CALLER-SUPPLIED
+; `seed`. On the first case where `predicate` returns false (or throws), shrink
+; the counterexample and throw
+;   "FAIL: property failed for <value> (seed <seed>)"
+; — the seed is REPORTED in the message so the exact failing run can be replayed
+; by passing the same seed back. All cases passing returns null. Because the run
+; is fully determined by `seed`, a passing/failing outcome is reproducible.
+;   gen / predicate / count / seed : the generator, the (value)->bool property,
+;                                    the number of cases, the starting seed
+;   ->                             : null when every case holds (throws on the
+;                                    first failure, after shrinking)
+(bind forall_seed
+  (lambda (gen predicate count seed)
+    (bind ((rng (ref (new_rng seed))) (i (ref 0)) (done (ref false)))
+      (do
+        (while (and (not (deref done)) (lt (deref i) count))
+          (bind ((step (gen (deref rng)))
+                 (value (get step "value")))
+            (do
+              (set_ref rng (get step "rng"))
+              (set_ref i (int_add (deref i) 1))
+              (bind ((held (try (predicate value) (catch e false))))
+                (if held
+                  null
+                  (bind ((small (shrink value predicate)))
+                    (do
+                      (set_ref done true)
+                      (throw (string_concat_many
+                        "FAIL: property failed for " (value_to_string small)
+                        " (seed " (value_to_string seed) ")")))))))))
+        null))))
+
+; forall — the 3-arg property runner: exactly `forall_seed` with `default_seed`.
+; Backward-compatible (same arity and reproducibility as before); the failure
+; message now also names the (default) seed. Pass a seed explicitly with
+; `forall_seed` to vary or replay a run.
+;   gen / predicate / count : the value generator, the (value)->bool property,
+;                             the number of cases to run
+;   ->                      : null when every case holds (throws after shrinking)
+(bind forall
+  (lambda (gen predicate count)
+    (forall_seed gen predicate count default_seed)))
+
+(export
+  fail! assert_false assert_ne assert_nil assert_approx assert_contains
+  assert_throws assert_error
+  new_rng gen_int gen_bool gen_string gen_list gen_alphabet
+  shrink_candidates shrink forall forall_seed default_seed)

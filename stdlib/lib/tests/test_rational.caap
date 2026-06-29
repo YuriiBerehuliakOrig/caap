@@ -1,0 +1,96 @@
+; stdlib/lib/tests/test_rational.caap — in-language tests for lib/numeric/rational.
+;
+; Exact fractions over bignums. Equality of rationals is checked with rat_eq?
+; (canonical form, so structural), and float conversion is checked with an
+; explicit tolerance since rat_to_float lands on the nearest f64.
+
+;; @area: numeric
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true assert_false assert_throws)
+(use stdlib.lib.numeric.bignum bn_from_int)
+(use stdlib.lib.numeric.rational
+  rat rat_from_int rat_zero rat_one
+  rat_is_zero? rat_sign
+  rat_add rat_sub rat_mul rat_div rat_neg rat_abs rat_recip
+  rat_cmp rat_eq?
+  rat_to_float rat_format rat_parse
+  rat? rat_validate)
+
+; ── tolerance helper ─────────────────────────────────────────────────────────
+(bind eps 0.0000001)
+(bind approx? (lambda (a b) (lt (float_abs (float_sub a b)) eps)))
+
+(do
+  ; ── addition: 1/2 + 1/3 = 5/6 ───────────────────────────────────────────────
+  (assert_true (rat_eq? (rat_add (rat 1 2) (rat 1 3)) (rat 5 6)) "1/2 + 1/3 = 5/6")
+  (assert_eq (rat_format (rat_add (rat 1 2) (rat 1 3))) "5/6" "format 1/2+1/3")
+
+  ; ── auto-reduce: 2/4 reduces to 1/2 ─────────────────────────────────────────
+  (assert_true (rat_eq? (rat 2 4) (rat 1 2)) "2/4 = 1/2")
+  (assert_eq (rat_format (rat 2 4)) "1/2" "2/4 reduces to 1/2")
+
+  ; ── multiply: 1/3 * 3/1 = 1 ─────────────────────────────────────────────────
+  (assert_true (rat_eq? (rat_mul (rat 1 3) (rat 3 1)) (rat_one)) "1/3 * 3/1 = 1")
+  (assert_eq (rat_format (rat_mul (rat 1 3) (rat 3 1))) "1" "format 1/3*3 = 1")
+
+  ; ── divide: (1/2) / (1/4) = 2 ───────────────────────────────────────────────
+  (assert_true (rat_eq? (rat_div (rat 1 2) (rat 1 4)) (rat_from_int 2)) "(1/2)/(1/4) = 2")
+  (assert_eq (rat_format (rat_div (rat 1 2) (rat 1 4))) "2" "format (1/2)/(1/4) = 2")
+
+  ; ── compare: 1/3 < 1/2 ──────────────────────────────────────────────────────
+  (assert_eq (rat_cmp (rat 1 3) (rat 1 2)) -1 "rat_cmp 1/3 vs 1/2 = -1")
+  (assert_eq (rat_cmp (rat 1 2) (rat 1 3)) 1 "rat_cmp 1/2 vs 1/3 = 1")
+  (assert_eq (rat_cmp (rat 1 2) (rat 2 4)) 0 "rat_cmp equal = 0")
+
+  ; ── subtraction ─────────────────────────────────────────────────────────────
+  (assert_true (rat_eq? (rat_sub (rat 5 6) (rat 1 3)) (rat 1 2)) "5/6 - 1/3 = 1/2")
+
+  ; ── negative denominator normalizes (sign moves to numerator) ────────────────
+  (assert_eq (rat_format (rat 1 -2)) "-1/2" "1/-2 normalizes to -1/2")
+  (assert_eq (rat_sign (rat 1 -2)) -1 "1/-2 is negative")
+  (assert_eq (rat_format (rat -1 -2)) "1/2" "-1/-2 normalizes to 1/2")
+  (assert_true (rat_eq? (rat 1 -2) (rat -1 2)) "1/-2 = -1/2")
+
+  ; ── neg / abs / recip ───────────────────────────────────────────────────────
+  (assert_eq (rat_format (rat_neg (rat 3 4))) "-3/4" "rat_neg 3/4")
+  (assert_eq (rat_format (rat_abs (rat -3 4))) "3/4" "rat_abs -3/4")
+  (assert_eq (rat_format (rat_recip (rat 2 3))) "3/2" "rat_recip 2/3")
+  (assert_eq (rat_format (rat_recip (rat -2 3))) "-3/2" "rat_recip -2/3 keeps sign")
+
+  ; ── zero / sign / predicates ────────────────────────────────────────────────
+  (assert_true (rat_is_zero? (rat_zero)) "rat_zero is zero")
+  (assert_true (rat_is_zero? (rat 0 5)) "0/5 is zero")
+  (assert_eq (rat_format (rat 0 5)) "0" "0/5 formats as 0")
+  (assert_eq (rat_sign (rat_zero)) 0 "sign of zero = 0")
+  (assert_eq (rat_sign (rat 3 4)) 1 "sign of 3/4 = 1")
+  (assert_true (rat_eq? (rat_add (rat 1 2) (rat_neg (rat 1 2))) (rat_zero)) "x + (-x) = 0")
+
+  ; ── to_float: 1/4 ≈ 0.25 ────────────────────────────────────────────────────
+  (assert_true (approx? (rat_to_float (rat 1 4)) 0.25) "rat_to_float 1/4 ~ 0.25")
+  (assert_true (approx? (rat_to_float (rat 5 6)) 0.8333333333333334) "rat_to_float 5/6")
+  (assert_true (approx? (rat_to_float (rat -3 4)) -0.75) "rat_to_float -3/4 ~ -0.75")
+
+  ; ── format / parse round-trip ───────────────────────────────────────────────
+  (assert_true (rat_eq? (rat_parse "5/6") (rat 5 6)) "parse 5/6")
+  (assert_true (rat_eq? (rat_parse "-3/4") (rat -3 4)) "parse -3/4")
+  (assert_true (rat_eq? (rat_parse "7") (rat_from_int 7)) "parse bare int 7")
+  (assert_eq (rat_format (rat_parse "10/4")) "5/2" "parse reduces 10/4 -> 5/2")
+  (assert_eq (rat_format (rat_parse "5/6")) "5/6" "round-trip 5/6")
+  (assert_eq (rat_format (rat_parse "-7/3")) "-7/3" "round-trip -7/3")
+  (assert_eq (rat_format (rat_parse "42")) "42" "round-trip 42")
+
+  ; ── big values exceed i64 but stay exact ────────────────────────────────────
+  (assert_eq (rat_format (rat_add (rat_parse "1/3") (rat_parse "1/9999999999")))
+    "3333333334/9999999999" "exact add beyond i64 denominator")
+
+  ; ── rat? / rat_validate (structural validators) ──
+  (assert_true (rat? (rat_from_int 2)) "rat? true for rat_from_int 2")
+  (assert_false (rat? 2) "rat? false for a non-map (int 2)")
+  ; malformed: valid bignum num/den but a non-positive (negative) denominator
+  (assert_false (rat? (assoc (map_of) "num" (bn_from_int 1) "den" (bn_from_int -2)))
+    "rat? false for a non-positive denominator")
+  (assert_eq (rat? (rat_validate (rat_from_int 3))) true "rat_validate returns a valid rational")
+  (assert_throws (lambda () (rat_validate 2)) "rat_validate throws on a non-rational")
+
+  true)

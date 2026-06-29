@@ -1,0 +1,71 @@
+; stdlib/lib/tests/test_kdf.caap — known-answer vectors for the key-derivation
+; functions in stdlib.lib.crypto.kdf. The hex vectors are the canonical RFC
+; test cases; an exact string match catches any block-counter, XOR-fold, or
+; big-endian byte-order bug in PBKDF2 / HKDF.
+
+;; @area: crypto
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_throws)
+(use stdlib.lib.crypto.kdf pbkdf2_sha256 hkdf_sha256 hkdf_extract hkdf_expand)
+(use stdlib.lib.collections.sequence each range)
+
+; repeat — a list of `n` copies of `v` (builds the RFC IKM blocks).
+(bind repeat
+  (lambda (v n)
+    (bind ((out (list_of)))
+      (do (each (range 0 n) (lambda (i) (append out v))) out))))
+
+(do
+  ; ── PBKDF2-HMAC-SHA-256 (RFC-style vectors, password "password" salt "salt") ──
+  ; 1 iteration, dkLen 32
+  (assert_eq (pbkdf2_sha256 "password" "salt" 1 32)
+    "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
+    "pbkdf2-sha256 c=1 dklen=32")
+  ; 2 iterations, dkLen 32
+  (assert_eq (pbkdf2_sha256 "password" "salt" 2 32)
+    "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43"
+    "pbkdf2-sha256 c=2 dklen=32")
+
+  ; ── HKDF-SHA-256, RFC 5869 Test Case 1 ──
+  ; IKM  = 0x0b * 22, salt = 0x000102..0c (13 bytes), info = 0xf0f1..f9 (10 bytes)
+  (bind ((ikm  (repeat 11 22))
+         (salt (range 0 13))
+         (info (range 240 250))
+         (prk  (hkdf_extract salt ikm))
+         (okm  (hkdf_sha256 ikm salt info 42)))
+    (do
+      ; PRK from the extract step (RFC 5869 §A.1)
+      (assert_eq prk
+        "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"
+        "hkdf-sha256 TC1 PRK")
+      ; OKM via the all-in-one helper
+      (assert_eq okm
+        "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+        "hkdf-sha256 TC1 OKM (one-shot)")
+      ; OKM via explicit extract + expand (same result)
+      (assert_eq (hkdf_expand prk info 42)
+        "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+        "hkdf-sha256 TC1 OKM (extract+expand)")))
+
+  ; ── parameter validation (behavior change: out-of-range params now throw) ──
+  ; pbkdf2_sha256: iterations must be >= 1, dklen must be >= 0.
+  (assert_throws (lambda () (pbkdf2_sha256 "password" "salt" 0 32))
+    "pbkdf2-sha256 iterations=0 throws")
+  (assert_throws (lambda () (pbkdf2_sha256 "password" "salt" 1 -1))
+    "pbkdf2-sha256 dklen=-1 throws")
+  ; hkdf_expand: length must be in 0..8160 (255*32).
+  (assert_throws (lambda () (hkdf_expand
+      "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5" "" 8161))
+    "hkdf_expand length=8161 throws")
+  (assert_throws (lambda () (hkdf_expand
+      "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5" "" -1))
+    "hkdf_expand length=-1 throws")
+  ; the max in-range length (8160) still computes: 8160 bytes -> 16320 hex chars.
+  (assert_eq (size (hkdf_expand
+      "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"
+      (range 240 250) 8160))
+    16320
+    "hkdf_expand length=8160 (max) still computes")
+
+  true)

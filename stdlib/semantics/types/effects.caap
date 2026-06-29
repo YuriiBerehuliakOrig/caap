@@ -1,0 +1,402 @@
+; stdlib/semantics/types/effects.caap — effect inference (tier 4).
+;
+; The effect model is a TAG SET inferred per function body: the kernel
+; vocabulary supplies builtin tags ("mutation", …), callee records supply
+; theirs, and OWNERSHIP analysis removes mutation of state the function
+; itself created (a fresh list appended and returned is not an effect).
+; settle_effect! verifies an optional declaration at the name — pure (no
+; certain tag), impure (blanket), or a tag list that must cover every
+; certain tag — and stores the settled tags + the derived binary view on the
+; record. Consumers: the const form (via the loader's effect_of) and any
+; future pass that needs purity facts.
+(module stdlib.semantics.types.effects)
+
+(use stdlib.syntax.ast call? name? string_lit? head_of callee args_of arg
+     name_of literal_of items_of)
+(use stdlib.semantics.types.records fn_record? lambda_param_names)
+
+; ── kernel tag vocabulary ───────────────────────────────────────────────────
+; the kernel's callable vocabulary (name -> {pure, effects, …}), the ground
+; truth for effect inference
+(bind vocab (ctfe_kernel_vocabulary))
+
+; every effect tag the kernel declares anywhere — the vocabulary for DECLARED
+; effect lists on defn (an unknown tag there is a certain typo)
+(bind known_tags
+  (bind ((acc (map_of)))
+    (do
+      (for k (map_keys vocab)
+        (for t (get (get vocab k) "effects" (list_of))
+          (assoc acc t true)))
+      acc)))
+
+; ── ownership optimization: freshness tracking (DATA-DRIVEN registries) ──────
+; Two open registries the freshness analysis consults. They SEED with the
+; kernel builtins (so existing inference is byte-identical) but are mutable
+; maps a caller can extend — a stdlib layer that adds its own fresh-allocating
+; primitive or arg0-mutating wrapper registers it instead of being invisible to
+; the ownership optimization. A USER fn record is recognized WITHOUT touching
+; these maps: a record carrying `"fresh_result" true` reads as a fresh head,
+; and one carrying `"mutates_arg0" true` reads as an arg0-mutator (see `fresh?`
+; and the owned-mutation suppression in `effect_scan`), so a typed defn can opt
+; into the optimization just by carrying the flag.
+
+; arg0_mutators — builtins that mutate their FIRST argument; when that argument
+; is a name bound to a certainly-fresh value, the mutation is OWNED by the
+; enclosing function — invisible from outside, so it carries no tag.
+(bind arg0_mutators
+  (assoc (map_of)
+    "append" true "assoc" true "set_ref" true "map_delete" true))
+
+; fresh_heads — heads whose result is certainly a FRESH value (an allocation
+; the binder uniquely owns).
+(bind fresh_heads
+  (assoc (map_of)
+    "list_of" true "map_of" true "ref" true
+    "sequence_map" true "sequence_filter" true "sequence_range" true
+    "sequence_reverse" true "sequence_take" true "sequence_drop" true
+    "sequence_zip" true "sequence_sort_by" true
+    "map_keys" true "map_values" true
+    "string_split" true "string_lines" true))
+
+; register_fresh_head! / register_arg0_mutator! — extend the registries. Used
+; by a higher layer that knows a primitive of its own allocates fresh / mutates
+; arg0; idempotent (re-registering an existing head is a no-op rewrite).
+;   name : the head identifier to register
+(bind register_fresh_head!
+  (lambda (name) (do (assoc fresh_heads name true) null)))
+(bind register_arg0_mutator!
+  (lambda (name) (do (assoc arg0_mutators name true) null)))
+
+; fresh_head? — is a CALL head certainly fresh-returning? A registered builtin
+; (the data-driven `fresh_heads` registry) OR a user fn record in scope that
+; declares `"fresh_result" true`. `env` rides in the scan state so this stays a
+; pure spelling query without widening every `fresh?` call site.
+;   h / state : the head identifier, the scan state (carries "env")
+(bind fresh_head?
+  (lambda (h state)
+    (or (eq (get fresh_heads h false) true)
+        (bind ((e (get (get state "env" (map_of)) h)))
+          (and (fn_record? e) (eq (get e "fresh_result") true))))))
+
+; fresh? — does `node` certainly evaluate to a fresh value? A fresh NAME is
+; one the current scan bound to a fresh expression; append/assoc return their
+; first argument, so they stay fresh over a fresh target; a call of a
+; fresh-returning head (builtin or a user fn flagged `"fresh_result"`) is
+; fresh. Anything else: no.
+;   self / node / state : recursion idiom, the expression, the scan state
+(bind fresh?
+  (lambda (self node state)
+    (cond
+      ((name? node)
+        (eq (get (get state "fresh" (map_of)) (name_of node) false) true))
+      ((call? node)
+        (bind ((h (head_of node)))
+          (cond
+            ((fresh_head? h state) true)
+            ((or (eq h "append") (eq h "assoc"))
+              (self self (arg node 0) state))
+            (else false))))
+      (else false))))
+
+; owned_arg0? — is the FIRST argument of `args` a name bound to a certainly-
+; fresh value? Then an arg0-mutating call only touches state the enclosing
+; function created, so the mutation is OWNED — invisible from outside, no tag.
+; The shared owned-mutation predicate for both the builtin arg0-mutators and a
+; user fn record flagged `"mutates_arg0"`.
+;   args / state : the call's arguments and the scan state (carries "fresh")
+(bind owned_arg0?
+  (lambda (args state)
+    (and (name? (get args 0))
+         (eq (get (get state "fresh" (map_of)) (name_of (get args 0)) false)
+             true))))
+
+; ── the effect scan ─────────────────────────────────────────────────────────
+; note_tag! / note_unknown! — record the FIRST witness of a tag / of an
+; unknowable head; mark_unfresh! — a binding we cannot vouch for shadows any
+; fresh name of the same spelling (order-correct for a lexical scan).
+(bind note_tag!
+  (lambda (state tag witness)
+    (bind ((tags (get state "tags" (map_of))))
+      (when (eq (get tags tag) null)
+        (assoc tags tag witness)))))
+
+(bind note_unknown!
+  (lambda (state witness)
+    (when (eq (get state "unknown") null)
+      (assoc state "unknown" witness))))
+
+(bind mark_unfresh!
+  (lambda (state nm) (assoc (get state "fresh" (map_of)) nm false)))
+
+; scan_bind — effect-scan a kernel `bind`: NAME positions are bindings (never
+; expanded as calls) and each pair feeds the freshness map; the shapes are
+; flat (bind name v body…), canonical ["n1" v1 … body…], multi ((n v)…) body….
+;   scan : the effect_scan walker (passed in)
+;   node / env / self_name / state : as in effect_scan
+(bind scan_bind
+  (lambda (scan node env self_name state)
+    (bind ((args (args_of node)) (first (arg node 0)))
+      (cond
+        ; flat (bind name value body…)
+        ((name? first)
+          (do
+            (scan scan (get args 1) env self_name state)
+            (assoc (get state "fresh" (map_of)) (name_of first)
+              (fresh? fresh? (get args 1) state))
+            (for k (sequence_range 2 (size args))
+              (scan scan (get args k) env self_name state))))
+        ; canonical ["n1" v1 … body…]
+        ((string_lit? first)
+          (bind ((st (map_of)))
+            (do
+              (assoc st "i" 0)
+              (while (and (lt (int_add (get st "i" 0) 1) (size args))
+                          (string_lit? (get args (get st "i" 0))))
+                (bind (
+                  (nm (literal_of (get args (get st "i" 0))))
+                  (v (get args (int_add (get st "i" 0) 1)))
+                )
+                  (do
+                    (scan scan v env self_name state)
+                    (assoc (get state "fresh" (map_of)) nm
+                      (fresh? fresh? v state))
+                    (assoc st "i" (int_add (get st "i" 0) 2)))))
+              (for k (sequence_range (get st "i" 0) (size args))
+                (scan scan (get args k) env self_name state)))))
+        ; multi ((n v)…) body…
+        (else
+          (do
+            (when (call? first)
+              (for pair (items_of first)
+                (when (call? pair)
+                  (do
+                    (scan scan (arg pair 0) env self_name state)
+                    (when (name? (callee pair))
+                      (assoc (get state "fresh" (map_of))
+                        (head_of pair)
+                        (fresh? fresh? (arg pair 0) state)))))))
+            (for k (sequence_range 1 (size args))
+              (scan scan (get args k) env self_name state))))))))
+
+; effect_scan — walk an expanded body recording effect evidence in `state`:
+; a TAG map (tag -> first witness head) for certain effects and "unknown"
+; when a head's effect cannot be established. Binding positions (lambda
+; params, bind names, match/catch binders) are names, not calls; `self_name`
+; makes plain recursion transparent (any effect comes from some OTHER head).
+; OWNED MUTATION carries no tag: an arg0-mutator hitting a name bound to a
+; certainly-fresh value only touches state this call created.
+;   self      : itself
+;   node      : an expanded kernel AST node
+;   env       : name -> type | fn record (records carry "effects"/"effect")
+;   self_name : the function being inferred (calls to it are skipped)
+;   state     : {tags, fresh, unknown} (mutated)
+(bind effect_scan
+  (lambda (self node env self_name state)
+    ; env rides in the scan state so freshness queries (fresh_head?) can read a
+    ; user fn record's `"fresh_result"`/`"mutates_arg0"` flags without widening
+    ; every fresh? call site. env is constant within one body scan, so set it
+    ; once (the same value re-threads down the recursion).
+    (when (eq (get state "env") null)
+      (assoc state "env" env))
+    (when (call? node)
+      (bind ((head (head_of node)) (args (args_of node)))
+        (cond
+          ((eq head "quote") null)              ; quoted data: nothing runs
+          ((eq head "lambda")
+            ; params shadow: nothing stays fresh under these names
+            (do
+              (for pn (lambda_param_names (arg node 0))
+                (mark_unfresh! state pn))
+              (for k (sequence_range 1 (size args))
+                (self self (get args k) env self_name state))))
+          ((eq head "bind")
+            (scan_bind self node env self_name state))
+          ((eq head "match")
+            ; patterns are not calls: scan the scrutinee and clause BODIES,
+            ; un-freshing each clause's binder
+            (do
+              (when (gt (size args) 0)
+                (self self (get args 0) env self_name state))
+              (for i (sequence_range 1 (size args))
+                (bind ((clause (get args i)))
+                  (when (call? clause)
+                    (do
+                      (bind ((pattern (callee clause)))
+                        (cond
+                          ((name? pattern)
+                            (mark_unfresh! state (name_of pattern)))
+                          ((call? pattern)
+                            (when (name? (arg pattern 0))
+                              (mark_unfresh! state (name_of (arg pattern 0)))))
+                          (else null)))
+                      (for b (args_of clause)
+                        (self self b env self_name state))))))))
+          ((eq head "try")
+            ; (try expr (catch e handler…)): the catch head and binder are
+            ; names, not calls
+            (do
+              (when (gt (size args) 0)
+                (self self (get args 0) env self_name state))
+              (when (gt (size args) 1)
+                (bind ((clause (get args 1)))
+                  (when (call? clause)
+                    (bind ((items (args_of clause)))
+                      (do
+                        (when (and (gt (size items) 0)
+                                   (name? (get items 0)))
+                          (mark_unfresh! state (name_of (get items 0))))
+                        (for k (sequence_range 1 (size items))
+                          (self self (get items k) env self_name state)))))))))
+          ((or (eq head "set!") (eq head "assign_lexical"))
+            ; assignment (the vocabulary lists the frontend form as a plain
+            ; special, so flag it here)
+            (do
+              (note_tag! state "mutation" "set!")
+              (for a args (self self a env self_name state))))
+          (else
+            (do
+              (cond
+                ((eq head null)
+                  ; computed callee: anything may run
+                  (do
+                    (note_unknown! state "<computed callee>")
+                    (self self (callee node) env self_name state)))
+                ((eq head self_name) null)
+                ((contains env head)
+                  ; lexical names shadow the kernel: a fn record answers with
+                  ; its effects; any other local binding is unknowable. A record
+                  ; flagged `"mutates_arg0"` over an OWNED-fresh arg0 carries no
+                  ; tag (the same ownership optimization the builtin mutators
+                  ; get — a custom mutator wrapper is recognized too).
+                  (bind ((e (get env head)))
+                    (if (fn_record? e)
+                      (if (and (eq (get e "mutates_arg0") true)
+                               (owned_arg0? args state))
+                        null
+                        (bind ((effs (get e "effects")))
+                          (if (eq effs null)
+                            (case (get e "effect")
+                              ("impure" (note_tag! state "impure" head))
+                              ("pure" null)
+                              (else (note_unknown! state head)))
+                            (do
+                              (for t effs (note_tag! state t head))
+                              (when (eq (get e "effect") null)
+                                (note_unknown! state head))))))
+                      (note_unknown! state head))))
+                (else
+                  (bind ((entry (get vocab head)))
+                    (cond
+                      ((eq entry null) (note_unknown! state head))
+                      (else
+                        (bind ((tags (get entry "effects" (list_of))))
+                          (if (eq (size tags) 0)
+                            (when (eq (get entry "pure" true) false)
+                              ; impure without tags: flag generically
+                              (note_tag! state "impure" head))
+                            (unless (and (eq (get arg0_mutators head false) true)
+                                         (owned_arg0? args state))
+                              (for t tags (note_tag! state t head))))))))))
+              (for a args (self self a env self_name state)))))))))
+
+; ── tag-set results ─────────────────────────────────────────────────────────
+; effect_state — a fresh evidence container for one body scan.
+(bind effect_state
+  (lambda () (assoc (map_of) "tags" (map_of) "fresh" (map_of))))
+
+; inferred_tags — the certain tags of a finished scan, sorted for stable
+; records and messages.
+(bind inferred_tags
+  (lambda (state)
+    (sequence_sort_by (map_keys (get state "tags" (map_of)))
+                      (lambda (k) k))))
+
+; derive_effect — the binary view of a tag set: any certain tag is "impure"
+; (even alongside unknowns), no tags + an unknowable head is null, else pure.
+(bind derive_effect
+  (lambda (tags unknown)
+    (cond
+      ((gt (size tags) 0) "impure")
+      ((not (eq unknown null)) null)
+      (else "pure"))))
+
+; ── purity check: settle a declared effect ──────────────────────────────────
+; settle_effect! — establish a paired record's effect. Constructor records
+; arrive with it set; a defn gets its TAGS inferred from the body, and a
+; declaration at the name is verified against them:
+;   pure     — no certain tag may remain (owned mutation carries none)
+;   impure   — anything goes (the legacy blanket)
+;   (tag …)  — every certain tag must be among the declared ones
+; Only certain contradictions are errors; the declaration wins otherwise
+; (the verified override for what inference cannot see).
+;   rec / lam : the sig record and its (lambda …) node
+;   env       : the typed body env
+;   sink      : diagnostics list
+;   report    : (sink msg node) -> located finding (passed in by infer, which
+;               owns the span/fallback machinery; effects loads before it)
+(bind settle_effect!
+  (lambda (rec lam env sink report)
+    (unless (contains rec "effect")
+      (bind ((state (effect_state)))
+        (do
+          (for k (sequence_range 1 (size (args_of lam)))
+            (effect_scan effect_scan (arg lam k) env
+                         (get rec "fname") state))
+          (bind (
+            (tags (inferred_tags state))
+            (tagmap (get state "tags" (map_of)))
+            (unknown (get state "unknown"))
+            (declared (get rec "declared_effect"))
+          )
+            (do
+              (cond
+                ((eq declared null) null)
+                ((eq declared "impure") null)
+                ((eq declared "pure")
+                  (when (gt (size tags) 0)
+                    (report sink
+                      (string_concat_many
+                        "`" (get rec "fname")
+                        "` declared pure but calls impure `"
+                        (get tagmap (get tags 0) "?") "`")
+                      lam)))
+                (else
+                  ; a declared TAG LIST ("a,b" in the marker)
+                  (bind ((allowed (map_of)))
+                    (do
+                      (for t (string_split declared ",")
+                        (do
+                          (unless (eq (get known_tags t false) true)
+                            (report sink
+                              (string_concat_many
+                                "`" (get rec "fname")
+                                "`: unknown effect tag `" t "`")
+                              lam))
+                          (assoc allowed t true)))
+                      (for t tags
+                        (unless (eq (get allowed t false) true)
+                          (report sink
+                            (string_concat_many
+                              "`" (get rec "fname")
+                              "` declared effects ("
+                              (string_replace declared "," " ")
+                              ") but its body has effect `" t
+                              "` (via `" (get tagmap t "?") "`)")
+                            lam)))))))
+              (assoc rec "effects"
+                (cond
+                  ((eq declared null) tags)
+                  ((eq declared "pure") (list_of))
+                  ((eq declared "impure") tags)
+                  (else (string_split declared ","))))
+              (assoc rec "effect"
+                (cond
+                  ((eq declared "pure") "pure")
+                  ((eq declared "impure") "impure")
+                  ((not (eq declared null)) "impure")
+                  (else (derive_effect tags unknown)))))))))))
+
+(export vocab known_tags effect_state effect_scan inferred_tags
+        derive_effect settle_effect!
+        register_fresh_head! register_arg0_mutator!)

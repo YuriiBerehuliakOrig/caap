@@ -1,0 +1,63 @@
+; stdlib/lib/test_option.caap — in-language tests for lib/option.
+
+;; @area: collections
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true assert_throws)
+(use stdlib.lib.collections.option some none some? none? option_of
+     option_unwrap option_unwrap_or option_map option_map_or option_filter
+     option_and_then option_or option_or_else option_to_result
+     option_map2 option_zip option_flatten
+     option? require_option!)
+
+(do
+  (assert_eq (some? (some 5)) true  "some? on some")
+  (assert_eq (some? (none))   false "some? on none")
+  (assert_eq (none? (none))   true  "none? on none")
+  (assert_eq (some? (option_of 5))    true  "option_of non-null")
+  (assert_eq (some? (option_of null)) false "option_of null -> none")
+  (assert_eq (option_unwrap (some 5)) 5 "option_unwrap some")
+  (assert_eq (option_unwrap_or (none) 9) 9  "option_unwrap_or none")
+  (assert_eq (option_unwrap_or (some 5) 9) 5 "option_unwrap_or some")
+  (assert_eq (option_unwrap_or (option_map (some 5) (lambda (x) (int_add x 1))) 0) 6 "option_map")
+  ; option_map_or — value-or-default, no Option wrapper
+  (assert_eq (option_map_or (some 5) 0 (lambda (x) (int_mul x 10))) 50 "option_map_or some")
+  (assert_eq (option_map_or (none) 0 (lambda (x) x)) 0 "option_map_or none is default")
+  ; option_filter — keep only when the predicate holds
+  (assert_eq (option_unwrap_or (option_filter (some 6) (lambda (x) (eq (int_mod x 2) 0))) -1) 6 "option_filter keeps")
+  (assert_eq (none? (option_filter (some 5) (lambda (x) (eq (int_mod x 2) 0)))) true "option_filter drops")
+  (assert_eq (none? (option_filter (none) (lambda (x) true))) true "option_filter on none")
+  (assert_eq (option_unwrap_or (option_and_then (some 5) (lambda (x) (some (int_mul x 2)))) 0) 10 "option_and_then")
+  (assert_eq (none? (option_and_then (none) (lambda (x) (some x)))) true "and_then on none")
+  (assert_eq (option_unwrap_or (option_or (none) (some 9)) 0) 9 "option_or alt")
+  (assert_eq (option_unwrap_or (option_or (some 3) (some 9)) 0) 3 "option_or first")
+  ; option_or_else — lazy alternative thunk
+  (assert_eq (option_unwrap_or (option_or_else (none) (lambda () (some 9))) 0) 9 "option_or_else calls thunk")
+  (assert_eq (option_unwrap_or (option_or_else (some 3) (lambda () (some 9))) 0) 3 "option_or_else keeps some")
+  ; option_to_result — labelled lift into Result
+  (assert_true (eq (get (option_to_result (some 5) "empty" "no value") "ok") true) "option_to_result some -> ok")
+  (assert_eq (get (get (option_to_result (none) "empty" "no value") "error") "code") "empty" "option_to_result none -> err code")
+  ; option_map2 — applicative lift over two Options
+  (assert_eq (option_unwrap_or (option_map2 (lambda (a b) (int_add a b)) (some 3) (some 4)) 0) 7 "option_map2 both some")
+  (assert_eq (none? (option_map2 (lambda (a b) a) (some 3) (none))) true "option_map2 short-circuits on none")
+  (assert_eq (none? (option_map2 (lambda (a b) a) (none) (some 4))) true "option_map2 none in first slot")
+  ; option_zip — pair two Options' values
+  (assert_eq (get (option_unwrap (option_zip (some 1) (some 2))) 0) 1 "option_zip first value")
+  (assert_eq (get (option_unwrap (option_zip (some 1) (some 2))) 1) 2 "option_zip second value")
+  (assert_eq (none? (option_zip (some 1) (none))) true "option_zip none -> none")
+  ; option_flatten — collapse nested Options
+  (assert_eq (option_unwrap_or (option_flatten (some (some 9))) 0) 9 "option_flatten unwraps one level")
+  (assert_eq (none? (option_flatten (some (none)))) true "option_flatten of (some none) is none")
+  (assert_eq (none? (option_flatten (none))) true "option_flatten of none is none")
+  (assert_eq (option_unwrap_or (option_flatten (some 7)) 0) 7 "option_flatten of a flat some passes through")
+  ; option? — strict structural predicate
+  (assert_eq (option? (some 1)) true  "option? on (some 1)")
+  (assert_eq (option? (none))   true  "option? on (none)")
+  (assert_eq (option? 5)        false "option? on a non-map")
+  (assert_eq (option? (assoc (map_of) "some" "yes")) false "option? on a malformed map (non-bool some)")
+  (assert_eq (option? (assoc (map_of) "some" true)) false "option? on a some lacking value")
+  ; require_option! — identity on a valid Option, throws otherwise
+  (assert_eq (option_unwrap (require_option! (some 7))) 7 "require_option! returns a valid Option")
+  (assert_throws (lambda () (require_option! 5)) "require_option! throws on a non-Option")
+  (assert_throws (lambda () (require_option! (assoc (map_of) "some" "yes"))) "require_option! throws on a malformed map")
+  true)

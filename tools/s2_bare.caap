@@ -1,0 +1,76 @@
+;; tools/s2_bare.caap — FREESTANDING / bare-metal build on stdlib's OWN
+;; backend (no host runtime). Authors RTOS/bare-metal code in the C-like NMV
+;; surface and cross-compiles it to a Cortex-M ELF.
+;;
+;;   caap stdlib/bootstrap.caap tools/s2_bare.caap SOURCE OUTPUT [TARGET] [SHIM] [LD]
+;;
+;; The bare stdlib/bootstrap.caap is enough; the driver and clike surface load
+;; by module name on demand. SOURCE may open with `(surface stdlib.frontend.clike)`
+;; (the NMV surface): it is lowered to kernel source, then emitted FREESTANDING
+;; (backend/emit/llvm emit_freestanding, no `main`/exit-code contract) for the
+;; chosen TARGET (default cortex-m3), assembled+linked by backend/driver
+;; compile_freestanding with the ARM asm SHIM and linker script LD.
+;; caap-sys-runtime is NOT linked.
+;;
+;; Target selection is bootstrap/tool POLICY (backend/driver targets), not a CLI
+;; flag — the CLI stays flagless (principle #7). This tool is a bare-kernel
+;; script (no stdlib sugar): it uses only kernel forms (if/do/bind/try).
+(bind (
+  (args  (ctfe_compiler_lookup_value compiler "cli.args"))
+  ; load_module auto-loads modules BY NAME, so bare stdlib/bootstrap.caap is
+  ; enough — backend.driver and the clike surface pull in on demand.
+  (lm    (get (ctfe_compiler_lookup_value compiler "stdlib.load") "load_module"))
+  (build (lm "stdlib.backend.driver"))
+  (clike (lm "stdlib.frontend.clike"))
+  (render (lm "stdlib.syntax.render"))
+  (svc (lambda (s n) (host_service_export s n "compile_time")))
+)
+  (do
+    (if (lt (size args) 2)
+      (runtime_error
+        "usage: caap stdlib/bootstrap.caap tools/s2_bare.caap SOURCE OUTPUT [TARGET] [SHIM] [LD]")
+      null)
+    (bind (
+      (src   (get args 0 null))
+      (out   (get args 1 null))
+      (tname (get args 2 "cortex-m3"))
+      (shim  (get args 3 null))
+      (ld    (get args 4 null))
+      (tgt   (get (get build "targets" (map_of)) tname))
+    )
+      (do
+        (if (eq tgt null)
+          (runtime_error (string_concat_many "s2_bare: unknown target `" tname "`"))
+          null)
+        (bind (
+          (read_text   (svc "fs" "read_text"))
+          (write_text  (svc "fs" "write_text"))
+          (remove_file (svc "fs" "remove_file"))
+          ; lower the C-like NMV surface to kernel source, then build it
+          (lr ((get clike "lower_program_at") (read_text src) src))
+        )
+          (do
+            (if (get lr "ok" false)
+              null
+              (runtime_error (string_concat_many "s2_bare clike: " (get lr "error" ""))))
+            (bind (
+              (tmp (string_concat_many out ".gen.caap"))
+              (opts (assoc (map_of)
+                      "triple" (get tgt "triple")
+                      "cpu" (get tgt "cpu")
+                      "datalayout" (get tgt "datalayout")
+                      "linker" (get tgt "linker" "lld")
+                      "shim" shim "ld" ld))
+            )
+              (do
+                (write_text tmp ((get render "render_program") (get lr "forms")))
+                (bind ((r ((get build "compile_freestanding") tmp out opts)))
+                  (do
+                    (try (remove_file tmp) (catch e null))
+                    (if (get r "ok" false)
+                      0
+                      (runtime_error
+                        (string_concat_many "s2_bare failed: "
+                          (if (eq (get r "error" null) null)
+                            (value_to_string (get r "diagnostics" null))
+                            (get r "error" "")))))))))))))))

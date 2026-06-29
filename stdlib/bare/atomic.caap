@@ -1,0 +1,164 @@
+; stdlib/bare/atomic.caap — typed atomic-word helpers over the atomic_* heads
+; (module stdlib.bare.atomic).
+;
+; Lock-free access to a shared word at a fixed integer address. Like MMIO, the
+; address is a plain int inttoptr'd to a pointer; UNLIKE MMIO, the access is an
+; LLVM atomic (`atomicrmw add` / `cmpxchg` / `load atomic` / `store atomic`),
+; so it is safe against concurrent access from another core. seq_cst ordering
+; (the strongest, the right default for a safe wrapper) is used throughout.
+;
+; This is the SMP / multi-core mechanism `docs/design-bare-metal.md` §7 deferred:
+; a single-core Cortex-M masks interrupts (stdlib.bare.critical) for mutual
+; exclusion, but a multi-core / SMP target needs real atomics. These wrappers
+; pin one width each so a driver writes `(atomic_add32 counter 1)` instead of
+; repeating the `(atomic_add addr u32 1)` triple at each use site.
+;
+; SCOPE — NATIVE/clike-targeted (the LLVM backend lowers atomic_*). They are
+; inlined into a native program by the backend prep path's `(use …)` mechanism;
+; they are NOT loadable by the plain eval loader (an atomic word has no meaning
+; in the CTFE sandbox, and atomic_* is a native-only head). See
+; stdlib/bare/README.md. The address is a u32 on a 32-bit MCU; widen to u64 on a
+; 64-bit target. The width token (u32/u64) names the LLVM scalar to access.
+(module stdlib.bare.atomic)
+
+; ── loads — atomically read a shared word ────────────────────────────────────
+; atomic_load32/64 — read the word at `addr` atomically (seq_cst).
+;   addr : the word's integer address
+;   ->   : the word's current value, the named width
+(defn atomic_load32 ((addr u32)) u32 (atomic_load addr u32))
+(defn atomic_load64 ((addr u64)) u64 (atomic_load addr u64))
+
+; ── stores — atomically write a shared word ──────────────────────────────────
+; atomic_store32/64 — store `val` into the word at `addr` atomically. Returns 0
+; so the helper is usable as an expression (the clike surface needs a value).
+;   addr : the word's integer address
+;   val  : the value to store, the named width
+;   ->   : 0
+(defn atomic_store32 ((addr u32) (val u32)) i32 (mutation)
+  (do (atomic_store addr u32 val) 0))
+(defn atomic_store64 ((addr u64) (val u64)) i32 (mutation)
+  (do (atomic_store addr u64 val) 0))
+
+; ── fetch-add — atomically add, returning the value BEFORE the add ───────────
+; atomic_add32/64 — atomically add `delta` to the word at `addr`; returns the
+; OLD value (the value in memory before the add), the lock-free counter idiom.
+;   addr  : the word's integer address
+;   delta : the amount to add, the named width
+;   ->    : the value that was at `addr` before the add
+(defn atomic_add32 ((addr u32) (delta u32)) u32 (mutation)
+  (atomic_add addr u32 delta))
+(defn atomic_add64 ((addr u64) (delta u64)) u64 (mutation)
+  (atomic_add addr u64 delta))
+
+; ── compare-and-swap — the lock-free building block ──────────────────────────
+; atomic_cas32/64 — if the word at `addr` equals `expected`, store `desired`.
+; Returns the value that WAS in memory (the loaded value): it equals `expected`
+; on success, and a different value on failure — the lock-free loop compares the
+; result to `expected` to decide whether to retry.
+;   addr     : the word's integer address
+;   expected : the value the caller expects to find
+;   desired  : the value to install if the expectation holds
+;   ->       : the value found in memory (== expected on success)
+(defn atomic_cas32 ((addr u32) (expected u32) (desired u32)) u32 (mutation)
+  (atomic_cas addr u32 expected desired))
+(defn atomic_cas64 ((addr u64) (expected u64) (desired u64)) u64 (mutation)
+  (atomic_cas addr u64 expected desired))
+
+; ── fetch-OP — read-modify-write composed from compare-and-swap ───────────────
+; The backend exposes exactly four atomic heads (atomic_load/store/add/cas — see
+; stdlib/backend/native_meta.caap); there is no native `atomicrmw sub/and/or/xor/
+; xchg`. The helpers below COMPOSE those ops from atomic_cas32/64 (portable: any
+; RMW is a CAS loop). Each is a fetch-OP: it returns the OLD value (the word in
+; memory before the op), matching atomic_add32/64's fetch-add idiom.
+;
+; The retry is the lock-free CAS loop: snapshot `old`, compute the desired word
+; from THAT snapshot, then CAS old->desired. CAS returns the value it FOUND; if
+; that equals `old` the swap landed (return the old value), otherwise another
+; core won the race — retry with a FRESH snapshot. The retry is a tail self-call,
+; so the expected value and the computed value always come from the same load
+; (no torn read-modify-write) and a settled word terminates the loop at once.
+;
+; RELIES ON TAIL-SELF-CALL LOWERING — each fetch-OP below recurses on itself in
+; TAIL position (the retry is the function's returned value), so a backend that
+; rewrites tail self-calls into a loop runs this in CONSTANT stack regardless of
+; contention. NOTE that this is a FACT the backend MAY exploit, not a guarantee:
+; the tailcall pass (stdlib.semantics.passes.tailcall) is an ANALYSIS — it
+; publishes a `tailcall` fact / a TCO-candidate advisory, it does not FORCE the
+; rewrite. A backend without TCO would recurse on the C stack instead, so under
+; pathological unbounded contention the loop could grow the stack; the wrappers
+; are written tail-recursive so the optimization is AVAILABLE, not mandated.
+;   addr  : the word's integer address
+;   val   : the operand (delta / mask / new value), the named width
+;   ->    : the value that was at `addr` before the op
+
+; atomic_sub32/64 — atomically subtract `delta`; returns the OLD value.
+(defn atomic_sub32 ((addr u32) (delta u32)) u32 (mutation)
+  (bind ((old (atomic_load32 addr)))
+    (if (eq (atomic_cas32 addr old (int_sub old delta)) old)
+      old
+      (atomic_sub32 addr delta))))
+(defn atomic_sub64 ((addr u64) (delta u64)) u64 (mutation)
+  (bind ((old (atomic_load64 addr)))
+    (if (eq (atomic_cas64 addr old (int_sub old delta)) old)
+      old
+      (atomic_sub64 addr delta))))
+
+; atomic_and32/64 — atomically AND-in `mask`; returns the OLD value.
+(defn atomic_and32 ((addr u32) (mask u32)) u32 (mutation)
+  (bind ((old (atomic_load32 addr)))
+    (if (eq (atomic_cas32 addr old (int_and old mask)) old)
+      old
+      (atomic_and32 addr mask))))
+(defn atomic_and64 ((addr u64) (mask u64)) u64 (mutation)
+  (bind ((old (atomic_load64 addr)))
+    (if (eq (atomic_cas64 addr old (int_and old mask)) old)
+      old
+      (atomic_and64 addr mask))))
+
+; atomic_or32/64 — atomically OR-in `mask`; returns the OLD value.
+(defn atomic_or32 ((addr u32) (mask u32)) u32 (mutation)
+  (bind ((old (atomic_load32 addr)))
+    (if (eq (atomic_cas32 addr old (int_or old mask)) old)
+      old
+      (atomic_or32 addr mask))))
+(defn atomic_or64 ((addr u64) (mask u64)) u64 (mutation)
+  (bind ((old (atomic_load64 addr)))
+    (if (eq (atomic_cas64 addr old (int_or old mask)) old)
+      old
+      (atomic_or64 addr mask))))
+
+; atomic_xor32/64 — atomically XOR-in `mask`; returns the OLD value.
+(defn atomic_xor32 ((addr u32) (mask u32)) u32 (mutation)
+  (bind ((old (atomic_load32 addr)))
+    (if (eq (atomic_cas32 addr old (int_xor old mask)) old)
+      old
+      (atomic_xor32 addr mask))))
+(defn atomic_xor64 ((addr u64) (mask u64)) u64 (mutation)
+  (bind ((old (atomic_load64 addr)))
+    (if (eq (atomic_cas64 addr old (int_xor old mask)) old)
+      old
+      (atomic_xor64 addr mask))))
+
+; atomic_xchg32/64 — atomically SWAP in `val` (the desired word ignores the old
+; value); returns the OLD value. The atomic test-and-set building block: install
+; `val` and learn what was there in one lock-free step.
+(defn atomic_xchg32 ((addr u32) (val u32)) u32 (mutation)
+  (bind ((old (atomic_load32 addr)))
+    (if (eq (atomic_cas32 addr old val) old)
+      old
+      (atomic_xchg32 addr val))))
+(defn atomic_xchg64 ((addr u64) (val u64)) u64 (mutation)
+  (bind ((old (atomic_load64 addr)))
+    (if (eq (atomic_cas64 addr old val) old)
+      old
+      (atomic_xchg64 addr val))))
+
+(export atomic_load32 atomic_load64
+        atomic_store32 atomic_store64
+        atomic_add32 atomic_add64
+        atomic_cas32 atomic_cas64
+        atomic_sub32 atomic_sub64
+        atomic_and32 atomic_and64
+        atomic_or32 atomic_or64
+        atomic_xor32 atomic_xor64
+        atomic_xchg32 atomic_xchg64)

@@ -1,0 +1,60 @@
+; stdlib/lib/test_result.caap — in-language tests for lib/result.
+
+;; @area: collections
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true assert_throws)
+(use stdlib.lib.collections.result ok err ok? err? error_of error_code error_message
+     unwrap unwrap_err unwrap_or map_ok map_or and_then map_err or_else result_or
+     to_option from_option
+     result? require_result!)
+(use stdlib.lib.collections.option some none some? none?)
+
+(do
+  (assert_eq (ok? (ok 5))        true  "ok? on ok")
+  (assert_eq (ok? (err "e" "m")) false "ok? on err")
+  (assert_eq (err? (err "e" "m")) true "err? on err")
+  (assert_eq (unwrap (ok 5))     5     "unwrap ok")
+  (assert_eq (unwrap_or (err "e" "m") 9) 9 "unwrap_or on err")
+  (assert_eq (unwrap_or (ok 5) 9) 5    "unwrap_or on ok")
+  (assert_eq (unwrap (map_ok (ok 5) (lambda (x) (int_add x 1)))) 6 "map_ok")
+  (assert_eq (ok? (map_ok (err "e" "m") (lambda (x) x))) false "map_ok on err passes through")
+  (assert_eq (unwrap (and_then (ok 5) (lambda (x) (ok (int_mul x 2))))) 10 "and_then")
+  (assert_eq (get (error_of (map_err (err "E" "boom") (lambda (e) (assoc (map_of) "code" "WRAP" "message" (get e "message"))))) "code") "WRAP" "map_err transforms")
+  (assert_eq (ok? (map_err (ok 1) (lambda (e) e))) true "map_err passes ok through")
+  (assert_eq (unwrap (or_else (err "E" "x") (lambda (e) (ok 42)))) 42 "or_else recovers")
+  (assert_eq (unwrap (or_else (ok 7) (lambda (e) (ok 0)))) 7 "or_else passes ok")
+  ; error_code / error_message — direct accessors, total on ok
+  (assert_eq (error_code (err "io.read" "boom"))    "io.read" "error_code on err")
+  (assert_eq (error_message (err "io.read" "boom")) "boom"    "error_message on err")
+  (assert_eq (error_code (ok 1)) "" "error_code on ok is empty")
+  ; unwrap_err — the error payload, throws on ok
+  (assert_eq (get (unwrap_err (err "E" "m")) "code") "E" "unwrap_err gives the error")
+  ; map_or — value-or-default without a Result wrapper
+  (assert_eq (map_or (ok 5) 0 (lambda (x) (int_mul x 10))) 50 "map_or on ok applies f")
+  (assert_eq (map_or (err "e" "m") 0 (lambda (x) x)) 0 "map_or on err is default")
+  ; result_or — eager alternative Result
+  (assert_eq (unwrap (result_or (err "e" "m") (ok 7))) 7 "result_or falls back")
+  (assert_eq (unwrap (result_or (ok 3) (ok 7))) 3 "result_or keeps ok")
+  ; to_option — bridge to Option, dropping the error
+  (assert_true (some? (to_option (ok 5))) "to_option ok -> some")
+  (assert_true (none? (to_option (err "e" "m"))) "to_option err -> none")
+  ; from_option — lift an Option into a Result, labelling an absence
+  (assert_eq (unwrap (from_option (some 5) (assoc (map_of) "code" "empty" "message" "no value"))) 5 "from_option some -> ok value")
+  (bind ((r (from_option (none) (assoc (map_of) "code" "empty" "message" "no value"))))
+    (do
+      (assert_true (err? r) "from_option none -> err")
+      (assert_eq (error_code r) "empty" "from_option carries the error code")))
+  ; result? — strict structural predicate
+  (assert_eq (result? (ok 1))      true  "result? on (ok 1)")
+  (assert_eq (result? (err "c" "m")) true "result? on (err c m)")
+  (assert_eq (result? 5)           false "result? on a non-map")
+  (assert_eq (result? (assoc (map_of) "ok" "yes")) false "result? on a malformed map (non-bool ok)")
+  (assert_eq (result? (assoc (map_of) "ok" true)) false "result? on an ok lacking value")
+  (assert_eq (result? (assoc (map_of) "ok" false)) false "result? on an err lacking error")
+  (assert_eq (result? (assoc (map_of) "ok" false "error" (assoc (map_of) "code" "c"))) false "result? on an err whose error lacks message")
+  ; require_result! — identity on a valid Result, throws otherwise
+  (assert_eq (unwrap (require_result! (ok 7))) 7 "require_result! returns a valid Result")
+  (assert_throws (lambda () (require_result! 5)) "require_result! throws on a non-Result")
+  (assert_throws (lambda () (require_result! (assoc (map_of) "ok" "yes"))) "require_result! throws on a malformed map")
+  true)

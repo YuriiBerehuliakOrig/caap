@@ -1,0 +1,108 @@
+; stdlib/lib/tests/test_session.caap — the unified compile-session context (audit #1).
+;
+; Proves the session contract: it OWNS cells (created once, reset re-inits in place),
+; AGGREGATES subsystem resets under one session_reset!, and exposes a live inventory
+; (session_subsystems / session_cell_names). Also proves the REAL subsystems wired in
+; round-3 Wave B #1 — backend.prep (target/strict cells), semantics.passes (fact
+; store), frontend.clike.state — are registered and actually reset by one call.
+;; @area: session
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true assert_throws)
+(use stdlib.semantics.session
+  session_cell! session_cell_owned! session_register! session_reset!
+  session_subsystems session_cell_names)
+(use stdlib.backend.prep
+  set_target_ptr_bytes! target_pointer_bytes set_strict! strict?)
+(use stdlib.semantics.passes.registry fact! fact_of)
+
+(do
+  (bind (
+    ; contains? — membership over a plain list (avoids assuming a stdlib helper).
+    (contains?
+      (lambda (lst x)
+        (bind ((found (ref false)))
+          (do (sequence_each lst (lambda (e) (if (eq e x) (set_ref found true) null)))
+              (deref found)))))
+    ; an owned cell + a hook counter, kept in the OUTER scope so they stay live
+    ; across the mutate -> session_reset! -> assert sequence below.
+    (c (session_cell! "test.session.x" (lambda () 7)))
+    (hook_ran (ref 0))
+  )
+    (do
+      ; ── owned cell: init from thunk, mutate, idempotent re-request ──
+      (assert_eq (deref c) 7 "session_cell! inits from its thunk")
+      (set_ref c 99)
+      (assert_eq (deref c) 99 "owned cell is mutable")
+      ; a second call with the same name returns the SAME ref (init ignored), so
+      ; the live value (99) is preserved.
+      (bind ((c2 (session_cell! "test.session.x" (lambda () 123))))
+        (assert_eq (deref c2) 99 "same-name session_cell! returns the same ref"))
+
+      ; ── a registered reset hook; re-registering the name REPLACES it ──
+      (session_register! "test.session.demo"
+        (lambda () (set_ref hook_ran (int_add (deref hook_ran) 1))))
+      (session_register! "test.session.demo"
+        (lambda () (set_ref hook_ran (int_add (deref hook_ran) 1))))
+
+      ; ── mutate the REAL wired subsystems, then ONE session_reset! ──
+      (set_target_ptr_bytes! 4)
+      (assert_eq (target_pointer_bytes) 4 "prep target pinned to 4")
+      (set_strict!)
+      (assert_true (strict?) "prep strict pinned on")
+      (fact! "test.session" "k" 1)
+      (assert_eq (fact_of "test.session" "k" 0) 1 "pass fact stored")
+
+      (session_reset!)
+
+      ; owned cell back to its init
+      (assert_eq (deref c) 7 "session_reset! re-inits the owned cell")
+      ; the demo hook ran exactly once (re-register replaced, did not duplicate)
+      (assert_eq (deref hook_ran) 1 "session_reset! runs each hook once")
+      ; prep cells restored to host defaults
+      (assert_eq (target_pointer_bytes) 8 "session_reset! restores prep target default (8)")
+      (assert_true (not (strict?)) "session_reset! clears prep strict")
+      ; pass fact store emptied
+      (assert_eq (fact_of "test.session" "k" 0) 0 "session_reset! empties the pass fact store")
+
+      ; ── inventory: the real subsystems + the owned cells are visible ──
+      (assert_true (contains? (session_subsystems) "semantics.passes")
+        "session_subsystems includes the pass fact store")
+      (assert_true (contains? (session_subsystems) "test.session.demo")
+        "session_subsystems includes the registered demo hook")
+      ; clike per-file state is a session CELL (audit #17), so it appears under
+      ; session_cell_names, not session_subsystems.
+      (assert_true (contains? (session_cell_names) "frontend.clike.state")
+        "session_cell_names includes the clike per-file state cell")
+      (assert_true (contains? (session_cell_names) "backend.prep.target_ptr_bytes")
+        "session_cell_names includes the prep target cell")
+      (assert_true (contains? (session_cell_names) "test.session.x")
+        "session_cell_names includes the test-owned cell")
+
+      ; ── session_cell_names returns a DETACHED copy (audit #31) ──
+      ; Mutating the returned list must NOT corrupt the internal registration
+      ; order: a later (session_cell_names) is unaffected, and session_reset!
+      ; (which walks the SAME internal list) still re-inits the cell.
+      (bind ((names1 (session_cell_names)))
+        (do
+          (append names1 "test.session.bogus")
+          (assert_true (not (contains? (session_cell_names) "test.session.bogus"))
+            "mutating session_cell_names result does not leak into a later inventory")))
+      (set_ref c 42)
+      (session_reset!)
+      (assert_eq (deref c) 7
+        "session_reset! still re-inits after the inventory list was mutated")
+
+      ; ── session_cell_owned!: owner contract (opt-in, audit #31) ──
+      ; A first claim returns a working ref initialised from its thunk.
+      (bind ((oc (session_cell_owned! "test.owner.a" "test.session.owned" (lambda () 5))))
+        (do
+          (assert_eq (deref oc) 5 "session_cell_owned! inits from its thunk")
+          ; the SAME owner re-claiming is idempotent: returns the SAME live ref.
+          (set_ref oc 88)
+          (bind ((oc2 (session_cell_owned! "test.owner.a" "test.session.owned" (lambda () 5))))
+            (assert_eq (deref oc2) 88 "same-owner session_cell_owned! reuses the ref"))))
+      ; a DIFFERENT owner claiming the same name is a contract violation -> throws.
+      (assert_throws
+        (lambda () (session_cell_owned! "test.owner.b" "test.session.owned" (lambda () 5)))
+        "session_cell_owned! rejects a different owner for the same name"))))

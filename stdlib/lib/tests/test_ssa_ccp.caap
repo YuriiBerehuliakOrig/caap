@@ -1,0 +1,392 @@
+; stdlib/lib/tests/test_ssa_ccp.caap — SSA-based sparse conditional constant
+; propagation (stdlib.semantics.passes.ssa_ccp), with an explicit BEHAVIOR-
+; PRESERVATION proof on every case (eval the IR before and after; the transform may
+; only change SHAPE, not MEANING) PLUS the SSA WIN and the ccp CONTRAST.
+;
+; THE WIN: a ref written the SAME constant on BOTH arms of an `if` —
+;   (bind "c" true (bind "r" (ref 0) (do (if c (set_ref r 5) (set_ref r 5)) (deref r))))
+; is provably 5 regardless of c. ssa_ccp folds the trailing `(deref r)` to 5 (the
+; ACROSS-MERGE fold). The conservative `ccp` BAILS on the cross-arm rebind and
+; leaves the deref intact — the contrast that proves SSA bought the precision.
+
+;; @area: passes
+;; @kind: regression
+;; @slow: true
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.ssa_ccp ssa_ccp_node)
+(use stdlib.semantics.passes.ccp ccp_node)
+(use stdlib.syntax.ir node_eq)
+(use stdlib.syntax.ast
+  sym lit calln call eval_ir walk head_is? call? name? name_of arg args_of head_of
+  literal? literal_of)
+
+; ── helpers ───────────────────────────────────────────────────────────────────
+; find_deref_of? — is there a `(deref <name nm>)` call anywhere in the tree (the
+; ref read was preserved, NOT folded to a literal)?
+(bind find_deref_of?
+  (lambda (node nm)
+    (cond
+      ((not (call? node)) false)
+      ((and (head_is? node "deref") (name? (arg node 0)) (eq (name_of (arg node 0)) nm))
+        true)
+      (else
+        (bind ((hit (ref false)))
+          (do
+            (when (find_deref_of? (syntax_call_callee node) nm) (set_ref hit true))
+            (for a (args_of node) (when (find_deref_of? a nm) (set_ref hit true)))
+            (deref hit)))))))
+
+; contains_lit? — does any literal node in the tree carry scalar VALUE v?
+(bind contains_lit?
+  (lambda (node v)
+    (cond
+      ((literal? node) (eq (literal_of node) v))
+      ((not (call? node)) false)
+      (else
+        (bind ((hit (ref false)))
+          (do
+            (when (contains_lit? (syntax_call_callee node) v) (set_ref hit true))
+            (for a (args_of node) (when (contains_lit? a v) (set_ref hit true)))
+            (deref hit)))))))
+
+; mentions_ref_deref? — any `(deref <name r>)` anywhere (the surface ref read, in
+; the SSA output a ref read of r only survives in an UNSUPPORTED/bailed body).
+(bind any_phi?
+  (lambda (node)
+    (bind ((hit (ref false)))
+      (do
+        (walk node (lambda (n) (when (and (call? n) (head_is? n "__phi__")) (set_ref hit true))))
+        (deref hit)))))
+
+; ── IR builders ───────────────────────────────────────────────────────────────
+(do
+  (bind (
+    (setr (lambda (r v) (calln "set_ref" (list_of (sym r) v))))
+    (drf  (lambda (r)   (calln "deref" (list_of (sym r)))))
+    (mkref (lambda (v)  (calln "ref" (list_of v))))
+    (refbind (lambda (r v body) (calln "bind" (list_of (lit r) (mkref v) body))))
+  )
+    (do
+      ; ════════════════════════════════════════════════════════════════════════
+      ; 1. THE WIN — const 5 on BOTH arms of an if; ssa_ccp folds the trailing
+      ;    (deref r) to (lit 5) ACROSS the merge. ccp bails (the contrast).
+      ;    (bind "c" true (bind "r" (ref 0) (do (if c (set_ref r 5) (set_ref r 5)) (deref r))))
+      ; ════════════════════════════════════════════════════════════════════════
+      (bind (
+        (win (calln "bind"
+               (list_of (lit "c") (lit true)
+                 (refbind "r" (lit 0)
+                   (calln "do"
+                     (list_of
+                       (calln "if" (list_of (sym "c") (setr "r" (lit 5)) (setr "r" (lit 5))))
+                       (drf "r")))))))
+        (out_ssa (ssa_ccp_node win))
+        (out_ccp (ccp_node win))
+      )
+        (do
+          ; behavior preserved: same value before and after.
+          (assert_eq (eval_ir win) 5 "WIN: original evals 5")
+          (assert_eq (eval_ir out_ssa) (eval_ir win) "WIN: ssa_ccp eval preserved")
+          ; THE FOLD FIRED: the trailing (deref r) is GONE (no deref of r survives)
+          ; AND the executable output is φ-free (from_ssa materialised it).
+          (assert_true (not (find_deref_of? out_ssa "r"))
+            "WIN: ssa_ccp folded the deref of r away (across-merge fold)")
+          (assert_true (contains_lit? out_ssa 5)
+            "WIN: the folded literal 5 is present in the rewritten tree")
+          (assert_true (not (any_phi? out_ssa))
+            "WIN: no __phi__ survives the from_ssa round-trip (executable)")
+          ; THE CONTRAST — the conservative ccp BAILS: it leaves the (deref r)
+          ; intact (it poisons r the moment it sees set_ref, and its env does not
+          ; cross the if merge). This is exactly the precision SSA bought.
+          (assert_eq (eval_ir out_ccp) (eval_ir win) "WIN/contrast: ccp eval preserved")
+          (assert_true (find_deref_of? out_ccp "r")
+            "WIN/contrast: ccp leaves the (deref r) intact — it bails on the cross-arm rebind")))
+
+      ; ════════════════════════════════════════════════════════════════════════
+      ; 1b. THE WIN with c=false — folds to the SAME 5 regardless of the condition.
+      ; ════════════════════════════════════════════════════════════════════════
+      (bind (
+        (win_f (calln "bind"
+                 (list_of (lit "c") (lit false)
+                   (refbind "r" (lit 0)
+                     (calln "do"
+                       (list_of
+                         (calln "if" (list_of (sym "c") (setr "r" (lit 5)) (setr "r" (lit 5))))
+                         (drf "r")))))))
+        (out (ssa_ccp_node win_f))
+      )
+        (do
+          (assert_eq (eval_ir win_f) 5 "WIN c=false: original evals 5")
+          (assert_eq (eval_ir out) (eval_ir win_f) "WIN c=false: eval preserved")
+          (assert_true (not (find_deref_of? out "r"))
+            "WIN c=false: folded across the merge regardless of c")))
+
+      ; ════════════════════════════════════════════════════════════════════════
+      ; 2. THE WIN folds INTO a downstream consumer — both arms write 5, the merge
+      ;    flows into arithmetic. ssa_ccp folds the deref to 5 AND constfold then
+      ;    folds (int_add 5 100) to 105.
+      ;    (bind "c" false (bind "r" (ref 0)
+      ;       (do (if c (set_ref r 5) (set_ref r 5)) (int_add (deref r) 100)))) -> 105
+      ; ════════════════════════════════════════════════════════════════════════
+      (bind (
+        (body (calln "bind"
+                (list_of (lit "c") (lit false)
+                  (refbind "r" (lit 0)
+                    (calln "do"
+                      (list_of
+                        (calln "if" (list_of (sym "c") (setr "r" (lit 5)) (setr "r" (lit 5))))
+                        (calln "int_add" (list_of (drf "r") (lit 100)))))))))
+        (out (ssa_ccp_node body))
+      )
+        (do
+          (assert_eq (eval_ir body) 105 "WIN-into-use: original evals 105")
+          (assert_eq (eval_ir out) (eval_ir body) "WIN-into-use: eval preserved")
+          (assert_true (not (find_deref_of? out "r"))
+            "WIN-into-use: the deref of r folded away")
+          (assert_true (contains_lit? out 105)
+            "WIN-into-use: the const-folded 105 is present (deref->5, int_add 5 100->105)")))
+
+      ; ════════════════════════════════════════════════════════════════════════
+      ; 3. STRAIGHT-LINE const — last store wins; the trailing deref folds.
+      ;    (bind "r" (ref 0) (do (set_ref r 1) (set_ref r 2) (deref r))) -> 2
+      ; ════════════════════════════════════════════════════════════════════════
+      (bind (
+        (sl (refbind "r" (lit 0)
+              (calln "do" (list_of (setr "r" (lit 1)) (setr "r" (lit 2)) (drf "r")))))
+        (out (ssa_ccp_node sl))
+      )
+        (do
+          (assert_eq (eval_ir sl) 2 "straight-line: original evals 2")
+          (assert_eq (eval_ir out) (eval_ir sl) "straight-line: eval preserved")
+          (assert_true (not (find_deref_of? out "r"))
+            "straight-line: the trailing deref folded to the last const (2)")
+          (assert_true (contains_lit? out 2) "straight-line: literal 2 present")))
+
+      ; ════════════════════════════════════════════════════════════════════════
+      ; 4. NON-CONST MERGE — arms write DIFFERENT consts (5 / 7); the φ-version is
+      ;    NOT const, so the trailing deref is KEPT (a missed fold, never a wrong
+      ;    one). Behavior preserved for BOTH conditions.
+      ;    (bind "c" <bool> (bind "r" (ref 0)
+      ;       (do (if c (set_ref r 5) (set_ref r 7)) (deref r))))
+      ; ════════════════════════════════════════════════════════════════════════
+      (bind (
+        (mk_nc
+          (lambda (cval)
+            (calln "bind"
+              (list_of (lit "c") (lit cval)
+                (refbind "r" (lit 0)
+                  (calln "do"
+                    (list_of
+                      (calln "if" (list_of (sym "c") (setr "r" (lit 5)) (setr "r" (lit 7))))
+                      (drf "r"))))))))
+      )
+        (do
+          ; c=true -> 5
+          (bind ((nc (mk_nc true)) (out (ssa_ccp_node nc)))
+            (do
+              (assert_eq (eval_ir nc) 5 "non-const-merge c=true: original evals 5")
+              (assert_eq (eval_ir out) (eval_ir nc) "non-const-merge c=true: eval preserved")
+              ; the diverging φ-version is NOT folded — its merged use is kept and
+              ; the output is φ-free (the merged value flows through the if's result).
+              (assert_true (not (any_phi? out))
+                "non-const-merge c=true: no φ survives (executable)")))
+          ; c=false -> 7
+          (bind ((nc (mk_nc false)) (out (ssa_ccp_node nc)))
+            (do
+              (assert_eq (eval_ir nc) 7 "non-const-merge c=false: original evals 7")
+              (assert_eq (eval_ir out) (eval_ir nc) "non-const-merge c=false: eval preserved")
+              (assert_true (not (any_phi? out))
+                "non-const-merge c=false: no φ survives (executable)")))))
+
+      ; ════════════════════════════════════════════════════════════════════════
+      ; 5. WHILE-LOOP — a loop-carried ref is NOT promotable, so to_ssa BAILS and
+      ;    ssa_ccp returns the body verbatim (identity). Behavior preserved.
+      ;    (bind "r" (ref 0)
+      ;       (do (while (lt (deref r) 3) (set_ref r (int_add (deref r) 1))) (deref r))) -> 3
+      ; ════════════════════════════════════════════════════════════════════════
+      (bind (
+        (wl (refbind "r" (lit 0)
+              (calln "do"
+                (list_of
+                  (calln "while"
+                    (list_of (calln "lt" (list_of (drf "r") (lit 3)))
+                      (setr "r" (calln "int_add" (list_of (drf "r") (lit 1))))))
+                  (drf "r")))))
+        (out (ssa_ccp_node wl))
+      )
+        (do
+          (assert_eq (eval_ir wl) 3 "while-loop: original evals 3")
+          (assert_eq (eval_ir out) (eval_ir wl) "while-loop: eval preserved")
+          ; unsupported -> identity: the output is node_eq the input, no fold attempted.
+          (assert_true (node_eq out wl)
+            "while-loop: unsupported body returned verbatim (identity, no fold)")
+          (assert_true (not (any_phi? out)) "while-loop: no φ introduced")))
+
+      ; ════════════════════════════════════════════════════════════════════════
+      ; 6. NO-PROMOTABLE-REF body — nothing to SSA (a plain do of literals); bails
+      ;    to identity, eval preserved.
+      ;    (do 1 2) -> 2
+      ; ════════════════════════════════════════════════════════════════════════
+      (bind (
+        (plain (calln "do" (list_of (lit 1) (lit 2))))
+        (out (ssa_ccp_node plain))
+      )
+        (do
+          (assert_eq (eval_ir plain) 2 "no-ref: original evals 2")
+          (assert_eq (eval_ir out) (eval_ir plain) "no-ref: eval preserved")
+          (assert_true (node_eq out plain)
+            "no-ref: a body with no promotable ref is returned verbatim (identity)")))
+
+      ; ════════════════════════════════════════════════════════════════════════
+      ; 7. SEQUENTIAL const merges — two if-merges in a row, BOTH const on both
+      ;    arms; ssa_ccp folds the trailing deref across both merges.
+      ;    (bind "c" true (bind "d" false (bind "r" (ref 0)
+      ;       (do (if c (set_ref r 3) (set_ref r 3))
+      ;           (if d (set_ref r 9) (set_ref r 9))
+      ;           (deref r))))) -> 9
+      ; ════════════════════════════════════════════════════════════════════════
+      (bind (
+        (body (calln "bind"
+                (list_of (lit "c") (lit true) (lit "d") (lit false)
+                  (refbind "r" (lit 0)
+                    (calln "do"
+                      (list_of
+                        (calln "if" (list_of (sym "c") (setr "r" (lit 3)) (setr "r" (lit 3))))
+                        (calln "if" (list_of (sym "d") (setr "r" (lit 9)) (setr "r" (lit 9))))
+                        (drf "r")))))))
+        (out (ssa_ccp_node body))
+      )
+        (do
+          (assert_eq (eval_ir body) 9 "sequential-const-merge: original evals 9")
+          (assert_eq (eval_ir out) (eval_ir body) "sequential-const-merge: eval preserved")
+          (assert_true (not (find_deref_of? out "r"))
+            "sequential-const-merge: the trailing deref folded across both merges")
+          (assert_true (contains_lit? out 9)
+            "sequential-const-merge: the final const 9 is present")
+          (assert_true (not (any_phi? out))
+            "sequential-const-merge: no φ survives (executable)")))
+
+      ; ════════════════════════════════════════════════════════════════════════
+      ; ADVERSARIAL / SOUNDNESS REGRESSIONS — every case below must be EVAL-
+      ; PRESERVED. These exercise the two guards that keep ssa_ccp sound: it folds
+      ; ONLY genuine SSA versions (never a user binding, so a shadow can't collapse),
+      ; and it BAILS when the underlying SSA round-trip is not behavior-faithful.
+      ; ════════════════════════════════════════════════════════════════════════
+
+      ; ── 8. SHADOWED user const — ssa_ccp folds only SSA VERSIONS, never a user
+      ;    binding, so a name bound twice in different scopes is never collapsed to
+      ;    one value. The OUTER `c`=10 use must NOT be rewritten with the inner
+      ;    shadow's 20. (bind "c" 10 (bind "r" (ref 0) (do (set_ref r 1)
+      ;       (int_add (bind "c" 20 c) c)))) -> 20 + 10 = 30.
+      (bind (
+        (b (calln "bind"
+             (list_of (lit "c") (lit 10)
+               (refbind "r" (lit 0)
+                 (calln "do"
+                   (list_of (setr "r" (lit 1))
+                     (calln "int_add"
+                       (list_of (calln "bind" (list_of (lit "c") (lit 20) (sym "c")))
+                                (sym "c")))))))))
+      )
+        (do
+          (assert_eq (eval_ir b) 30 "shadow: original evals 30 (outer c=10 + inner c=20)")
+          (assert_eq (eval_ir (ssa_ccp_node b)) (eval_ir b)
+            "shadow: ssa_ccp eval preserved (the outer user c is NOT folded to the inner 20)")))
+
+      ; ── 9. SHADOWED bool const as an if CONDITION — the outer c=true must pick
+      ;    the then-arm; folding the inner c=false into the condition would flip it.
+      ;    (bind "r" (ref 0) (bind "c" true (do (bind "c" false 0)
+      ;       (if c (set_ref r 5) (set_ref r 9)) (deref r)))) -> 5.
+      (bind (
+        (b (refbind "r" (lit 0)
+             (calln "bind"
+               (list_of (lit "c") (lit true)
+                 (calln "do"
+                   (list_of
+                     (calln "bind" (list_of (lit "c") (lit false) (lit 0)))
+                     (calln "if" (list_of (sym "c") (setr "r" (lit 5)) (setr "r" (lit 9))))
+                     (drf "r")))))))
+      )
+        (do
+          (assert_eq (eval_ir b) 5 "shadow-cond: original evals 5 (outer c=true -> then arm)")
+          (assert_eq (eval_ir (ssa_ccp_node b)) (eval_ir b)
+            "shadow-cond: eval preserved (the if condition is not mis-folded to the inner false)")))
+
+      ; ── 10. VERSION-NAME / USER-NAME COLLISION — a user identifier shaped like an
+      ;    SSA version (`r__1`) collides with a minted version. ssa_ccp refuses to
+      ;    fold a colliding version and returns the body verbatim, so behavior holds.
+      ;    (bind "r__1" 7 (bind "r" (ref 0) (do (set_ref r 3) (int_add (deref r) r__1)))) -> 10.
+      (bind (
+        (b (calln "bind"
+             (list_of (lit "r__1") (lit 7)
+               (refbind "r" (lit 0)
+                 (calln "do"
+                   (list_of (setr "r" (lit 3))
+                     (calln "int_add" (list_of (drf "r") (sym "r__1")))))))))
+      )
+        (do
+          (assert_eq (eval_ir b) 10 "collision: original evals 10 (deref r=3 + user r__1=7)")
+          (assert_eq (eval_ir (ssa_ccp_node b)) (eval_ir b)
+            "collision: eval preserved (a version colliding with a user name is not folded)")))
+
+      ; ── 11. ROUND-TRIP HAZARD: a value-position `if` reading a promoted ref. The
+      ;    SSA substrate rewrites the if's arms to yield the ref version, so the
+      ;    round-trip alone is not behavior-faithful — ssa_ccp BAILS to identity.
+      ;    (bind "r" (ref 0) (do (set_ref r 7) (if (gt (deref r) 0) 111 222))) -> 111.
+      (bind (
+        (b (refbind "r" (lit 0)
+             (calln "do"
+               (list_of (setr "r" (lit 7))
+                 (calln "if"
+                   (list_of (calln "gt" (list_of (drf "r") (lit 0))) (lit 111) (lit 222)))))))
+        (out (ssa_ccp_node b))
+      )
+        (do
+          (assert_eq (eval_ir b) 111 "hazard-tail-if: original evals 111")
+          (assert_eq (eval_ir out) (eval_ir b) "hazard-tail-if: eval preserved")
+          (assert_true (node_eq out b)
+            "hazard-tail-if: a value-position if-over-a-ref bails to identity")))
+
+      ; ── 12. ROUND-TRIP HAZARD: a const-merged ref flows into a downstream
+      ;    value-position `if` condition. Even though the merge IS const, the
+      ;    downstream if-over-the-ref makes the round-trip unfaithful — ssa_ccp BAILS.
+      ;    (bind "c" false (bind "r" (ref false)
+      ;       (do (if c (set_ref r true) (set_ref r true)) (if (deref r) 100 200)))) -> 100.
+      (bind (
+        (b (calln "bind"
+             (list_of (lit "c") (lit false)
+               (refbind "r" (lit false)
+                 (calln "do"
+                   (list_of
+                     (calln "if" (list_of (sym "c") (setr "r" (lit true)) (setr "r" (lit true))))
+                     (calln "if" (list_of (drf "r") (lit 100) (lit 200)))))))))
+        (out (ssa_ccp_node b))
+      )
+        (do
+          (assert_eq (eval_ir b) 100 "hazard-downstream-cond: original evals 100")
+          (assert_eq (eval_ir out) (eval_ir b) "hazard-downstream-cond: eval preserved")
+          (assert_true (node_eq out b)
+            "hazard-downstream-cond: a downstream value-position if-over-a-ref bails to identity")))
+
+      ; ── 13. ROUND-TRIP HAZARD: a value-position `set_ref` of a promoted ref. The
+      ;    SSA substrate opens the new version binding scoped only to the set_ref's
+      ;    sub-expression yet threads it to a later read, so the round-trip leaks an
+      ;    out-of-scope version (a crash) — ssa_ccp BAILS to identity.
+      ;    (bind "p" 7 (bind "r" (ref 0)
+      ;       (do (int_add (set_ref r (int_mul p 3)) 0) (deref r)))) -> 21.
+      (bind (
+        (b (calln "bind"
+             (list_of (lit "p") (lit 7)
+               (refbind "r" (lit 0)
+                 (calln "do"
+                   (list_of
+                     (calln "int_add"
+                       (list_of (setr "r" (calln "int_mul" (list_of (sym "p") (lit 3)))) (lit 0)))
+                     (drf "r")))))))
+        (out (ssa_ccp_node b))
+      )
+        (do
+          (assert_eq (eval_ir b) 21 "hazard-valpos-setref: original evals 21")
+          (assert_eq (eval_ir out) (eval_ir b) "hazard-valpos-setref: eval preserved (no crash)")
+          (assert_true (node_eq out b)
+            "hazard-valpos-setref: a value-position set_ref of a promoted ref bails to identity"))))))

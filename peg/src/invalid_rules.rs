@@ -8,7 +8,9 @@ use crate::grammar::Grammar;
 pub const DEFAULT_INVALID_RULE_PREFIXES: &[&str] = &["invalid_"];
 
 /// Normalise caller-supplied prefix list; `None` yields the default prefix.
-pub fn normalize_invalid_rule_prefixes(value: Option<&[String]>) -> Result<Vec<String>, String> {
+pub fn normalize_invalid_rule_prefixes(
+    value: Option<&[String]>,
+) -> Result<Vec<String>, ParseError> {
     match value {
         None => Ok(DEFAULT_INVALID_RULE_PREFIXES
             .iter()
@@ -18,9 +20,9 @@ pub fn normalize_invalid_rule_prefixes(value: Option<&[String]>) -> Result<Vec<S
             let mut out = Vec::with_capacity(items.len());
             for item in items {
                 if item.is_empty() {
-                    return Err(
-                        "invalid_rule_prefixes must contain only non-empty strings".to_string()
-                    );
+                    return Err(invalid_rule_prefix_error(
+                        "invalid_rule_prefixes must contain only non-empty strings",
+                    ));
                 }
                 out.push(item.clone());
             }
@@ -32,32 +34,34 @@ pub fn normalize_invalid_rule_prefixes(value: Option<&[String]>) -> Result<Vec<S
 /// Read `invalid_rule_prefixes` from grammar metadata (`__grammar__` section).
 pub fn normalize_metadata_invalid_rule_prefixes(
     value: Option<&Value>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, ParseError> {
     match value {
         None => normalize_invalid_rule_prefixes(None),
         Some(Value::Array(items)) => {
             let mut out = Vec::with_capacity(items.len());
             for item in items {
                 let Some(s) = item.as_str() else {
-                    return Err(
-                        "invalid_rule_prefixes metadata must be a sequence of non-empty strings"
-                            .to_string(),
-                    );
+                    return Err(invalid_rule_prefix_error(
+                        "invalid_rule_prefixes metadata must be a sequence of non-empty strings",
+                    ));
                 };
                 if s.is_empty() {
-                    return Err(
-                        "invalid_rule_prefixes metadata must contain only non-empty strings"
-                            .to_string(),
-                    );
+                    return Err(invalid_rule_prefix_error(
+                        "invalid_rule_prefixes metadata must contain only non-empty strings",
+                    ));
                 }
                 out.push(s.to_string());
             }
             Ok(out)
         }
-        Some(_) => Err(
-            "invalid_rule_prefixes metadata must be a sequence of non-empty strings".to_string(),
-        ),
+        Some(_) => Err(invalid_rule_prefix_error(
+            "invalid_rule_prefixes metadata must be a sequence of non-empty strings",
+        )),
     }
+}
+
+fn invalid_rule_prefix_error(message: impl Into<String>) -> ParseError {
+    ParseError::new(message, 0, 0)
 }
 
 #[derive(Clone, Debug)]
@@ -73,13 +77,11 @@ impl InvalidRulePolicy {
         invalid_rule_prefixes: Option<&[String]>,
     ) -> Result<Self, ParseError> {
         let prefixes = if let Some(prefixes) = invalid_rule_prefixes {
-            normalize_invalid_rule_prefixes(Some(prefixes))
-                .map_err(|msg| ParseError::new(msg, 0, 0))?
+            normalize_invalid_rule_prefixes(Some(prefixes))?
         } else if let Some(section) = grammar.metadata.get("__grammar__") {
-            normalize_metadata_invalid_rule_prefixes(section.get("invalid_rule_prefixes"))
-                .map_err(|msg| ParseError::new(msg, 0, 0))?
+            normalize_metadata_invalid_rule_prefixes(section.get("invalid_rule_prefixes"))?
         } else {
-            normalize_invalid_rule_prefixes(None).map_err(|msg| ParseError::new(msg, 0, 0))?
+            normalize_invalid_rule_prefixes(None)?
         };
 
         Ok(Self {

@@ -1,0 +1,156 @@
+; stdlib/lib/text/path.caap — pure, lexical path helpers (no filesystem access).
+; Module stdlib.lib.text.path.
+; The project library needs these to resolve manifest-relative paths.
+(module stdlib.lib.text.path)
+
+(use stdlib.lib.collections.sequence join)
+; rfind gives the LAST occurrence of a substring (index|null); last_dot wraps it
+; to keep its -1 sentinel. (string is rank-2, same tier; no cycle.)
+(use stdlib.lib.text.string rfind)
+
+; absolute? — does the path start at the filesystem root?
+(defn absolute? ((p string)) bool
+  (string_starts_with p "/"))
+
+; is_relative? — the complement of absolute?: does the path NOT start at root?
+(defn is_relative? ((p string)) bool
+  (not (absolute? p)))
+
+; path_join — join two segments; an absolute `b` wins outright.
+(defn path_join ((a string) (b string)) string
+  (cond
+    ((absolute? b) b)
+    ((eq a "") b)
+    ((string_ends_with a "/") (string_concat_many a b))
+    (else (string_concat_many a "/" b))))
+
+; normalize — resolve "." and ".." lexically (no symlink awareness).
+;   "a/./b/../c" -> "a/c";  leading "/" is preserved;  "" -> "."
+(defn normalize ((p string)) string
+  (bind (
+    (abs (absolute? p))
+    (parts (string_split p "/"))
+    (kept (ref (list_of)))
+  )
+    (do
+      (for part parts
+        (bind ((cur (deref kept)))
+          (cond
+            ((eq part "") null)
+            ((eq part ".") null)
+            ((eq part "..")
+              (if (and (gt (size cur) 0)
+                       (not (eq (get cur (int_sub (size cur) 1)) "..")))
+                (set_ref kept (sequence_take cur (int_sub (size cur) 1)))
+                (unless abs (append cur ".."))))
+            (else (append cur part)))))
+      (bind ((body (join (deref kept) "/")))
+        (cond
+          (abs (string_concat_many "/" body))
+          ((eq body "") ".")
+          (else body))))))
+
+; dirname — everything before the last "/" ("." when there is none, "/" at root).
+(defn dirname ((p string)) string
+  (bind (
+    (parts (string_split p "/"))
+    (n (size parts))
+  )
+    (cond
+      ((le n 1) ".")
+      ((and (eq n 2) (eq (get parts 0) "")) "/")
+      (else
+        (bind ((head (sequence_take parts (int_sub n 1))))
+          (join head "/"))))))
+
+; basename — everything after the last "/".
+(defn basename ((p string)) string
+  (bind ((parts (string_split p "/")))
+    (get parts (int_sub (size parts) 1) "")))
+
+; last_dot — index of the last "." in `name`, or -1 when there is none. Delegates
+; to lib/text/string.rfind (which returns the final-match index or null) and maps
+; the null miss back onto the -1 sentinel its callers expect.
+(defn last_dot ((name string)) int
+  (bind ((hit (rfind name ".")))
+    (if (eq hit null) -1 hit)))
+
+; extension — the file extension of `p` (without the dot), or "" when there is
+; none. The extension is the text after the LAST "." in the basename, but a
+; leading dot is part of a dotfile name, not an extension: "a.txt" -> "txt",
+; "archive.tar.gz" -> "gz", "README" -> "", ".gitignore" -> "", "a." -> "".
+(defn extension ((p string)) string
+  (bind ((name (basename p)) (dot (last_dot (basename p))))
+    (if (le dot 0) ""
+      (string_slice name (int_add dot 1) (size name)))))
+
+; stem — the basename of `p` with its final extension (and that dot) removed. A
+; leading dot is part of a dotfile name, not an extension, so it is kept:
+; "a/b.tar.gz" -> "b.tar", "a.txt" -> "a", "README" -> "README",
+; ".gitignore" -> ".gitignore", "a." -> "a". (Mirrors extension's leading-dot rule.)
+(defn stem ((p string)) string
+  (bind ((name (basename p)) (dot (last_dot (basename p))))
+    (if (le dot 0) name (string_slice name 0 dot))))
+
+; with_extension — `p` with its extension replaced by `ext` (no leading dot in
+; `ext`). An empty `ext` drops the extension (and its dot). A path with no
+; current extension gains one: "a" + "txt" -> "a.txt". The directory part and a
+; leading-dot dotfile name are preserved ("dir/.bashrc" + "bak" -> "dir/.bashrc.bak").
+(defn with_extension ((p string) (ext string)) string
+  (bind ((dir (dirname p))
+         ; the basename stripped of its current extension (dot included)
+         (base (stem p))
+         (newname (if (eq ext "") base (string_concat_many base "." ext))))
+    (cond
+      ((eq dir ".") (if (string_contains p "/") (string_concat_many "./" newname) newname))
+      ((eq dir "/") (string_concat_many "/" newname))
+      (else (string_concat_many dir "/" newname)))))
+
+; segments — the non-empty path components of `p` (a leading "/" and any
+; doubled/trailing slash collapse away, like `normalize`'s view). "/a/b" and
+; "a//b/" both yield ["a" "b"]; "" and "/" yield []. A purely lexical split —
+; no "."/".." resolution (callers pass a normalized path).
+(defn segments ((p string)) (list string)
+  (sequence_filter (string_split p "/") (lambda (part) (not (eq part "")))))
+
+; common_prefix_len — how many leading components `a` and `b` share.
+(defn common_prefix_len ((a (list string)) (b (list string))) int
+  (bind ((i (ref 0)) (go (ref true)) (n (if (lt (size a) (size b)) (size a) (size b))))
+    (do
+      (while (and (deref go) (lt (deref i) n))
+        (if (eq (get a (deref i)) (get b (deref i)))
+          (set_ref i (int_add (deref i) 1))
+          (set_ref go false)))
+      (deref i))))
+
+; relpath — the lexical relative path FROM directory `from` TO `to`, such that
+; (normalize (path_join from result)) reaches (normalize to). Pure path algebra:
+; no filesystem, no symlinks. Both paths are normalized first; the shared
+; leading components are dropped, each remaining `from` component becomes a "..",
+; and the remaining `to` components follow. "/a/b/c" from "/a" -> "b/c";
+; "/a" from "/a/b/c" -> "../.."; identical paths -> ".".
+;   from / to : two paths of the SAME kind (both absolute or both relative)
+;   ->        : the relative path, or (normalize to) when the two paths are of
+;               different kinds (no lexical relation exists — e.g. relative vs
+;               absolute, which would need the cwd this pure lib cannot see).
+(defn relpath ((from string) (to string)) string
+  (bind (
+    (nf (normalize from))
+    (nt (normalize to))
+  )
+    (if (not (eq (absolute? nf) (absolute? nt)))
+      nt
+      (bind (
+        (fs (segments nf))
+        (ts (segments nt))
+        (shared (common_prefix_len fs ts))
+        ; one ".." per `from` component past the shared prefix
+        (ups (sequence_map (sequence_range shared (size fs)) (lambda (i) "..")))
+        (rest (sequence_drop ts shared))
+        ; concat the ups and the remaining `to` components (flatten one level)
+        (parts (sequence_flatten (list_of ups rest)))
+      )
+        (if (eq (size parts) 0) "." (join parts "/"))))))
+
+(export absolute? is_relative? path_join normalize dirname basename
+        extension stem with_extension segments relpath)

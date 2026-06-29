@@ -1,0 +1,37 @@
+; stdlib/sys/rand.caap — facade for the host "rand" library (OS CSPRNG).
+;
+; Cryptographically-secure randomness sourced from the OS entropy pool, read
+; fresh per call (stateless, like time/os/path). Two layers, one file (the
+; boilerplate lives in stdlib.sys.wrap):
+;   1. The visible, TYPED surface (`ops`): each function with its parameters
+;      (name + type) and return type. verify_facade checks this against the
+;      catalog, so the declaration cannot drift.
+;   2. CALLABLE wrappers: dual-phase callables from boot/sys_grants.caap, with the
+;      capability handle partially applied. Each phase's sandbox policy gates
+;      behaviour. Without the grant the module still loads — wrappers are
+;      self-describing throwing stubs that raise "requires a sys grant" when
+;      called (declaration-only mode).
+; `make_facade` files the typed surface AND builds the wrapper bundle in one step;
+; each export reads its wrapper from that bundle.
+(module stdlib.sys.rand)
+
+(use stdlib.sys.verify op p)
+(use stdlib.sys.wrap make_facade)
+
+(bind ops
+  (list_of
+    (op "bytes" (list_of (p "count" "int")) "bytes" "impure")
+    (op "int"   (list_of (p "lo" "int") (p "hi" "int")) "int" "impure")
+    (op "float" (list_of) "float" "impure")
+    (op "bool"  (list_of) "bool" "impure")))
+
+; one call: file the typed surface AND build the wrapper bundle. Each export
+; below reads its (capability-applied, or null) callable from this bundle.
+(bind sys (make_facade "rand" ops))
+
+(bind bytes (get sys "bytes"))
+(bind int   (get sys "int"))
+(bind float (get sys "float"))
+(bind bool  (get sys "bool"))
+
+(export ops bytes int float bool)

@@ -1,0 +1,9 @@
+; tests/bad_body_arg.caap — an error INSIDE a
+; defn body that does not involve the params: the body is walked exactly once
+; (the typed pairing walk), so the finding appears exactly once.
+(module stdlib.fixtures.bad_body_arg)
+
+(defn f ((n int)) int
+  (do (int_add 1 "x") n))
+
+(export f)

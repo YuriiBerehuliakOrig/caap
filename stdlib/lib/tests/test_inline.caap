@@ -1,0 +1,237 @@
+; stdlib/lib/tests/test_inline.caap — the interprocedural inliner: read the
+; call-graph facts, fold a small single-call-site helper into its one caller and
+; drop the now-dead definition. The first CONSUMER of callgraph.caap's facts.
+;
+; Facts are keyed by helper NAME (not span), so this test uses helper names with
+; a unique `inl_` prefix to avoid colliding with any other test's facts in the
+; shared session store; it also clears those facts on the way out.
+
+;; @area: passes
+;; @kind: regression
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.inline
+  node_cost lambda_params inline_call inline_node candidate? run)
+(use stdlib.semantics.passes.registry fact! fact_of)
+(use stdlib.syntax.ast
+  sym lit calln call lam head_of head_is? def_of literal_of arg bind_pairs walk)
+(use stdlib.lib.collections.sequence any?)
+
+(do
+  (bind (
+    ; a top-level definition form: (bind "name" value)
+    (def (lambda (nm v) (calln "bind" (list_of (lit nm) v))))
+    ; wrap forms as the loader's located list
+    (located (lambda (forms)
+               (bind ((out (list_of)))
+                 (do (for f forms (append out (assoc (map_of) "node" f "loc" "m")))
+                     out))))
+    ; publish a callgraph EDGE fact (the exact key callgraph.caap writes:
+    ; namespace "callgraph", key = name, value = the callee list)
+    (edges! (lambda (nm callees) (fact! "callgraph" nm callees)))
+    ; does any top-level form still call `nm` as a head, anywhere in its tree?
+    (calls? (lambda (loc nm)
+              (any? loc
+                (lambda (f)
+                  (bind ((found (ref false)))
+                    (do
+                      (walk (get f "node")
+                        (lambda (n) (when (head_is? n nm) (set_ref found true))))
+                      (deref found)))))))
+    ; the def of `nm` in a located list, or null
+    (def_named (lambda (loc nm)
+                 (bind ((hit (ref null)))
+                   (do
+                     (for f loc
+                       (bind ((d (def_of (get f "node"))))
+                         (when (and (not (eq d null)) (eq (get d "name") nm))
+                           (set_ref hit f))))
+                     (deref hit)))))
+  )
+    (do
+      ; ── node_cost counts nodes (literal=1; (f a b) = 1+1+1+1 = 4) ──
+      (assert_eq (node_cost (lit 1)) 1 "a literal costs 1")
+      (assert_eq (node_cost (calln "int_add" (list_of (sym "x") (lit 1)))) 4
+        "(int_add x 1) costs 4")
+
+      ; ── lambda_params reads the literal-tuple param shape ──
+      (assert_eq (get (lambda_params (lam (list_of "a" "b") (sym "a"))) 0) "a"
+        "first param name read back")
+      (assert_eq (size (lambda_params (lam (list_of "a" "b") (sym "a")))) 2
+        "two params")
+
+      ; ── inline_call: (h 5) with helper (lambda (x) (int_add x 1))
+      ;    -> (bind ("x" 5) (int_add x 1)) — a let* over the argument ──
+      (bind ((helper (lam (list_of "x") (calln "int_add" (list_of (sym "x") (lit 1)))))
+             (r (inline_call helper (calln "inl_h" (list_of (lit 5))))))
+        (do
+          (assert_true (head_is? r "bind") "inlined call becomes a bind (let*)")
+          (assert_eq (get (get (get (bind_pairs r) "pairs") 0) "name") "x"
+            "the parameter is bound")
+          (assert_eq (literal_of (get (get (get (bind_pairs r) "pairs") 0) "value")) 5
+            "bound to the call argument")))
+
+      ; ── inline_call refuses an arity mismatch (conservative) ──
+      (assert_true
+        (eq (inline_call (lam (list_of "x" "y") (sym "x"))
+                         (calln "inl_h" (list_of (lit 1)))) null)
+        "arity mismatch is not inlined")
+
+      ; ── inline_call refuses capture: arg mentions the param name ──
+      (assert_true
+        (eq (inline_call (lam (list_of "y") (sym "y"))
+                         (calln "inl_h" (list_of (sym "y")))) null)
+        "capture-unsafe call is not inlined")
+
+      ; ── inline_node: rewrite the one call site inside a caller body ──
+      (bind ((helper (lam (list_of "x") (calln "int_add" (list_of (sym "x") (lit 1)))))
+             (caller (calln "int_mul" (list_of (calln "inl_h" (list_of (lit 5))) (lit 2))))
+             (r (inline_node "inl_h" helper caller)))
+        (assert_true (head_is? (arg r 0) "bind")
+          "the (inl_h 5) site became a let* inside the caller"))
+
+      ; ── candidate?: a small, non-recursive, single-call-site helper WITH a
+      ;    published edge fact is a candidate ──
+      (bind (
+        (helper (lam (list_of "x") (calln "int_add" (list_of (sym "x") (lit 1)))))
+        (loc (located (list_of
+                (def "inl_small" helper)
+                (def "inl_main" (lam (list_of) (calln "inl_small" (list_of (lit 7)))))
+                (calln "export" (list_of (sym "inl_main"))))))
+      )
+        (do
+          ; before facts exist, candidate? refuses (no graph seen)
+          (assert_true (not (candidate? loc "inl_small" helper))
+            "no edge fact -> refuse to inline against a graph we never saw")
+          ; publish the call-graph facts the analysis would have produced
+          (edges! "inl_small" (list_of "int_add"))
+          (edges! "inl_main"  (list_of "inl_small"))
+          (assert_true (candidate? loc "inl_small" helper)
+            "small single-call-site helper with an edge fact is a candidate")))
+
+      ; ── a RECURSIVE helper is never inlined (the recursion guard) ──
+      (bind (
+        (rec (lam (list_of "n") (calln "inl_rec" (list_of (sym "n")))))
+        (loc (located (list_of
+                (def "inl_rec" rec)
+                (def "inl_caller" (lam (list_of) (calln "inl_rec" (list_of (lit 0)))))
+                (calln "export" (list_of (sym "inl_caller"))))))
+      )
+        (do
+          (edges! "inl_rec" (list_of "inl_rec"))
+          (edges! "inl_caller" (list_of "inl_rec"))
+          (fact! "callgraph.recursive" "inl_rec" true)
+          (assert_true (not (candidate? loc "inl_rec" rec))
+            "recursive helper is NOT a candidate (recursion guard)")))
+
+      ; ── a TWO-call-site helper is never inlined-and-dropped ──
+      (bind (
+        (helper (lam (list_of "x") (calln "int_add" (list_of (sym "x") (lit 1)))))
+        (loc (located (list_of
+                (def "inl_twice" helper)
+                (def "inl_a" (lam (list_of) (calln "inl_twice" (list_of (lit 1)))))
+                (def "inl_b" (lam (list_of) (calln "inl_twice" (list_of (lit 2)))))
+                (calln "export" (list_of (sym "inl_a") (sym "inl_b"))))))
+      )
+        (do
+          (edges! "inl_twice" (list_of "int_add"))
+          (edges! "inl_a" (list_of "inl_twice"))
+          (edges! "inl_b" (list_of "inl_twice"))
+          (assert_true (not (candidate? loc "inl_twice" helper))
+            "two call sites -> not a single-call-site candidate")))
+
+      ; ── END-TO-END `run`: a single-call-site helper is folded into its caller
+      ;    and its definition removed; the caller no longer calls it ──
+      (bind (
+        (helper (lam (list_of "x") (calln "int_add" (list_of (sym "x") (lit 1)))))
+        (loc (located (list_of
+                (def "inl_one" helper)
+                (def "inl_use" (lam (list_of) (calln "inl_one" (list_of (lit 9)))))
+                (calln "export" (list_of (sym "inl_use"))))))
+      )
+        (do
+          (edges! "inl_one" (list_of "int_add"))
+          (edges! "inl_use" (list_of "inl_one"))
+          ; sanity: the helper IS defined and the caller DOES call it pre-run
+          (assert_true (not (eq (def_named loc "inl_one") null))
+            "helper defined before run")
+          (assert_true (calls? loc "inl_one") "caller calls the helper before run")
+          ; run the transform IN PLACE
+          (run loc)
+          ; the helper definition is gone, and nothing calls it anymore
+          (assert_true (eq (def_named loc "inl_one") null)
+            "inlined helper's definition removed after run")
+          (assert_true (not (calls? loc "inl_one"))
+            "transformed module no longer calls the inlined helper")
+          ; the caller's body now holds the inlined let* binding `x` -> 9
+          (bind ((use_def (def_named loc "inl_use")))
+            (assert_true (not (eq use_def null)) "the caller survives"))))
+
+      ; ── SHADOWING guard: `(lambda (inl_shadow) (inl_shadow 2))` calls the
+      ;    PARAMETER, not the module helper — a binder-aware count must NOT treat
+      ;    this as a reference (a naive name walk would, and wrongly inline) ──
+      (bind (
+        (helper (lam (list_of "x") (calln "int_add" (list_of (sym "x") (lit 1)))))
+        (loc (located (list_of
+                (def "inl_shadow" helper)
+                ; the caller binds a param named exactly "inl_shadow" and calls IT
+                (def "inl_shg" (lam (list_of "inl_shadow")
+                                 (calln "inl_shadow" (list_of (lit 2)))))
+                (calln "export" (list_of (sym "inl_shg"))))))
+      )
+        (do
+          (edges! "inl_shadow" (list_of "int_add"))
+          (edges! "inl_shg" (list_of))
+          (assert_true (not (candidate? loc "inl_shadow" helper))
+            "a shadowed (parameter) call is NOT a reference to the module helper")))
+
+      ; ── ARITY guard: the sole call site has the WRONG arity, so the helper is
+      ;    NOT a candidate — `run` must not inline it AND must not drop its def
+      ;    (dropping while a live mis-arity call remains = dangling reference) ──
+      (bind (
+        (helper (lam (list_of "a" "b") (calln "int_add" (list_of (sym "a") (sym "b")))))
+        (loc (located (list_of
+                (def "inl_ar" helper)
+                (def "inl_arm" (lam (list_of) (calln "inl_ar" (list_of (lit 1)))))
+                (calln "export" (list_of (sym "inl_arm"))))))
+      )
+        (do
+          (edges! "inl_ar" (list_of "int_add"))
+          (edges! "inl_arm" (list_of "inl_ar"))
+          (assert_true (not (candidate? loc "inl_ar" helper))
+            "mis-arity sole call site is not a candidate")
+          (run loc)
+          (assert_true (not (eq (def_named loc "inl_ar") null))
+            "mis-arity helper's definition is KEPT (no dangling reference)")
+          (assert_true (calls? loc "inl_ar")
+            "the mis-arity call is left intact")))
+
+      ; ── BODY-CAPTURE guard: the helper body references a free `cap`; the sole
+      ;    caller BINDS a local `cap`. Splicing the body in would re-capture it
+      ;    (the body's `cap` resolves to module scope before the move, the
+      ;    caller's `cap` after) — so the inline is refused ──
+      (bind (
+        (helper (lam (list_of "x") (calln "int_add" (list_of (sym "x") (sym "cap")))))
+        (loc (located (list_of
+                (def "inl_cap" helper)
+                ; caller locally binds `cap`, then calls the helper in that scope
+                (def "inl_capm" (lam (list_of)
+                                  (calln "bind" (list_of (lit "cap") (lit 100)
+                                    (calln "inl_cap" (list_of (lit 1)))))))
+                (calln "export" (list_of (sym "inl_capm"))))))
+      )
+        (do
+          (edges! "inl_cap" (list_of "int_add" "cap"))
+          (edges! "inl_capm" (list_of "inl_cap"))
+          (assert_true (not (candidate? loc "inl_cap" helper))
+            "body free-name captured by a caller binder -> inline refused")))
+
+      ; ── hygiene: clear the facts this test published (keyed by our names) ──
+      (do
+        (for nm (list_of "inl_small" "inl_main" "inl_rec" "inl_caller"
+                         "inl_twice" "inl_a" "inl_b" "inl_one" "inl_use"
+                         "inl_shadow" "inl_shg" "inl_ar" "inl_arm"
+                         "inl_cap" "inl_capm")
+          (fact! "callgraph" nm null))
+        (fact! "callgraph.recursive" "inl_rec" null)
+        (assert_true true "facts cleared")))))

@@ -1,0 +1,144 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  sample_urun — the APPLICATION + kernel entry (the freestanding PROGRAM,
+//  not a module). It `use`s the ur_* modules, allocates the control blocks and
+//  stacks (as URun apps do), defines the threads + a semaphore + a queue + an
+//  application timer in ur_application_define, and brings the kernel up in
+//  c_entry (the C reset entry the asm port calls).
+//
+//  Demo (UART output "MABCPDT"):
+//    M  — kernel entered.
+//    A,B,C — a HIGH-priority consumer blocks on the semaphore, then receives a
+//           1-word message from the queue and prints it; a LOW-priority producer
+//           sends 'A','B','C' and posts the semaphore each round, every post
+//           PREEMPTING into the consumer (priority preemption + sem + queue).
+//    P  — a one-shot APPLICATION TIMER fires after the first tick (proves the
+//           ur_timer interrupt + active-timer list).
+//    D  — the producer, finished, SLEEPS 3 ticks then prints 'D' on wakeup
+//           (proves ur_thread_sleep + the delayed list).
+//    T  — the consumer's 4th get uses a 5-tick WAIT OPTION; with no further post
+//           it TIMES OUT (returns UR_NO_INSTANCE) and prints 'T' (proves timed
+//           semaphore waits). A lowest-priority idle thread runs whenever both
+//           workers are blocked, so the timer base keeps advancing.
+// ═══════════════════════════════════════════════════════════════════════════
+(surface stdlib.frontend.clike)
+
+use stdlib.urun.ur_port (putc, ur_systick_config, ur_wait_for_interrupt)
+use stdlib.urun.ur_scheduler (UR_THREAD, ur_thread_first_psp)
+use stdlib.urun.ur_thread (ur_thread_create, ur_stack_base, ur_stack_top, ur_thread_sleep)
+use stdlib.urun.ur_semaphore (UR_SEMAPHORE, ur_semaphore_create, ur_semaphore_get, ur_semaphore_put)
+use stdlib.urun.ur_queue (UR_QUEUE, ur_queue_create, ur_queue_send, ur_queue_receive)
+use stdlib.urun.ur_timer (UR_TIMER, ur_timer_create, ur_timer_activate)
+use stdlib.urun.ur_mutex (UR_MUTEX, ur_mutex_create)
+use stdlib.urun.ur_event_flags (UR_EVENT_FLAGS, ur_event_flags_create, ur_event_flags_set, ur_event_flags_get, UR_EVENT_OR)
+use stdlib.urun.ur_status (UR_NO_INSTANCE, UR_NO_WAIT, UR_WAIT_FOREVER)
+
+// the asm port's first-thread launch (a global linker symbol, resolved by
+// ur_port_cortexm3.s — declared here where it is called).
+start_first_task (psp0 u32) i32
+
+// ── statically allocated control blocks + stacks (the "user" owns these) ─────
+ur_thread_pool UR_THREAD[4]
+ur_sem_pool UR_SEMAPHORE[2]
+ur_queue_pool UR_QUEUE[2]
+ur_timer_pool UR_TIMER[2]
+stack0 u32[256]
+stack1 u32[256]
+stack2 u32[256]
+msgbuf u32[1]                              // producer's outgoing 1-word message
+rcvbuf u32[1]                              // consumer's incoming 1-word message
+
+ur_mutex_pool UR_MUTEX[2]
+ur_event_pool UR_EVENT_FLAGS[2]
+
+// control-block handles (slot 0 of each pool).
+ur_sem () UR_SEMAPHORE* = { ur_sem_pool + 0 }
+ur_queue () UR_QUEUE* = { ur_queue_pool + 0 }
+ur_mtx () UR_MUTEX* = { ur_mutex_pool + 0 }
+ur_ef () UR_EVENT_FLAGS* = { ur_event_pool + 0 }
+
+// one-shot application-timer callback: pulse 'P' once, from the timer interrupt.
+ur_pulse_fire (arg u32) i32 = {
+  putc(80)                                 // 'P'
+  0
+}
+
+// consumer (priority 1, HIGH): get the semaphore, receive a byte, print it,
+// three rounds; then a 5-tick timed get that TIMES OUT -> 'T'; then idle-spin.
+ur_consumer () i32 = {
+  i mut u32 = 0
+  while i < 3 {
+    ur_semaphore_get(ur_sem(), UR_WAIT_FOREVER())         // UR_WAIT_FOREVER
+    ur_queue_receive(ur_queue(), rcvbuf + 0, UR_WAIT_FOREVER())
+    putc(rcvbuf[0])
+    i = i + 1
+  }
+  r i32 = ur_semaphore_get(ur_sem(), 5)            // wait 5 ticks, then time out
+  match r {
+    UR_NO_INSTANCE => { putc(84) },                // 'T' — timed out as expected
+    _ => { putc(63) }                              // '?' — any other outcome
+  }
+  while 0 == 0 { }
+  0
+}
+
+// producer (priority 2, LOW): send 'A','B','C' and post the semaphore each
+// round; each post preempts into the consumer. Then SLEEP 3 ticks -> 'D'.
+ur_producer () i32 = {
+  i mut u32 = 0
+  while i < 3 {
+    msgbuf[0] = 65 + i
+    ur_queue_send(ur_queue(), msgbuf + 0, UR_WAIT_FOREVER())
+    ur_semaphore_put(ur_sem())
+    i = i + 1
+  }
+  ur_thread_sleep(3)
+  putc(68)                                         // 'D' (woke from sleep)
+  while 0 == 0 { }
+  0
+}
+
+// idle (priority 3, LOWEST): runs whenever both workers block, so SysTick keeps
+// ticking the time base. A real URun system has exactly such a system thread.
+ur_idle () i32 = {
+  while 0 == 0 { ur_wait_for_interrupt() }     // sleep until SysTick, don't hot-spin
+  0
+}
+
+// ur_application_define: create the objects, the application timer, and threads.
+ur_application_define () i32 = {
+  ur_semaphore_create(ur_sem(), 0)
+  ur_queue_create(ur_queue(), 1, 4)                // 1-word messages, depth 4
+  ur_mutex_create(ur_mtx())
+  ur_event_flags_create(ur_ef())
+  ur_event_flags_set(ur_ef(), 1)                    // signal bit 0
+  ur_event_flags_get(ur_ef(), 1, UR_EVENT_OR(), 1, UR_NO_WAIT())   // met -> consume, no block
+  ur_timer_create(ur_timer_pool + 0,
+                  fn_ptr(ur_pulse_fire) as u32, 0, 1, 0)  // one-shot, 1 tick
+  ur_timer_activate(ur_timer_pool + 0)
+  ur_thread_create(ur_thread_pool + 0,
+                   fn_ptr(ur_consumer) as u32, 1, ur_stack_base(stack0), ur_stack_top(stack0))
+  ur_thread_create(ur_thread_pool + 1,
+                   fn_ptr(ur_producer) as u32, 2, ur_stack_base(stack1), ur_stack_top(stack1))
+  ur_thread_create(ur_thread_pool + 2,
+                   fn_ptr(ur_idle) as u32, 3, ur_stack_base(stack2), ur_stack_top(stack2))
+  0
+}
+
+// board / core registers the kernel entry touches (mps2-an385 Cortex-M3),
+// as named hex constants instead of opaque decimals (const = compile-time fold).
+UART0_CTRL u32 const volatile = 0x40004008 // UART0 control register (TX enable bit)
+SHPR3 u32 const volatile = 0xE000ED20      // System Handler Priority Register 3
+PENDSV_LOWEST u32 const = 0xFF0000         // PendSV priority field = lowest (bits 23:16)
+SYSTICK_RELOAD u32 const = 100000          // kernel tick reload (core cycles)
+
+// ur_kernel_enter (c_entry): bring up the board, configure the PendSV + SysTick
+// exceptions, define the app, then launch the highest-priority ready thread.
+c_entry () i32 = {
+  UART0_CTRL = 1                            // enable UART0 TX
+  putc(77)                                  // 'M' — kernel entered
+  SHPR3 = PENDSV_LOWEST                     // PendSV at lowest priority
+  ur_systick_config(SYSTICK_RELOAD)         // start the kernel tick
+  ur_application_define()
+  start_first_task(ur_thread_first_psp())
+  0
+}

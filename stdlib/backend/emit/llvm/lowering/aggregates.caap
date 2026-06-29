@@ -1,0 +1,57 @@
+; stdlib/backend/emit/llvm/lowering/aggregates.caap - aggregate pointer helpers.
+;
+; Internal leaf behind stdlib.backend.emit.llvm.lowering.
+(module stdlib.backend.emit.llvm.lowering.aggregates)
+
+(use stdlib.lib.collections.sequence find)
+(use stdlib.backend.emit.llvm.types ptr_cell field_lookup)
+(use stdlib.backend.emit.llvm.instructions tmp! emit!)
+
+(bind lower_field_ptr
+  (lambda (self args st env fns kv)
+    (bind (
+      (subject (self self (get args 0) st env fns))
+      (structs (get (get st "prog" (map_of)) "structs" (map_of)))
+    )
+      (do
+        (unless (and (not (eq kv null)) (eq (value_type kv) "string"))
+          (throw "native codegen: field_ptr key must be a string literal"))
+        (unless (and (eq (get subject "type" "") "ptr")
+                     (not (eq (get structs (get subject "elemct" "")) null)))
+          (throw "native codegen: field_ptr expects a pointer to a struct"))
+        (bind (
+          (sname (get subject "elemct"))
+          (f (field_lookup structs sname kv))
+          (fp (tmp! st))
+        )
+          (do
+            (emit! st (string_concat_many
+              fp " = getelementptr %" sname ", ptr "
+              (get subject "repr" "?") ", i32 0, i32 "
+              (int_to_string (get f "idx"))))
+            (ptr_cell fp (get f "ftype") structs)))))))
+
+(bind lower_union_field
+  (lambda (self args st env fns kv)
+    (bind (
+      (subject (self self (get args 0) st env fns))
+      (structs (get (get st "prog" (map_of)) "structs" (map_of)))
+      (unions (get (get st "prog" (map_of)) "unions" (map_of)))
+      (uname (get subject "elemct" ""))
+    )
+      (do
+        (unless (and (not (eq kv null)) (eq (value_type kv) "string"))
+          (throw "native codegen: union_field key must be a string literal"))
+        (unless (and (eq (get subject "type" "") "ptr")
+                     (not (eq (get unions uname) null)))
+          (throw "native codegen: union_field expects a pointer to a union"))
+        (bind ((m (find (get unions uname (list_of))
+                    (lambda (mm) (eq (get mm "name") kv)))))
+          (do
+            (when (eq m null)
+              (throw (string_concat_many
+                "native codegen: union `" uname
+                "` has no member `" kv "`")))
+            (ptr_cell (get subject "repr") (get m "type") structs)))))))
+
+(export lower_field_ptr lower_union_field)

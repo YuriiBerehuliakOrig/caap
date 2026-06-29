@@ -1,0 +1,95 @@
+; stdlib/lib/tests/test_dce.caap — dead-binding elimination.
+
+;; @area: passes
+;; @kind: regression
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.dce rewrite_node)
+(use stdlib.syntax.ast sym lit calln literal? literal_of bind_pairs)
+(use stdlib.lib.collections.sequence any?)
+
+(do
+  (bind (
+    (in? (lambda (lst x) (any? lst (lambda (e) (eq e x)))))
+    (names_of (lambda (n)
+      (bind ((bp (bind_pairs n)) (out (list_of)))
+        (do (when (not (eq bp null))
+              (for p (get bp "pairs" (list_of)) (append out (get p "name"))))
+            out))))
+  )
+    (do
+      ; ── unused literal binding is removed, used one kept ──
+      (bind ((r (rewrite_node
+                  (calln "bind"
+                    (list_of (lit "tmp") (lit 1) (lit "y") (lit 2) (sym "y"))))))
+        (do
+          (assert_true (in? (names_of r) "y") "used binding `y` kept")
+          (assert_true (not (in? (names_of r) "tmp")) "unused `tmp` removed")))
+
+      ; ── a used binding survives ──
+      (bind ((r (rewrite_node
+                  (calln "bind" (list_of (lit "x") (lit 1) (sym "x"))))))
+        (assert_true (in? (names_of r) "x") "used binding survives"))
+
+      ; ── an impure value is NOT removed even when unused ──
+      (bind ((r (rewrite_node
+                  (calln "bind"
+                    (list_of (lit "u") (calln "println" (list_of (lit "hi")))
+                             (lit 0))))))
+        (assert_true (in? (names_of r) "u")
+          "unused binding to an effectful value is kept"))
+
+      ; ── a throwing value (div by zero) is kept too ──
+      (bind ((r (rewrite_node
+                  (calln "bind"
+                    (list_of (lit "d") (calln "int_div" (list_of (lit 1) (lit 0)))
+                             (lit 0))))))
+        (assert_true (in? (names_of r) "d")
+          "unused binding to a throwing value is kept"))
+
+      ; ── cascade: a -> (used only by) b -> (unused); both fall, collapse to body ──
+      (bind ((r (rewrite_node
+                  (calln "bind"
+                    (list_of (lit "a") (lit 1) (lit "b") (sym "a") (lit 0))))))
+        (do
+          (assert_true (literal? r) "fully-dead bindings collapse to the body")
+          (assert_eq (literal_of r) 0 "collapsed result is the body literal 0")))
+
+      ; ── underscore opts out ──
+      (bind ((r (rewrite_node (calln "bind" (list_of (lit "_keep") (lit 1) (lit 0))))))
+        (assert_true (in? (names_of r) "_keep")
+          "underscore binding is intentionally kept"))
+
+      ; ── total-pure whitelist: an unused (string_concat_many …) is droppable ──
+      (bind ((r (rewrite_node
+                  (calln "bind"
+                    (list_of (lit "s")
+                             (calln "string_concat_many" (list_of (lit "a") (lit "b")))
+                             (lit 0))))))
+        (assert_true (not (in? (names_of r) "s"))
+          "unused binding to a total-pure string_concat_many is removed"))
+
+      ; ── total bitwise op: an unused (int_and …) binding is droppable ──
+      (bind ((r (rewrite_node
+                  (calln "bind"
+                    (list_of (lit "m") (calln "int_and" (list_of (sym "x") (lit 7)))
+                             (sym "x"))))))
+        (assert_true (not (in? (names_of r) "m"))
+          "unused binding to a total-pure int_and is removed"))
+
+      ; ── total string predicate: an unused (string_contains …) is droppable ──
+      (bind ((r (rewrite_node
+                  (calln "bind"
+                    (list_of (lit "p")
+                             (calln "string_contains" (list_of (sym "s") (lit "x")))
+                             (sym "s"))))))
+        (assert_true (not (in? (names_of r) "p"))
+          "unused binding to a total-pure string_contains is removed"))
+
+      ; ── a PARTIAL head (int_shl, can throw) is NOT removed even when unused ──
+      (bind ((r (rewrite_node
+                  (calln "bind"
+                    (list_of (lit "sh") (calln "int_shl" (list_of (sym "x") (sym "k")))
+                             (lit 0))))))
+        (assert_true (in? (names_of r) "sh")
+          "unused binding to a partial int_shl is kept (it may throw)")))))

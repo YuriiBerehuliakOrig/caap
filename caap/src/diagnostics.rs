@@ -1,7 +1,6 @@
-//! Structured diagnostics and rendering for Rust CAAP.
+//! Structured diagnostics and rendering for CAAP.
 
-use std::collections::BTreeMap;
-
+use crate::error::{CaapError, CaapResult};
 use crate::source::SourceSpan;
 use crate::values::{EvaluationError, RuntimeCallFrame};
 
@@ -10,6 +9,7 @@ pub enum DiagnosticSeverity {
     Error,
     Warning,
     Note,
+    Hint,
 }
 
 impl DiagnosticSeverity {
@@ -18,7 +18,62 @@ impl DiagnosticSeverity {
             Self::Error => "error",
             Self::Warning => "warning",
             Self::Note => "note",
+            Self::Hint => "hint",
         }
+    }
+}
+
+/// Typed, unique diagnostic codes.
+///
+/// Each variant maps to exactly one code string; the compiler rejects
+/// duplicate variant names, so uniqueness is enforced at compile time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum DiagnosticCode {
+    /// A CAAP parse error produced by the PEG engine.
+    Parse,
+    /// A compiler-internal error (type checking, lowering, etc.).
+    Compiler,
+    /// A runtime evaluation error.
+    Runtime,
+    /// A host capability / sandbox policy violation.
+    Capability,
+    /// An artifact cache or fingerprinting error.
+    Artifacts,
+    /// An error in the diagnostics subsystem itself.
+    Diagnostics,
+    /// A provider graph / query-routing error.
+    Graph,
+    /// A host-function error (fs, net, proc).
+    Host,
+    /// An IR construction or validation error.
+    Ir,
+    /// A semantic analysis error (types, effects, policies).
+    Semantic,
+    /// A compilation unit error.
+    Unit,
+}
+
+impl DiagnosticCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Parse => "CAAP-PARSE-001",
+            Self::Compiler => "CAAP-COMPILER-001",
+            Self::Runtime => "CAAP-RUNTIME-001",
+            Self::Capability => "CAAP-CAP-001",
+            Self::Artifacts => "CAAP-ARTIFACTS-001",
+            Self::Diagnostics => "CAAP-DIAGNOSTICS-001",
+            Self::Graph => "CAAP-GRAPH-001",
+            Self::Host => "CAAP-HOST-001",
+            Self::Ir => "CAAP-IR-001",
+            Self::Semantic => "CAAP-SEMANTIC-001",
+            Self::Unit => "CAAP-UNIT-001",
+        }
+    }
+}
+
+impl From<DiagnosticCode> for String {
+    fn from(code: DiagnosticCode) -> String {
+        code.as_str().to_string()
     }
 }
 
@@ -37,7 +92,7 @@ pub struct DiagnosticFrame {
 }
 
 impl DiagnosticFrame {
-    pub fn new(name: impl Into<String>) -> Result<Self, String> {
+    pub fn new(name: impl Into<String>) -> CaapResult<Self> {
         Self::with_location(name, None, None)
     }
 
@@ -45,13 +100,17 @@ impl DiagnosticFrame {
         name: impl Into<String>,
         location: Option<String>,
         span: Option<SourceSpan>,
-    ) -> Result<Self, String> {
+    ) -> CaapResult<Self> {
         let name = name.into();
         if name.is_empty() {
-            return Err("diagnostic frame name must be non-empty".to_string());
+            return Err(CaapError::diagnostics(
+                "diagnostic frame name must be non-empty",
+            ));
         }
         if location.as_ref().is_some_and(String::is_empty) {
-            return Err("diagnostic frame location must be non-empty when present".to_string());
+            return Err(CaapError::diagnostics(
+                "diagnostic frame location must be non-empty when present",
+            ));
         }
         Ok(Self {
             name,
@@ -87,19 +146,6 @@ pub struct Diagnostic {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DiagnosticExplanation {
-    pub code: String,
-    pub title: String,
-    pub body: String,
-    pub help: Vec<String>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct DiagnosticExplanationRegistry {
-    explanations: BTreeMap<String, DiagnosticExplanation>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompilerEvent {
     pub kind: String,
     pub target: Option<String>,
@@ -113,22 +159,24 @@ pub struct CompilerEventLog {
 }
 
 impl Diagnostic {
-    pub fn error(message: impl Into<String>) -> Result<Self, String> {
+    pub fn error(message: impl Into<String>) -> CaapResult<Self> {
         Self::new(DiagnosticSeverity::Error, message)
     }
 
-    pub fn warning(message: impl Into<String>) -> Result<Self, String> {
+    pub fn warning(message: impl Into<String>) -> CaapResult<Self> {
         Self::new(DiagnosticSeverity::Warning, message)
     }
 
-    pub fn note(message: impl Into<String>) -> Result<Self, String> {
+    pub fn note(message: impl Into<String>) -> CaapResult<Self> {
         Self::new(DiagnosticSeverity::Note, message)
     }
 
-    pub fn new(severity: DiagnosticSeverity, message: impl Into<String>) -> Result<Self, String> {
+    pub fn new(severity: DiagnosticSeverity, message: impl Into<String>) -> CaapResult<Self> {
         let message = message.into();
         if message.is_empty() {
-            return Err("diagnostic message must be non-empty".to_string());
+            return Err(CaapError::diagnostics(
+                "diagnostic message must be non-empty",
+            ));
         }
         Ok(Self {
             severity,
@@ -145,19 +193,19 @@ impl Diagnostic {
         })
     }
 
-    pub fn with_code(mut self, code: impl Into<String>) -> Result<Self, String> {
+    pub fn with_code(mut self, code: impl Into<String>) -> CaapResult<Self> {
         let code = code.into();
         if code.is_empty() {
-            return Err("diagnostic code must be non-empty".to_string());
+            return Err(CaapError::diagnostics("diagnostic code must be non-empty"));
         }
         self.code = Some(code);
         Ok(self)
     }
 
-    pub fn with_label(mut self, label: impl Into<String>) -> Result<Self, String> {
+    pub fn with_label(mut self, label: impl Into<String>) -> CaapResult<Self> {
         let label = label.into();
         if label.is_empty() {
-            return Err("diagnostic label must be non-empty".to_string());
+            return Err(CaapError::diagnostics("diagnostic label must be non-empty"));
         }
         self.label = Some(label);
         Ok(self)
@@ -169,25 +217,25 @@ impl Diagnostic {
         self
     }
 
-    pub fn add_note(mut self, note: impl Into<String>) -> Result<Self, String> {
+    pub fn add_note(mut self, note: impl Into<String>) -> CaapResult<Self> {
         let note = note.into();
         if note.is_empty() {
-            return Err("diagnostic note must be non-empty".to_string());
+            return Err(CaapError::diagnostics("diagnostic note must be non-empty"));
         }
         self.notes.push(note);
         Ok(self)
     }
 
-    pub fn add_help(mut self, help: impl Into<String>) -> Result<Self, String> {
+    pub fn add_help(mut self, help: impl Into<String>) -> CaapResult<Self> {
         let help = help.into();
         if help.is_empty() {
-            return Err("diagnostic help must be non-empty".to_string());
+            return Err(CaapError::diagnostics("diagnostic help must be non-empty"));
         }
         self.help.push(help);
         Ok(self)
     }
 
-    pub fn add_fix(mut self, fix: DiagnosticFix) -> Result<Self, String> {
+    pub fn add_fix(mut self, fix: DiagnosticFix) -> CaapResult<Self> {
         fix.validate()?;
         self.fixes.push(fix);
         Ok(self)
@@ -205,7 +253,7 @@ impl Diagnostic {
         Self {
             severity: DiagnosticSeverity::Error,
             message: error.message().to_string(),
-            code: Some("CAAP-RUNTIME-001".to_string()),
+            code: Some(DiagnosticCode::Runtime.as_str().to_string()),
             label: None,
             span,
             location,
@@ -216,10 +264,66 @@ impl Diagnostic {
             stack_trace,
         }
     }
+
+    pub fn from_caap_error(error: &CaapError, fallback_location: Option<&str>) -> Option<Self> {
+        let contexts = caap_error_contexts(error);
+        let leaf = caap_error_leaf(error);
+        let mut diagnostic = match leaf {
+            CaapError::Diagnostic(diagnostic) => diagnostic.as_ref().clone(),
+            CaapError::Eval(error) => Self::from_evaluation_error(error),
+            _ => {
+                let code = diagnostic_code_for_caap_domain(leaf.domain())?;
+                Self::error(leaf.message().to_string())
+                    .and_then(|diagnostic| diagnostic.with_code(code))
+                    .ok()?
+            }
+        };
+        if diagnostic.location.is_none() {
+            diagnostic.location = fallback_location.map(str::to_string);
+        }
+        if diagnostic.context.is_empty() {
+            diagnostic.context.push(leaf.domain().to_string());
+        }
+        diagnostic.context.extend(contexts);
+        Some(diagnostic)
+    }
+}
+
+fn diagnostic_code_for_caap_domain(domain: &str) -> Option<DiagnosticCode> {
+    match domain {
+        "artifacts" => Some(DiagnosticCode::Artifacts),
+        "parse" => Some(DiagnosticCode::Parse),
+        "compiler" => Some(DiagnosticCode::Compiler),
+        "diagnostics" => Some(DiagnosticCode::Diagnostics),
+        "graph" => Some(DiagnosticCode::Graph),
+        "host" => Some(DiagnosticCode::Host),
+        "ir" => Some(DiagnosticCode::Ir),
+        "semantic" => Some(DiagnosticCode::Semantic),
+        "unit" => Some(DiagnosticCode::Unit),
+        _ => None,
+    }
+}
+
+fn caap_error_leaf(mut error: &CaapError) -> &CaapError {
+    while let CaapError::Context { source, .. } = error {
+        error = source;
+    }
+    error
+}
+
+fn caap_error_contexts(error: &CaapError) -> Vec<String> {
+    let mut contexts = Vec::new();
+    let mut current = error;
+    while let CaapError::Context { context, source } = current {
+        contexts.push(context.clone());
+        current = source;
+    }
+    contexts.reverse();
+    contexts
 }
 
 impl DiagnosticFix {
-    pub fn new(label: impl Into<String>, kind: impl Into<String>) -> Result<Self, String> {
+    pub fn new(label: impl Into<String>, kind: impl Into<String>) -> CaapResult<Self> {
         let fix = Self {
             label: label.into(),
             kind: kind.into(),
@@ -232,90 +336,40 @@ impl DiagnosticFix {
     pub fn with_metadata(
         mut self,
         metadata: impl IntoIterator<Item = (String, String)>,
-    ) -> Result<Self, String> {
+    ) -> CaapResult<Self> {
         let mut metadata: Vec<(String, String)> = metadata.into_iter().collect();
         if metadata.iter().any(|(key, _)| key.is_empty()) {
-            return Err("diagnostic fix metadata keys must be non-empty".to_string());
+            return Err(CaapError::diagnostics(
+                "diagnostic fix metadata keys must be non-empty",
+            ));
         }
         metadata.sort_by(|left, right| left.0.cmp(&right.0));
         self.metadata = metadata;
         Ok(self)
     }
 
-    fn validate(&self) -> Result<(), String> {
+    fn validate(&self) -> CaapResult<()> {
         if self.label.is_empty() {
-            return Err("diagnostic fix label must be non-empty".to_string());
+            return Err(CaapError::diagnostics(
+                "diagnostic fix label must be non-empty",
+            ));
         }
         if self.kind.is_empty() {
-            return Err("diagnostic fix kind must be non-empty".to_string());
+            return Err(CaapError::diagnostics(
+                "diagnostic fix kind must be non-empty",
+            ));
         }
         if self.metadata.iter().any(|(key, _)| key.is_empty()) {
-            return Err("diagnostic fix metadata keys must be non-empty".to_string());
+            return Err(CaapError::diagnostics(
+                "diagnostic fix metadata keys must be non-empty",
+            ));
         }
         Ok(())
     }
 }
 
-impl DiagnosticExplanation {
-    pub fn new(
-        code: impl Into<String>,
-        title: impl Into<String>,
-        body: impl Into<String>,
-    ) -> Result<Self, String> {
-        let code = code.into();
-        let title = title.into();
-        let body = body.into();
-        if code.is_empty() {
-            return Err("diagnostic explanation code must be non-empty".to_string());
-        }
-        if title.is_empty() {
-            return Err("diagnostic explanation title must be non-empty".to_string());
-        }
-        if body.is_empty() {
-            return Err("diagnostic explanation body must be non-empty".to_string());
-        }
-        Ok(Self {
-            code,
-            title,
-            body,
-            help: Vec::new(),
-        })
-    }
-
-    pub fn with_help(mut self, help: impl IntoIterator<Item = String>) -> Result<Self, String> {
-        let help: Vec<String> = help.into_iter().collect();
-        if help.iter().any(String::is_empty) {
-            return Err("diagnostic explanation help entries must be non-empty".to_string());
-        }
-        self.help = help;
-        Ok(self)
-    }
-}
-
-impl DiagnosticExplanationRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn register(&mut self, explanation: DiagnosticExplanation) {
-        self.explanations
-            .insert(explanation.code.clone(), explanation);
-    }
-
-    pub fn explain(&self, code: &str) -> Result<Option<&DiagnosticExplanation>, String> {
-        if code.is_empty() {
-            return Err("diagnostic explanation lookup code must be non-empty".to_string());
-        }
-        Ok(self.explanations.get(code))
-    }
-
-    pub fn codes(&self) -> Vec<&str> {
-        self.explanations.keys().map(String::as_str).collect()
-    }
-}
-
 impl CompilerEvent {
-    pub fn new(kind: impl Into<String>, message: impl Into<String>) -> Result<Self, String> {
+    pub fn new(kind: impl Into<String>, message: impl Into<String>) -> CaapResult<Self> {
         Self::with_target(kind, None, message, [])
     }
 
@@ -324,24 +378,32 @@ impl CompilerEvent {
         target: Option<String>,
         message: impl Into<String>,
         metadata: impl IntoIterator<Item = (String, String)>,
-    ) -> Result<Self, String> {
+    ) -> CaapResult<Self> {
         let kind = kind.into();
         let message = message.into();
         if kind.is_empty() {
-            return Err("compiler event kind must be non-empty".to_string());
+            return Err(CaapError::diagnostics(
+                "compiler event kind must be non-empty",
+            ));
         }
         if message.is_empty() {
-            return Err("compiler event message must be non-empty".to_string());
+            return Err(CaapError::diagnostics(
+                "compiler event message must be non-empty",
+            ));
         }
         if target.as_ref().is_some_and(String::is_empty) {
-            return Err("compiler event target must be non-empty when present".to_string());
+            return Err(CaapError::diagnostics(
+                "compiler event target must be non-empty when present",
+            ));
         }
         let mut metadata: Vec<(String, String)> = metadata.into_iter().collect();
         if metadata
             .iter()
             .any(|(key, value)| key.is_empty() || value.is_empty())
         {
-            return Err("compiler event metadata entries must be non-empty".to_string());
+            return Err(CaapError::diagnostics(
+                "compiler event metadata entries must be non-empty",
+            ));
         }
         metadata.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
         Ok(Self {
@@ -366,9 +428,11 @@ impl CompilerEventLog {
         &self.events
     }
 
-    pub fn by_kind(&self, kind: &str) -> Result<Vec<&CompilerEvent>, String> {
+    pub fn by_kind(&self, kind: &str) -> CaapResult<Vec<&CompilerEvent>> {
         if kind.is_empty() {
-            return Err("compiler event kind lookup must be non-empty".to_string());
+            return Err(CaapError::diagnostics(
+                "compiler event kind lookup must be non-empty",
+            ));
         }
         Ok(self
             .events
@@ -481,5 +545,51 @@ mod tests {
         log.emit(CompilerEvent::new("eval", "started").unwrap());
         assert_eq!(log.by_kind("query").unwrap().len(), 1);
         assert!(log.by_kind("").is_err());
+    }
+
+    #[test]
+    fn caap_error_projects_to_structured_diagnostic() {
+        let diagnostic = Diagnostic::from_caap_error(
+            &CaapError::semantic("duplicate symbol"),
+            Some("demo.caap"),
+        )
+        .expect("semantic errors should project to diagnostics");
+
+        assert_eq!(diagnostic.code.as_deref(), Some("CAAP-SEMANTIC-001"));
+        assert_eq!(diagnostic.message, "duplicate symbol");
+        assert_eq!(diagnostic.location.as_deref(), Some("demo.caap"));
+        assert_eq!(diagnostic.context, vec!["semantic"]);
+    }
+
+    #[test]
+    fn caap_error_diagnostic_projection_preserves_context_chain() {
+        let error = CaapError::compiler("provider failed")
+            .with_context("query stage analyze")
+            .with_context("bootstrap demo");
+        let diagnostic = Diagnostic::from_caap_error(&error, Some("demo.caap"))
+            .expect("contextual compiler errors should project to diagnostics");
+
+        assert_eq!(diagnostic.code.as_deref(), Some("CAAP-COMPILER-001"));
+        assert_eq!(diagnostic.message, "provider failed");
+        assert_eq!(diagnostic.location.as_deref(), Some("demo.caap"));
+        assert_eq!(
+            diagnostic.context,
+            vec!["compiler", "query stage analyze", "bootstrap demo"]
+        );
+    }
+
+    #[test]
+    fn caap_error_diagnostic_projection_preserves_embedded_diagnostic() {
+        let embedded = Diagnostic::error("capability denied")
+            .and_then(|diagnostic| diagnostic.with_code(DiagnosticCode::Capability))
+            .unwrap();
+        let diagnostic =
+            Diagnostic::from_caap_error(&CaapError::diagnostic(embedded), Some("demo.caap"))
+                .expect("embedded diagnostics should project");
+
+        assert_eq!(diagnostic.code.as_deref(), Some("CAAP-CAP-001"));
+        assert_eq!(diagnostic.message, "capability denied");
+        assert_eq!(diagnostic.location.as_deref(), Some("demo.caap"));
+        assert_eq!(diagnostic.context, vec!["diagnostic"]);
     }
 }

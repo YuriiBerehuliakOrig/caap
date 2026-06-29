@@ -1,0 +1,32 @@
+; stdlib/lib/tests/test_value_order.caap — in-language smoke for the kernel
+; value_compare / value_hash builtins (total structural order + structural hash).
+
+;; @area: collections
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq)
+
+; ── value_compare: total order over mixed kinds (-1 / 0 / +1) ──────────────
+(assert_eq (value_compare 1 2) -1 "int less")
+(assert_eq (value_compare 2 1) 1 "int greater")
+(assert_eq (value_compare 1 1) 0 "int equal")
+; cross-kind: null < bool < int < float < string (by type rank)
+(assert_eq (value_compare null true) -1 "null before bool")
+(assert_eq (value_compare true 0) -1 "bool before int")
+(assert_eq (value_compare 0 0.0) -1 "int before float (no coercion)")
+(assert_eq (value_compare 9 "a") -1 "int before string")
+; nested lists, lexicographic + by length
+(assert_eq (value_compare (list_of 1 2) (list_of 1 3)) -1 "list lexicographic")
+(assert_eq (value_compare (list_of 1) (list_of 1 0)) -1 "shorter prefix first")
+(assert_eq (value_compare (list_of 1 (list_of 2)) (list_of 1 (list_of 2))) 0 "nested equal")
+; equal IFF value_eq, on distinct structurally-equal lists
+(assert_eq (value_eq (list_of 1 2) (list_of 1 2)) true "value_eq holds")
+(assert_eq (value_compare (list_of 1 2) (list_of 1 2)) 0 "value_compare 0 matches value_eq")
+
+; ── value_hash: structurally-equal values hash equal; distinct ones differ ──
+(assert_eq (value_hash (list_of 1 2)) (value_hash (list_of 1 2)) "equal lists hash equal")
+(assert_eq (value_hash "abc") (value_hash "abc") "equal strings hash equal")
+(assert_eq (eq (value_hash 1) (value_hash (list_of 1))) false "int 1 vs [1] differ")
+(assert_eq (eq (value_hash 1) (value_hash 2)) false "distinct ints differ")
+
+0

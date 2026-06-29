@@ -1,0 +1,218 @@
+; stdlib/lib/project.caap — multi-file projects with dependencies (à la CMake).
+;
+; A PROJECT is a directory with a manifest file — a plain .caap whose single
+; expression is a data map (no module directive, nothing to evaluate but data):
+;
+;   (assoc (map_of)
+;     "name"  "demo_app"
+;     "roots" (list_of (assoc (map_of) "prefix" "demo_app" "base" "src"))
+;     "deps"  (list_of "../mathlib/project.caap")
+;     "entry" "demo_app.main")
+;
+;   name  : unique project name (collisions across manifests are an error)
+;   roots : name->path conventions wired into the loader (prefix.a.b ->
+;           <manifest dir>/<base>/a/b.caap); `base` is manifest-relative
+;   deps  : other manifests, manifest-relative; loaded first, recursively;
+;           the same project reached twice (diamond) loads once; a CYCLE of
+;           projects is a hard error (module-level cycles stay legal)
+;   entry : optional module name to load/run as the project's target
+;
+; load_project wires everything; after it returns, every module of the project
+; and of all its dependencies resolves by name through the ordinary loader —
+; with the checker and the type pass applied as usual.
+(module stdlib.lib.project)
+
+(use stdlib.lib.text.path path_join normalize dirname absolute?)
+(use stdlib.lib.collections.sequence join contains? concat)
+
+; ── loader handle ───────────────────────────────────────────────────────────
+; The live loader's control surface (the same one the loader uses for its own
+; resolution); we drive it as DATA — no callbacks. load_file evaluates a
+; manifest to its data map, declare_root wires a name->path convention, and
+; load_module resolves+runs a module by name.
+(bind loader_api (ctfe_compiler_lookup_value compiler "stdlib.load"))
+(bind load_file    (get loader_api "load"))
+(bind declare_root (get loader_api "declare_root"))
+(bind load_module  (get loader_api "load_module"))
+
+; ── load-time state (mutated as the dependency tree is walked) ──────────────
+(bind by_path (map_of))   ; normalized manifest path -> project record
+(bind by_name (map_of))   ; project name -> normalized manifest path
+(bind loading (ref (list_of))) ; manifest-path stack (ref: it must shrink)
+
+; ── manifest helpers ────────────────────────────────────────────────────────
+
+; manifest_error — fail (runtime_error) with the manifest path in front.
+;   path / msg : the manifest and the complaint
+(bind manifest_error
+  (lambda (path msg)
+    (runtime_error (string_concat_many "project " path ": " msg))))
+
+; require_string — read a manifest field that must be a non-empty string,
+; else manifest_error. (`m` the manifest/clause map, `key` the field name.)
+(bind require_string
+  (lambda (path m key)
+    (bind ((v (get m key)))
+      (if (and (eq (value_type v) "string") (gt (size v) 0))
+        v
+        (manifest_error path
+          (string_concat_many "manifest field \"" key
+            "\" must be a non-empty string"))))))
+
+; ── manifest schema + validation ─────────────────────────────────────────────
+; A manifest is a closed schema: only the keys below are recognised. An unknown
+; top-level key is almost always a TYPO ("dep" for "deps", "entrypoint" for
+; "entry") that would otherwise be silently ignored, so it is rejected with a
+; located error naming the bad key. `version` is optional and, when present,
+; must equal the schema version this loader speaks — a manifest written for a
+; newer schema is refused rather than half-understood.
+
+; schema_version — the manifest schema version this loader understands.
+(bind schema_version 1)
+
+; known_keys — the recognised top-level manifest keys (the closed schema).
+(bind known_keys (list_of "version" "name" "roots" "deps" "entry"))
+
+; validate_manifest! — reject a manifest that violates the schema, with a
+; located (path-prefixed) error. Checks, in order: every top-level key is known,
+; and (when present) "version" is an int equal to schema_version. Returns null on
+; success; this is a guard run for its effect, not a transform.
+;   path : the manifest path (for the located error)
+;   m    : the manifest data map (already known to be a map)
+;   ->   : null (or a thrown manifest_error)
+(bind validate_manifest!
+  (lambda (path m)
+    (do
+      (for k (map_keys m)
+        (unless (contains? known_keys k)
+          (manifest_error path
+            (string_concat_many "unknown manifest key \"" k
+              "\" (recognised keys: " (join known_keys ", ") ")"))))
+      (when (contains m "version")
+        (bind ((v (get m "version")))
+          (unless (and (eq (value_type v) "int") (eq v schema_version))
+            (manifest_error path
+              (string_concat_many "manifest \"version\" must be "
+                (value_to_string schema_version) ", got "
+                (value_to_string v))))))
+      null)))
+
+; ── public surface ──────────────────────────────────────────────────────────
+
+; load_project — load a manifest and everything it depends on, recursively.
+; Dependencies load before the project's own roots go live; a project reached
+; twice (DIAMOND) loads once (reused from by_path); a project that depends on
+; itself transitively (CYCLE) is a hard error naming the chain. Module-level
+; cycles among a project's files stay legal — this guards only the manifests.
+;   manifest_path : ABSOLUTE path to the project manifest
+;   ->            : the project record {name, path, dir, entry, deps: [names]}
+(defn load_project ((manifest_path string)) map
+  (bind ((path (normalize manifest_path)))
+    (do
+      (unless (absolute? path)
+        (manifest_error path "manifest path must be absolute"))
+      ; diamond: already fully loaded -> reuse
+      (if_let (existing (get by_path path))
+        existing
+        (do
+          ; project-level cycle is a hard error (clear chain in the message)
+          (when (contains? (deref loading) path)
+            (runtime_error
+              (string_concat_many
+                "project dependency cycle: "
+                (join (deref loading) " -> ") " -> " path)))
+          (set_ref loading (concat (deref loading) (list_of path)))
+          ; Pop this frame off `loading` on EITHER outcome. A thrown load/
+          ; validate/dependency/declare_root error must NOT leave `path` wedged
+          ; in the stack — that would fake a "dependency cycle" on the next load
+          ; attempt in the same session. CAAP has no `finally`, so a local
+          ; `pop_loading!` is called in both the success tail and the catch arm.
+          (bind ((pop_loading!
+                   (lambda ()
+                     (set_ref loading
+                       (sequence_take (deref loading)
+                         (int_sub (size (deref loading)) 1))))))
+            (try
+              (bind (
+                (m (load_file path))
+                (dir (dirname path))
+                (name (require_string path m "name"))
+                (dep_names (list_of))
+              )
+                (do
+                  (when (not (eq (value_type m) "map"))
+                    (manifest_error path "manifest must evaluate to a map"))
+                  ; schema check: reject unknown top-level keys / a wrong version
+                  (validate_manifest! path m)
+                  ; name uniqueness across DIFFERENT manifests
+                  (when_let (prior (get by_name name))
+                    (when (not (eq prior path))
+                      (manifest_error path
+                        (string_concat_many
+                          "project name \"" name "\" is already taken by " prior))))
+                  ; dependencies first — their roots must be live before our modules
+                  (for dep (get m "deps" (list_of))
+                    (bind ((dp (normalize (path_join dir dep))))
+                      (append dep_names
+                        (get (load_project dp) "name"))))
+                  ; wire this project's roots into the loader
+                  (for r (get m "roots" (list_of))
+                    (declare_root
+                      (require_string path r "prefix")
+                      (path_join dir (require_string path r "base"))))
+                  (bind ((record
+                           (assoc (map_of)
+                             "name" name
+                             "path" path
+                             "dir" dir
+                             "entry" (get m "entry")
+                             "deps" dep_names)))
+                    (do
+                      (assoc by_path path record)
+                      (assoc by_name name path)
+                      (pop_loading!)
+                      record))))
+              (catch e (do (pop_loading!) (throw e))))))))))
+
+; load_entry — load the project's entry module and return its exports.
+;   project : a record from load_project (must declare "entry")
+(defn load_entry ((project map)) map
+  (bind ((entry (get project "entry")))
+    (if (eq entry null)
+      (runtime_error
+        (string_concat_many
+          "project " (get project "name" "?") " declares no entry module"))
+      (load_module entry))))
+
+; run — load the entry module and call its `main` export (if any).
+;   project : a record from load_project
+;   ->      : main's return value, or the exports map when there is no main
+(defn run ((project map)) any
+  (bind (
+    (exports (load_entry project))
+    (main (get exports "main"))
+  )
+    (if (eq main null) exports (main))))
+
+; projects — the records of every project loaded so far (observability).
+;   -> : a map of normalized manifest path -> project record
+(bind projects (lambda () by_path))
+
+; clear_projects! — reset ALL project session state (hygiene / reload).
+; Empties the three module-global registries IN PLACE — `by_path` and
+; `by_name` keep their identity (callers holding `(projects)` still observe
+; the same live map), and `loading` is reset to an empty stack. After this a
+; fresh load_project starts from a clean slate: a project reloads cleanly, a
+; name is free to be reclaimed, and no stale `loading` frame fakes a cycle.
+; This ADDS a reset; it does not alter load-time behaviour.
+;   -> : null
+(bind clear_projects!
+  (lambda ()
+    (do
+      (for k (map_keys by_path) (map_delete by_path k))
+      (for k (map_keys by_name) (map_delete by_name k))
+      (set_ref loading (list_of))
+      null)))
+
+(export load_project load_entry run projects clear_projects!
+        schema_version known_keys validate_manifest!)

@@ -1,0 +1,161 @@
+; stdlib/lib/tests/test_ordered_map.caap — in-language tests for
+; lib/collections/ordered_map: sorted-key map + ordered set + binary_search.
+;
+; NOTE: the kernel `assert_eq` uses `eq` (IDENTITY equality — distinct lists with
+; equal elements are NOT `eq`), so list results are checked with `assert_list`,
+; which compares STRUCTURALLY via `value_eq`. Scalars use `assert_eq`.
+
+;; @area: collections
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.collections.ordered_map
+     binary_search insertion_point
+     omap_new omap_put omap_get omap_has? omap_del
+     omap_keys omap_values omap_entries omap_size
+     omap_min_key omap_max_key omap_floor omap_ceil omap_between
+     oset_new oset_add oset_has? oset_del oset_items oset_size
+     oset_min oset_max oset_between)
+
+; assert_list — structural list equality (value_eq), reusing assert_true.
+(bind assert_list
+  (lambda (actual expected label) (assert_true (value_eq actual expected) label)))
+
+(do
+  ; ── standalone binary_search: hit + miss-insertion-point ───────────────────
+  (bind ((cmp (lambda (a b) (value_compare a b)))
+         (sl (list_of 2 4 6 8 10)))
+    (do
+      (assert_eq (binary_search sl 6 cmp) 2 "binary_search hit returns the index")
+      (assert_eq (binary_search sl 2 cmp) 0 "binary_search hit at index 0")
+      (assert_eq (binary_search sl 10 cmp) 4 "binary_search hit at last index")
+      ; miss: result is negative; insertion_point recovers where it would slot in
+      (assert_true (lt (binary_search sl 5 cmp) 0) "binary_search miss is negative")
+      (assert_eq (insertion_point (binary_search sl 5 cmp)) 2
+        "miss 5 inserts between 4 and 6 (index 2)")
+      (assert_eq (insertion_point (binary_search sl 1 cmp)) 0
+        "miss below all inserts at front (index 0)")
+      (assert_eq (insertion_point (binary_search sl 11 cmp)) 5
+        "miss above all inserts at end (index 5)")
+      (assert_eq (binary_search (list_of) 1 cmp) -1
+        "binary_search on empty list is the encoded miss for insertion point 0")))
+
+  ; ── ordered map: insert OUT OF ORDER, read back ASCENDING ──────────────────
+  (bind ((m (omap_put
+              (omap_put
+                (omap_put
+                  (omap_put
+                    (omap_put (omap_new) 5 "e")
+                    1 "a")
+                  9 "i")
+                3 "c")
+              7 "g")))
+    (do
+      (assert_eq (omap_size m) 5 "five keys inserted")
+      (assert_list (omap_keys m) (list_of 1 3 5 7 9) "keys come back ascending")
+      (assert_list (omap_values m) (list_of "a" "c" "e" "g" "i") "values track key order")
+      (assert_eq (omap_get m 3 "?") "c" "get hits an existing key")
+      (assert_eq (omap_get m 4 "?") "?" "get misses with the default")
+      (assert_true (omap_has? m 7) "has? true for a present key")
+      (assert_eq (omap_has? m 8) false "has? false for an absent key")
+      (assert_eq (omap_min_key m) 1 "min key")
+      (assert_eq (omap_max_key m) 9 "max key")
+      (assert_list (omap_entries m)
+        (list_of (list_of 1 "a") (list_of 3 "c") (list_of 5 "e")
+                 (list_of 7 "g") (list_of 9 "i"))
+        "entries are [k,v] pairs in key order")
+
+      ; replace-on-equal-key keeps order and size
+      (bind ((m2 (omap_put m 5 "E")))
+        (do
+          (assert_eq (omap_size m2) 5 "replacing a key does not grow the map")
+          (assert_eq (omap_get m2 5 "?") "E" "replaced value is read back")
+          (assert_list (omap_keys m2) (list_of 1 3 5 7 9) "order preserved after replace")
+          (assert_eq (omap_get m 5 "?") "e" "original map is unchanged (pure put)")))
+
+      ; ── floor / ceil ───────────────────────────────────────────────────────
+      (assert_eq (omap_floor m 5) 5 "floor of a present key is itself")
+      (assert_eq (omap_floor m 6) 5 "floor of 6 is 5 (largest key <= 6)")
+      (assert_eq (omap_floor m 0) null "floor below the minimum is null")
+      (assert_eq (omap_floor m 100) 9 "floor above the maximum is the max key")
+      (assert_eq (omap_ceil m 5) 5 "ceil of a present key is itself")
+      (assert_eq (omap_ceil m 6) 7 "ceil of 6 is 7 (smallest key >= 6)")
+      (assert_eq (omap_ceil m 100) null "ceil above the maximum is null")
+      (assert_eq (omap_ceil m 0) 1 "ceil below the minimum is the min key")
+
+      ; ── between (inclusive range) ───────────────────────────────────────────
+      (assert_list (omap_between m 3 7)
+        (list_of (list_of 3 "c") (list_of 5 "e") (list_of 7 "g"))
+        "between [3,7] is inclusive on both ends")
+      (assert_list (omap_between m 4 6) (list_of (list_of 5 "e"))
+        "between [4,6] selects only key 5")
+      (assert_list (omap_between m 100 200) (list_of)
+        "between an out-of-range window is empty")
+
+      ; ── del ─────────────────────────────────────────────────────────────────
+      (bind ((m3 (omap_del m 5)))
+        (do
+          (assert_list (omap_keys m3) (list_of 1 3 7 9) "del removes the key, order kept")
+          (assert_eq (omap_size m3) 4 "del shrinks the map")
+          (assert_eq (omap_has? m3 5) false "deleted key is gone")
+          (assert_list (omap_keys m) (list_of 1 3 5 7 9) "original unchanged (pure del)")
+          (assert_list (omap_keys (omap_del m 42)) (list_of 1 3 5 7 9)
+            "del of an absent key is a no-op")))))
+
+  ; ── ordered set over INTS ──────────────────────────────────────────────────
+  (bind ((s (oset_add (oset_add (oset_add (oset_add (oset_add (oset_new) 4) 1) 4) 8) 2)))
+    (do
+      (assert_list (oset_items s) (list_of 1 2 4 8) "ints sorted, duplicate 4 collapsed")
+      (assert_eq (oset_size s) 4 "set size counts distinct elements")
+      (assert_true (oset_has? s 4) "has? true for a member")
+      (assert_eq (oset_has? s 5) false "has? false for a non-member")
+      (assert_eq (oset_min s) 1 "set min")
+      (assert_eq (oset_max s) 8 "set max")
+      (assert_list (oset_between s 2 4) (list_of 2 4) "set between [2,4] inclusive")
+      (assert_list (oset_items (oset_del s 4)) (list_of 1 2 8) "del removes a member")
+      (assert_list (oset_items s) (list_of 1 2 4 8) "original set unchanged (pure del)")))
+
+  ; ── ordered set over STRINGS (value_compare orders strings too) ─────────────
+  (bind ((ss (oset_add (oset_add (oset_add (oset_add (oset_new) "pear") "apple") "fig") "apple")))
+    (do
+      (assert_list (oset_items ss) (list_of "apple" "fig" "pear")
+        "strings sorted lexicographically, duplicate apple collapsed")
+      (assert_true (oset_has? ss "fig") "string membership")
+      (assert_eq (oset_min ss) "apple" "string min")
+      (assert_eq (oset_max ss) "pear" "string max")
+      (assert_list (oset_between ss "apple" "fig") (list_of "apple" "fig")
+        "string range [apple,fig] inclusive")))
+
+  ; ── value_compare is cross-kind: a set may hold ints AND strings together ───
+  (bind ((mixed (oset_add (oset_add (oset_add (oset_add (oset_new) "z") 7) 3) "a")))
+    (do
+      ; total order by type-rank: ints (3,7) sort before strings ("a","z")
+      (assert_list (oset_items mixed) (list_of 3 7 "a" "z")
+        "cross-kind set: ints precede strings by value_compare type-rank")
+      (assert_eq (oset_min mixed) 3 "cross-kind min is the least int")
+      (assert_eq (oset_max mixed) "z" "cross-kind max is the greatest string")))
+
+  ; ── custom comparator: DESCENDING ints ─────────────────────────────────────
+  (bind ((desc (lambda (a b) (value_compare b a)))
+         (dm (omap_put (omap_put (omap_put (omap_new desc) 1 "a") 5 "e") 3 "c")))
+    (do
+      (assert_list (omap_keys dm) (list_of 5 3 1) "custom descending comparator orders keys")
+      (assert_eq (omap_get dm 3 "?") "c" "lookup works under a custom comparator")
+      (assert_eq (omap_min_key dm) 5 "min_key follows the comparator (5 is 'least')")
+      (assert_eq (omap_floor dm 4) 5 "floor under descending cmp: largest-by-cmp <= 4 is 5")))
+
+  ; ── custom EQUIVALENCE comparator: floor/ceil on a hit return the STORED key,
+  ;    not the probe (the two share a cmp-class but are distinct values) ───────
+  (bind ((by_first (lambda (a b) (value_compare (get a 0) (get b 0))))
+         ; keys are 2-element lists; by_first compares only the first element,
+         ; so [1,"x"] and [1,"probe"] are cmp-equal but not value-equal
+         (em (omap_put (omap_put (omap_new by_first) (list_of 1 "x") "a") (list_of 3 "y") "b")))
+    (do
+      (assert_list (omap_floor em (list_of 1 "probe")) (list_of 1 "x")
+        "floor on a cmp-hit returns the stored key, not the probe")
+      (assert_list (omap_ceil em (list_of 3 "probe")) (list_of 3 "y")
+        "ceil on a cmp-hit returns the stored key, not the probe")
+      (assert_eq (omap_get em (list_of 1 "anything") "?") "a"
+        "get on a cmp-hit returns the stored value regardless of probe payload")))
+
+  true)

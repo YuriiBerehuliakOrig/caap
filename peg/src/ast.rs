@@ -1,24 +1,33 @@
+//! [`AstNode`] — the concrete syntax tree built from a parse, plus [`AstSpan`]
+//! byte ranges, the [`Source`] text helper, and the `parse_ast` / tolerant
+//! tree builders.
+
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 // ── AstSpan ────────────────────────────────────────────────────────────────
 
 /// Byte-offset span in the source text `[start, end)`.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct AstSpan {
+    /// Inclusive start byte offset.
     pub start: usize,
+    /// Exclusive end byte offset.
     pub end: usize,
 }
 
 impl AstSpan {
+    /// A span over the byte range `[start, end)`.
     pub fn new(start: usize, end: usize) -> Self {
         Self { start, end }
     }
 
+    /// Length in bytes (saturating, so a reversed span reads as `0`).
     pub fn length(&self) -> usize {
         self.end.saturating_sub(self.start)
     }
 
+    /// Whether the span covers no bytes.
     pub fn is_empty(&self) -> bool {
         self.start >= self.end
     }
@@ -32,12 +41,15 @@ impl AstSpan {
 /// The first entry is always `0`.
 #[derive(Clone, Debug)]
 pub struct Source {
+    /// The source text.
     pub text: String,
+    /// Optional source name (e.g. a file path) for diagnostics.
     pub name: Option<String>,
     line_offsets: Vec<usize>,
 }
 
 impl Source {
+    /// Build a `Source` from text, precomputing its line-offset table.
     pub fn new(text: impl Into<String>) -> Self {
         let text = text.into();
         let line_offsets = Self::compute_offsets(&text);
@@ -48,6 +60,7 @@ impl Source {
         }
     }
 
+    /// Attach a source name (e.g. a file path) for diagnostics.
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
@@ -86,11 +99,14 @@ impl Source {
 /// A named binding captured during a parse rule match.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AstCapture {
+    /// The capture label (the `name` in a `capture("name", …)`).
     pub label: String,
+    /// The captured subtree.
     pub node: Box<AstNode>,
 }
 
 impl AstCapture {
+    /// Build a capture binding `label` to `node`.
     pub fn new(label: impl Into<String>, node: AstNode) -> Self {
         Self {
             label: label.into(),
@@ -107,34 +123,71 @@ impl AstCapture {
 /// `source.slice(&node.span)` or `node.text_from(&source)` to retrieve text.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AstNode {
+    /// The rule (or construct) name this node was produced by.
     pub rule: String,
+    /// The byte span this node covers.
     pub span: AstSpan,
-    pub children: Vec<AstNode>,
+    /// Children are held behind an [`Arc`] so structurally identical subtrees can
+    /// be physically shared between successive parses (see
+    /// [`crate::ast_diff::reparse_ast_incremental`]). Clone is cheap; mutation
+    /// goes through [`Arc::make_mut`]-style copy-on-write (`to_vec` + `into`).
+    pub children: Arc<[AstNode]>,
+    /// Named captures attached to this node.
     pub captures: Vec<AstCapture>,
+    /// The semantic action name attached by the grammar, if any.
     pub action: String,
+    /// `true` for synthetic error nodes produced by [`parse_ast_tolerant`] over
+    /// input the grammar could not match. Always `false` for matched rules.
+    #[serde(default)]
+    pub error: bool,
 }
 
+/// The reserved rule name used for synthetic error nodes.
+pub const ERROR_RULE: &str = "<error>";
+
 impl AstNode {
+    /// A leaf node for `rule` over `span` (no children, captures, or action).
     pub fn new(rule: impl Into<String>, span: AstSpan) -> Self {
         Self {
             rule: rule.into(),
             span,
-            children: Vec::new(),
+            children: Arc::from([]),
             captures: Vec::new(),
             action: String::new(),
+            error: false,
         }
     }
 
+    /// A synthetic error node covering `[start, end)` (rule [`ERROR_RULE`]).
+    pub fn error(start: usize, end: usize) -> Self {
+        Self {
+            rule: ERROR_RULE.to_string(),
+            span: AstSpan::new(start, end),
+            children: Arc::from([]),
+            captures: Vec::new(),
+            action: String::new(),
+            error: true,
+        }
+    }
+
+    /// Whether any node in this subtree is an error node.
+    pub fn has_errors(&self) -> bool {
+        walk(self).any(|n| n.error)
+    }
+
+    /// Builder: set the node's children.
     pub fn with_children(mut self, children: Vec<AstNode>) -> Self {
-        self.children = children;
+        self.children = children.into();
         self
     }
 
+    /// Builder: set the node's captures.
     pub fn with_captures(mut self, captures: Vec<AstCapture>) -> Self {
         self.captures = captures;
         self
     }
 
+    /// Builder: set the node's semantic-action name.
     pub fn with_action(mut self, action: impl Into<String>) -> Self {
         self.action = action.into();
         self
@@ -169,6 +222,61 @@ struct TraceNode {
     children: Vec<TraceNode>,
 }
 
+/// A rule-lifecycle event collected during the parse, folded into the tree.
+#[derive(Clone, Copy)]
+enum TraceKind {
+    Enter,
+    Exit,
+    Fail,
+}
+
+struct TraceEvent {
+    kind: TraceKind,
+    rule: String,
+    pos: usize,
+}
+
+/// A [`crate::driver::ParseDriver`] that records the rule lifecycle (enter /
+/// exit / fail) so the AST builder can fold it into a tree. The replacement for
+/// the former `with_trace` event stream.
+#[derive(Default)]
+struct AstCollector {
+    events: std::cell::RefCell<Vec<TraceEvent>>,
+}
+
+impl crate::driver::ParseDriver for AstCollector {
+    fn handle(
+        &self,
+        effect: &crate::driver::ParseEffect<'_>,
+        _view: &crate::driver::ParseView<'_>,
+    ) -> crate::driver::Directive {
+        use crate::driver::ParseEffect::*;
+        let event = match effect {
+            RuleEnter { rule, pos } => Some(TraceEvent {
+                kind: TraceKind::Enter,
+                rule: rule.to_string(),
+                pos: *pos,
+            }),
+            // The exit "position" is the rule's end, matching the old trace.
+            RuleExit { rule, end, .. } => Some(TraceEvent {
+                kind: TraceKind::Exit,
+                rule: rule.to_string(),
+                pos: *end,
+            }),
+            RuleFail { rule, pos } => Some(TraceEvent {
+                kind: TraceKind::Fail,
+                rule: rule.to_string(),
+                pos: *pos,
+            }),
+            _ => None,
+        };
+        if let Some(event) = event {
+            self.events.borrow_mut().push(event);
+        }
+        crate::driver::Directive::Proceed
+    }
+}
+
 /// Parse `text` with `grammar` and build an `AstNode` tree from the rule trace.
 ///
 /// This mirrors `peg/ast/_core.py`'s `parse_ast()`. The grammar is run with
@@ -189,8 +297,61 @@ pub fn parse_ast_with_max_steps(
     start_rule: Option<&str>,
     max_steps: Option<usize>,
 ) -> Result<AstNode, crate::error::ParseError> {
-    use crate::parser::PEGParser;
-    use crate::types::{ParseEvent, ParserConfig};
+    let (start, collected, result) = collect_ast_events(grammar, text, start_rule, max_steps);
+    result?;
+    let roots = build_trace_forest(&collected);
+    let root = select_root_node(&roots, &start, text.len()).ok_or_else(|| {
+        crate::error::ParseError::new("AST parse produced no trace", 0, text.len())
+    })?;
+    Ok(build_ast_tree(&dedupe_trace_tree(root.clone())))
+}
+
+/// Error-tolerant parse: **always** returns a best-effort tree, never an error.
+///
+/// When the grammar cannot match the whole input, the matched prefix is returned
+/// with a synthetic [`ERROR_RULE`] node ([`AstNode::error`]) covering the
+/// unmatched tail, and the root's `error` flag set. If nothing matched at all,
+/// a single error node spanning the whole input is returned. Built on the same
+/// rule-lifecycle stream (enter/exit/fail) as [`parse_ast`] — useful for editors
+/// and IDE tooling that must produce a tree even from invalid source.
+pub fn parse_ast_tolerant(
+    grammar: &crate::grammar::Grammar,
+    text: &str,
+    start_rule: Option<&str>,
+) -> AstNode {
+    let (start, collected, _result) = collect_ast_events(grammar, text, start_rule, None);
+    let text_len = text.len();
+    let roots = build_trace_forest(&collected);
+    match select_root_node(&roots, &start, text_len) {
+        None => AstNode::error(0, text_len),
+        Some(root) => {
+            let mut node = build_ast_tree(&dedupe_trace_tree(root.clone()));
+            if node.span.end < text_len {
+                let mut kids = node.children.to_vec();
+                kids.push(AstNode::error(node.span.end, text_len));
+                node.children = kids.into();
+                node.span.end = text_len;
+                node.error = true;
+            }
+            node
+        }
+    }
+}
+
+/// Run the parse with an `AstCollector` driver, returning the effective start
+/// rule, the collected lifecycle events, and the (possibly failed) parse result.
+fn collect_ast_events(
+    grammar: &crate::grammar::Grammar,
+    text: &str,
+    start_rule: Option<&str>,
+    max_steps: Option<usize>,
+) -> (
+    String,
+    Vec<TraceEvent>,
+    Result<(), crate::error::ParseError>,
+) {
+    use crate::parser_engine::PEGParser;
+    use crate::types::ParserConfig;
 
     let effective_grammar: std::borrow::Cow<crate::grammar::Grammar> =
         if let Some(rule) = start_rule {
@@ -205,34 +366,26 @@ pub fn parse_ast_with_max_steps(
             std::borrow::Cow::Borrowed(grammar)
         };
 
-    let events: Arc<Mutex<Vec<ParseEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let ev = events.clone();
     let steps = max_steps.unwrap_or_else(|| text.len().saturating_add(65536).max(65536));
-    let config = ParserConfig::default()
-        .with_max_steps(steps)
-        .with_trace(move |e| {
-            ev.lock().unwrap().push(e.clone());
-        });
+    let config = ParserConfig::default().with_max_steps(steps);
 
-    let parser = PEGParser;
-    parser.parse(&effective_grammar, text, &config)?;
-
-    let collected = events.lock().unwrap().clone();
-    let roots = build_trace_forest(&collected);
-    let root =
-        select_root_node(&roots, &effective_grammar.start_rule, text.len()).ok_or_else(|| {
-            crate::error::ParseError::new("AST parse produced no trace", 0, text.len())
-        })?;
-    let deduped = dedupe_trace_tree(root.clone());
-    Ok(build_ast_tree(&deduped))
+    let collector = AstCollector::default();
+    let result = PEGParser
+        .parse_with_driver(&effective_grammar, text, &config, Some(&collector))
+        .map(|_| ());
+    (
+        effective_grammar.start_rule.clone(),
+        collector.events.into_inner(),
+        result,
+    )
 }
 
-fn build_trace_forest(events: &[crate::types::ParseEvent]) -> Vec<TraceNode> {
+fn build_trace_forest(events: &[TraceEvent]) -> Vec<TraceNode> {
     let mut stack: Vec<TraceNode> = Vec::new();
     let mut roots: Vec<TraceNode> = Vec::new();
     for event in events {
         match event.kind {
-            "enter" => {
+            TraceKind::Enter => {
                 stack.push(TraceNode {
                     rule: event.rule.clone(),
                     start: event.pos,
@@ -240,7 +393,7 @@ fn build_trace_forest(events: &[crate::types::ParseEvent]) -> Vec<TraceNode> {
                     children: Vec::new(),
                 });
             }
-            "exit" => {
+            TraceKind::Exit => {
                 if let Some(mut node) = stack.pop() {
                     node.end = event.pos;
                     if let Some(parent) = stack.last_mut() {
@@ -250,10 +403,9 @@ fn build_trace_forest(events: &[crate::types::ParseEvent]) -> Vec<TraceNode> {
                     }
                 }
             }
-            "fail" => {
+            TraceKind::Fail => {
                 stack.pop();
             }
-            _ => {}
         }
     }
     roots
@@ -301,36 +453,18 @@ fn dedupe_trace_tree(mut node: TraceNode) -> TraceNode {
 }
 
 fn build_ast_tree(node: &TraceNode) -> AstNode {
-    let mut children = Vec::new();
-    let mut captures = Vec::new();
-    let mut action = String::new();
-    for child in &node.children {
-        let built = build_ast_tree(child);
-        match parse_behavior_trace_rule(&child.rule) {
-            Some(("capture", label)) => captures.push(AstCapture::new(label, built)),
-            Some(("action", label)) => action = label.to_string(),
-            _ => children.push(built),
-        }
-    }
+    // The rule-lifecycle trace carries only rule enter/exit, so every trace child
+    // is an AST child. (`captures`/`action` are populated by the value-building
+    // path, not this trace-folding one — they stay empty here.)
+    let children: Vec<AstNode> = node.children.iter().map(build_ast_tree).collect();
     AstNode {
         rule: node.rule.clone(),
         span: AstSpan::new(node.start, node.end),
-        children,
-        captures,
-        action,
+        children: children.into(),
+        captures: Vec::new(),
+        action: String::new(),
+        error: false,
     }
-}
-
-fn parse_behavior_trace_rule(rule: &str) -> Option<(&str, &str)> {
-    let mut parts = rule.splitn(5, "::");
-    if parts.next()? != "__beh" {
-        return None;
-    }
-    let kind = parts.next()?;
-    let _node_id = parts.next()?;
-    let _index = parts.next()?;
-    let label = parts.next()?;
-    Some((kind, label))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -419,9 +553,46 @@ mod tests {
     #[test]
     fn parse_ast_builds_tree_for_simple_grammar() {
         use crate::grammar::Grammar;
-        let grammar = Grammar::new("word <- [a-z]+").with_start_rule("word");
+        let grammar = Grammar::trusted_new("word <- [a-z]+").with_start_rule("word");
         let tree = parse_ast(&grammar, "abc", None).expect("parse_ast succeeds");
         assert_eq!(tree.rule, "word");
+        assert_eq!(tree.span, AstSpan::new(0, 3));
+    }
+
+    #[test]
+    fn parse_ast_tolerant_returns_clean_tree_on_full_match() {
+        use crate::grammar::Grammar;
+        let grammar = Grammar::trusted_new("word <- [a-z]+").with_start_rule("word");
+        let tree = parse_ast_tolerant(&grammar, "abc", None);
+        assert_eq!(tree.rule, "word");
+        assert!(!tree.has_errors());
+        assert_eq!(tree.span, AstSpan::new(0, 3));
+    }
+
+    #[test]
+    fn parse_ast_tolerant_marks_unmatched_tail() {
+        use crate::grammar::Grammar;
+        // `[a-z]+` matches the "abc" prefix; "123" is the unmatched tail.
+        let grammar = Grammar::trusted_new("word <- [a-z]+").with_start_rule("word");
+        let tree = parse_ast_tolerant(&grammar, "abc123", None);
+        assert!(tree.error, "root should be flagged as containing an error");
+        assert_eq!(tree.span, AstSpan::new(0, 6));
+        let err = tree
+            .children
+            .iter()
+            .find(|c| c.error)
+            .expect("an error child for the tail");
+        assert_eq!(err.rule, ERROR_RULE);
+        assert_eq!(err.span, AstSpan::new(3, 6));
+    }
+
+    #[test]
+    fn parse_ast_tolerant_full_error_when_nothing_matches() {
+        use crate::grammar::Grammar;
+        let grammar = Grammar::trusted_new("digits <- [0-9]+").with_start_rule("digits");
+        let tree = parse_ast_tolerant(&grammar, "abc", None);
+        assert!(tree.error);
+        assert_eq!(tree.rule, ERROR_RULE);
         assert_eq!(tree.span, AstSpan::new(0, 3));
     }
 }

@@ -1,0 +1,221 @@
+; stdlib/lib/core/math.caap — pure integer math helpers (module stdlib.lib.core.math).
+;
+; The kernel gives int_add/sub/mul/div/mod and comparisons but no derived
+; numerics; these are the common ones, all pure (eval and compile alike). They
+; operate on the dynamic kernel int; sized widths flow through unchanged.
+(module stdlib.lib.core.math)
+
+; abs — magnitude. (the kernel has no int_neg, so negate via 0 - x)
+;   x  : an int
+;   -> : x when x >= 0, else -x
+(defn abs ((x int)) int
+  (if (lt x 0) (int_sub 0 x) x))
+
+; sign — -1, 0 or 1 by the sign of `x`.
+(defn sign ((x int)) int
+  (cond ((lt x 0) -1) ((gt x 0) 1) (else 0)))
+
+; min / max — the smaller / larger of two ints.
+(defn min ((a int) (b int)) int (if (lt a b) a b))
+(defn max ((a int) (b int)) int (if (gt a b) a b))
+
+; clamp — `x` confined to [lo, hi] (lo <= hi assumed).
+;   x / lo / hi : the value and the inclusive bounds
+;   ->          : lo if x < lo, hi if x > hi, else x
+(defn clamp ((x int) (lo int) (hi int)) int
+  (max lo (min x hi)))
+
+; pow — integer exponentiation by repeated multiply (n >= 0).
+;   base / n : the base and a non-negative exponent
+;   ->       : base^n (1 when n = 0; n < 0 clamps to 1, no fractions in ints)
+(defn pow ((base int) (n int)) int
+    (bind ((acc (ref 1)) (i (ref 0)))
+      (do
+        (while (lt (deref i) n)
+          (do
+            (set_ref acc (int_mul (deref acc) base))
+            (set_ref i (int_add (deref i) 1))))
+        (deref acc))))
+
+; gcd — greatest common divisor (Euclid), always non-negative.
+;   a / b : two ints
+;   ->    : gcd(|a|, |b|); gcd(0,0) = 0
+(defn gcd ((a int) (b int)) int
+    (bind ((x (ref (abs a))) (y (ref (abs b))))
+      (do
+        (while (ne (deref y) 0)
+          (bind ((t (deref y)))
+            (do
+              (set_ref y (int_mod (deref x) (deref y)))
+              (set_ref x t))))
+        (deref x))))
+
+; lcm — least common multiple, always non-negative.
+;   a / b : two ints
+;   ->    : |a / gcd(a,b) * b|; lcm(0, _) = lcm(_, 0) = 0 (no division by zero)
+; Divides BEFORE multiplying (a/gcd is exact) so the product stays small: this
+; computes any LCM that itself fits in i64 without `int_mul` overflowing on the
+; intermediate a*b (which the multiply-first form would throw on).
+(defn lcm ((a int) (b int)) int
+  (if (or (eq a 0) (eq b 0)) 0
+    (abs (int_mul (int_div a (gcd a b)) b))))
+
+; factorial — n! by repeated multiply (n >= 0).
+;   n  : a non-negative int
+;   -> : n! (1 when n <= 0 — the empty product)
+(defn factorial ((n int)) int
+  (bind ((acc (ref 1)) (i (ref 2)))
+    (do
+      (while (le (deref i) n)
+        (do
+          (set_ref acc (int_mul (deref acc) (deref i)))
+          (set_ref i (int_add (deref i) 1))))
+      (deref acc))))
+
+; even? / odd? — parity.
+(defn even? ((x int)) bool (eq (int_mod x 2) 0))
+(defn odd?  ((x int)) bool (ne (int_mod x 2) 0))
+
+; pow_mod — modular exponentiation base^exp mod m, by square-and-multiply.
+;   base / exp / m : the base, a non-negative exponent, and a positive modulus
+;   ->             : base^exp mod m (1 mod m when exp = 0)
+; Each step reduces with int_mod so the running values never grow past m^2,
+; which keeps huge exponents tractable where (pow base exp) would blow up.
+(defn pow_mod ((base int) (exp int) (m int)) int
+  (bind ((acc (ref (int_mod 1 m)))
+         (b   (ref (int_mod base m)))
+         (e   (ref exp)))
+    (do
+      (while (gt (deref e) 0)
+        (do
+          (if (odd? (deref e))
+            (set_ref acc (int_mod (int_mul (deref acc) (deref b)) m))
+            null)
+          (set_ref b (int_mod (int_mul (deref b) (deref b)) m))
+          (set_ref e (int_div (deref e) 2))))
+      (deref acc))))
+
+; isqrt — integer square root: the largest int r with r*r <= n (n >= 0).
+; Newton's method on integers; converges from an over-estimate downward.
+;   n  : a non-negative int
+;   -> : floor(sqrt(n)) (0 for n = 0)
+(defn isqrt ((n int)) int
+  (if (le n 1) (max n 0)
+    (bind ((x (ref n))
+           (y (ref (int_div (int_add n 1) 2))))
+      (do
+        (while (lt (deref y) (deref x))
+          (do
+            (set_ref x (deref y))
+            (set_ref y (int_div (int_add (deref x) (int_div n (deref x))) 2))))
+        (deref x)))))
+
+; divmod — quotient and remainder together as a list (q r), where
+; q = a / b and r = a mod b (kernel int_div / int_mod semantics).
+;   a / b : dividend and a non-zero divisor
+;   ->    : (list_of q r)
+(defn divmod ((a int) (b int)) list
+  (list_of (int_div a b) (int_mod a b)))
+
+; ceil_div — ceiling of a / b for non-negative `a` and positive `b`.
+;   a : a non-negative dividend
+;   b : a positive divisor
+;   -> : the smallest int q with q*b >= a
+; q = a/b, bumped by one when the division left a remainder. Computed without an
+; `a + b` bias so it never overflows even at a = i64::MAX (where the textbook
+; floor((a+b-1)/b) form would throw on the addition).
+(defn ceil_div ((a int) (b int)) int
+  (bind ((q (int_div a b)))
+    (if (eq (int_mod a b) 0) q (int_add q 1))))
+
+; mod_inverse — the modular inverse of `a` modulo `m`: the x in 0..m-1 with
+; a*x ≡ 1 (mod m), or null when gcd(a, m) ≠ 1 (no inverse exists).
+;   a : any int (reduced mod m internally)
+;   m : a modulus m > 1
+;   -> : the inverse in 0..m-1, or null when a and m are not coprime
+; Extended Euclid carries (old_r, r) alongside the Bézout coefficient (old_s,
+; s); when the gcd (old_r) is 1 the coefficient old_s is the inverse, brought
+; into 0..m-1 with int_mod (whose result follows the divisor's sign).
+(defn mod_inverse ((a int) (m int)) any
+  (bind ((old_r (ref (int_mod a m))) (r (ref m))
+         (old_s (ref 1))             (s (ref 0)))
+    (do
+      (while (ne (deref r) 0)
+        (bind ((q  (int_div (deref old_r) (deref r)))
+               (tr (deref r))
+               (ts (deref s)))
+          (do
+            (set_ref r     (int_sub (deref old_r) (int_mul q tr)))
+            (set_ref old_r tr)
+            (set_ref s     (int_sub (deref old_s) (int_mul q ts)))
+            (set_ref old_s ts))))
+      (if (eq (deref old_r) 1)
+        (int_mod (deref old_s) m)
+        null))))
+
+; is_prime? — primality test, EXACT and safe for 0 <= n <= 3,037,000,499.
+;   n  : an int in 0 .. 3,037,000,499 (the supported domain; see below)
+;   -> : true when n is prime, false otherwise (n < 2 is not prime)
+; Deterministic Miller–Rabin with the witness set {2,3,5,7,11,13}: that set is
+; mathematically exact for every n below 3,215,031,751, so correctness is never
+; the limiting factor here — OVERFLOW is. pow_mod (and the round's squaring)
+; multiply two residues < n, so n*n must stay in i64; that holds only up to
+; n = 3,037,000,499 (floor(sqrt(i64::MAX))). For n above that the multiply would
+; throw, so the usable domain ends there even though the witness set would still
+; be exact. Even n and the small primes are screened first so the witness loop
+; only runs on odd candidates with n-1 = d*2^s.
+(defn is_prime? ((n int)) bool
+  (cond
+    ((lt n 2) false)
+    ((le n 3) true)
+    ((eq (int_mod n 2) 0) false)
+    (else
+      ; factor n-1 = d * 2^s with d odd
+      (bind ((d (ref (int_sub n 1))) (s (ref 0)) (ok (ref true)))
+        (do
+          (while (eq (int_mod (deref d) 2) 0)
+            (do
+              (set_ref d (int_div (deref d) 2))
+              (set_ref s (int_add (deref s) 1))))
+          ; one Miller–Rabin round for witness a: composite-unless x reaches 1
+          ; or n-1 across the squarings. Mutates `ok` to false on a witness.
+          (bind ((round
+                  (lambda (a)
+                    (if (eq (int_mod a n) 0)
+                      null ; a ≡ 0 (mod n): a is a multiple of n, not a witness
+                      (bind ((x (ref (pow_mod a (deref d) n))))
+                        (if (or (eq (deref x) 1) (eq (deref x) (int_sub n 1)))
+                          null
+                          (bind ((j (ref 1)) (cont (ref true)))
+                            (do
+                              (while (and (deref cont) (lt (deref j) (deref s)))
+                                (do
+                                  (set_ref x (int_mod (int_mul (deref x) (deref x)) n))
+                                  (if (eq (deref x) (int_sub n 1))
+                                    (set_ref cont false)
+                                    null)
+                                  (set_ref j (int_add (deref j) 1))))
+                              ; never reached n-1 across the squarings -> composite
+                              (if (deref cont)
+                                (set_ref ok false)
+                                null)))))))))
+            (do
+              (round 2) (round 3) (round 5) (round 7) (round 11) (round 13)
+              (deref ok))))))))
+
+; gcd_list — gcd over a list of ints (non-empty by contract).
+;   xs : a non-empty list of ints
+;   -> : gcd of all elements (always non-negative); seed 0 means gcd of an
+;        empty list is 0 and a singleton (x) yields |x|.
+(defn gcd_list ((xs (list int))) int
+  (sequence_fold_left xs 0 (lambda (acc x) (gcd acc x))))
+
+; lcm_list — lcm over a list of ints (non-empty by contract).
+;   xs : a non-empty list of ints
+;   -> : lcm of all elements (always non-negative); seed 1 means lcm of an
+;        empty list is 1 and a singleton (x) yields |x|; any 0 element makes 0.
+(defn lcm_list ((xs (list int))) int
+  (sequence_fold_left xs 1 (lambda (acc x) (lcm acc x))))
+
+(export abs sign min max clamp pow gcd lcm factorial even? odd?
+        pow_mod isqrt divmod ceil_div mod_inverse is_prime? gcd_list lcm_list)

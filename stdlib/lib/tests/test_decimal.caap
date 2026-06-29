@@ -1,0 +1,127 @@
+; stdlib/lib/tests/test_decimal.caap — fixed-point decimal: parse/format,
+; exact arithmetic (the 0.1+0.2 float-failure case), banker's rounding,
+; scale-aligned comparison, sign + round-trip.
+
+;; @area: numeric
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true assert_false assert_throws)
+(use stdlib.lib.numeric.bignum bn_from_int)
+(use stdlib.lib.numeric.decimal
+  dec_from_int dec_parse dec_format
+  dec_add dec_sub dec_mul dec_div
+  dec_neg dec_abs dec_sign dec_is_zero?
+  dec_cmp dec_eq? dec_round dec_rescale
+  dec? dec_validate)
+(do
+  ; ── parse / format round-trip ──
+  (assert_eq (dec_format (dec_parse "123.45")) "123.45" "parse/format 123.45")
+  (assert_eq (dec_format (dec_parse "0.1")) "0.1" "parse/format 0.1")
+  (assert_eq (dec_format (dec_parse "-0.050")) "-0.050" "parse/format -0.050 (keeps trailing zero)")
+  (assert_eq (dec_format (dec_parse "42")) "42" "parse/format integer 42 (scale 0)")
+  (assert_eq (dec_format (dec_from_int -7)) "-7" "dec_from_int -7")
+  (assert_eq (dec_format (dec_parse ".5")) "0.5" "parse .5 -> 0.5 (empty int part)")
+  (assert_eq (dec_format (dec_parse "-.5")) "-0.5" "parse -.5 -> -0.5")
+  (assert_eq (dec_format (dec_parse "0.00")) "0.00" "parse/format 0.00 (zero keeps scale)")
+
+  ; ── EXACT decimal addition: the float-failure case ──
+  ; In IEEE f64, 0.1 + 0.2 = 0.30000000000000004. Here it is EXACTLY 0.3.
+  (assert_eq (dec_format (dec_add (dec_parse "0.1") (dec_parse "0.2")))
+             "0.3" "0.1 + 0.2 = 0.3 (exact, not 0.30000000000000004)")
+  ; scale preserved through addition: 1.50 + 2.50 = 4.00 (scale 2 kept).
+  (assert_eq (dec_format (dec_add (dec_parse "1.50") (dec_parse "2.50")))
+             "4.00" "1.50 + 2.50 = 4.00 (scale 2 preserved)")
+  ; mixed scales align to the larger.
+  (assert_eq (dec_format (dec_add (dec_parse "1.5") (dec_parse "2.005")))
+             "3.505" "1.5 + 2.005 = 3.505 (align to scale 3)")
+  ; carrying across the decimal point.
+  (assert_eq (dec_format (dec_add (dec_parse "0.99") (dec_parse "0.01")))
+             "1.00" "0.99 + 0.01 = 1.00")
+
+  ; ── subtraction ──
+  (assert_eq (dec_format (dec_sub (dec_parse "4.00") (dec_parse "2.50")))
+             "1.50" "4.00 - 2.50 = 1.50")
+  (assert_eq (dec_format (dec_sub (dec_parse "0.3") (dec_parse "0.1")))
+             "0.2" "0.3 - 0.1 = 0.2 (exact)")
+  (assert_eq (dec_format (dec_sub (dec_parse "1.0") (dec_parse "1.5")))
+             "-0.5" "1.0 - 1.5 = -0.5 (negative result)")
+
+  ; ── multiplication: scales add ──
+  (assert_eq (dec_format (dec_mul (dec_parse "1.5") (dec_parse "1.5")))
+             "2.25" "1.5 * 1.5 = 2.25 (scale 1 + 1 = 2)")
+  (assert_eq (dec_format (dec_mul (dec_parse "0.01") (dec_parse "0.01")))
+             "0.0001" "0.01 * 0.01 = 0.0001 (scale 4)")
+  (assert_eq (dec_format (dec_mul (dec_parse "-2.5") (dec_parse "4")))
+             "-10.0" "-2.5 * 4 = -10.0 (scale 1 + 0)")
+
+  ; ── division to a target scale, round-half-even ──
+  (assert_eq (dec_format (dec_div (dec_parse "1") (dec_parse "3") 4))
+             "0.3333" "1 / 3 @ scale 4 = 0.3333 (round-half-even)")
+  (assert_eq (dec_format (dec_div (dec_parse "2") (dec_parse "3") 4))
+             "0.6667" "2 / 3 @ scale 4 = 0.6667 (rounds up)")
+  (assert_eq (dec_format (dec_div (dec_parse "10") (dec_parse "4") 2))
+             "2.50" "10 / 4 @ scale 2 = 2.50 (exact)")
+  ; exact-half tie that rounds to even: 1 / 8 = 0.125, @ scale 2 -> 0.12 (even).
+  (assert_eq (dec_format (dec_div (dec_parse "1") (dec_parse "8") 2))
+             "0.12" "1 / 8 @ scale 2 = 0.12 (tie -> even, banker's)")
+  ; 3 / 8 = 0.375 @ scale 2 -> 0.38 (tie -> even, 7->8).
+  (assert_eq (dec_format (dec_div (dec_parse "3") (dec_parse "8") 2))
+             "0.38" "3 / 8 @ scale 2 = 0.38 (tie -> even up)")
+  ; negative division.
+  (assert_eq (dec_format (dec_div (dec_parse "-1") (dec_parse "3") 4))
+             "-0.3333" "-1 / 3 @ scale 4 = -0.3333")
+  (assert_eq (dec_format (dec_div (dec_parse "1") (dec_parse "-8") 2))
+             "-0.12" "1 / -8 @ scale 2 = -0.12 (sign + banker's)")
+
+  ; ── dec_round / dec_rescale: round-half-even ──
+  ; classic banker's-rounding cases: half goes to the nearest EVEN integer.
+  (assert_eq (dec_format (dec_round (dec_parse "2.5") 0)) "2" "round 2.5 -> 2 (half to even)")
+  (assert_eq (dec_format (dec_round (dec_parse "3.5") 0)) "4" "round 3.5 -> 4 (half to even)")
+  (assert_eq (dec_format (dec_round (dec_parse "0.5") 0)) "0" "round 0.5 -> 0 (half to even)")
+  (assert_eq (dec_format (dec_round (dec_parse "1.5") 0)) "2" "round 1.5 -> 2 (half to even)")
+  (assert_eq (dec_format (dec_round (dec_parse "-2.5") 0)) "-2" "round -2.5 -> -2 (half to even)")
+  (assert_eq (dec_format (dec_round (dec_parse "-3.5") 0)) "-4" "round -3.5 -> -4 (half to even)")
+  ; non-midpoint rounds to nearer.
+  (assert_eq (dec_format (dec_round (dec_parse "2.4") 0)) "2" "round 2.4 -> 2 (down)")
+  (assert_eq (dec_format (dec_round (dec_parse "2.6") 0)) "3" "round 2.6 -> 3 (up)")
+  ; round to 2 places, midpoint to even.
+  (assert_eq (dec_format (dec_round (dec_parse "0.125") 2)) "0.12" "round 0.125 -> 0.12 (tie even)")
+  (assert_eq (dec_format (dec_round (dec_parse "0.135") 2)) "0.14" "round 0.135 -> 0.14 (tie even)")
+  ; widening is exact.
+  (assert_eq (dec_format (dec_rescale (dec_parse "1.5") 3)) "1.500" "rescale 1.5 -> 1.500 (widen)")
+  (assert_eq (dec_format (dec_rescale (dec_parse "2") 2)) "2.00" "rescale 2 -> 2.00 (widen from int)")
+
+  ; ── scale-aligned comparison / equality ──
+  (assert_eq (dec_cmp (dec_parse "1.0") (dec_parse "1.00")) 0 "1.0 cmp 1.00 = 0 (value equal)")
+  (assert_true (dec_eq? (dec_parse "1.0") (dec_parse "1.00")) "1.0 eq? 1.00 (value, not struct)")
+  (assert_eq (dec_cmp (dec_parse "1.5") (dec_parse "1.50")) 0 "1.5 cmp 1.50 = 0")
+  (assert_eq (dec_cmp (dec_parse "0.1") (dec_parse "0.2")) -1 "0.1 < 0.2")
+  (assert_eq (dec_cmp (dec_parse "2.5") (dec_parse "2.05")) 1 "2.5 > 2.05 (align before compare)")
+  (assert_true (not (dec_eq? (dec_parse "1.0") (dec_parse "1.01"))) "1.0 != 1.01")
+
+  ; ── sign / magnitude / zero ──
+  (assert_eq (dec_sign (dec_parse "-3.14")) -1 "sign -3.14 = -1")
+  (assert_eq (dec_sign (dec_parse "0.00")) 0 "sign 0.00 = 0")
+  (assert_eq (dec_sign (dec_parse "3.14")) 1 "sign 3.14 = 1")
+  (assert_eq (dec_format (dec_abs (dec_parse "-3.14"))) "3.14" "abs -3.14 = 3.14")
+  (assert_eq (dec_format (dec_neg (dec_parse "3.14"))) "-3.14" "neg 3.14 = -3.14")
+  (assert_eq (dec_format (dec_neg (dec_parse "-0.5"))) "0.5" "neg -0.5 = 0.5")
+  (assert_true (dec_is_zero? (dec_parse "0.000")) "0.000 is zero")
+  (assert_true (not (dec_is_zero? (dec_parse "0.001"))) "0.001 is not zero")
+  ; negate of zero stays zero, format round-trips.
+  (assert_eq (dec_format (dec_neg (dec_parse "0.00"))) "0.00" "neg 0.00 = 0.00 (no -0)")
+
+  ; ── negative format round-trip (the spec's negative case) ──
+  (assert_eq (dec_format (dec_parse "-123.456")) "-123.456" "negative round-trip -123.456")
+  (assert_eq (dec_format (dec_mul (dec_parse "-1.50") (dec_parse "2.00")))
+             "-3.0000" "-1.50 * 2.00 = -3.0000 (negative, scales add)")
+
+  ; ── dec? / dec_validate (structural validators) ──
+  (assert_true (dec? (dec_from_int 3)) "dec? true for dec_from_int 3")
+  (assert_false (dec? 3) "dec? false for a non-map (int 3)")
+  ; malformed: valid bignum mantissa but a negative scale
+  (assert_false (dec? (assoc (map_of) "mantissa" (bn_from_int 1) "scale" -1))
+    "dec? false for a negative scale")
+  (assert_eq (dec? (dec_validate (dec_from_int 4))) true "dec_validate returns a valid decimal")
+  (assert_throws (lambda () (dec_validate 3)) "dec_validate throws on a non-decimal")
+  true)

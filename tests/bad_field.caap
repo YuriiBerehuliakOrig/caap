@@ -1,0 +1,11 @@
+; tests/bad_field.caap — access to a field the struct does not
+; declare; the type pass rejects it at load time.
+(module stdlib.fixtures.bad_field)
+
+(struct Pt (x i32))
+
+; get_z — reads a nonexistent field; `p` is typed, so this is a certain error.
+(defn get_z ((p Pt)) int
+  (get p "z" 0))
+
+(export get_z)

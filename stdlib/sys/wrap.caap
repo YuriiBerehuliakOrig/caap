@@ -1,0 +1,133 @@
+; stdlib/sys/wrap.caap — the shared facade generator for the sys layer.
+;
+; Every sys facade (io/fs/os/process/net/time) is the same shape: a TYPED op
+; table, a per-op callable wrapper that hides the capability handle, and an
+; export list. This module factors that shape into ONE entry point —
+; `make_facade` — so a facade is just its op table plus the names it publishes.
+;
+; A facade hands its op table to `make_facade "<lib>" ops`; it
+;   1. files the typed surface with the type pass (`declare_ops!`), so every
+;      importer gets full param/result checking and the catalog effect at its
+;      call sites, and
+;   2. returns a `name -> wrapper` map: each wrapper is the host callable from
+;      boot/sys_grants.caap with the capability handle partially applied, so a
+;      caller writes `(println "hi")`, never `(println <handle> "hi")`.
+; No grant -> every wrapper is a SELF-DESCRIBING throwing stub (declaration-only
+; mode): the facade still loads and its typed surface is still verified against
+; caap-sys by verify_sys, but actually CALLING an op without the grant raises
+; "sys.<lib>.<op> requires a sys grant …" instead of returning a silent null.
+; The op table itself is checked against the live catalog by verify_sys, so the
+; signatures filed here are VERIFIED extern overrides — never trust-me metadata.
+(module stdlib.sys.wrap)
+
+; op_effect_tag — the FINER effect tag for an impure facade op. An op's own
+; `effect` field is a COARSE binary label ("pure"/"impure"/"io"); the facade's
+; LIBRARY name is the finest signal of WHAT a non-pure op touches (a `sys.net`
+; op reaches the network, a `sys.fs` op the filesystem), so each impure op is
+; tagged with its library — "net"/"fs"/"io"/"proc"/… The type layer's effect
+; model is a tag SET, so these distinct tags flow as evidence into every
+; caller's effect set: a function that calls only `sys.fs` ops carries `fs`,
+; not a blanket "impure". The coarse binary view ("effect") stays "impure"
+; regardless, so code that only asks pure-vs-impure is unaffected.
+;   lib : the facade's library name ("io", "fs", …)
+(bind op_effect_tag (lambda (lib) lib))
+
+; declare_ops! — hand a facade's TYPED op list to the type pass as the
+; module's signatures: importers then get full param/result checking at
+; their call sites, and the catalog effect rides along ("pure" -> no tags,
+; anything else -> a FINER per-library tag — "net"/"fs"/"io"/"proc"/… via
+; op_effect_tag — so the type layer distinguishes which host surface a call
+; touches instead of collapsing them all to one "impure"). The op list itself
+; is checked against the live catalog by verify_sys, so these are VERIFIED
+; extern overrides — never trust-me metadata.
+;   module_name : the facade's module name ("sys.io", …)
+;   lib         : the facade's library name ("io", …) — source of the finer tag
+;   ops         : the facade's (op …) list
+(bind declare_ops!
+  (lambda (module_name lib ops)
+    (bind (
+      (ti (ctfe_compiler_lookup_value compiler "stdlib.semantics.types.infer" null))
+      (tag (op_effect_tag lib))
+    )
+      (when_let (ds (if (eq ti null) null (get ti "declare_sigs!")))
+        (ds module_name
+          (sequence_map ops
+            (lambda (o)
+              (bind ((pure (eq (get o "effect") "pure")))
+                (assoc (map_of)
+                  "kind" "fn"
+                  "fname" (get o "name")
+                  "params" (get o "params" (list_of))
+                  "result" (get o "result")
+                  "declared_effect" (get o "effect")
+                  "effects" (if pure (list_of) (list_of tag))
+                  "effect" (if pure "pure" "impure"))))))))))
+
+; make_fn — the wrapper factory for one host library.
+;   lib : the library name ("io", "fs", …); grant looked up at
+;         stdlib.sys.grant.<lib>
+;   ->  : (name) -> a callable. With the grant it is the host op with the
+;         capability partially applied; WITHOUT it (or for an op absent from the
+;         grant's raw table) it is a SELF-DESCRIBING throwing stub — calling it
+;         raises "sys.<lib>.<op> requires a sys grant …" rather than returning a
+;         silent null that fails later as "not callable". The typed surface is
+;         filed regardless (declare_ops!), so declaration-only mode still works.
+(bind make_fn
+  (lambda (lib)
+    (bind (
+      (grant (ctfe_compiler_lookup_value compiler
+               (string_concat_many "stdlib.sys.grant." lib) null))
+      ; an unavailable op -> a throwing stub naming the missing grant/op
+      (stub
+        (lambda (name reason)
+          (lambda _args
+            (runtime_error (string_concat_many "sys." lib "." name " " reason)))))
+    )
+      (if (eq grant null)
+        (lambda (name)
+          (stub name (string_concat_many
+            "requires a sys grant — load boot/sys_grants.caap with \"" lib
+            "\" before calling it (facade is in declaration-only mode)")))
+        (bind (
+          (capability (get grant "capability"))
+          (raw (get grant "raw" (map_of)))
+        )
+          (lambda (name)
+            (if_let (r (get raw name))
+              (lambda args (apply r capability args))
+              (stub name
+                "is not provided by the granted capability (absent from its raw table)"))))))))
+
+; make_facade — THE generator. Given a host library name and a facade's op
+; table, file the typed surface and build the full wrapper bundle in one step.
+; The returned map is keyed by op name, so the facade binds each export with
+; `(get bundle "<name>")` — the wiring lives in exactly one place and the bind
+; names derive from the same op table verify_sys checks, with nothing to drift.
+;   lib : the host library name ("io", "fs", …) — also the grant key suffix
+;   ops : the facade's (op …) list (its `ops` export)
+;   ->  : { "<op name>" -> wrapper }, one entry per op (a real callable with the
+;         grant, else a throwing capability stub — never null)
+(bind make_facade
+  (lambda (lib ops)
+    (do
+      ; file the typed surface with the type pass: importers get checked call
+      ; sites and the catalog effect (a finer per-library tag) at zero extra
+      ; declarations. Filed under BOTH module names a facade may be imported as
+      ; — the canonical `stdlib.sys.<lib>` (the file's `(module …)` directive)
+      ; and the compat alias `sys.<lib>` — so `(use sys.io …)` and
+      ; `(use stdlib.sys.io …)` BOTH get call-site checking (see the sys-alias
+      ; allowlist in stdlib/CONVENTIONS.md). declare_sigs! is idempotent.
+      (declare_ops! (string_concat_many "stdlib.sys." lib) lib ops)
+      (declare_ops! (string_concat_many "sys." lib) lib ops)
+      ; one wrapper factory for the whole library; project every op through it
+      (bind (
+        (fn (make_fn lib))
+        (bundle (map_of))
+      )
+        (do
+          (for o ops
+            (bind ((name (get o "name")))
+              (assoc bundle name (fn name))))
+          bundle)))))
+
+(export make_fn make_facade declare_ops!)

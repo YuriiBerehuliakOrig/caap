@@ -1,0 +1,66 @@
+; stdlib/frontend/clike/grammar.caap — the clike LEXER grammar (a flat token
+; stream with bracket nesting) for stdlib.frontend.clike.
+;
+; This module owns ONLY the surface grammar (clike_grammar / clike_units).
+; ParsedForm token helpers live in stdlib.frontend.clike.tokens so grammar can
+; remain a clean lexer leaf.
+(module stdlib.frontend.clike.grammar)
+
+(import stdlib.load loader_api)
+(use stdlib.frontend.surface apply_grammar!
+     grammar syntax_rule entry_rule set_comment
+     regex literal token rule_ref named many seq choice)
+
+; ── the grammar: a lexer with brackets, declared AS FORMS ───────────────────
+(bind clike_grammar
+  (grammar (list_of
+    (set_comment "//")
+    (syntax_rule "num" (token "integer") "integer")
+    ; digit-leading atoms that are not plain decimals (`0xFF`, `1u32`, etc.).
+    ; The lexer keeps them whole; expression semantics decides what is valid.
+    (syntax_rule "numatom" (regex "[0-9]+[a-zA-Z_][a-zA-Z0-9_]*") "symbol")
+    (syntax_rule "str" (token "string") "string")
+    (syntax_rule "op"
+      (regex "[-+*\\/%<>=&|^!~]+|[,;]") "symbol")
+    (syntax_rule "ident"
+      (regex "[a-zA-Z_][a-zA-Z0-9_.]*") "symbol")
+    (syntax_rule "parens"
+      (seq (list_of (literal "(")
+                    (named "items" (many (rule_ref "tok")))
+                    (literal ")")))
+      "list")
+    (syntax_rule "braces"
+      (seq (list_of (literal "{")
+                    (named "items" (many (rule_ref "tok")))
+                    (literal "}")))
+      "list")
+    (syntax_rule "brackets"
+      (seq (list_of (literal "[")
+                    (named "items" (many (rule_ref "tok")))
+                    (literal "]")))
+      "list")
+    (syntax_rule "tok"
+      (choice (list_of (rule_ref "parens") (rule_ref "braces")
+                       (rule_ref "brackets")
+                       (rule_ref "numatom")
+                       (rule_ref "num") (rule_ref "str")
+                       (rule_ref "ident") (rule_ref "op")))
+      null)
+    (syntax_rule "stream"
+      (named "items" (many (rule_ref "tok"))) "list")
+    (entry_rule (rule_ref "stream")))))
+
+(bind clike_host (ref null))
+; clike_units — lazily applies the lexer grammar for the clike surface.
+(bind clike_units
+  (lambda ()
+    (do
+      (when (eq (deref clike_host) null)
+        (set_ref clike_host
+          (apply_grammar!
+            (ctfe_compiler_load_surface_file_template compiler
+              ((get loader_api "module_path") "stdlib.frontend.clike"))
+            clike_grammar)))
+      (list_of (deref clike_host)))))
+
+(export clike_grammar clike_units)

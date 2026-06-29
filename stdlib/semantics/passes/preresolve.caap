@@ -1,0 +1,210 @@
+; stdlib/semantics/passes/preresolve.caap — ARGUMENT-TYPE INFERENCE for native
+; generics, a whole-module TRANSFORM (module stdlib.semantics.passes.preresolve).
+;
+; Lets a generic call OMIT its compile-time `type`/`field` arguments (C++ template
+; argument deduction): instead of `ur_list_push(UR_THREAD, "lf", &list, node)` the
+; caller writes `ur_list_push(&list, node)` and BOTH the type parameter `T` and the
+; link-field parameter `lf` are DEDUCED from the receiver's declared `List<T, lf>`
+; type (the field name rides in the type, so it need not be passed). Runs BEFORE the
+; function monomorph: for each such under-applied generic call it INFERS the omitted
+; leading args and PREPENDS them, reconstructing the explicit form the monomorph
+; already specializes — so monomorph is unchanged and a fully-applied call is untouched.
+;
+; The deduction uses only DECLARED types (no full type pass, which runs later):
+;   - a bare-name argument -> the enclosing function's parameter type (sig marker),
+;     or a module global's declared type (published by the native prep);
+;   - a field read `x->f` / address `&x->f` -> x's struct, then field f's type.
+; This covers the intrusive-list pattern (every argument is a typed param, field, or
+; global). An argument whose type cannot be resolved this way leaves the call
+; under-applied, and the monomorph surfaces it (no silent wrong specialization).
+(module stdlib.semantics.passes.preresolve)
+
+(use stdlib.syntax.ast call? name? head_is? args_of arg callee name_of literal_of sym call)
+(use stdlib.syntax.ir transform)
+(use stdlib.semantics.passes.monomorph decode_defn has_ct_param? ct_kind nargs pad_omitted_fields)
+(use stdlib.semantics.passes.struct_monomorph decode_struct)
+(use stdlib.semantics.types.registry ctor_of)
+(use stdlib.semantics.passes.registry install_transform!)
+
+; infer1 — structurally match a declared parameter type `want` (carrying the
+; generic's compile-time parameter NAMES) against a concrete argument type `got`,
+; binding each into `subst`. A name binds when it is in `vars` (the generic's
+; type/field parameter names) — so both a TYPE parameter `T` and a FIELD parameter
+; `lf` are deduced from a `List<T, lf>` argument (vs `List<UR_THREAD, …suspend_next>`).
+; Handles the pointer constructor (`ptr_T`) and a parameterized spelling (`List<…>`)
+; recursively. Best-effort: an unmatched shape binds nothing.
+(bind infer1
+  (lambda (want got vars subst)
+    (cond
+      ((or (eq want null) (eq got null)) null)
+      ((eq (get vars want) true) (do (assoc subst want got) null))
+      ((and (string_starts_with want "ptr_") (string_starts_with got "ptr_"))
+        (infer1 (string_slice want 4 (size want)) (string_slice got 4 (size got)) vars subst))
+      ((and (not (eq (ctor_of want) null)) (eq (ctor_of want) (ctor_of got)))
+        (bind ((wa (nargs want)) (ga (nargs got)) (k (ref 0)))
+          (do
+            (while (and (lt (deref k) (size wa)) (lt (deref k) (size ga)))
+              (do (infer1 (get wa (deref k)) (get ga (deref k)) vars subst)
+                  (set_ref k (int_add (deref k) 1))))
+            null)))
+      (else null))))
+
+; sig_env — {param-name -> declared type} for a defn's signature.
+(bind sig_env
+  (lambda (sig)
+    (bind ((e (map_of)))
+      (do (for p (get sig "params") (assoc e (get p "name") (get p "type"))) e))))
+
+; arg_type — the DECLARED type of a call argument spec, or null:
+;   a bare name -> env;  a mut-local read (deref x) -> x's type;
+;   a field read (ptr_read (field_ptr x "f")) -> x's struct's field f type.
+(bind arg_type
+  (lambda (spec env globals fields)
+    (cond
+      ((name? spec)
+        (bind ((nm (name_of spec)))
+          (cond
+            ; a parameter -> its declared value type
+            ((not (eq (get env nm) null)) (get env nm))
+            ; a bare GLOBAL name is `&global` (clike `&name` is the cell) -> the
+            ; ADDRESS, ptr_<global type>. (A global VALUE read is `(deref g)` below.)
+            ((not (eq (get globals nm) null)) (string_concat_many "ptr_" (get globals nm)))
+            (else null))))
+      ((and (call? spec) (head_is? spec "deref"))
+        (bind ((nm (name_of (arg spec 0))))
+          (if (and (not (eq nm null)) (not (eq (get globals nm) null)))
+            (get globals nm)                                    ; a global VALUE
+            (arg_type (arg spec 0) env globals fields))))
+      ((and (call? spec) (head_is? spec "ptr_read"))
+        (bind ((inner (arg spec 0)))
+          (if (and (call? inner) (head_is? inner "field_ptr"))
+            (bind ((xt (arg_type (arg inner 0) env globals fields))
+                   (fn (literal_of (arg inner 1))))
+              (if (and (not (eq xt null)) (string_starts_with xt "ptr_"))
+                (get (get fields (string_slice xt 4 (size xt)) (map_of)) fn)
+                null))
+            null)))
+      ; `&x->f` -> a field_ptr (no read): the ADDRESS of a field, type ptr_<ftype>.
+      ((and (call? spec) (head_is? spec "field_ptr"))
+        (bind ((xt (arg_type (arg spec 0) env globals fields)) (fn (literal_of (arg spec 1))))
+          (if (and (not (eq xt null)) (string_starts_with xt "ptr_"))
+            (bind ((ft (get (get fields (string_slice xt 4 (size xt)) (map_of)) fn)))
+              (if (eq ft null) null (string_concat_many "ptr_" ft)))
+            null)))
+      (else null))))
+
+; infer_call — if `n` is an UNDER-APPLIED call to a generic (its `type` args
+; omitted), deduce them from the runtime args and PREPEND them (as bareword Name
+; nodes); otherwise return null (leave unchanged).
+(bind infer_call
+  (lambda (n generics fields env globals kinds_of)
+    (if (not (call? n))
+      null
+      (bind ((h (name_of (callee n))))
+        (if (or (eq h null) (eq (get generics h) null))
+          null
+          (bind (
+            (sig    (get generics h))
+            (params (get sig "params"))
+            (args   (args_of n))
+            ; an under-applied call OMITS some compile-time parameters from the
+            ; FRONT (the convention: type/field params lead). #omitted = #params -
+            ; #args; the args match the trailing params positionally.
+            (n_omit (int_sub (size params) (size args)))
+          )
+            (if (le n_omit 0)
+              null                                  ; fully explicit (or malformed) — leave it
+              (bind ((vars (map_of)) (subst (map_of)) (i (ref 0)))
+                (do
+                  ; the names to deduce: every compile-time parameter (type + field)
+                  (for p params
+                    (when (not (eq (ct_kind (get p "type")) null))
+                      (assoc vars (get p "name") true)))
+                  ; unify each argument's declared type against its (trailing) param
+                  (while (lt (deref i) (size args))
+                    (do
+                      (infer1 (get (get params (int_add n_omit (deref i))) "type")
+                              (pad_omitted_fields
+                                (arg_type (get args (deref i)) env globals fields) kinds_of)
+                              vars subst)
+                      (set_ref i (int_add (deref i) 1))))
+                  ; the omitted leading params must be compile-time and fully deduced
+                  (bind ((pre (list_of)) (ok (ref true)) (j (ref 0)))
+                    (do
+                      (while (lt (deref j) n_omit)
+                        (bind ((p (get params (deref j))))
+                          (do
+                            (if (or (eq (ct_kind (get p "type")) null)
+                                    (eq (get subst (get p "name")) null))
+                              (set_ref ok false)
+                              (append pre (sym (get subst (get p "name")))))
+                            (set_ref j (int_add (deref j) 1)))))
+                      (if (not (deref ok))
+                        null                          ; an omitted param is runtime / undeduced — leave it
+                        (bind ((all (list_of)))
+                          (do
+                            (for a pre (append all a))
+                            (for a args (append all a))
+                            (call (callee n) all)))))))))))))))
+
+; infer_calls — rewrite every under-applied generic call in `body`.
+(bind infer_calls
+  (lambda (body generics fields env globals kinds_of)
+    (transform body (lambda (n) (infer_call n generics fields env globals kinds_of)))))
+
+; program_globals — the {name -> declared type} of the program's mutable globals,
+; published by the native prep BEFORE it runs the transforms (a global declaration
+; is consumed during `visit_unit` into `acc.globals` and never reaches the expanded
+; form stream a transform iterates, so it cannot be recovered from `located`). This
+; lets `&global` arguments deduce their container's type/field. Reset per program.
+(bind program_globals (ref (map_of)))
+(bind set_program_globals!
+  (lambda (gs)
+    (bind ((m (map_of)))
+      (do
+        (for g gs (assoc m (get g "name") (get g "type")))
+        (set_ref program_globals m)))))
+
+; run — index generics + struct fields, take globals from the published table, then
+; prepend deduced type/field args to every under-applied generic call inside each
+; (non-generic) caller. No-op when nothing is under-applied.
+(bind run
+  (lambda (located)
+    (bind ((generics (map_of)) (fields (map_of)) (gkinds (map_of))
+           (globals (deref program_globals)))
+      (do
+        (for f located
+          (do
+            (bind ((d (decode_defn (get f "node"))))
+              (when (and (not (eq d null)) (has_ct_param? (get d "sig")))
+                (assoc generics (get d "name") (get d "sig"))))
+            (bind ((sm (decode_struct (get f "node"))))
+              (when (not (eq sm null))
+                (bind ((fm (map_of)) (kinds (list_of)))
+                  (do
+                    (for fld (get sm "fields")
+                      (do
+                        (assoc fm (get fld "name") (get fld "type"))
+                        ; the ordered compile-time parameter kinds, so a receiver
+                        ; spelling with an OMITTED `field` parameter defaults it.
+                        (when (or (eq (get fld "type") "type") (eq (get fld "type") "field"))
+                          (append kinds (get fld "type")))))
+                    (assoc fields (get sm "name") fm)
+                    (when (gt (size kinds) 0) (assoc gkinds (get sm "name") kinds))))))))
+        (when (gt (size (map_keys generics)) 0)
+          (bind ((kinds_of (lambda (c) (get gkinds c))))
+            (for f located
+              (bind ((d (decode_defn (get f "node"))))
+                (when (and (not (eq d null))
+                           (not (eq (get d "sig") null))
+                           (not (has_ct_param? (get d "sig"))))
+                  (assoc f "node"
+                    (infer_calls (get f "node") generics fields
+                                 (sig_env (get d "sig")) globals kinds_of)))))))))))
+
+; register_preresolve! — installed by backend/prep BEFORE the function monomorph,
+; so the deduced calls reach monomorph in the explicit form it specializes.
+(bind register_preresolve!
+  (lambda () (install_transform! "preresolve" run)))
+
+(export infer1 arg_type infer_call run set_program_globals! register_preresolve!)

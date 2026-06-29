@@ -1,0 +1,88 @@
+; stdlib/semantics/passes/ur_isr.caap — ISR-SAFETY analysis pass (module
+; stdlib.semantics.passes.ur_isr).
+;
+; urun documents an ISR-SAFE CALLBACK CONTRACT (ur_timer_create): code that runs
+; in INTERRUPT context must NOT call a BLOCKING API (ur_semaphore_get /
+; ur_queue_send|receive|front_send / ur_thread_sleep with a wait) — those suspend
+; the CALLING thread, and an interrupt has no thread to suspend, so a blocking call
+; from an ISR is a priority-inversion / deadlock. Today this is enforced only by a
+; comment. This pass makes it a STATIC, build-time invariant.
+;
+; It is self-contained: it decodes the native marker-led forms with `decode_defn`,
+; builds a name->callees call graph from the free NAME references in each body, and
+; does a transitive reachability search from every ISR ROOT (a definition whose
+; name ends in `_interrupt`, e.g. `_ur_timer_interrupt`, wired from SysTick). Any
+; reachable function that DIRECTLY calls a blocking primitive is reported.
+;
+; LIMITATION (documented): indirect calls through `call_ptr` (the timer callback)
+; are function pointers and are NOT analysable — a blocking call reached only via a
+; call_ptr target is out of scope (no static target). The reachability over direct
+; edges is a conservative over-approximation otherwise (it can only flag more).
+(module stdlib.semantics.passes.ur_isr)
+
+(use stdlib.syntax.ast call? name? name_of head_of walk)
+(use stdlib.semantics.passes.monomorph decode_defn)
+(use stdlib.semantics.passes.registry install_pass! note!)
+
+; the blocking primitives: each SUSPENDS the calling thread when its wait option is
+; not UR_NO_WAIT. (Not ur_pend_switch — pending a PendSV from an ISR is legal.)
+(bind blocking?
+  (lambda (h)
+    (or (eq h "ur_semaphore_get")
+        (or (eq h "ur_queue_send")
+            (or (eq h "ur_queue_receive")
+                (or (eq h "ur_queue_front_send")
+                    (eq h "ur_thread_sleep")))))))
+
+; isr_root? — a definition that runs in interrupt context. Convention: its name
+; ends in `_interrupt` (urun's SysTick handler `_ur_timer_interrupt`).
+(bind isr_root?
+  (lambda (nm)
+    (bind ((n (size nm)) (suf "_interrupt") (k (size "_interrupt")))
+      (and (ge n k) (eq (string_slice nm (int_sub n k) n) suf)))))
+
+; reach! — mark `nm` and everything it transitively calls into `seen`.
+(bind reach!
+  (lambda (edges nm seen)
+    (when (eq (get seen nm) null)
+      (do
+        (assoc seen nm true)
+        (for c (get edges nm (list_of)) (reach! edges c seen))))))
+
+(bind run
+  (lambda (located sink)
+    (bind ((defs (map_of)) (vals (map_of)) (edges (map_of)) (blocks (map_of)))
+      (do
+        ; 1. index definitions
+        (for f located
+          (bind ((d (decode_defn (get f "node"))))
+            (when (not (eq d null))
+              (do (assoc defs (get d "name") (get f "node"))
+                  (assoc vals (get d "name") (get d "value"))))))
+        ; 2. per definition: call edges (to other defs) + does it directly block?
+        (for nm (map_keys defs)
+          (bind ((es (map_of)) (b (ref false)))
+            (do
+              (walk (get vals nm)
+                (lambda (n)
+                  (do
+                    (when (and (name? n) (not (eq (get defs (name_of n)) null)))
+                      (assoc es (name_of n) true))
+                    (when (and (call? n) (blocking? (head_of n))) (set_ref b true)))))
+              (assoc edges nm (map_keys es))
+              (when (deref b) (assoc blocks nm true)))))
+        ; 3. reachability from every ISR root; flag any reachable blocking function
+        (bind ((seen (map_of)))
+          (do
+            (for nm (map_keys defs) (when (isr_root? nm) (reach! edges nm seen)))
+            (for nm (map_keys seen)
+              (when (not (eq (get blocks nm) null))
+                (note! sink "ur-isr" (get defs nm)
+                  (string_concat_many "`" nm "` is reachable from an interrupt handler "
+                    "(_*_interrupt) and calls a BLOCKING API — an ISR has no thread to "
+                    "suspend; this is a priority-inversion / deadlock"))))))))))
+
+(bind register!
+  (lambda () (install_pass! "ur-isr" (lambda (located sink) (run located sink)))))
+
+(export run register!)

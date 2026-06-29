@@ -1,0 +1,372 @@
+; stdlib/lib/text/format.caap — string formatting / templating (module stdlib.lib.text.format).
+;
+; A pure-CAAP formatting subsystem over the kernel string_* / int_* builtins:
+;   - format(template, args)        — {} / {0} / {name} substitution, with {{ }} escapes
+;   - pad_left/pad_right/center     — fixed-width padding by character count
+;   - format_int(n, radix)          — integer → string in radix 2/8/10/16
+;   - hex/oct/bin                    — format_int convenience wrappers
+;   - align_columns(rows, widths)   — render a grid of strings as aligned columns
+;
+; Values are stringified via the kernel `value_to_string` (unquoted: 42, hi, true).
+; Everything here is pure (eval and compile alike): no sys access, no float deps.
+(module stdlib.lib.text.format)
+
+; pad_left / pad_right live in lib/text/string as typed `defn`s. string is the
+; more basic module and does NOT depend on format, so importing them here is
+; acyclic; we re-export them below so `(use … format pad_left pad_right …)`
+; callers — and the spec/float renderers in this file — share one definition.
+(use stdlib.lib.text.string pad_left pad_right)
+
+; ── padding ──────────────────────────────────────────────────────────────────
+
+; center — center `s` within `width`, padding with `fill` on both sides.
+;   Extra odd pad goes on the right (left gets the floor of total/2).
+;   ->    : `s` unchanged when already >= width wide.
+(bind center
+  (lambda (s width fill)
+    (bind ((n (size s)))
+      (if (ge n width) s
+        (bind ((total (int_sub width n))
+               (left (int_div total 2))
+               (right (int_sub total left)))
+          (string_concat_many
+            (string_repeat fill left)
+            s
+            (string_repeat fill right)))))))
+
+; ── integer formatting ───────────────────────────────────────────────────────
+
+(bind format_digits "0123456789abcdef")
+
+; format_int — render `n` in `radix` (2, 8, 10, or 16), negatives get a "-".
+;   n     : an int
+;   radix : the base; digits above 9 use lowercase a–f
+;   ->    : the digit string ("0" for zero)
+; Digits are extracted least-significant-first via int_mod / int_div, then the
+; accumulator is prepended so the result reads most-significant-first.
+(bind format_int
+  (lambda (n radix)
+    (cond
+      ; guard the radix: a base < 2 never terminates (m / 1 = m), and a base
+      ; > 16 has no digit glyph — surface it rather than hang or drop digits.
+      ((or (lt radix 2) (gt radix 16))
+        (throw (string_concat_many "format_int: radix out of range [2,16]: "
+                                   (int_to_string radix))))
+      ((eq n 0) "0")
+      ((lt n 0)
+        (string_concat_many "-" (format_int (int_sub 0 n) radix)))
+      (else
+        (bind ((acc (ref ""))
+               (m (ref n)))
+          (do
+            (while (gt (deref m) 0)
+              (bind ((d (int_mod (deref m) radix)))
+                (do
+                  (set_ref acc
+                    (string_concat_many
+                      (string_slice format_digits d (int_add d 1))
+                      (deref acc)))
+                  (set_ref m (int_div (deref m) radix)))))
+            (deref acc)))))))
+
+; hex / oct / bin — format_int in the usual programmer radices (no 0x/0o/0b prefix).
+(bind hex (lambda (n) (format_int n 16)))
+(bind oct (lambda (n) (format_int n 8)))
+(bind bin (lambda (n) (format_int n 2)))
+
+; ── format specs (the `:spec` after a placeholder name) ──────────────────────
+; A small Rust-flavoured mini-language for the text after the first ":" inside a
+; placeholder, e.g. {0:>8}, {:08}, {x:.2}, {n:x}. Grammar:
+;   spec  = [ [fill] align ] [ "0" ] [ width ] [ "." precision ] [ type ]
+;   align = "<" (left) | ">" (right) | "^" (center)
+;   type  = "x"/"X" (hex) | "b" (binary) | "o" (octal) | "d" (decimal)
+; The empty spec means "default": value_to_string with no padding (so an absent
+; ":" is byte-identical to the previous behaviour).
+
+; format_pow10 — 10^p as an int (p >= 0), by repeated multiply.
+(bind format_pow10
+  (lambda (p)
+    (bind ((acc (ref 1)) (k (ref 0)))
+      (do
+        (while (lt (deref k) p)
+          (do (set_ref acc (int_mul (deref acc) 10)) (set_ref k (int_add (deref k) 1))))
+        (deref acc)))))
+
+; format_align? — is `c` one of the alignment markers < > ^ ?
+(bind format_align?
+  (lambda (c) (or (eq c "<") (or (eq c ">") (eq c "^")))))
+
+; format_parse_spec — parse a spec STRING into a record:
+;   {fill align zero width prec type}, where missing fields are null/false/-1.
+; Walks the char list once with a cursor; an unparseable tail is ignored (kept
+; minimal — the documented forms are what matter).
+(bind format_parse_spec
+  (lambda (spec)
+    (bind ((cs (string_chars spec)) (n (size cs)) (k (ref 0))
+           (fill (ref null)) (align (ref null)) (zero (ref false))
+           (width (ref -1)) (prec (ref -1)) (type (ref null)))
+      (do
+        ; [ [fill] align ] — a fill char is only present when char[1] is an align
+        (if (and (ge n 2) (format_align? (get cs 1 "")))
+          (do (set_ref fill (get cs 0 "")) (set_ref align (get cs 1 "")) (set_ref k 2))
+          (if (and (ge n 1) (format_align? (get cs 0 "")))
+            (do (set_ref align (get cs 0 "")) (set_ref k 1))
+            null))
+        ; [ "0" ] zero-pad flag (right-aligns numbers, pads with "0")
+        (if (and (lt (deref k) n) (eq (get cs (deref k) "") "0"))
+          (do (set_ref zero true) (set_ref k (int_add (deref k) 1)))
+          null)
+        ; [ width ] — a run of digits
+        (bind ((w0 (deref k)))
+          (do
+            (while (and (lt (deref k) n) (string_contains "0123456789" (get cs (deref k) "x")))
+              (set_ref k (int_add (deref k) 1)))
+            (if (gt (deref k) w0)
+              (set_ref width (string_to_int (sequence_join (sequence_slice cs w0 (deref k)) "")))
+              null)))
+        ; [ "." precision ] — a dot then a run of digits
+        (if (and (lt (deref k) n) (eq (get cs (deref k) "") "."))
+          (bind ((p0 (int_add (deref k) 1)))
+            (do
+              (set_ref k p0)
+              (while (and (lt (deref k) n) (string_contains "0123456789" (get cs (deref k) "x")))
+                (set_ref k (int_add (deref k) 1)))
+              (set_ref prec
+                (if (gt (deref k) p0)
+                  (string_to_int (sequence_join (sequence_slice cs p0 (deref k)) ""))
+                  0))))
+          null)
+        ; [ type ] — the final non-consumed char, if any (x/X/b/o/d)
+        (if (lt (deref k) n)
+          (set_ref type (get cs (deref k) ""))
+          null)
+        (assoc (map_of)
+          "fill" (deref fill) "align" (deref align) "zero" (deref zero)
+          "width" (deref width) "prec" (deref prec) "type" (deref type))))))
+
+; format_render_float — `x` rendered with exactly `prec` digits after the point
+; (prec >= 0; prec = 0 drops the point). Half-away-from-zero rounding via the
+; kernel `round`; the sign is handled explicitly so -0.00 never appears.
+(bind format_render_float
+  (lambda (x prec)
+    (bind ((neg (lt x 0.0))
+           (m (float_abs x))
+           (scale (format_pow10 prec))
+           (scaled (float_to_int (round (float_mul m (int_to_float scale)))))
+           (whole (int_div scaled scale))
+           (frac (int_mod scaled scale))
+           (sign (if neg "-" ""))
+           (body
+             (if (le prec 0)
+               (int_to_string whole)
+               (string_concat_many (int_to_string whole) "."
+                 (pad_left (int_to_string frac) prec "0")))))
+      ; suppress a leading "-" when the rounded magnitude is exactly zero
+      (if (and neg (eq scaled 0)) body (string_concat_many sign body)))))
+
+; format_render_radix — `n` (an int) in the radix named by a type char.
+;   "x"/"X" -> hex (X upper), "b" -> binary, "o" -> octal, "d"/else -> decimal.
+(bind format_render_radix
+  (lambda (n type)
+    (cond
+      ((eq type "x") (format_int n 16))
+      ((eq type "X") (string_upcase (format_int n 16)))
+      ((eq type "b") (format_int n 2))
+      ((eq type "o") (format_int n 8))
+      (else (format_int n 10)))))
+
+; format_pad_spec — apply width/align/fill/zero to an already-rendered `s`.
+; Default alignment is right for the zero flag, otherwise left. A "0" zero-pad
+; keeps any leading sign ("-") ahead of the zeros.
+(bind format_pad_spec
+  (lambda (s spec)
+    (bind ((width (get spec "width" -1)))
+      (if (or (lt width 0) (ge (size s) width)) s
+        (bind ((align (get spec "align" null))
+               (fillc (get spec "fill" null))
+               (zero (get spec "zero" false))
+               (pad (int_sub width (size s))))
+          (cond
+            ; zero-pad: digits after the sign, no explicit align needed
+            ((and zero (eq align null))
+              (if (and (gt (size s) 0)
+                       (or (eq (string_slice s 0 1) "-") (eq (string_slice s 0 1) "+")))
+                (string_concat_many (string_slice s 0 1)
+                  (string_repeat "0" pad) (string_slice s 1 (size s)))
+                (string_concat_many (string_repeat "0" pad) s)))
+            (else
+              (bind ((f (if (eq fillc null) " " fillc))
+                     (a (if (eq align null) "<" align)))
+                (cond
+                  ((eq a ">") (string_concat_many (string_repeat f pad) s))
+                  ((eq a "^")
+                    (bind ((l (int_div pad 2)) (r (int_sub pad l)))
+                      (string_concat_many (string_repeat f l) s (string_repeat f r))))
+                  (else (string_concat_many s (string_repeat f pad))))))))))))
+
+; format_apply_spec — render `value` according to a spec STRING (the text after
+; the first ":"). The empty spec is value_to_string with no padding (so a
+; specless placeholder is byte-identical to before).
+(bind format_apply_spec
+  (lambda (value spec)
+    (if (eq spec "") (value_to_string value)
+      (bind ((p (format_parse_spec spec))
+             (type (get p "type" null))
+             (prec (get p "prec" -1))
+             (vt (value_type value))
+             (base
+               (cond
+                 ; a radix type formats an int (floats/other fall back to string)
+                 ((and (ne type null) (eq vt "int")) (format_render_radix value type))
+                 ; a precision on a float renders fixed decimals
+                 ((and (ge prec 0) (eq vt "float")) (format_render_float value prec))
+                 ; a precision on an int with no radix: treat as a float
+                 ((and (ge prec 0) (eq vt "int")) (format_render_float (int_to_float value) prec))
+                 (else (value_to_string value)))))
+        (format_pad_spec base p)))))
+
+; ── template substitution ────────────────────────────────────────────────────
+
+; format_split_spec — split a placeholder body at the FIRST ":" into (name spec).
+;   "0:>8" -> ("0" ">8");  "name" -> ("name" "");  ":x" -> ("" "x")
+(bind format_split_spec
+  (lambda (body)
+    (bind ((at (string_find body ":")))
+      (if (eq at null)
+        (list_of body "")
+        (list_of (string_slice body 0 at)
+                 (string_slice body (int_add at 1) (size body)))))))
+
+; format_parse_index — parse `spec` as a non-negative decimal index, totally.
+;   spec : the placeholder text
+;   ->   : the int index on success, or null when spec is not a base-10 integer
+(bind format_parse_index
+  (lambda (spec)
+    (try (string_to_int spec) (catch e null))))
+
+; format_arg_at — fetch the substitution text for placeholder `body` from `args`.
+;   body : the text inside the braces — "" / "N" / "name", optionally with a
+;          ":spec" format suffix (e.g. "0:>8", ":x", "k:.2")
+;   args : a list (index lookup) or a map (key lookup)
+;   auto : the auto-increment counter (a ref), advanced only when the name is ""
+;   ->   : the rendered value (formatted by the spec), or the literal "{body}"
+;          left intact on a miss
+; The name part is resolved exactly as before (empty -> next positional, numeric
+; -> list index, else map key); the spec part (after the first ":") then formats
+; the looked-up value. Misses degrade gracefully to the literal placeholder text.
+(bind format_arg_at
+  (lambda (body args auto)
+    (bind ((ns (format_split_spec body))
+           (name (get ns 0))
+           (spec (get ns 1))
+           (kind (value_type args)))
+      (cond
+        ; map args — look the name up as a key (empty name has no meaning for a map)
+        ((eq kind "map")
+          (if (contains args name)
+            (format_apply_spec (get args name) spec)
+            (string_concat_many "{" body "}")))
+        ; list args — empty name advances the auto counter, else a numeric index
+        ((eq kind "list")
+          (bind ((idx
+                  (if (eq name "")
+                    (bind ((i (deref auto)))
+                      (do (set_ref auto (int_add i 1)) i))
+                    (format_parse_index name))))
+            (if (and (ne idx null) (ge idx 0) (lt idx (size args)))
+              (format_apply_spec (get args idx) spec)
+              (string_concat_many "{" body "}"))))
+        (else (string_concat_many "{" body "}"))))))
+
+; format — fill a template's placeholders from `args`.
+;   template : text with {} / {0} / {name} placeholders; {{ and }} are literal braces
+;   args     : a list (positional / indexed) or a map (named)
+;   ->        : the rendered string
+; Single char walk over (string_chars template): we accumulate literal runs and,
+; on an unescaped "{", read up to the matching "}" as the placeholder spec.
+; Output fragments are pushed onto a local `out` list and joined ONCE at the end
+; (O(n)); the old per-fragment `string_concat_many` onto a growing string was
+; O(n^2). The inner placeholder body uses the same list-then-join shape.
+(bind format
+  (lambda (template args)
+    (bind ((cs (string_chars template))
+           (n (size cs))
+           (out (list_of))
+           (i (ref 0))
+           (auto (ref 0)))
+      (do
+        (while (lt (deref i) n)
+          (bind ((c (get cs (deref i))))
+            (cond
+              ; "{" — either an escaped "{{" or the start of a placeholder
+              ((eq c "{")
+                (if (and (lt (int_add (deref i) 1) n)
+                         (eq (get cs (int_add (deref i) 1)) "{"))
+                  (do
+                    (append out "{")
+                    (set_ref i (int_add (deref i) 2)))
+                  ; read spec chars until the closing "}"
+                  (bind ((spec (list_of))
+                         (j (ref (int_add (deref i) 1))))
+                    (do
+                      (while (and (lt (deref j) n) (ne (get cs (deref j)) "}"))
+                        (do
+                          (append spec (get cs (deref j)))
+                          (set_ref j (int_add (deref j) 1))))
+                      (append out
+                        (format_arg_at (sequence_join spec "") args auto))
+                      ; skip past the "}" (or to end if it was unterminated)
+                      (set_ref i (int_add (deref j) 1))))))
+              ; "}}" is an escaped brace; a lone "}" is emitted literally
+              ((eq c "}")
+                (if (and (lt (int_add (deref i) 1) n)
+                         (eq (get cs (int_add (deref i) 1)) "}"))
+                  (do
+                    (append out "}")
+                    (set_ref i (int_add (deref i) 2)))
+                  (do
+                    (append out "}")
+                    (set_ref i (int_add (deref i) 1)))))
+              (else
+                (do
+                  (append out c)
+                  (set_ref i (int_add (deref i) 1)))))))
+        (sequence_join out "")))))
+
+; ── column layout ────────────────────────────────────────────────────────────
+
+; format_pad_cell — right-pad a single cell to `width` with spaces (no truncation).
+(bind format_pad_cell
+  (lambda (cell width)
+    (if (ge (size cell) width) cell
+      (string_concat_many cell (string_repeat " " (int_sub width (size cell)))))))
+
+; align_columns — render a grid of strings as space-separated aligned columns.
+;   rows   : a list of rows; each row is a list of cell strings
+;   widths : a list of per-column target widths (right-padded with spaces)
+;   ->      : the rows joined by "\n", cells within a row joined by " "
+; A missing cell (fewer cells than widths) is treated as ""; cells are emitted
+; for exactly as many columns as `widths` has.
+(bind align_columns
+  (lambda (rows widths)
+    (bind ((nw (size widths))
+           (lines
+            (sequence_map rows
+              (lambda (row)
+                (bind ((cells (ref ""))
+                       (k (ref 0))
+                       (rlen (size row)))
+                  (do
+                    (while (lt (deref k) nw)
+                      (bind ((idx (deref k))
+                             (cell (if (lt idx rlen) (get row idx) ""))
+                             (padded (format_pad_cell cell (get widths idx))))
+                        (do
+                          (set_ref cells
+                            (if (eq idx 0) padded
+                              (string_concat_many (deref cells) " " padded)))
+                          (set_ref k (int_add idx 1)))))
+                    (deref cells)))))))
+      (sequence_join lines "\n"))))
+
+(export format pad_left pad_right center format_int hex oct bin align_columns)

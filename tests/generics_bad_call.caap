@@ -1,0 +1,5 @@
+; a list<string> where list<int> is declared — certain mismatch.
+(module stdlib.fixtures.generics_bad_call)
+(use stdlib.fixtures.generics total)
+(bind broken (lambda () (total (list_of "a" "b"))))
+(export broken)

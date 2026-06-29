@@ -1,16 +1,181 @@
+; stdlib/bootstrap.caap
+; MODULE IDENTITY: the ROOT bootstrap script (run via ctfe_compiler_execute_bootstrap_file),
+; so it carries NO `(module …)` form — adding one would raise `unknown name: module`, since
+; this file is what BRINGS the expander/forms (and eventually the loader) into existence.
+; Allowlisted in stdlib/CONVENTIONS.md + stdlib_module_identity_check.
+;
+; Tier loader for the from-scratch stdlib. Each tier is written in the language
+; the tier below provides; the bare-substrate surface is concentrated here at the
+; bottom and shrinks to nothing as we climb.
+;
+;   tier 0  expand      — spec->spec transforms + one expansion pass  [this commit]
+;   tier 1  forms       — cond/when/unless/-> /with_map as transforms
+;   tier 2  lib         — result/sequence/string/... written WITH the sugar
+;                         (proof modules live in examples/ + tests/)
+;   tier 3  module      — registry/linker/provider pipeline
+;   tier 4  semantics   — compile passes, codegen
+;   tier 5  surface     — opt-in user grammars
+;
+; Status: tier 0 + initial forms. A "macro" is a plain spec->spec function; one
+; expansion pass produces pure kernel AST that eval and compile consume the same
+; way — fixing v1's split where sugar (compile-pipeline normalizers) never
+; reached module source loaded via raw eval.
 (do
-  (ctfe-compiler-execute-bootstrap-file
-    compiler
-    "kits/compiler_kit/toolchain.caap")
-  (ctfe-compiler-execute-bootstrap-file
-    compiler
-    "module/bootstrap_plan.caap")
-  (ctfe-compiler-execute-bootstrap-file
-    compiler
-    "module/seed.caap")
+  ; boot/expander.caap IS the expander engine (mechanism), so it loads bare.
+  (ctfe_compiler_execute_bootstrap_file compiler "boot/expander.caap")
+  ; boot/forms.caap is the form set (policy) — registered via define_form.
+  (ctfe_compiler_execute_bootstrap_file compiler "boot/forms.caap")
+  ; The remaining boot files are NOT the expander — run them THROUGH it so they
+  ; may use stdlib's own sugar (cond/with_map/for/…). For each top-level form:
+  ; expand, then eval. `compiler` stays in scope for their ctfe_compiler_* calls.
+  ;   check.caap  — the load-time semantic checker (consumed by the loader)
+  ;   loader.caap — the module loader
   (bind (
-    (seed-api
-      (ctfe-compiler-lookup-value compiler "stdlib.module.seed.api"))
-    (load-module (get seed-api "load-module" null))
+    (expand
+      (get (ctfe_compiler_lookup_value compiler "stdlib.expand") "expand"))
+    (run_expanded
+      (lambda (path)
+        (sequence_each
+          (ctfe_unit_top_level_forms
+            (ctfe_compiler_load_surface_file_template compiler path))
+          (lambda (form)
+            (ctfe_eval_node (expand (ctfe_node_to_spec form)))))))
+    ; ── ORDERED BOOT MANIFEST (the phase sequence as DATA) ──────────────────────
+    ; The single source of truth for "which phase registers which registry key".
+    ; It does NOT drive the load order below (that stays the hand-written sequence
+    ; the comments document) — it is the CONTRACT the post-phase assertions check:
+    ; after a phase runs, the key it is supposed to have published MUST be present,
+    ; so a silently-dropped phase fails LOUDLY at boot instead of surfacing later as
+    ; a confusing "unknown module" deep in a load. Documented in
+    ; docs/mechanisms/stdlib-bootstrap-contract.md.
+    (boot_manifest
+      (list_of
+        (assoc (map_of) "phase" "expander"   "file" "boot/expander.caap"   "key" "stdlib.expand")
+        (assoc (map_of) "phase" "forms"      "file" "boot/forms.caap"      "key" "stdlib.expand")
+        (assoc (map_of) "phase" "check"      "file" "boot/check.caap"      "key" "stdlib.check")
+        (assoc (map_of) "phase" "namespace"  "file" "boot/namespace.caap"  "key" "stdlib.namespace")
+        (assoc (map_of) "phase" "resolve"    "file" "boot/resolve.caap"    "key" "stdlib.resolve")
+        (assoc (map_of) "phase" "gate"       "file" "boot/gate.caap"       "key" "stdlib.gate")
+        (assoc (map_of) "phase" "reader"     "file" "boot/reader.caap"     "key" "stdlib.reader")
+        (assoc (map_of) "phase" "unit_build" "file" "boot/unit_build.caap" "key" "stdlib.unit_build")
+        (assoc (map_of) "phase" "loader"     "file" "boot/loader.caap"     "key" "stdlib.load")
+        (assoc (map_of) "phase" "types"      "file" "semantics/types/infer.caap" "key" "stdlib.semantics.types.infer")
+        (assoc (map_of) "phase" "commands"   "file" "boot/commands.caap"   "key" "caap.session.commands")))
+    ; check_phase! — assert the manifest phase's registry key is now present.
+    ; A missing key means the phase ran but did NOT publish its contract (or was
+    ; reordered/dropped) — raise with the phase, file, and key so the break is
+    ; obvious. Additive: it only READS the registry, never changes load order.
+    (check_phase!
+      (lambda (phase_name)
+        (bind (
+          (entry
+            (sequence_find boot_manifest
+              (lambda (e) (eq (get e "phase") phase_name))))
+        )
+          (if (eq entry null)
+            (runtime_error
+              (string_concat_many
+                "stdlib bootstrap: no manifest entry for phase \"" phase_name
+                "\" (boot_manifest in bootstrap.caap is the source of truth)"))
+            (if (eq (ctfe_compiler_lookup_value compiler (get entry "key") null) null)
+              (runtime_error
+                (string_concat_many
+                  "stdlib bootstrap: phase \"" phase_name "\" (" (get entry "file")
+                  ") did not register \"" (get entry "key")
+                  "\" — the boot sequence is broken or reordered"))
+              null)))))
   )
-    (load-module "stdlib.module")))
+    (do
+      (run_expanded "boot/check.caap")
+      (check_phase! "check")
+      ; loader responsibilities, each a reusable boot module the loader orchestrates
+      ; (must precede it — the orchestrator looks them up + threads its state).
+      ; check_phase! after each asserts the boot_manifest contract for that phase.
+      (run_expanded "boot/namespace.caap")  (check_phase! "namespace")
+      (run_expanded "boot/resolve.caap")    (check_phase! "resolve")
+      (run_expanded "boot/gate.caap")       (check_phase! "gate")
+      (run_expanded "boot/reader.caap")     (check_phase! "reader")
+      (run_expanded "boot/unit_build.caap") (check_phase! "unit_build")
+      (run_expanded "boot/loader.caap")     (check_phase! "loader")
+      ; Eager-load the type layer THROUGH the loader (ordinary modules, in
+      ; dependency order; relative paths resolve against this directory at boot
+      ; time). Once infer registers, the loader's type pass is live for every
+      ; module loaded afterwards.
+      (bind (
+        (api (ctfe_compiler_lookup_value compiler "stdlib.load"))
+        (load (get api "load"))
+        (backfill (get api "backfill_types"))
+      )
+        (do
+          ; tier-2 groundwork the type layer is written WITH
+          (load "lib/collections/sequence.caap")
+          (load "lib/collections/map.caap")
+          (load "syntax/ast.caap")
+          ; the unified compile-session context (audit #1) — load BEFORE the type
+          ; layer so both the eager type pass and every lazy subsystem (prep, llvm,
+          ; clike, passes) attach to the ONE session. Kernel-builtins only, so it
+          ; resolves here even though the stdlib root is declared further below.
+          (load "semantics/session.caap")
+          ; the type layer: registry -> markers/records -> effects -> walker
+          ; (the COMPILE layer — render/prep/llvm — is NOT loaded here: most
+          ; sessions never emit; boot/native_emit.caap or load_module pull it
+          ; in on demand)
+          (load "semantics/types/registry.caap")
+          (load "semantics/types/records.caap")
+          (load "semantics/types/effects.caap")
+          ; the type-pass walker is split into a facade + leaves; the leaves
+          ; load FIRST (by relative path, like the modules above) because the
+          ; facade `(use)`s them eagerly here — before the stdlib root is
+          ; declared (below), so they cannot yet resolve by name. Order is the
+          ; dependency order: report -> unify -> constraint/store/result -> facade.
+          (load "semantics/types/infer/report.caap")
+          (load "semantics/types/infer/unify.caap")
+          (load "semantics/types/infer/constraint.caap")
+          (load "semantics/types/infer/store.caap")
+          (load "semantics/types/infer/result.caap")
+          (load "semantics/types/infer.caap")
+          (check_phase! "types")
+          ; the three groundwork modules loaded before infer existed — file
+          ; their signatures now, so importers see inferred results AND
+          ; effects (e.g. const folds sequence's pure functions)
+          (backfill "lib/collections/sequence.caap" "stdlib.lib.collections.sequence")
+          (backfill "lib/collections/map.caap" "stdlib.lib.collections.map")
+          (backfill "syntax/ast.caap" "stdlib.syntax.ast")
+          ; SELF-DECLARE the stdlib root: derive the base directory from an
+          ; already-loaded module's canonical path, so stdlib.* names
+          ; resolve BY NAME in every session (surface kits, lazy lib, tools)
+          ; without the embedder declaring anything
+          (bind ((sq ((get api "module_path") "stdlib.lib.collections.sequence")))
+            (if (eq sq null)
+              null
+              (bind ((base (string_slice sq 0
+                             (int_sub (size sq)
+                               (size "/lib/collections/sequence.caap")))))
+                (do
+                  ((get api "declare_root") "stdlib" base)
+                  ; COMPAT root for the sys facades: their canonical module name
+                  ; is `stdlib.sys.<lib>` (resolves via the stdlib root above),
+                  ; but the legacy short name `sys.<lib>` must still resolve so
+                  ; existing `(use sys.fs …)` call sites load. Mapping `sys.* ->
+                  ; <base>/sys/*.caap` points BOTH names at the same file; the
+                  ; loader reads each file's `(module stdlib.sys.<lib>)` directive
+                  ; and registers it canonically, so a `sys.<lib>` load returns
+                  ; the SAME export map (see stdlib/CONVENTIONS.md sys aliases).
+                  ((get api "declare_root") "sys"
+                    (string_concat_many base "/sys"))))))
+          ; the DEFAULT bare-import gate (audit #26): a native-only stdlib.bare.*
+          ; module reached through the PLAIN eval loader bottoms out in an unknown
+          ; volatile_*/asm/atomic_* head deep inside the wrapper. Eager-load the
+          ; gate (after the stdlib root is declared, so its `(use stdlib.semantics
+          ; .passes.…)` resolve by name) so the loader's directive-level bare check
+          ; is LIVE for every later eval load. It is null-safe before this point and
+          ; SKIPS in the native backend's bare-inlining context (the shared
+          ; backend.prep.native_context session cell), so native programs that
+          ; legitimately use the bare wrappers are unaffected.
+          (load "semantics/passes/source_read.caap")
+          (load "semantics/passes/bare_gate.caap")
+          ; the session command surface (LSP analyze / DAP run): ONE small
+          ; eager module registering the capability map + compat names as
+          ; THUNKS — analyze.caap/run.caap load lazily on first call
+          (load "boot/commands.caap")
+          (check_phase! "commands"))))))

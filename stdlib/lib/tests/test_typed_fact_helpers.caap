@@ -1,0 +1,52 @@
+; stdlib/lib/tests/test_typed_fact_helpers.caap — the strict/soft helpers over
+; the typed-fact channel (stdlib.semantics.passes.typed_fact_helpers). These pin
+; the contract on top of the registry's typed facts: fact_require! returns a
+; recorded value and THROWS on a missing key (or undeclared namespace), while
+; fact_require_default falls back WITHOUT throwing. We drive the real registry
+; (declare a schema, record a typed fact) so the helpers exercise the actual
+; backing store.
+
+;; @area: passes
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true assert_throws)
+(use stdlib.semantics.passes.registry fact_schema! fact_typed! clear_passes!)
+(use stdlib.semantics.passes.typed_fact_helpers fact_require! fact_require_default)
+
+(do
+  ; a clean store, then a declared namespace with one recorded fact
+  (clear_passes!)
+  (fact_schema! "test.tfh" "string" "string")
+  (fact_typed! "test.tfh" "f" "pure")
+
+  ; ── fact_require! — strict read: present key reads through ──
+  (assert_eq (fact_require! "test.tfh" "f") "pure"
+    "fact_require! returns the recorded value")
+
+  ; ── fact_require! — a missing key in a DECLARED namespace throws ──
+  (assert_throws (lambda () (fact_require! "test.tfh" "absent"))
+    "fact_require! throws on a missing key")
+  ; the throw names the offending key
+  (assert_true
+    (string_contains
+      (value_to_string
+        (try (do (fact_require! "test.tfh" "absent") "NO_THROW")
+          (catch e e)))
+      "absent")
+    "the missing-fact throw names the key")
+
+  ; ── fact_require! — an UNDECLARED namespace throws (the typed contract) ──
+  (assert_throws (lambda () (fact_require! "test.undeclared" "f"))
+    "fact_require! throws on an undeclared namespace")
+
+  ; ── fact_require_default — present key reads, absent key falls back ──
+  (assert_eq (fact_require_default "test.tfh" "f" "DEFAULT") "pure"
+    "fact_require_default returns a present value")
+  (assert_eq (fact_require_default "test.tfh" "absent" "DEFAULT") "DEFAULT"
+    "fact_require_default falls back on a missing key WITHOUT throwing")
+  (assert_eq (fact_require_default "test.undeclared" "f" "DEFAULT") "DEFAULT"
+    "fact_require_default falls back on an undeclared namespace")
+
+  ; tidy up: drop the schema and fact this test installed (defensive — each
+  ; corpus test runs in its own session, so this is hygiene, not isolation)
+  (clear_passes!))

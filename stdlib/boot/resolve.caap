@@ -1,0 +1,143 @@
+; stdlib/boot/resolve.caap — module-name RESOLUTION (module stdlib.resolve).
+; MODULE IDENTITY: a RAW bootstrap script (run via ctfe_compiler_execute_bootstrap_file /
+; run_expanded BEFORE the `module` form is a bound name), so it carries NO `(module …)`
+; form — adding one would raise `unknown name: module`. Its registry identity is set
+; explicitly via ctfe_compiler_register_value. Allowlisted in stdlib/CONVENTIONS.md +
+; stdlib_module_identity_check (caap/tests/stdlib_governance_tests.rs).
+;
+; The "where does a module name live, and what is indexed" responsibility, lifted
+; out of the loader so name->path resolution is reusable (tooling, alternate
+; embedders). `make` binds it over the loader's shared `state` (it reads/writes the
+; same `roots`/`fragments`/`loaded_paths` maps the orchestrator owns) and the
+; `namespace` toolkit (for reading a file's `(module …)`/`(surface …)` header).
+; The cache-or-load step (load_module / resolve_import) stays in the orchestrator —
+; it needs `load` — so this module holds NO load pipeline, only resolution.
+(do
+  (bind (
+    (make
+      (lambda (state ns)
+        (bind (
+          (roots        (get state "roots"))
+          (fragments    (get state "fragments"))
+          (loaded_paths (get state "loaded_paths"))
+          (form_head    (get ns "form_head"))
+          (ident_arg    (get ns "ident_arg"))
+
+          ; name_to_path — derive a file path from a module name via a declared root.
+          ;   "stdlib.lib.collections.result" -> "<base>/lib/collections/result.caap"
+          (name_to_path
+            (lambda (name)
+              (bind (
+                ; the LONGEST matching prefix wins — "stdlib.examples" beats the
+                ; broader "stdlib" regardless of declaration order
+                (match
+                  (bind ((best (ref null)))
+                    (do
+                      (for r roots
+                        (if (string_starts_with name
+                              (string_concat_many (get r "prefix") "."))
+                          (if (or (eq (deref best) null)
+                                  (gt (size (get r "prefix"))
+                                      (size (get (deref best) "prefix"))))
+                            (set_ref best r)
+                            null)
+                          null))
+                      (deref best))))
+              )
+                (if (eq match null)
+                  null
+                  (bind (
+                    (prefix (get match "prefix"))
+                    (base (get match "base"))
+                    ; drop "<prefix>." then turn the dotted suffix into a path
+                    (suffix (string_slice name (int_add (size prefix) 1)))
+                  )
+                    (string_concat_many base "/"
+                      (string_replace suffix "." "/") ".caap"))))))
+
+          ; module_path — explicit fragment first, then where the module was
+          ; actually LOADED from, then the name->path convention.
+          (module_path
+            (lambda (name)
+              (bind (
+                (explicit (get fragments name))
+                (loaded (get loaded_paths name))
+              )
+                (cond
+                  ((not (eq explicit null)) explicit)
+                  ((not (eq loaded null)) loaded)
+                  (else (name_to_path name))))))
+
+          ; declare — map a module name to a file path.
+          (declare
+            (lambda (name path) (assoc fragments name path)))
+
+          ; declare_root — register a name->path convention: `prefix.a.b` -> `base/a/b.caap`.
+          (declare_root
+            (lambda (prefix base)
+              (append roots (assoc (map_of) "prefix" prefix "base" base))))
+
+          ; read_module_name — peek a file for its (module "X") directive without eval.
+          ;   -> the declared module name, or null if the file has no (module …)
+          (read_module_name
+            (lambda (path)
+              (bind (
+                ; LEADING forms suffice for the (module …) directive — and a
+                ; surface-headed file (whose body the default reader cannot parse)
+                ; simply yields no module name and stays out of the index
+                (forms
+                  (ctfe_unit_top_level_forms
+                    (ctfe_compiler_load_surface_file_template compiler path
+                      (assoc (map_of) "leading_parenthesized_forms_only" true))))
+                (found
+                  (sequence_find forms
+                    (lambda (form)
+                      (bind ((spec (ctfe_node_to_spec form)))
+                        (bind ((h (form_head spec)))
+                          (or (eq h "module")
+                              ; a NAMED surface file: (surface <kit> <name>)
+                              (and (eq h "surface")
+                                   (gt (size (syntax_call_args spec)) 1))))))))
+              )
+                (if (eq found null)
+                  null
+                  (bind ((spec (ctfe_node_to_spec found)))
+                    ; a surface header names the module in slot 1 (slot 0 = kit)
+                    (ident_arg spec
+                      (if (eq (form_head spec) "surface") 1 0)))))))
+
+          ; discover — recursively index every named module under `dir`.
+          ; Files without a (module …) directive are skipped; two files claiming
+          ; the same name fail loudly (duplicate at index time).
+          (discover
+            (lambda (dir)
+              (do
+                (sequence_each (ctfe_compiler_list_dir compiler dir)
+                  (lambda (entry)
+                    (if (get entry "is_dir" false)
+                      (discover (get entry "path"))
+                      (if (and (get entry "is_file" false)
+                               (string_ends_with (get entry "name" "") ".caap"))
+                        (bind (
+                          (path (get entry "path"))
+                          (name (read_module_name path))
+                        )
+                          (if (eq name null)
+                            null
+                            (bind ((prior (get fragments name)))
+                              (if (and (not (eq prior null)) (not (eq prior path)))
+                                (runtime_error
+                                  (string_concat_many
+                                    "stdlib: duplicate module name \"" name
+                                    "\" discovered (" prior " and " path ")"))
+                                (declare name path)))))
+                        null))))
+                null)))
+        )
+          (assoc (map_of)
+            "name_to_path" name_to_path "module_path" module_path
+            "declare" declare "declare_root" declare_root
+            "read_module_name" read_module_name "discover" discover))))
+  )
+    (ctfe_compiler_register_value compiler "stdlib.resolve"
+      (assoc (map_of) "make" make))))

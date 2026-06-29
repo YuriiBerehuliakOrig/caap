@@ -1,0 +1,10 @@
+; stdlib/frontend/clike/ast.caap - local AST helper facade for clike internals.
+;
+; Clike leaves share these constructors through this small shim so a refactor of
+; the lowerer does not widen the repo-wide fan-in to stability-critical syntax.ast.
+(module stdlib.frontend.clike.ast)
+
+(use stdlib.syntax.ast sym lit call calln literal_of call? head_is? arg
+     name_of head_of)
+
+(export sym lit call calln literal_of call? head_is? arg name_of head_of)

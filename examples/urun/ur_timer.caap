@@ -1,0 +1,175 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  ur_timer — the kernel TIME base + APPLICATION TIMERS (module
+//  stdlib.urun.ur_timer). The analogue of URun's ur_timer.h +
+//  ur_timer_*.c + the ur_timer_interrupt handler. SysTick is wired (in the asm
+//  port) to call `_ur_timer_interrupt`, which (1) advances the tick counter,
+//  (2) drives the thread DELAYED list (waking sleeps + expiring object waits via
+//  ur_thread's `_ur_thread_timer_tick`), and (3) decrements every active
+//  application timer, firing its callback on expiry. `export` = public interface;
+//  the active-timer list head is module-private.
+// ═══════════════════════════════════════════════════════════════════════════
+(surface stdlib.frontend.clike stdlib.urun.ur_timer)
+
+use stdlib.urun.ur_scheduler (_ur_thread_timer_tick)
+use stdlib.urun.ur_port (ur_interrupt_save, ur_interrupt_restore)
+use stdlib.urun.ur_list (List, Node, ur_list_head, ur_list_push_front, ur_list_remove)
+
+// An application timer: a down-counter (ur_timer_remaining) that fires
+// ur_timer_expiry(ur_timer_arg) at zero, then reloads with ur_timer_reschedule
+// (0 = one-shot) — exactly URun's initial-ticks / reschedule-ticks model.
+// Linked into the active list through a `Node<UR_TIMER>` hook. A timer lives in
+// exactly ONE list, so its hook takes the DEFAULT name (`next`) and `List<UR_TIMER>`
+// need not name it (the analogue of List's own fixed `head`); the hook is reached
+// as `(&t->next)->next` — the hook's address, then its link pointer.
+UR_TIMER struct export = {
+  ur_timer_remaining u32,
+  ur_timer_reschedule u32,
+  ur_timer_expiry u32,             // expiry callback address (fn_ptr -> int)
+  ur_timer_arg u32,                // value passed to the callback
+  ur_timer_active u32,             // 1 while on the active list
+  next Node<UR_TIMER>
+}
+
+// ── kernel time base + the active application-timer list (PRIVATE) ───────────
+// The active list is the generic STRUCT-container `List<UR_TIMER>` held as a module
+// global. `UR_TIMER` is in just ONE list, so its link field uses the DEFAULT name
+// `next` and the list type omits it — operations take just `&ur_timer_head` and
+// deduce the element type (and the default `next` link). Layout-identical to the
+// old raw head pointer.
+ur_tick_count mut u32 = 0
+ur_timer_head mut List<UR_TIMER> = 0
+
+ur_timer_null () UR_TIMER* export = {
+  0 as UR_TIMER*
+}
+_timer_is_null (t UR_TIMER*) bool = {
+  t as uptr == 0
+}
+
+// ── the kernel time base (URun ur_time_get / ur_time_set) ─────────────────
+ur_time_get () u32 export = {
+  ur_tick_count
+}
+ur_time_set (t u32) i32 export = {
+  ur_tick_count = t
+  0
+}
+
+// ── application timer services ───────────────────────────────────────────────
+// create: record the callback + schedule, but do NOT start it (activate does).
+//
+// ISR-SAFE CALLBACK CONTRACT: the `expiry` callback is invoked by
+// _ur_timer_interrupt FROM THE SysTick INTERRUPT, while the timer list is being
+// traversed. A callback therefore MUST:
+//   - NOT call a blocking API (ur_semaphore_get/ur_queue_receive with a wait, …);
+//   - NOT mutate the timer list (ur_timer_activate/deactivate) — it re-enters the
+//     traversal;
+//   - stay short — set a flag or signal a thread and return.
+// For arbitrary work, post to a service thread instead (a deferred-callback queue
+// is out of scope for this slice). The sample callback only writes UART (safe).
+ur_timer_create (t UR_TIMER*, expiry u32, arg u32, initial u32, reschedule u32) i32 export = {
+  t->ur_timer_remaining = initial
+  t->ur_timer_reschedule = reschedule
+  t->ur_timer_expiry = expiry
+  t->ur_timer_arg = arg
+  t->ur_timer_active = 0
+  (&t->next)->next = ur_timer_null()
+  0
+}
+
+// activate: push onto the active list (idempotent). If the remaining count is 0
+// (e.g. after a one-shot), reload it from the reschedule value first. A timer
+// with no initial count AND no reload (both zero) has no well-defined fire tick,
+// so it is left inactive rather than added with remaining == 0 — which the
+// interrupt path would decrement to 0xFFFFFFFF and then never fire.
+ur_timer_activate (t UR_TIMER*) i32 export = {
+  prev u32 = ur_interrupt_save()
+  if t->ur_timer_active == 0 {
+    if t->ur_timer_remaining == 0 {
+      t->ur_timer_remaining = t->ur_timer_reschedule
+    } else {
+      0
+    }
+    if t->ur_timer_remaining == 0 {
+      0                                      // zero initial + zero reload: stay inactive
+    } else {
+      t->ur_timer_active = 1
+      ur_list_push_front(&ur_timer_head, t)
+    }
+  } else {
+    0
+  }
+  ur_interrupt_restore(prev)
+  0
+}
+
+// deactivate: unlink from the active list (a labeled walk that `break`s out the
+// moment it finds the timer).
+ur_timer_deactivate (t UR_TIMER*) i32 export = {
+  prev u32 = ur_interrupt_save()
+  if t->ur_timer_active == 1 {
+    // the same intrusive unlink as the thread lists, threaded through the default
+    // `next` link (a UR_TIMER instantiation of the generic list); the explicit
+    // null below force-clears the link even if `t` was already off.
+    ur_list_remove(&ur_timer_head, t)
+    t->ur_timer_active = 0
+    (&t->next)->next = ur_timer_null()
+  } else {
+    0
+  }
+  ur_interrupt_restore(prev)
+  0
+}
+
+// delete: with static control blocks, deletion is just deactivation.
+ur_timer_delete (t UR_TIMER*) i32 export = {
+  ur_timer_deactivate(t)
+}
+
+// ── the timer interrupt (called from SysTick in the asm port) ────────────────
+// Advance time, tick the thread delayed list, then expire application timers.
+// One linear pass; the active-list head is re-read each step because an expiry
+// callback may (de)activate timers. Fires the callback through its stored
+// address; a one-shot (reschedule == 0) deactivates, otherwise it reloads.
+// Runs in SysTick INTERRUPT context — the callback (line ~137) executes here, so
+// it must be ISR-safe (see the contract on ur_timer_create).
+_ur_timer_interrupt () i32 export = {
+  ur_tick_count += 1
+  _ur_thread_timer_tick()
+  p mut UR_TIMER* = ur_list_head(&ur_timer_head)
+  while !_timer_is_null(p) {
+    nxt UR_TIMER* = (&p->next)->next
+    if p->ur_timer_remaining > 0 {           // guard: never decrement below zero
+      p->ur_timer_remaining = p->ur_timer_remaining - 1
+    } else {
+      0
+    }
+    if p->ur_timer_remaining == 0 {
+      // ISR RE-ENTRANCY: unlink a one-shot BEFORE firing its callback, so a
+      // re-entrant ur_timer_deactivate(p) from inside the callback is a clean
+      // no-op (active is already 0 — it never re-touches the list the interrupt
+      // is still walking). The walk continues via the saved `nxt`. A periodic
+      // timer is reloaded AFTER the callback (unchanged order), so its
+      // remaining-on-entry stays 0 for any callback that reads it.
+      if p->ur_timer_reschedule == 0 {
+        ur_timer_deactivate(p)
+      } else {
+        0
+      }
+      if p->ur_timer_expiry != 0 {
+        call_ptr(p->ur_timer_expiry as UR_TIMER*, i32, p->ur_timer_arg)
+      } else {
+        0
+      }
+      if p->ur_timer_reschedule != 0 {
+        p->ur_timer_remaining = p->ur_timer_reschedule
+      } else {
+        0
+      }
+    } else {
+      0
+    }
+    p = nxt
+  }
+  0
+}

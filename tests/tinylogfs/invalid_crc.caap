@@ -1,0 +1,3 @@
+; negative: a crc field must be u32 (this one is u16).
+(use stdlib.storage.binary le_bytes)
+(storage Bad (record R 1 (field a u32) (field crc u16 (crc_of (before crc)))))

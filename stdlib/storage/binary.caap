@@ -1,0 +1,134 @@
+; stdlib/storage/binary.caap — a binary-format "compiler" as a LIBRARY
+; (module stdlib.storage.binary).
+;
+; `(storage Name …)` is a library-defined grammar extension (a `define_form`):
+; it PARSES a binary-format spec, VALIDATES it at compile time (duplicate fields
+; / versions, unsupported types, enum value size, CRC region, missing
+; migrations — each a located load-time diagnostic), and LOWERS to generated,
+; specialized runtime functions: encode/decode/validate/migrate/load_latest,
+; per-record SIZE constants, and a documentation table. The generated eval code
+; is ordinary CAAP IR (visible via the `snapshot` it produces) that calls the
+; small byte runtime; `render_native` lowers the SAME spec to the typed native
+; subset for backend/emit/llvm — nothing about TinyLogFS lives in the kernel.
+;
+; This file is the FACADE. The mini-compiler is split into acyclic submodules
+; under stdlib/storage/binary/:
+;   runtime          — the byte runtime + CRC the generated code calls by name
+;   parse            — spec node -> spec data (+ the endian policy)
+;   validate         — the seven compile-time checks
+;   generate_eval    — spec data -> generated eval IR (the runnable output)
+;   generate_native  — spec data -> native-subset source (backend/emit/llvm)
+; The `generate` driver below assembles both backends' output into one map, the
+; `storage` form registers the grammar extension, and the (export …) re-publishes
+; the SAME public contract these modules used to expose as one file.
+;
+; Supported field types (parse_type): unsigned u8/u16/u32/u64, signed i8/i16/
+; i32/i64 (two's-complement), bool (one byte 0/1), `(bytes N)` fixed slices, and
+; `(enum uN …)` tagged unions. `float`/`f32`/`f64` round-trip on the integer-only
+; eval byte runtime via float_to_bits/bits_to_float — see storage/README.md.
+(module stdlib.storage.binary)
+
+(use stdlib.syntax.ast sym lit calln call)
+(use stdlib.lib.collections.sequence each drop)
+(use stdlib.lib.text.string upcase downcase)
+(use stdlib.expand define_form)
+
+; the byte runtime (re-exported as the public contract below; the generated code
+; and importers call these by name)
+(use stdlib.storage.binary.runtime
+  le_bytes read_le read_le_signed
+  be_bytes read_be read_be_signed
+  pow256 crc32 emit! pad_bytes slice_bytes)
+; parse (spec node -> spec data) + the endian policy
+(use stdlib.storage.binary.parse parse_storage endian_be?)
+; validate (the seven checks) + record_names (the distinct record names)
+(use stdlib.storage.binary.validate validate record_names)
+; eval codegen + the sizing/table builders the generate driver assembles
+(use stdlib.storage.binary.generate_eval
+  gen_encode gen_decode gen_validate gen_migrate
+  latest_record build_docs build_snapshot record_size)
+; native codegen (render_native) + the native-skip probe the driver reports
+(use stdlib.storage.binary.generate_native render_native native_skip_field)
+
+; generate — spec -> { pairs:[{k,v-spec}…], report:[line…] }. The driver: it
+; assembles the EVAL codegen (encode/decode/validate/migrate/SIZE/load_latest/
+; docs/snapshot) into the pairs the form binds, and folds in a native-skip
+; report line per record the native backend can't lower (so a missing native
+; encode/decode is reported, not a silent drop).
+(bind generate
+  (lambda (spec)
+    (bind (
+      (pairs (list_of)) (report (list_of))
+      ; `be?` is the spec's byte order (default little); it picks the LE/BE byte
+      ; helpers in the generated encode/decode (see endian_be? for the policy).
+      (be? (endian_be? spec))
+      (tag (string_concat_many "[" (downcase (get spec "name")) "] "))
+      (push (lambda (k v) (append pairs (assoc (map_of) "k" k "v" v))))
+    )
+      (do
+        (append report (string_concat_many tag "storage " (get spec "name") " validated"))
+        (each (get spec "records")
+          (lambda (rec)
+            (bind ((rn (get rec "name")) (vn (int_to_string (get rec "version")))
+                   (base (string_concat_many rn "_v" vn)))
+              (do
+                (push (string_concat_many "encode_" base) (gen_encode be? rec))
+                (push (string_concat_many "decode_" base) (gen_decode be? rec))
+                (push (string_concat_many "validate_" base) (gen_validate rec))
+                (push (string_concat_many (upcase rn) "_V" vn "_SIZE") (lit (record_size rec)))
+                (append report (string_concat_many tag "generated " rn " v" vn " encode/decode"))
+                ; render_native SKIPS this record when a field can't lower to a
+                ; native struct field (native_type null, e.g. a `(bytes N)` slice).
+                ; Report it so a native build's missing encode/decode isn't silent.
+                (bind ((skip (native_skip_field rec)))
+                  (when (not (eq skip null))
+                    (append report (string_concat_many tag "native: record " rn
+                      " skipped (contains a field type the native backend can't lower: "
+                      (get skip "name") " : " (get (get skip "type") "spelling" "?") ")"))))))))
+        (each (get spec "migrations")
+          (lambda (mig)
+            (do
+              (push (string_concat_many "migrate_" (get mig "record")
+                "_v" (int_to_string (get mig "from")) "_to_v" (int_to_string (get mig "to")))
+                (gen_migrate mig))
+              (append report (string_concat_many tag "generated " (get mig "record")
+                " v" (int_to_string (get mig "from")) "/v" (int_to_string (get mig "to")) " migration")))))
+        (each (record_names (get spec "records"))
+          (lambda (rn)
+            (push (string_concat_many "load_" rn "_latest")
+              (gen_decode be? (latest_record (get spec "records") rn)))))
+        (push "docs" (lit (build_docs spec)))
+        (push "snapshot" (lit (build_snapshot pairs)))
+        (append report (string_concat_many tag "generated documentation table"))
+        (assoc (map_of) "pairs" pairs "report" report)))))
+
+; ════ the `storage` FORM — validate at compile time, lower to generated code ══
+; On a clean spec it expands to ONE `(assoc (map_of) "encode_…" <fn> … "report"
+; <lines>)` map: the generated functions, SIZE constants, docs, snapshot, and the
+; success report. The unit binds it and uses the pieces; nothing is in the kernel.
+(define_form "storage" 2 -1
+  (lambda (ctx node)
+    (bind (
+      (spec (parse_storage node))
+      (findings (validate spec node))
+      (emit (get ctx "emit"))
+    )
+      (if (gt (size findings) 0)
+        (do
+          (each findings
+            (lambda (f) (emit (assoc (map_of) "severity" "error" "message" f))))
+          (lit null))
+        (bind ((g (generate spec)) (args (list_of (calln "map_of" (list_of)))))
+          (do
+            (each (get g "pairs")
+              (lambda (p) (do (append args (lit (get p "k"))) (append args (get p "v")))))
+            (append args (lit "report"))
+            (append args (bind ((rs (list_of (sym "list_of"))))
+                           (do (each (get g "report") (lambda (l) (append rs (lit l))))
+                               (call (sym "list_of") (drop rs 1)))))
+            (calln "assoc" args)))))))
+
+(export parse_storage validate generate render_native
+        le_bytes read_le read_le_signed
+        be_bytes read_be read_be_signed
+        pow256 crc32 emit! pad_bytes slice_bytes)

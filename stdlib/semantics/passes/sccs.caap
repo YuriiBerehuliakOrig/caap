@@ -1,0 +1,190 @@
+; stdlib/semantics/passes/sccs.caap — strongly-connected components over the
+; module call graph (module stdlib.semantics.passes.sccs).
+;
+; Where callgraph.caap answers "is this name recursive at all?" with a per-name
+; boolean, this groups the names: it partitions the call graph into its
+; strongly-connected components — the maximal sets of definitions that are all
+; mutually reachable. A singleton component is an ordinary (possibly self-)
+; definition; a component of size > 1 is a mutual-recursion clique (a, b, c…
+; that call round to one another). The middle-end wants the GROUP, not the
+; per-node flag: a TCO / monomorphization / type-inference pass schedules a
+; mutually recursive cluster together, in reverse-topological order so callees
+; are settled before callers.
+;
+; The core is Tarjan's algorithm, run ITERATIVELY (an explicit work-stack rather
+; than host recursion): the call graph of a real module can be deep, and this
+; evaluator's native stack is the wrong place to bet the analysis. Tarjan emits
+; components in reverse-topological order for free (a component is closed only
+; once all of its successors are), which is exactly the order a fixpoint pass
+; wants to consume them. External callees (names with no definition in the
+; module) are not nodes — edges to them are dropped before the walk.
+;
+; Why NOT delegate to stdlib.lib.collections.algo's `scc` (which is also Tarjan
+; over the same node->successors map shape)? Two deliberate reasons:
+;   • External edges. `algo.scc` walks EVERY successor — it does not drop edges
+;     to undefined names. The call graph's edge values reference external
+;     callees (names defined in no top-level bind); algo.scc would visit each as
+;     a spurious singleton component. This pass must drop them first (`succ`
+;     below filters to intra-module callees), so the membership it reports stays
+;     exactly the module's own definitions.
+;   • Stack safety. `algo.scc` recurses on the HOST stack (its `visit` calls
+;     itself per successor); this iterative variant exists precisely so a deep
+;     module call graph does not overflow the evaluator's native stack.
+; So the iterative Tarjan is kept here as a deliberate, self-contained choice.
+(module stdlib.semantics.passes.sccs)
+
+(use stdlib.semantics.passes.callgraph analyze)
+(use stdlib.semantics.passes.registry finding_at fact! install_pass!)
+(use stdlib.lib.collections.sequence sort_by)
+
+; nodes_of — the node set of an edge map (its keys), as a name list.
+(bind nodes_of (lambda (edges) (map_keys edges)))
+
+; sccs — Tarjan's strongly-connected components of an edge map.
+;   edges : {name -> [callee…]}  (callees that are not themselves keys of the
+;           map are EXTERNAL and ignored — only intra-module edges are walked)
+;   -> [[name…]…] : the components, each a list of member names, in REVERSE
+;      topological order (a component appears before the components it calls).
+;
+; Iterative Tarjan: `work` is a stack of frames {node, i} where `i` is the index
+; of the next successor of `node` to visit. Visiting a node assigns it the next
+; `index`/`lowlink` and pushes it onto the SCC `stack` (marked on_stack). On
+; return from a child we relax the parent's lowlink by the child's; an unvisited
+; child is pushed as a new frame (and we PAUSE the parent at its current `i` so
+; we resume right after this child). When a node's lowlink equals its own index
+; it is an SCC root: pop the SCC `stack` down to it, that popped run is one
+; component.
+(bind sccs
+  (lambda (edges)
+    (bind (
+        (index    (ref 0))      ; next DFS discovery number
+        (indices  (map_of))     ; name -> discovery index
+        (lowlinks (map_of))     ; name -> lowlink
+        (on_stack (map_of))     ; name -> true while on the SCC stack
+        (sstack   (list_of))    ; the SCC stack
+        (out      (list_of))    ; emitted components
+        ; defined? — is `n` a node (a key of the edge map)? Edges to undefined
+        ; (external) names are not followed.
+        (defined? (lambda (n) (contains edges n)))
+        ; succ — the intra-module successors of `n` (external callees dropped).
+        (succ
+          (lambda (n)
+            (bind ((acc (list_of)))
+              (do
+                (for c (get edges n (list_of))
+                  (when (defined? c) (append acc c)))
+                acc))))
+        ; strongconnect — the iterative DFS rooted at `root` (only entered when
+        ; `root` is still unvisited).
+        (strongconnect
+          (lambda (root)
+            (bind ((work (list_of)))
+              (do
+                ; push & number the root
+                (assoc indices  root (deref index))
+                (assoc lowlinks root (deref index))
+                (set_ref index (int_add (deref index) 1))
+                (append sstack root)
+                (assoc on_stack root true)
+                (append work (assoc (map_of) "node" root "i" (ref 0)))
+                (while (gt (size work) 0)
+                  (bind (
+                      (top  (get work (int_sub (size work) 1)))
+                      (n    (get top "node"))
+                      (ip   (get top "i"))
+                      (ss   (succ n))
+                    )
+                    (if (lt (deref ip) (size ss))
+                      ; still successors to process for `n`
+                      (bind ((w (get ss (deref ip))))
+                        (do
+                          (set_ref ip (int_add (deref ip) 1))
+                          (if (not (contains indices w))
+                            ; tree edge: number `w` and descend (the parent stays
+                            ; on `work` paused at the advanced `ip`)
+                            (do
+                              (assoc indices  w (deref index))
+                              (assoc lowlinks w (deref index))
+                              (set_ref index (int_add (deref index) 1))
+                              (append sstack w)
+                              (assoc on_stack w true)
+                              (append work (assoc (map_of) "node" w "i" (ref 0))))
+                            ; back / cross edge: relax by w if it is on the stack
+                            (when (eq (get on_stack w false) true)
+                              (when (lt (get indices w) (get lowlinks n))
+                                (assoc lowlinks n (get indices w)))))))
+                      ; n is finished — pop the frame, relax the parent, and if n
+                      ; is an SCC root, peel its component off the SCC stack
+                      (do
+                        (list_remove_at work (int_sub (size work) 1))
+                        (when (gt (size work) 0)
+                          (bind ((parent (get (get work (int_sub (size work) 1)) "node")))
+                            (when (lt (get lowlinks n) (get lowlinks parent))
+                              (assoc lowlinks parent (get lowlinks n)))))
+                        (when (eq (get lowlinks n) (get indices n))
+                          (bind ((comp (list_of)) (popping (ref true)))
+                            (do
+                              (while (deref popping)
+                                (bind ((m (get sstack (int_sub (size sstack) 1))))
+                                  (do
+                                    (list_remove_at sstack (int_sub (size sstack) 1))
+                                    (assoc on_stack m false)
+                                    (append comp m)
+                                    (when (eq m n) (set_ref popping false)))))
+                              (append out comp))))))))))))
+      )
+      (do
+        (for v (nodes_of edges)
+          (when (not (contains indices v)) (strongconnect v)))
+        out))))
+
+; sorted_component — a component with its member names sorted (deterministic
+; ordering for assertions / stable findings). Tarjan's intra-component order is
+; an implementation detail; callers that compare membership want it canonical.
+(bind sorted_component (lambda (comp) (sort_by comp (lambda (x) x))))
+
+; analyze_module — the call graph -> its SCC partition.
+;   located : [{node, loc}] the module's top-level forms
+;   -> { components : [[name…]…]            the SCCs, reverse-topological
+;        scc_of     : {name -> scc_id} }    scc_id = index into `components`
+(bind analyze_module
+  (lambda (located)
+    (bind ((g (analyze located)))
+      (bind (
+          (comps (sccs (get g "edges" (map_of))))
+          (scc_of (map_of))
+          (id (ref 0))
+        )
+        (do
+          (for comp comps
+            (do
+              (for nm comp (assoc scc_of nm (deref id)))
+              (set_ref id (int_add (deref id) 1))))
+          (assoc (map_of) "components" comps "scc_of" scc_of))))))
+
+; check_module — the pass entry: publish each name's SCC id as a fact and emit a
+; finding for every non-trivial (mutually recursive) group.
+;   facts: (fact! "callgraph.scc" name scc_id)
+;   findings: one per component of size > 1, naming the (sorted) members.
+(bind check_module
+  (lambda (located sink)
+    (bind ((r (analyze_module located)))
+      (do
+        (for nm (map_keys (get r "scc_of" (map_of)))
+          (fact! "callgraph.scc" nm (get (get r "scc_of" (map_of)) nm)))
+        (for comp (get r "components" (list_of))
+          (when (gt (size comp) 1)
+            (append sink
+              (finding_at "callgraph.scc" ""
+                (string_concat_many
+                  "mutually recursive group: "
+                  (sequence_join (sorted_component comp) ", "))))))))))
+
+; register! — install the SCC analysis as a load-time pass (idempotent). It runs
+; after `callgraph` (which it reuses via `analyze`); the edge map is recomputed
+; rather than read from facts so the pass is self-contained.
+(bind register!
+  (lambda ()
+    (install_pass! "sccs" (lambda (located sink) (check_module located sink)))))
+
+(export sccs sorted_component analyze_module check_module register!)

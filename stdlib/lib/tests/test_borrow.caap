@@ -1,0 +1,105 @@
+; stdlib/lib/test_borrow.caap — the borrow analysis (move + aliasing).
+
+;; @area: passes
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.borrow check)
+(use stdlib.syntax.ast sym lit calln)
+(use stdlib.lib.collections.sequence any?)
+
+(do
+  ; helper: does any finding mention `needle`?
+  (bind ((has (lambda (findings needle)
+                (any? findings (lambda (f) (string_contains f needle))))))
+    (do
+      ; clean: move once, never used again
+      (assert_eq (size (check (calln "do" (list_of (calln "move" (list_of (sym "x"))))))) 0
+        "single move is clean")
+
+      ; use after move: (do (move x) x)
+      (assert_true
+        (has (check (calln "do" (list_of (calln "move" (list_of (sym "x")))
+                                         (sym "x"))))
+             "use after move of `x`")
+        "use after move flagged")
+
+      ; double move: (do (move x) (move x))
+      (assert_true
+        (has (check (calln "do" (list_of (calln "move" (list_of (sym "x")))
+                                         (calln "move" (list_of (sym "x"))))))
+             "use after move of `x`")
+        "double move flagged")
+
+      ; two mutable borrows of x nested -> aliasing violation
+      (assert_true
+        (has (check (calln "borrow_mut"
+                      (list_of (sym "x")
+                        (calln "borrow_mut" (list_of (sym "x") (lit 0))))))
+             "already borrowed")
+        "double &mut flagged")
+
+      ; shared borrow inside a mut borrow -> violation
+      (assert_true
+        (has (check (calln "borrow_mut"
+                      (list_of (sym "x")
+                        (calln "borrow" (list_of (sym "x") (lit 0))))))
+             "already mutably borrowed")
+        "shared-while-mut flagged")
+
+      ; reading x while it is mutably borrowed -> violation
+      (assert_true
+        (has (check (calln "borrow_mut" (list_of (sym "x") (sym "x"))))
+             "cannot use it")
+        "read-while-mut flagged")
+
+      ; move while borrowed -> violation
+      (assert_true
+        (has (check (calln "borrow"
+                      (list_of (sym "x") (calln "move" (list_of (sym "x"))))))
+             "cannot move `x` while it is borrowed")
+        "move-while-borrowed flagged")
+
+      ; lexical scope: two SEQUENTIAL mut borrows are fine (first ended)
+      (assert_eq
+        (size (check (calln "do"
+                       (list_of
+                         (calln "borrow_mut" (list_of (sym "x") (lit 1)))
+                         (calln "borrow_mut" (list_of (sym "x") (lit 2)))))))
+        0 "sequential &mut borrows are clean (lexical scopes)")
+
+      ; borrowing a moved name is also use-after-move: (do (move x) (borrow x (lambda (r) r)))
+      (assert_true
+        (has (check (calln "do"
+                      (list_of (calln "move" (list_of (sym "x")))
+                        (calln "borrow"
+                          (list_of (sym "x")
+                            (calln "lambda" (list_of (lit (list_of "r")) (sym "r"))))))))
+             "use after move of `x`")
+        "borrow after move flagged")
+
+      ; cross-alias (cm from semantics/passes/alias): a POINTER copied, the original
+      ; moved, the COPY read — borrow's alias map taints the whole class.
+      ; (bind ((p (int_to_ptr a 0)) (q p)) (do (move p) (ptr_read q)))
+      (assert_true
+        (has (check (calln "bind"
+                      (list_of
+                        (lit "p") (calln "int_to_ptr" (list_of (sym "a") (lit 0)))
+                        (lit "q") (sym "p")
+                        (calln "do"
+                          (list_of (calln "move" (list_of (sym "p")))
+                                   (calln "ptr_read" (list_of (sym "q"))))))))
+             "use after move of `q`")
+        "use after move through a pointer alias flagged")
+
+      ; copy-type discipline: a plain VALUE copy is independent — moving the
+      ; original does NOT taint the copy. (bind ((b a)) (do (move a) b)) is clean.
+      (assert_eq
+        (size (check (calln "bind"
+                       (list_of (lit "b") (sym "a")
+                         (calln "do"
+                           (list_of (calln "move" (list_of (sym "a"))) (sym "b")))))))
+        0
+        "value copy is not tainted by moving the original")
+      true))
+  true)

@@ -1,0 +1,48 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      // Build the URun slice to a freestanding Cortex-M3 ELF via the stdlib
+      // bootstrap and ur_build. Output: target/urun.elf (not stripped; carries
+      // FUNC symbols). This task does not enable DWARF, so gdb does
+      // symbol/instruction-level debugging.
+      "label": "urun: build ELF",
+      "type": "shell",
+      "command": "${workspaceFolder}/target/debug/caap",
+      "args": [
+        "stdlib/bootstrap.caap",
+        "examples/urun/ur_build.caap",
+        "examples/urun",
+        "${workspaceFolder}/target/urun.elf",
+        "cortex-m3"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      // Launch QEMU with the gdbstub halted at reset (-S), listening on
+      // tcp::1234, and stay alive for the debug session. Builds the ELF first.
+      // The matcher reports "ready" only once the port is actually bound, so
+      // the attach config below can connect without a race.
+      "label": "urun: QEMU (debug)",
+      "type": "shell",
+      "dependsOn": "urun: build ELF",
+      "command": "qemu-system-arm -M mps2-an385 -cpu cortex-m3 -nographic -kernel \"${workspaceFolder}/target/urun.elf\" -S -gdb tcp::1234 & QPID=$!; until (exec 3<>/dev/tcp/127.0.0.1/1234) 2>/dev/null; do sleep 0.1; done; exec 3>&- 3<&-; echo QEMU-GDB-READY; wait $QPID",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": { "executable": "/bin/bash", "args": ["-c"] }
+      },
+      "isBackground": true,
+      "problemMatcher": {
+        "pattern": { "regexp": "^(QEMU-GDB-READY)$", "file": 1, "message": 1 },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "^.*$",
+          "endsPattern": "QEMU-GDB-READY"
+        }
+      },
+      "presentation": { "reveal": "always", "panel": "dedicated" }
+    }
+  ]
+}

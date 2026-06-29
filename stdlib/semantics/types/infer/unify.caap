@@ -1,0 +1,130 @@
+; stdlib/semantics/types/infer/unify.caap — A2 call-site unification of type
+; variables (the pure type-binding logic of the type pass).
+;
+; A generic signature mentions type variables (`T`) in parameter and result
+; positions; they bind at the CHECK OF A CALL. This leaf owns the variable
+; machinery — `unify`/`bind_var!` (witness binding), `type_mentions_var?`/
+; `sig_has_vars?` (the generic-vs-plain gate), and `finalize_result` (collapse
+; still-open variables). It is a SAFE leaf of types/infer: no walk state, no
+; module store — only `report.report!` for the one mismatch it can raise and
+; the registry's variable/constructor reader. constraint.caap drives it from
+; the call site; the facade's walker never touches it directly.
+(module stdlib.semantics.types.infer.unify)
+
+(use stdlib.semantics.types.registry assignable? type_var? ctor_of type_args)
+(use stdlib.semantics.types.infer.report report!)
+
+; ── A2: call-site unification of type variables ─────────────────────────────
+; A generic signature mentions type variables (`T`) in parameter and result
+; positions; they bind at the CHECK OF A CALL. `unify` matches one declared
+; parameter type `want` (which may contain variables) against the inferred
+; argument type `got`, growing the `subst` map (var -> bound type). The same
+; mechanism a type constructor is — a compile-time function over descriptors —
+; but run in the OTHER direction: structure flows from the argument INTO the
+; variable. Pure binding here; ordinary assignability mismatches stay with
+; `check_one_arg` (the single mismatch sink), so a non-generic signature is
+; unaffected and emits no duplicate diagnostics.
+
+; bind_var! — record (or re-check) a variable's witness. The FIRST concrete
+; witness sticks; a later witness must be assignable to it (two `T` arguments
+; of disagreeing type is a certain error), and a more precise later witness
+; (concrete over a still-open one) refines the binding.
+;   subst : the {var -> type} map (mutated)
+;   var   : the type-variable name
+;   got   : the witnessed concrete type (non-null)
+;   sink / head / i / anode : diagnostics context (the offending argument)
+(bind bind_var!
+  (lambda (subst var got sink head i anode)
+    (bind ((cur (get subst var)))
+      (cond
+        ((eq cur null) (assoc subst var got))
+        ((eq cur got) null)
+        ((assignable? cur got)
+          ; same family, keep the first (already the looser of the two)
+          null)
+        ((assignable? got cur)
+          ; the new witness is more precise — refine
+          (assoc subst var got))
+        (else
+          (report! sink
+            (string_concat_many
+              "`" head "` arg " (int_to_string (int_add i 1))
+              ": type variable `" var "` was " cur ", got " got)
+            anode))))))
+
+; unify — match a declared parameter type against an inferred argument type,
+; binding any variables in `want`. Recurses through matching parameterized
+; structure (a `(list T)` parameter against a "list<int>" argument unifies `T`
+; with "int"); a non-variable, non-decomposable `want` is left for
+; `check_one_arg` (it carries the assignability + literal-range checks). An
+; unknown argument (`got` null) binds nothing — the variable stays open.
+;   want  : the declared type (may hold variables)
+;   got   : the inferred argument type (null = unknown)
+;   subst : the {var -> type} map (mutated)
+;   sink / head / i / anode : diagnostics context
+(bind unify
+  (lambda (want got subst sink head i anode)
+    (cond
+      ((eq got null) null)
+      ; a diverging argument (`never`) carries NO instantiation information —
+      ; bind nothing, exactly as an unknown (null) does, so generalization is
+      ; unaffected by the reachability signal
+      ((eq got "never") null)
+      ((type_var? want) (bind_var! subst want got sink head i anode))
+      (else
+        (bind (
+          (cw (ctor_of want))
+          (cg (ctor_of got))
+        )
+          ; same constructor on both sides: unify argument-wise so nested
+          ; variables bind. A bare/typed-container MISMATCH (or any concrete
+          ; pair) is left to check_one_arg's assignability check.
+          (when (and (not (eq cw null)) (eq cw cg))
+            (bind ((wa (type_args want)) (ga (type_args got)))
+              (when (and (not (eq wa null))
+                         (and (not (eq ga null))
+                              (eq (size wa) (size ga))))
+                (for k (sequence_range 0 (size wa))
+                  (unify (get wa k) (get ga k) subst sink head i anode))))))))))
+
+; sig_has_vars? — does any parameter or the result of a signature mention a
+; type variable? When none do, the call check stays on the plain (non-generic)
+; path — zero overhead and byte-identical behavior for ordinary signatures.
+;   ps     : the parameter records
+;   result : the result type
+;   ->     : bool
+(bind type_mentions_var?
+  (lambda (t)
+    (cond
+      ((eq t null) false)
+      ((type_var? t) true)
+      (else
+        (bind ((targs (type_args t)))
+          (if (eq targs null) false
+            (not (eq (sequence_find targs
+                       (lambda (a) (type_mentions_var? a))) null))))))))
+(bind sig_has_vars?
+  (lambda (ps result)
+    (or (type_mentions_var? result)
+        (not (eq (sequence_find ps
+                   (lambda (p) (type_mentions_var? (get p "type")))) null)))))
+
+; finalize_result — the instantiated result of a generic call, with any
+; STILL-OPEN variable collapsed away (an argument was an unknown or a bare
+; container, so that position carries no element certainty). A bare open
+; variable becomes null (fully unknown); a parameterized spelling with an open
+; argument drops to its bare constructor ("list<T>" with T unbound -> "list"),
+; which resolves to the kernel container kind — never a "<T>" spelling leaks
+; into an inferred type.
+;   result : the declared result type after subst_type
+;   ->     : a fully concrete type name, a bare constructor, or null
+(bind finalize_result
+  (lambda (result)
+    (cond
+      ((eq result null) null)
+      ((not (type_mentions_var? result)) result)
+      ((type_var? result) null)
+      (else (ctor_of result)))))
+
+; type_mentions_var? stays file-private (used only by sig_has_vars?/finalize_result here)
+(export unify sig_has_vars? finalize_result)

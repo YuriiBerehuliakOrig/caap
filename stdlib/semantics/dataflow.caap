@@ -1,0 +1,486 @@
+; stdlib/semantics/dataflow.caap — a reusable CFG + monotone-dataflow framework
+; (module stdlib.semantics.dataflow).
+;
+; The substrate a flow-sensitive analysis stands on. alias/escape walk the AST
+; directly because their question is structural; a question about VALUES along
+; PATHS (what is live here, what is constant here, what reaches here) wants a
+; control-flow graph and a fixpoint over it. This module provides both, parameter-
+; ized so an analysis brings only its lattice.
+;
+; ── the model ────────────────────────────────────────────────────────────────
+;   build_cfg(node) -> a CFG over the 3-node IR (Name/Literal/Call). Control
+;   comes from the CALLEE policy, never the node shape — `if`/`while`/`match`/
+;   `do`/`throw`/`leave`/`try`/`block` are ordinary Call nodes whose head names a
+;   control form. A CFG is { blocks:[block…], entry, exit, succ:{id->[id…]},
+;   pred:{id->[id…]}, block:{id->block} }; a block is { id, stmts:[node…],
+;   succ:[id…] }. Every CFG has a synthetic ENTRY (id 0) and EXIT (id 1) sink;
+;   `throw`/`leave` edge to EXIT, `if` forks to two successors then rejoins,
+;   `while` adds the loop back-edge, `do`/`bind` chain sequentially.
+;
+;   solve(cfg, lattice, direction) -> { in:{id->fact}, out:{id->fact} }: the
+;   classic monotone worklist fixpoint. A lattice is
+;     { bottom        : the initial fact for every block,
+;       join(a,b)     : the meet/join of two facts (confluence at a merge),
+;       transfer(blk,f): the fact AFTER a block given the fact BEFORE it }
+;   `solve_forward`/`solve_backward` fix the direction; `solve` takes it as
+;   "forward"/"backward". Forward: in[b] = join of out[preds], out[b] =
+;   transfer(b, in[b]). Backward: out[b] = join of in[succs], in[b] =
+;   transfer(b, out[b]). Iterated over a worklist to a fixpoint (monotone +
+;   finite-height lattice ⇒ termination).
+;
+;   liveness(node) -> { in:{id->nameset}, out:{id->nameset}, cfg }: the proof
+;   client. Backward, the lattice is sets of live NAMES under union; a name is
+;   live at a point if some path from there USES it before redefining it. The
+;   textbook use[b]/def[b] transfer: live_in = use ∪ (live_out − def).
+;
+; ── boundaries ───────────────────────────────────────────────────────────────
+; Statement-granular within straight-line code is unnecessary for the clients
+; here, so a basic block holds a LIST of statements and the transfer folds over
+; them (liveness folds backward). `match` arms each become a successor of the
+; scrutinee block (one fork per arm, rejoining after) — pattern BINDINGS are not
+; modelled (the arm body is analyzed as-is). `try`/`catch` is approximated: the
+; protected body may exit to the handler at any point, so the handler is a
+; successor of the try-entry block (conservative, the safe direction). Inter-
+; procedural flow is out of scope — a call is one statement, its callee a black
+; box (its argument names still read as uses).
+(module stdlib.semantics.dataflow)
+
+(use stdlib.syntax.ast
+  call? name? literal? name_of head_of args_of arg bind_pairs)
+(use stdlib.syntax.ir names_set)
+(use stdlib.lib.collections.sequence reverse any?)
+(use stdlib.lib.collections.set set_of set_union set_difference)
+
+; ── CFG construction ─────────────────────────────────────────────────────────
+; A builder threads a mutable { blocks, next } record: blocks is id->block, next
+; is the id counter. We build by a structured walk that, given the block we are
+; CURRENTLY filling and a node, returns the block id flow has reached AFTER that
+; node — splitting a fresh block at each control join so straight-line runs stay
+; in one block. ENTRY is id 0, EXIT is id 1; both pre-allocated.
+
+(bind ENTRY 0)
+(bind EXIT 1)
+
+; make_block — a fresh empty block record with a given id.
+(bind make_block
+  (lambda (id) (assoc (map_of) "id" id "stmts" (list_of) "succ" (list_of))))
+
+; new_builder — a fresh CFG builder with the ENTRY and EXIT blocks pre-seeded.
+(bind new_builder
+  (lambda ()
+    (bind ((blocks (map_of)))
+      (do
+        (assoc blocks (int_to_string ENTRY) (make_block ENTRY))
+        (assoc blocks (int_to_string EXIT) (make_block EXIT))
+        (assoc (map_of) "blocks" blocks "next" (ref 2))))))
+
+; block_at — the block record for an id.
+(bind block_at
+  (lambda (bld id) (get (get bld "blocks") (int_to_string id))))
+
+; new_block — allocate a fresh empty block, returning its id.
+(bind new_block
+  (lambda (bld)
+    (bind ((id (deref (get bld "next"))))
+      (do
+        (set_ref (get bld "next") (int_add id 1))
+        (assoc (get bld "blocks") (int_to_string id) (make_block id))
+        id))))
+
+; emit! — append a statement node to a block (in flow order).
+(bind emit!
+  (lambda (bld id node) (append (get (block_at bld id) "stmts") node)))
+
+; link! — add a control edge from->to (deduplicated; succ stays a list of ints).
+(bind link!
+  (lambda (bld from to)
+    (bind ((succ (get (block_at bld from) "succ")))
+      (unless (any? succ (lambda (e) (eq e to))) (append succ to)))))
+
+; visit_sub — lay out a sub-node for its side effects, keeping flow in the SAME
+; block (the test of an `if`/`while`, the scrutinee of a `match`): we descend so
+; nested control inside the condition is still graphed, but the returned id is
+; the one we keep building from (the condition does not, itself, fork).
+(bind visit_sub
+  (lambda (self bld cur node) (do (self self bld cur node) null)))
+
+; build_node — the structured CFG walk.
+;   self : recursion idiom    bld : the builder    cur : current block id
+;   node : the IR node to lay out
+;   ->   : the block id flow has reached AFTER `node`. For a non-local exit
+;          (throw/leave) flow does not continue, so a FRESH unreachable block is
+;          returned — trailing statements land there with no live in-edge.
+(bind build_node
+  (lambda (self bld cur node)
+    (cond
+      ((eq node null) cur)
+      ((not (call? node)) (do (emit! bld cur node) cur))
+      (else
+        (bind ((h (head_of node)))
+          (cond
+            ; ── (do e1 e2 … en): sequential chaining ──
+            ((eq h "do")
+              (bind ((c (ref cur)))
+                (do
+                  (for e (args_of node) (set_ref c (self self bld (deref c) e)))
+                  (deref c))))
+
+            ; ── (if test then else): fork, then rejoin ──
+            ((eq h "if")
+              (do
+                (visit_sub self bld cur (arg node 0))
+                (bind (
+                  (tb (new_block bld)) (eb (new_block bld))
+                  (joinb (new_block bld))
+                )
+                  (do
+                    (link! bld cur tb)
+                    (link! bld cur eb)
+                    (link! bld (self self bld tb (arg node 1)) joinb)
+                    (link! bld (self self bld eb (arg node 2)) joinb)
+                    joinb))))
+
+            ; ── (while test body): loop header + back-edge ──
+            ((eq h "while")
+              (bind (
+                (header (new_block bld)) (bodyb (new_block bld))
+                (after (new_block bld))
+              )
+                (do
+                  (link! bld cur header)
+                  (visit_sub self bld header (arg node 0))
+                  (link! bld header bodyb)     ; enter the loop body
+                  (link! bld header after)     ; or fall out
+                  (link! bld (self self bld bodyb (arg node 1)) header) ; back-edge
+                  after)))
+
+            ; ── (match subj (pat body) …): fork per arm, rejoin ──
+            ((eq h "match")
+              (bind ((arms (args_of node)) (joinb (new_block bld)))
+                (do
+                  (when (gt (size arms) 0)
+                    (visit_sub self bld cur (get arms 0)))   ; the scrutinee
+                  (if (le (size arms) 1)
+                    (do (link! bld cur joinb) joinb)         ; no arms: fall through
+                    (do
+                      (for i (sequence_range 1 (size arms))
+                        (bind (
+                          (arm (get arms i))
+                          ; an arm is `(pat body…)`: the pattern is the callee, the
+                          ; clause body is the SEQUENCE of args (a multi-form body —
+                          ; matching infer's `(for b (args_of clause) …)` reading)
+                          (armb (new_block bld)) (c (ref armb))
+                        )
+                          (do
+                            (link! bld cur armb)
+                            (if (call? arm)
+                              (for b (args_of arm)
+                                (set_ref c (self self bld (deref c) b)))
+                              (set_ref c (self self bld (deref c) arm)))
+                            (link! bld (deref c) joinb))))
+                      joinb)))))
+
+            ; ── (bind …): canonical let* — each value, then the bound name as a
+            ; def statement, then the body, all sequential. A non-canonical bind
+            ; (2-arg flat / malformed) is laid out as a plain statement. ──
+            ((eq h "bind")
+              (bind ((bp (bind_pairs node)))
+                (if (eq bp null)
+                  (do (emit! bld cur node) cur)
+                  (bind ((c (ref cur)))
+                    (do
+                      (for p (get bp "pairs")
+                        (do
+                          ; lay the value out first (its uses become statements);
+                          ; then emit a NAME-ONLY def marker `(bind "name")` so the
+                          ; def is recorded WITHOUT re-counting the value's uses (the
+                          ; value already contributed them as laid-out statements).
+                          ; In let* order the def takes effect AFTER its value, so a
+                          ; later pair's value reading this name sees it bound.
+                          (set_ref c (self self bld (deref c) (get p "value")))
+                          (emit! bld (deref c)
+                            (syntax_call (syntax_name "bind")
+                              (list_of (syntax_literal (get p "name")))))))
+                      (for b (get bp "body")
+                        (set_ref c (self self bld (deref c) b)))
+                      (deref c))))))
+
+            ; ── (throw e) / (leave …): non-local exit to EXIT ──
+            ((or (eq h "throw") (eq h "leave"))
+              (do
+                (emit! bld cur node)
+                (link! bld cur EXIT)
+                (new_block bld)))   ; flow does not continue past here
+
+            ; ── (block label body…): a labelled region `leave` targets ──
+            ((eq h "block")
+              (bind ((c (ref cur)) (as (args_of node)))
+                (do
+                  (for i (sequence_range 1 (size as))
+                    (set_ref c (self self bld (deref c) (get as i))))
+                  (deref c))))
+
+            ; ── (try body) / (catch try handler): protected region ──
+            ; Conservative: the protected body may transfer to the handler at any
+            ; point, so the handler is a successor of the try-entry block; both
+            ; rejoin after.
+            ((or (eq h "try") (eq h "catch"))
+              (bind (
+                (handler (arg node 1))
+                (tryb (new_block bld)) (joinb (new_block bld))
+              )
+                (do
+                  (link! bld cur tryb)
+                  (link! bld (self self bld tryb (arg node 0)) joinb)
+                  (when (not (eq handler null))
+                    (bind ((hb (new_block bld)))
+                      (do
+                        (link! bld cur hb)
+                        (link! bld (self self bld hb handler) joinb))))
+                  joinb)))
+
+            ; ── any other call: one statement in the current block ──
+            (else (do (emit! bld cur node) cur))))))))
+
+; finish — freeze a builder into the public CFG record: blocks in id order, and
+; succ/pred adjacency maps derived from each block's `succ`.
+(bind finish
+  (lambda (bld)
+    (bind (
+      (bmap (get bld "blocks"))
+      (n (deref (get bld "next")))
+      (blocks (list_of)) (succ (map_of)) (pred (map_of))
+    )
+      (do
+        ; seed pred for every block so cfg_pred never returns null mid-build
+        (for id (sequence_range 0 n)
+          (when (not (eq (get bmap (int_to_string id)) null))
+            (assoc pred (int_to_string id) (list_of))))
+        ; blocks in id order; succ straight from each block
+        (for id (sequence_range 0 n)
+          (bind ((b (get bmap (int_to_string id))))
+            (when (not (eq b null))
+              (do
+                (append blocks b)
+                (assoc succ (int_to_string id) (get b "succ"))))))
+        ; predecessors: invert succ
+        (for id (sequence_range 0 n)
+          (bind ((b (get bmap (int_to_string id))))
+            (when (not (eq b null))
+              (for s (get b "succ")
+                (append (get pred (int_to_string s)) id)))))
+        (assoc (map_of)
+          "blocks" blocks "entry" ENTRY "exit" EXIT
+          "succ" succ "pred" pred "block" bmap)))))
+
+; build_cfg — build a CFG for one body form.
+;   node : the IR body (typically a `(do …)` or a function body)
+;   ->   : { blocks:[block…], entry, exit, succ:{id->[id…]}, pred:{id->[id…]},
+;           block:{id->block} }  (blocks in id order; succ/pred indexed by id)
+(bind build_cfg
+  (lambda (node)
+    (bind ((bld (new_builder)))
+      (do
+        ; lay the body out from ENTRY; the block flow reaches at the end edges to
+        ; EXIT (the normal-return sink)
+        (link! bld (build_node build_node bld ENTRY node) EXIT)
+        (finish bld)))))
+
+; ── CFG accessors (the public reading surface) ───────────────────────────────
+
+; cfg_blocks — the block records, in id order.
+(bind cfg_blocks (lambda (cfg) (get cfg "blocks")))
+
+; cfg_block — the block record for an id (or null).
+(bind cfg_block (lambda (cfg id) (get (get cfg "block") (int_to_string id))))
+
+; cfg_block_ids — every block id, in order.
+(bind cfg_block_ids
+  (lambda (cfg) (sequence_map (cfg_blocks cfg) (lambda (b) (get b "id")))))
+
+; block_stmts — the statement nodes of a block.
+(bind block_stmts (lambda (b) (get b "stmts")))
+
+; block_id — a block's id.
+(bind block_id (lambda (b) (get b "id")))
+
+; cfg_succ / cfg_pred — successor / predecessor ids of a block id.
+(bind cfg_succ
+  (lambda (cfg id) (get (get cfg "succ") (int_to_string id) (list_of))))
+(bind cfg_pred
+  (lambda (cfg id) (get (get cfg "pred") (int_to_string id) (list_of))))
+
+; cfg_entry / cfg_exit — the entry / exit block ids.
+(bind cfg_entry (lambda (cfg) (get cfg "entry")))
+(bind cfg_exit  (lambda (cfg) (get cfg "exit")))
+
+; ── monotone worklist fixpoint ───────────────────────────────────────────────
+; A lattice is a map { bottom, join, transfer }. The solver is direction-
+; parameterized; forward and backward differ only in which adjacency feeds the
+; confluence and which side `transfer` updates.
+
+; pop_front! — remove and return the first element of a list (IN PLACE).
+(bind pop_front!
+  (lambda (lst) (bind ((x (get lst 0))) (do (list_remove_at lst 0) x))))
+
+; enqueue! — add `id` to the worklist if not already queued.
+(bind enqueue!
+  (lambda (worklist queued id)
+    (when (not (eq (get queued (int_to_string id) false) true))
+      (do (append worklist id) (assoc queued (int_to_string id) true)))))
+
+; fact_eq — structural equality of two facts (the fixpoint's "no change" test).
+; Uses `value_eq`, NOT `eq`: a set-valued fact is a name->true map, and a fresh
+; one rebuilt by set_union carries a different KEY ORDER than the prior — kernel
+; `eq` is order-SENSITIVE on maps, so it would report "changed" at the true
+; fixpoint and the worklist would spin forever on any loop. `value_eq` compares
+; maps by key SET (order-insensitive) and works on ints/lists too, so it is the
+; correct generic comparator across every lattice here.
+(bind fact_eq (lambda (a b) (value_eq a b)))
+
+; solve — iterate the dataflow equations to a fixpoint.
+;   cfg       : a CFG from build_cfg
+;   lattice   : { bottom, join:(a b)->fact, transfer:(block in)->out }
+;   direction : "forward" | "backward"
+;   ->        : { in:{id->fact}, out:{id->fact} }
+; Forward:  in[b]  = join over preds of out[p]; out[b] = transfer(b, in[b]).
+; Backward: out[b] = join over succs of in[s];  in[b]  = transfer(b, out[b]).
+; A worklist holds the blocks whose facts may have changed; a block re-enters the
+; list when a neighbour it depends on updates. Monotone transfer over a finite-
+; height lattice ⇒ a fixpoint is reached.
+(bind solve
+  (lambda (cfg lattice direction)
+    (bind (
+      (forward (eq direction "forward"))
+      (bottom (get lattice "bottom"))
+      (join (get lattice "join"))
+      (transfer (get lattice "transfer"))
+      (in_ (map_of)) (out_ (map_of))
+      (ids (cfg_block_ids cfg))
+      (worklist (list_of)) (queued (map_of))
+    )
+      (do
+        ; seed every block's in/out to bottom and enqueue all blocks
+        (for id ids
+          (do
+            (assoc in_ (int_to_string id) bottom)
+            (assoc out_ (int_to_string id) bottom)
+            (append worklist id)
+            (assoc queued (int_to_string id) true)))
+        (while (gt (size worklist) 0)
+          (bind ((id (pop_front! worklist)))
+            (do
+              (assoc queued (int_to_string id) false)
+              (if forward
+                ; ── FORWARD ──
+                (bind ((merged (ref bottom)))
+                  (do
+                    (for p (cfg_pred cfg id)
+                      (set_ref merged
+                        (join (deref merged) (get out_ (int_to_string p)))))
+                    (assoc in_ (int_to_string id) (deref merged))
+                    (bind ((new_out (transfer (cfg_block cfg id) (deref merged))))
+                      (unless (fact_eq new_out (get out_ (int_to_string id)))
+                        (do
+                          (assoc out_ (int_to_string id) new_out)
+                          (for s (cfg_succ cfg id) (enqueue! worklist queued s)))))))
+                ; ── BACKWARD ──
+                (bind ((merged (ref bottom)))
+                  (do
+                    (for s (cfg_succ cfg id)
+                      (set_ref merged
+                        (join (deref merged) (get in_ (int_to_string s)))))
+                    (assoc out_ (int_to_string id) (deref merged))
+                    (bind ((new_in (transfer (cfg_block cfg id) (deref merged))))
+                      (unless (fact_eq new_in (get in_ (int_to_string id)))
+                        (do
+                          (assoc in_ (int_to_string id) new_in)
+                          (for p (cfg_pred cfg id) (enqueue! worklist queued p)))))))))))
+        (assoc (map_of) "in" in_ "out" out_)))))
+
+; solve_forward / solve_backward — direction-fixed convenience wrappers.
+(bind solve_forward  (lambda (cfg lattice) (solve cfg lattice "forward")))
+(bind solve_backward (lambda (cfg lattice) (solve cfg lattice "backward")))
+
+; ── liveness (the proof client: a backward set-union analysis) ───────────────
+; A name is LIVE at a program point if some path from there USES it before
+; redefining it. Per block the transfer is the textbook
+;   live_in = use(b) ∪ (live_out − def(b))
+; The lattice is sets of names under union; bottom is the empty set; join is
+; set_union.
+
+; stmt_def — the name a statement DEFINES, or null. A `(bind "x" v)` statement
+; (build_node emits one per binding) and a `(set_ref name v)` write a name.
+(bind stmt_def
+  (lambda (node)
+    (cond
+      ((not (call? node)) null)
+      ((eq (head_of node) "bind")
+        (bind ((a0 (arg node 0)))
+          (cond
+            ((literal? a0) (syntax_literal_value a0))   ; (bind "x" v)
+            ((name? a0) (name_of a0))                   ; flat (bind x v)
+            (else null))))
+      ((eq (head_of node) "set_ref")
+        (bind ((a0 (arg node 0))) (if (name? a0) (name_of a0) null)))
+      (else null))))
+
+; stmt_uses — the names a statement READS (a nameset). For a `bind`/`set_ref`
+; the read is the names in the VALUE (the defined name is a write); otherwise
+; every name the node mentions.
+(bind stmt_uses
+  (lambda (node)
+    (cond
+      ((not (call? node)) (names_set node))
+      ((or (eq (head_of node) "bind") (eq (head_of node) "set_ref"))
+        (bind ((a1 (arg node 1))) (if (eq a1 null) (map_of) (names_set a1))))
+      (else (names_set node)))))
+
+; block_transfer_live — fold a block's statements BACKWARD: live_in from
+; live_out by live = uses ∪ (live − {def}), statement by statement in reverse
+; flow order. Pure set algebra.
+(bind block_transfer_live
+  (lambda (b live_out)
+    (bind ((live (ref live_out)))
+      (do
+        (for s (reverse (block_stmts b))
+          (bind ((d (stmt_def s)) (uses (stmt_uses s)))
+            (do
+              (when (not (eq d null))
+                (set_ref live (set_difference (deref live) (set_of (list_of d)))))
+              (set_ref live (set_union (deref live) uses)))))
+        (deref live)))))
+
+; liveness — run backward liveness over a body.
+;   node : the IR body
+;   ->   : { in:{id->nameset}, out:{id->nameset}, cfg } where a nameset is a set
+;          (name->true). live_in[b] / live_out[b] are the names live on entry to
+;          / exit from block b.
+(bind liveness
+  (lambda (node)
+    (bind (
+      (cfg (build_cfg node))
+      (lattice (assoc (map_of)
+        "bottom" (map_of) "join" set_union "transfer" block_transfer_live))
+      (sol (solve cfg lattice "backward"))
+    )
+      (assoc (map_of)
+        "in" (get sol "in") "out" (get sol "out") "cfg" cfg))))
+
+; live_in / live_out — the live-name SET on entry to / exit from a block id (a
+; nameset; query membership with set_has?, list with set_items).
+(bind live_in
+  (lambda (result id) (get (get result "in") (int_to_string id) (map_of))))
+(bind live_out
+  (lambda (result id) (get (get result "out") (int_to_string id) (map_of))))
+
+(export
+  ; CFG
+  build_cfg cfg_blocks cfg_block cfg_block_ids cfg_succ cfg_pred
+  cfg_entry cfg_exit block_stmts block_id
+  ; solver
+  solve solve_forward solve_backward
+  ; liveness
+  liveness live_in live_out
+  ; lattice helpers a client may reuse
+  block_transfer_live stmt_def stmt_uses)

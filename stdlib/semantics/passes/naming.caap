@@ -1,0 +1,102 @@
+; stdlib/semantics/passes/naming.caap — naming-convention lint (module
+; stdlib.semantics.passes.naming).
+;
+; CONVENTIONS asks predicates to end in `?` and effectful functions in `!`.
+;
+;   `?` suffix   a top-level function whose body RESULT COMPUTES a boolean
+;                (result positions: do / both if-branches / bind body, down to a
+;                comparison / boolean op / a `?`-predicate call) but whose name
+;                lacks `?` (and is not a comparison-family name). A bare
+;                `true`/`false` sentinel is deliberately NOT counted — see
+;                `bool_result?` — so an action is not mistaken for a predicate.
+;   `!` suffix   a top-level function the type pass settled as IMPURE (a certain
+;                effect after ownership analysis) whose name lacks `!`. The effect
+;                arrives on the fact channel: types/infer publishes "fn_effect"
+;                keyed by the def's loc; this pass reads it back.
+;
+; A register_pass! over `located`. (Limitation: effect granularity is a tag set,
+; not arg-provenance, so an out-parameter accumulator — a function handed a list
+; it appends to — also reads "impure"; the `!` nudge is a suggestion, and the
+; pass is opt-in, not run on every load.)
+(module stdlib.semantics.passes.naming)
+
+(use stdlib.syntax.ast
+  call? head_of head_is? args_of arg string_lit? bind_pairs def_of loc)
+(use stdlib.lib.collections.sequence any?)
+(use stdlib.semantics.passes.registry note! fact_of install_pass!)
+
+; ends? — does string `s` end with the suffix `suf`? (The `?`/`!` suffix test.)
+;   s suf : strings    -> : bool
+(bind ends?
+  (lambda (s suf)
+    (and (ge (size s) (size suf))
+         (eq (string_slice s (int_sub (size s) (size suf)) (size s)) suf))))
+
+; bool_heads — heads that COMPUTE a boolean (comparisons + logical ops).
+(bind bool_heads
+  (bind ((m (map_of)))
+    (do (for h (list_of "eq" "ne" "lt" "gt" "le" "ge" "not" "and" "or")
+          (assoc m h true))
+        m)))
+
+; comparison_name? — a name in the kernel's eq/ne/lt/gt/le/ge family. These are
+; the recognized boolean-COMPARISON spelling (like the kernel's own `eq`/`ne`),
+; not the `?`-predicate family, so they are not nudged toward `?`.
+(bind comparison_name?
+  (lambda (nm)
+    (any? (list_of "eq" "ne" "lt" "gt" "le" "ge") (lambda (s) (ends? nm s)))))
+
+; bool_result? — does the node's RESULT position COMPUTE a boolean (a comparison
+; / logical op / `?`-predicate call)? A bare `true`/`false` is NOT counted: a
+; function returning a literal sentinel (e.g. `(do … true)`) is an action, not a
+; predicate — so only genuine boolean computations are nudged toward `?`.
+(bind bool_result?
+  (lambda (self node)
+    (cond
+      ((not (call? node)) false)
+      ((head_is? node "do")
+        (bind ((as (args_of node)))
+          (if (eq (size as) 0) false (self self (get as (int_sub (size as) 1))))))
+      ((head_is? node "if")
+        (and (self self (arg node 1)) (self self (arg node 2))))
+      ((and (head_is? node "bind") (string_lit? (arg node 0)))
+        (bind ((b (get (bind_pairs node) "body" (list_of))))
+          (if (eq (size b) 0) false (self self (get b (int_sub (size b) 1))))))
+      ((eq (get bool_heads (head_of node) false) true) true)
+      ((and (not (eq (head_of node) null)) (ends? (head_of node) "?")) true)
+      (else false))))
+
+; check_module — the pass entry: the `?` (boolean result) and `!` (impure)
+; suffix nudges, over every top-level definition. Only `(bind <name> (lambda …))`
+; forms (read via lib/ast def_of) are considered; non-defn forms are skipped.
+;   located : [{node, loc}] the module's expanded top-level forms
+;   sink    : the findings list to append to
+;   ->      : null
+(bind check_module
+  (lambda (located sink)
+    (for f located
+      (bind ((node (get f "node")) (d (def_of (get f "node"))))
+        (when (not (eq d null))
+          (bind ((nm (get d "name")) (v (get d "value")))
+            (when (head_is? v "lambda")
+              (do
+                ; `?` — a boolean-computing body whose name lacks `?`
+                (when (and (bool_result? bool_result? (arg v 1))
+                           (not (ends? nm "?")) (not (ends? nm "!"))
+                           (not (comparison_name? nm)))
+                  (note! sink "naming" node
+                    (string_concat_many "`" nm
+                      "` returns a boolean — consider a `?` suffix")))
+                ; `!` — an impure body (settled by the type pass) whose name
+                ; lacks `!` (and is not a `?`-predicate)
+                (when (and (eq (fact_of "fn_effect" (loc node) null) "impure")
+                           (not (ends? nm "!")) (not (ends? nm "?")))
+                  (note! sink "naming" node
+                    (string_concat_many "`" nm
+                      "` has side effects — consider a `!` suffix")))))))))))
+
+; register! — install naming lint as a load-time pass (idempotent).
+(bind register!
+  (lambda () (install_pass! "naming" (lambda (located sink) (check_module located sink)))))
+
+(export bool_result? check_module register!)

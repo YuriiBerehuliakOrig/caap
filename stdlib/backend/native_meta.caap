@@ -1,0 +1,128 @@
+; stdlib/backend/native_meta.caap — the SINGLE declarative source of truth for
+; the native operation/type vocabulary (module stdlib.backend.native_meta).
+;
+; Before this module the same knowledge lived in three hand-kept places that had
+; to be edited together by convention: backend/native_meta's `native_vocab`/`type_tokens`
+; (the pre-codegen gate's scope seed), the LLVM emitter's head dispatch + ll_type,
+; and the WAT emitter's head dispatch + w_type. Nothing enforced agreement, and it
+; HAD drifted — the four `atomic_*` heads were in the gate vocabulary but the WAT
+; emitter had no arm for them, so a wasm program using one fell through to the
+; generic "unsupported form" error instead of a precise "no wasm realization" one.
+;
+; This module holds the vocabulary ONCE; the gate derives its scope from it, the
+; WAT emitter derives its "LLVM-only" rejects from it, and the strict native
+; profile (backend/prep gate, strict mode) validates types against it. Nothing here
+; renders LLVM IR or WAT — each backend keeps its own per-target SPELLING of a head
+; (sdiv vs div_s, { ptr, i64 } vs an i32 header); only the shared FACTS live here:
+; which heads exist, which backends realize each, and the width/signedness of each
+; native type. Same rank-5 sideways tier edge backend/emit/llvm and backend/emit/wasm already take
+; onto backend/prep and codegen_common, so importing it stays within the tier tower.
+;
+; Pure data: every binding is a literal table or a predicate over kernel builtins;
+; the module needs no imports.
+(module stdlib.backend.native_meta)
+
+; native_heads — every head the native backends understand but the kernel does
+; NOT (so the semantic checker, which knows only the kernel vocabulary, would
+; otherwise flag it as an unknown name). Each row tags the backends that realize
+; the head; an LLVM-only head also carries `wasm_gap`, the tail of the WAT
+; emitter's "no realization" diagnostic (it explains WHY the gap is the target,
+; not an omission). `backends` is a SET (a map) so membership is one `contains`.
+(bind native_heads
+  (assoc (map_of)
+    ; ── pointer / memory / call (both backends) ──
+    "ptr_read"    (assoc (map_of) "backends" (assoc (map_of) "llvm" true "wasm" true))
+    "ptr_write"   (assoc (map_of) "backends" (assoc (map_of) "llvm" true "wasm" true))
+    "ptr_add"     (assoc (map_of) "backends" (assoc (map_of) "llvm" true "wasm" true))
+    "int_to_ptr"  (assoc (map_of) "backends" (assoc (map_of) "llvm" true "wasm" true))
+    "ptr_to_int"  (assoc (map_of) "backends" (assoc (map_of) "llvm" true "wasm" true))
+    "union_field" (assoc (map_of) "backends" (assoc (map_of) "llvm" true "wasm" true))
+    "field_ptr"   (assoc (map_of) "backends" (assoc (map_of) "llvm" true "wasm" true))
+    "array_local" (assoc (map_of) "backends" (assoc (map_of) "llvm" true "wasm" true))
+    "cast"        (assoc (map_of) "backends" (assoc (map_of) "llvm" true "wasm" true))
+    "fn_ptr"      (assoc (map_of) "backends" (assoc (map_of) "llvm" true "wasm" true))
+    "call_ptr"    (assoc (map_of) "backends" (assoc (map_of) "llvm" true "wasm" true))
+    "println"     (assoc (map_of) "backends" (assoc (map_of) "llvm" true "wasm" true))
+    ; ── bare-metal / privileged (LLVM only — the wasm execution model can't) ──
+    "asm" (assoc (map_of) "backends" (assoc (map_of) "llvm" true)
+            "wasm_gap" (string_concat_many
+              "has no WebAssembly realization (no machine-code escape in the wasm "
+              "execution model) — use the LLVM backend for bare-metal/privileged code"))
+    "volatile_read" (assoc (map_of) "backends" (assoc (map_of) "llvm" true)
+            "wasm_gap" (string_concat_many
+              "(MMIO) has no WebAssembly realization (linear memory is a sandboxed byte "
+              "array with no memory-mapped hardware) — use the LLVM backend for device access"))
+    "volatile_write" (assoc (map_of) "backends" (assoc (map_of) "llvm" true)
+            "wasm_gap" (string_concat_many
+              "(MMIO) has no WebAssembly realization (linear memory is a sandboxed byte "
+              "array with no memory-mapped hardware) — use the LLVM backend for device access"))
+    ; ── lock-free atomics (LLVM only — SMP/threads, not the WAT emitter's model) ──
+    "atomic_load" (assoc (map_of) "backends" (assoc (map_of) "llvm" true)
+            "wasm_gap" (string_concat_many
+              "has no WebAssembly realization in this backend (lock-free atomics target a "
+              "shared-memory threads context the WAT emitter does not model) — use the LLVM backend"))
+    "atomic_store" (assoc (map_of) "backends" (assoc (map_of) "llvm" true)
+            "wasm_gap" (string_concat_many
+              "has no WebAssembly realization in this backend (lock-free atomics target a "
+              "shared-memory threads context the WAT emitter does not model) — use the LLVM backend"))
+    "atomic_add" (assoc (map_of) "backends" (assoc (map_of) "llvm" true)
+            "wasm_gap" (string_concat_many
+              "has no WebAssembly realization in this backend (lock-free atomics target a "
+              "shared-memory threads context the WAT emitter does not model) — use the LLVM backend"))
+    "atomic_cas" (assoc (map_of) "backends" (assoc (map_of) "llvm" true)
+            "wasm_gap" (string_concat_many
+              "has no WebAssembly realization in this backend (lock-free atomics target a "
+              "shared-memory threads context the WAT emitter does not model) — use the LLVM backend"))))
+
+; native_types — the type NAMES that appear as bare-name ARGUMENTS to native
+; heads (e.g. `u32` in (cast x u32), `void` in (asm … void), the element type in
+; int_to_ptr / volatile_read / array_local). The checker would read them as value
+; references, so the gate seeds them into scope. The width/signedness metadata is
+; the source the strict native profile validates against (and documents the set a
+; backend's type lowering must cover). An aggregate row additionally carries an
+; `element` scalar-type key naming its buffer element (e.g. string -> "i8").
+(bind native_types
+  (assoc (map_of)
+    "int"    (assoc (map_of) "bits" 32 "signed" true)
+    "i8"     (assoc (map_of) "bits" 8  "signed" true)
+    "u8"     (assoc (map_of) "bits" 8  "signed" false)
+    "i16"    (assoc (map_of) "bits" 16 "signed" true)
+    "u16"    (assoc (map_of) "bits" 16 "signed" false)
+    "i32"    (assoc (map_of) "bits" 32 "signed" true)
+    "u32"    (assoc (map_of) "bits" 32 "signed" false)
+    "i64"    (assoc (map_of) "bits" 64 "signed" true)
+    "u64"    (assoc (map_of) "bits" 64 "signed" false)
+    "uptr"   (assoc (map_of) "bits" 64 "signed" false)
+    "f32"    (assoc (map_of) "bits" 32 "float" true)
+    "f64"    (assoc (map_of) "bits" 64 "float" true)
+    "bool"   (assoc (map_of) "bits" 1  "signed" false)
+    "string" (assoc (map_of) "aggregate" true "element" "i8")
+    "void"   (assoc (map_of) "void" true)
+    "ptr"    (assoc (map_of) "ptr" true)))
+
+; ── derived views (the consumers import these, not the tables, where they can) ──
+; head_names / type_names — the bare name lists the gate seeds into its scope
+; (order is irrelevant; the gate builds a set). Replaces prep's hand-kept lists.
+(bind head_names (map_keys native_heads))
+(bind type_names (map_keys native_types))
+
+; backend_supports? — does `backend` ("llvm" | "wasm") realize this native head?
+; (false for an unknown head too, so callers can ask without a prior membership test.)
+(bind backend_supports?
+  (lambda (head backend)
+    (bind ((row (get native_heads head null)))
+      (and (not (eq row null)) (contains (get row "backends" (map_of)) backend)))))
+
+; wasm_gap_of — for an LLVM-only native head, the tail of the WAT emitter's "no
+; realization" diagnostic; null for a head wasm realizes (or a non-native head).
+; The WAT emitter rejects exactly the heads for which this is non-null.
+(bind wasm_gap_of
+  (lambda (head) (get (get native_heads head (map_of)) "wasm_gap" null)))
+
+; native_type? — is `t` one of the known native type tokens? (The strict native
+; profile uses this to reject a type that would silently lower to a null IR type.)
+(bind native_type?
+  (lambda (t) (contains native_types t)))
+
+(export native_heads native_types head_names type_names
+        backend_supports? wasm_gap_of native_type?)

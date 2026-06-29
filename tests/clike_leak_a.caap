@@ -1,0 +1,7 @@
+(surface stdlib.frontend.clike)
+
+// Fixture A for the cross-file state-leak test (caap-lsp analyze_smoke).
+// Declares a struct TYPE `Leaky`, which registers in clike's per-file symbol
+// table. File B is then analyzed in the SAME session and must NOT see `Leaky`
+// (reset_file_state! has to clear it first).
+Leaky struct export = { x i32 }

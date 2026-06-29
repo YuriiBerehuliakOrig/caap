@@ -1,0 +1,4 @@
+; proj/lib.caap — a dependency module for the cross-module analyze test.
+(module proj.lib)
+(defn helper ((n int)) int (int_mul n 2))
+(export helper)

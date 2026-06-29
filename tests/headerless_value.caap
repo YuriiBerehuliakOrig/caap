@@ -1,0 +1,4 @@
+; headerless_value — a NORMAL (no surface header) kernel file. It must keep
+; loading through the default reader exactly as before the surface-failure
+; diagnostic was added: only the header-present-but-kit-failed case changed.
+(int_add 40 2)

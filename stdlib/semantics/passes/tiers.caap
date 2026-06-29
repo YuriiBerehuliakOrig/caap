@@ -1,0 +1,141 @@
+; stdlib/semantics/passes/tiers.caap — tier / layering check (module
+; stdlib.semantics.passes.tiers).
+;
+; The tower must not invert: a module may import only its own tier or lower.
+; Ranks (by module name): boot engine + services = 0, lib = 2, syntax = 2,
+; sys = 3, semantics (types + passes) = 4, frontend = 5, backend = 5,
+; bare = 5, storage = 5. An import whose target rank exceeds the source's is an
+; upward edge — a layering violation — unless it is on the small, DOCUMENTED
+; allowlist of intentional exceptions.
+;
+; Like imports, this reads RAW top-level forms (directives intact), so it is a
+; project linter (check_forms / check_file), not a register_pass!.
+(module stdlib.semantics.passes.tiers)
+
+(use stdlib.syntax.ast name_of head_is? arg loc)
+(use stdlib.semantics.passes.registry finding_at)
+(use stdlib.semantics.passes.source_read read_leading_forms)
+
+; prefix? — does string `s` start with `p`? (the rank check's only string test).
+(bind prefix?
+  (lambda (s p) (and (ge (size s) (size p)) (eq (string_slice s 0 (size p)) p))))
+
+; tier_ranks — the tier TABLE as DATA: each row is {segment, rank}, where a
+; module matches the row whose `segment` it equals or begins with (as a `.`-
+; prefix). Scanned IN ORDER, so the first match wins — the exact top-down order
+; the previous hand-written `cond` had (no overlapping segments here, but the
+; order is preserved so the contract is byte-for-byte). To add or re-tier a
+; layer, edit this list — there is no inline branch to keep in sync.
+;   - frontend / backend / bare / storage : top of the tower, rank 5
+;     (bare = native-only bare-metal wrappers over backend primitives;
+;      storage = orthogonal codegen-DSL library)
+;   - semantics (types + passes) : rank 4
+;   - sys : rank 3 ; syntax + lib : rank 2 ; everything else (engine) : rank 0
+(bind tier_ranks
+  (list_of
+    (assoc (map_of) "segment" "frontend"  "rank" 5)
+    (assoc (map_of) "segment" "backend"   "rank" 5)
+    (assoc (map_of) "segment" "bare"      "rank" 5)
+    (assoc (map_of) "segment" "storage"   "rank" 5)
+    (assoc (map_of) "segment" "semantics" "rank" 4)
+    (assoc (map_of) "segment" "sys"       "rank" 3)
+    (assoc (map_of) "segment" "syntax"    "rank" 2)
+    (assoc (map_of) "segment" "lib"       "rank" 2)))
+
+; rank_of — the tier of a module by name (unknown / boot-engine names = 0).
+; Normalizes a leading `stdlib.` so a short facade name (`sys.fs`) ranks the
+; same as its qualified form (`stdlib.sys.fs`). Data-driven: the first
+; `tier_ranks` row whose segment the module equals or `.`-prefixes wins.
+(bind rank_of
+  (lambda (mod)
+    (if (eq mod null)
+      0
+      (bind ((m (if (prefix? mod "stdlib.")
+                  (string_slice mod (size "stdlib.") (size mod)) mod))
+             (found (ref 0)) (hit (ref false)))
+        (do
+          (for row tier_ranks
+            (when (and (not (deref hit))
+                       (bind ((seg (get row "segment")))
+                         (or (eq m seg) (prefix? m (string_concat_many seg ".")))))
+              (do (set_ref found (get row "rank")) (set_ref hit true))))
+          (deref found))))))
+
+; tier_exceptions — the DOCUMENTED, REVIEWABLE allowlist of intentional upward
+; edges, as DATA. Each row is a self-describing record:
+;   { src         : the importing module (must carry a `(module …)` header)
+;     target_rank : the tier rank it is permitted to import UP to
+;     why         : one-line justification — WHY this inversion is legitimate }
+; Rows are folded into the `allow` set below (keyed "src=>targetRank") for the
+; O(1) lookup `allowed?` does; only `src`/`target_rank` drive the logic, `why`
+; is documentation that travels WITH the data. This list is the single source of
+; truth: it is exported as `tier_exceptions` and pinned by a golden-set test
+; (stdlib/lib/tests/test_tiers_exceptions.caap), so adding or removing an entry
+; without a deliberate, reviewed change fails the suite — the allowlist cannot
+; drift silently. To sanction a new upward edge: add a row here (with a real
+; `why`), then update the golden list in that test.
+;
+; Per-row rationale (kept in sync with the `why` fields):
+;   - stdlib.analyze -> rank 2 (syntax/lib): the LSP analyze service
+;     (stdlib.analyze, an UNTIERED tier-0 boot service) lowers source and
+;     inspects it, so it legitimately reaches the syntax substrate (ast, rank 2)
+;     and lib collection helpers (rank 2). A boot-layer tool standing above the
+;     library it analyzes is expected, not a tower inversion.
+;   - stdlib.semantics.passes.derive -> rank 4 (types): a defensive carve-out
+;     that permits derive (semantics, rank 4) to import the type registry
+;     (semantics.types.registry, ALSO rank 4). As both modules now sit at the
+;     SAME tier this edge is no longer upward, so the entry is presently a
+;     NO-OP safety belt (it predates derive's move under semantics, when it lived
+;     in lib at rank 2). It is retained so a future re-tiering of derive below
+;     the type layer stays sanctioned; a reviewer may drop it (and its golden
+;     entry) if that history is no longer worth guarding.
+(bind tier_exceptions
+  (list_of
+    (assoc (map_of) "src" "stdlib.analyze" "target_rank" 2
+      "why" "tier-0 LSP analyze service reaches the syntax/lib substrate it analyzes")
+    (assoc (map_of) "src" "stdlib.semantics.passes.derive" "target_rank" 4
+      "why" "defensive: derive (4) -> type registry (4); a same-tier no-op kept across a re-tiering")))
+(bind allow_exceptions tier_exceptions)
+(bind allow
+  (bind ((m (map_of)))
+    (do
+      (for row allow_exceptions
+        (assoc m
+          (string_concat_many (get row "src") "=>"
+            (int_to_string (get row "target_rank")))
+          true))
+      m)))
+(bind allowed?
+  (lambda (src trank)
+    (eq (get allow (string_concat_many src "=>" (int_to_string trank)) false) true)))
+
+; check_forms — layering findings over a module's raw top-level forms.
+(bind check_forms
+  (lambda (forms)
+    (bind ((findings (list_of)) (srcmod (ref null)))
+      (do
+        ; the source module name (engine files without (module …) stay rank 0)
+        (for f forms
+          (when (head_is? f "module") (set_ref srcmod (name_of (arg f 0)))))
+        (bind ((src (deref srcmod)) (srank (rank_of (deref srcmod))))
+          (do
+            (for f forms
+              (when (or (head_is? f "use") (head_is? f "import")
+                        (head_is? f "re_export"))
+                (bind ((tgt (name_of (arg f 0))) (trank (rank_of (name_of (arg f 0)))))
+                  (when (and (gt trank srank)
+                             (not (allowed? (if (eq src null) "?" src) trank)))
+                    (append findings
+                      (finding_at "tiers" (loc f)
+                        (string_concat_many
+                          (if (eq src null) "<engine>" src) " (tier "
+                          (int_to_string srank) ") must not import "
+                          tgt " (tier " (int_to_string trank) ")")))))))
+            findings))))))
+
+; check_file — read a module file's raw top-level forms and check layering.
+; The raw-form read is the shared sanctioned loader-bypass (source_read).
+(bind check_file
+  (lambda (path) (check_forms (read_leading_forms path))))
+
+(export rank_of check_forms check_file tier_exceptions)

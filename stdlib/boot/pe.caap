@@ -1,0 +1,40 @@
+; stdlib/boot/pe.caap — OPT-IN: enable polyvariant binding-time specialization.
+; MODULE IDENTITY: a RAW bootstrap script (run via ctfe_compiler_execute_bootstrap_file /
+; run_expanded BEFORE the `module` form is a bound name), so it carries NO `(module …)`
+; form — adding one would raise `unknown name: module`. Its registry identity is set
+; explicitly via ctfe_compiler_register_value. Allowlisted in stdlib/CONVENTIONS.md +
+; stdlib_module_identity_check (caap/tests/stdlib_governance_tests.rs).
+;
+; Execute AFTER stdlib/bootstrap.caap in a composed bootstrap (the
+; boot/peval.caap pattern):
+;
+;   ; composed.caap: (do (ctfe_compiler_execute_bootstrap_file compiler ".../bootstrap.caap")
+;   ;                    (ctfe_compiler_execute_bootstrap_file compiler ".../boot/pe.caap"))
+;   caap composed.caap program.caap
+;
+; Once this leg runs, every module loaded AFTERWARDS is run through the `pe`
+; load-time transform before the check gate (the loader runs the transform
+; registry by name; loading pe registers it). pe is the polyvariant layer over
+; peval: a call to a user function with literal arguments is either compile-time
+; EVALUATED to its result or REDIRECTED to a specialized variant `f__<vals>`
+; whose body inlines those statics and is partially evaluated. Annotations only
+; RESTRICT the static set — an in-source (static_params …) marker (or the data-API
+; (static! …)) names which parameters are static, and (comptime …) requires a fn
+; to fold fully; with NO annotation pe auto-treats every literal argument as
+; static. It is BEHAVIOUR-PRESERVING (a specialized variant is the partial
+; evaluation of the original, and pe runs peval over every form), so a program's
+; result never changes; only the IR is rewritten.
+;
+; It is OPT-IN, not on by default: specialization adds load-time cost (and the
+; (static_params …) / (comptime …) forms only exist once pe loads), so the base
+; bootstrap stays fast and you compose this leg when you want the specialized IR.
+; pe installs the standalone transform NAMED "pe" via install_transform!; peval
+; (boot/peval.caap) installs a SEPARATE transform named "peval" — they do not
+; collide, and pe already runs peval internally over each form / specialized
+; body, so composing BOTH legs just adds peval's whole-module fixpoint on top
+; (redundant for the forms pe touched, but harmless). Loading pe pulls in its
+; use/import deps (syntax/ast, lib/collections/sequence, syntax/ir,
+; semantics/passes/peval, the passes registry, the expander) by name.
+; (Raw kernel forms.)
+(bind ((load (get (ctfe_compiler_lookup_value compiler "stdlib.load") "load")))
+  ((get (load "../semantics/passes/pe.caap") "register!")))

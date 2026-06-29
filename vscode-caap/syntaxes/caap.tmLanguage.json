@@ -1,0 +1,73 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "CAAP",
+  "scopeName": "source.caap",
+  "_comment": "LEXICAL fallback ONLY: comments, strings, numbers, basic operators, and a small FIXED keyword list (control + declaration words). The SEMANTIC categories — function, type, parameter, variable, property, enumMember, and which identifier is a call/field/declaration — come from the CAAP LSP's semantic tokens (the real parser + symbol table), which override these scopes. Never hand-add type/function/identifier classification here; that is the parser's job and would drift.",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#char" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        { "name": "comment.line.double-slash.caap", "match": "//.*$" },
+        { "name": "comment.line.semicolon.caap", "match": ";.*$" },
+        {
+          "name": "comment.block.caap",
+          "begin": "/\\*",
+          "end": "\\*/"
+        },
+        {
+          "name": "comment.block.caap",
+          "begin": "#\\|",
+          "end": "\\|#"
+        }
+      ]
+    },
+    "strings": {
+      "name": "string.quoted.double.caap",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        { "name": "constant.character.escape.caap", "match": "\\\\." }
+      ]
+    },
+    "char": {
+      "name": "constant.character.caap",
+      "match": "'(\\\\.|[^'\\\\])'"
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.hex.caap",
+          "match": "\\b0[xX][0-9A-Fa-f]+\\b"
+        },
+        {
+          "name": "constant.numeric.caap",
+          "match": "(?<![A-Za-z0-9_+\\-*/<>=!?$%&:.])-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+(?:[eE][+\\-]?[0-9]+)?)?\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "_comment": "A small FIXED set of clike control + declaration keywords. Purely lexical (these spellings are reserved words, never user identifiers); the LSP decides every other category.",
+      "patterns": [
+        {
+          "name": "keyword.control.caap",
+          "match": "\\b(if|else|return|break|while|match|as)\\b"
+        },
+        {
+          "name": "keyword.declaration.caap",
+          "match": "\\b(struct|type|enum|union|const|mut|export|extern|use|surface)\\b"
+        }
+      ]
+    },
+    "operators": {
+      "name": "keyword.operator.caap",
+      "match": "->|\\|\\||&&|<<=|>>=|==|!=|<=|>=|\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=|<<|>>|\\+\\+|--|[-+*/%<>=!~&|^]"
+    }
+  }
+}

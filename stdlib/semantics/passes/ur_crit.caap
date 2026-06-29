@@ -1,0 +1,106 @@
+; stdlib/semantics/passes/ur_crit.caap — CRITICAL-SECTION BALANCE pass (module
+; stdlib.semantics.passes.ur_crit).
+;
+; urun masks interrupts around critical regions with the ur_port primitives
+;   prev u32 = ur_interrupt_save()      ; mask, remember prior PRIMASK
+;   …                                   ; critical region
+;   ur_interrupt_restore(prev)          ; restore prior state
+; If a control-flow path leaves a region WITHOUT a matching restore, interrupts
+; stay masked forever — a system-wide deadlock with no diagnostic. Symmetry is
+; hand-maintained today across dozens of sites (ur_semaphore/ur_queue/ur_timer).
+; This pass makes it a STATIC, build-time invariant: every `ur_interrupt_save()`
+; must be balanced by an `ur_interrupt_restore(…)` on EVERY path before the
+; function returns.
+;
+; Model: a per-path NESTING DEPTH (save = +1, restore = −1) threaded through the
+; body. It is nesting-aware (ur_queue genuinely nests prev + prev2). At each `if`
+; the two branches are analysed from the SAME entry depth and must leave the SAME
+; depth (else a branch escapes the region). A restore at depth 0 is a restore
+; without a save. The function must end at depth 0.
+;
+; SCOPE (documented): branch-join is precise for `if`/`cond` (urun's only
+; conditional with critical regions); loops and `match` thread linearly (urun
+; never opens a region inside a loop / match arm), so a region opened inside such
+; a form is conservatively summed, never split — a sound over-approximation for
+; the imbalance it checks. Pairing is by COUNT, not by the saved token name.
+(module stdlib.semantics.passes.ur_crit)
+
+(use stdlib.syntax.ast call? name? literal? head_of args_of arg)
+(use stdlib.semantics.passes.monomorph decode_defn)
+(use stdlib.semantics.passes.registry install_pass! note!)
+
+(bind save_head "ur_interrupt_save")
+(bind restore_head "ur_interrupt_restore")
+
+; cs_seq — thread `depth` left-to-right through a list of forms; returns the
+; exit depth.
+(bind cs_seq
+  (lambda (walk forms depth sink)
+    (bind ((d (ref depth)))
+      (do (for x forms (set_ref d (walk walk x (deref d) sink)))
+          (deref d)))))
+
+; walk — analyse one form, returning the exit depth; emits findings on imbalance.
+(bind walk
+  (lambda (walk node depth sink)
+    (if (or (name? node) (literal? node) (not (call? node)))
+      depth
+      (bind ((h (head_of node)) (as (args_of node)))
+        (cond
+          ((eq h save_head) (int_add depth 1))
+          ((eq h restore_head)
+            (do
+              (when (le depth 0)
+                (note! sink "ur-crit" node
+                  "ur_interrupt_restore() with no open ur_interrupt_save() on this path"))
+              (int_sub depth 1)))
+          ; `if` (and clike `if/else` -> nested `if`): evaluate the condition, then
+          ; require both branches to leave the SAME depth from the post-condition
+          ; entry. A missing `else` carries the entry depth through.
+          ((or (eq h "if") (eq h "cond"))
+            (if (eq h "if")
+              (bind ((dc (walk walk (get as 0) depth sink))
+                     (dt (walk walk (get as 1) dc sink))
+                     (de (if (gt (size as) 2) (walk walk (get as 2) dc sink) dc)))
+                (do
+                  (when (not (eq dt de))
+                    (note! sink "ur-crit" node
+                      (string_concat_many "unbalanced critical section across branches: "
+                        "one path leaves " (int_to_string dt) " open save(s), another "
+                        (int_to_string de))))
+                  dt))
+              ; `cond` clauses are (test body) calls — each body is a branch from
+              ; the entry depth; require agreement.
+              (bind ((exit (ref depth)) (seen (map_of)))
+                (do
+                  (for cl as
+                    (when (call? cl)
+                      (bind ((e (cs_seq walk (args_of cl) depth sink)))
+                        (do (assoc seen (int_to_string e) true) (set_ref exit e)))))
+                  (when (gt (size (map_keys seen)) 1)
+                    (note! sink "ur-crit" node "unbalanced critical section across cond branches"))
+                  (deref exit)))))
+          ; `do` / `bind` / everything else: thread depth through the children.
+          (else (cs_seq walk as depth sink)))))))
+
+; run — for each definition, analyse its body; a non-zero exit depth means a
+; critical section was opened but not restored on some path.
+(bind run
+  (lambda (located sink)
+    (for f located
+      (bind ((d (decode_defn (get f "node")))
+             (val (if (eq d null) null (get d "value"))))
+        (when (and (not (eq val null)) (call? val))
+          ; analyse the lambda's children (the leading parameter clause carries no
+          ; save/restore, so threading depth through it is a no-op).
+          (bind ((exit (cs_seq walk (args_of val) 0 sink)))
+            (when (gt exit 0)
+              (note! sink "ur-crit" (get f "node")
+                (string_concat_many "`" (get d "name") "` opens " (int_to_string exit)
+                  " critical section(s) (ur_interrupt_save) not restored on every "
+                  "path before return — interrupts would stay masked (deadlock)")))))))))
+
+(bind register!
+  (lambda () (install_pass! "ur-crit" (lambda (located sink) (run located sink)))))
+
+(export run register!)

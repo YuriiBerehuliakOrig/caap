@@ -1,0 +1,74 @@
+; stdlib/backend/emit/wasm.caap — stdlib's OWN WebAssembly (WAT) emitter (tier 4
+; codegen), the sibling of backend/emit/llvm: both consume prep_units' flat program
+; (root + inlined dependencies) and emit text. Where llvm emits LLVM IR, this
+; emits the WebAssembly text format — folded s-expressions a `wat2wasm` /
+; `wasmtime` toolchain runs. Function signatures come from OUR defn markers, so
+; the stdlib type system drives the wasm ABI: (defn f ((a u8)) u8 …) becomes
+; `(func $f (param $a0 i32) (result i32) …)` (sub-i32 ints are i32 in wasm).
+;
+; The supported subset is deliberately small and CERTAIN (anything else is a
+; named diagnostic, never wrong code):
+;   - int arithmetic  int_add/sub/mul/and/or/xor/shl  -> iWW.add/…/shl
+;   - signed/unsigned int_div/mod/shr                 -> div_s|u, rem_s|u, shr_s|u
+;   - bitwise NOT     int_not                         -> xor -1
+;   - comparisons     lt/gt/le/ge/eq/ne               -> iWW.cmp (-> i32 bool)
+;   - control         3-arm `if` (cond/case sugar)    -> (if (result T) …)
+;                     `while`                         -> (block (loop (br_if …)))
+;   - state           ref/deref/set_ref               -> mutable locals
+;   - locals          flat/multi bind, do             -> locals + blocks
+;   - width/repr cast cast                            -> wrap/extend/mask AND
+;                     int<->float convert/trunc (the full LLVM `cast` matrix)
+;   - int<->float     int_to_float/float_to_int       -> convert/trunc (i32<->f64)
+;   - structs         memory-backed: a value is an i32 pointer; the constructor
+;                     bump-allocates + stores fields, (get …) loads at offset
+;   - strings         literals + string_concat_many   -> a {ptr,len} header in
+;                     static/heap memory + a runtime $__strcat
+;   - runtime IO      (println x) — string OR i32, via host imports
+;                     env.print(ptr,len) / env.print_int(i32)
+;   - pointers/memory ptr_add/read/write, int_to_ptr/ptr_to_int, field_ptr,
+;                     union_field, array_local ($__sp frame), global_array
+;   - fn pointers     fn_ptr/call_ptr -> a funcref table + call_indirect
+;   - extern / global declared externs -> host imports; mutable globals
+;   - direct calls between the program's functions     -> call $f
+;   - literals        int (adopts the expected width), bool, float, string
+; Two integer widths: i8/i16/i32 + their u* and `int`/`bool` map to i32, i64/u64
+; to i64; floats are f32/f64 (`float` = f64).
+; NOT in this subset, and physically impossible in the wasm execution model (a
+; CERTAIN located reject in lower_call, NOT silent wrong code): inline `asm`
+; (no machine-code escape) and `volatile_*`/MMIO (no memory-mapped hardware
+; behind sandboxed linear memory). Those take the LLVM backend. main's value is
+; the module's result (a wasm host reads it); the function is exported by name.
+;
+; DEBUG INFO (best-effort): WAT has NO debug-metadata syntax — there is no
+; `!DI…`-style channel a textual emitter can write the way the LLVM backend does.
+; So `emit_program_debug`/`emit_module_debug` (the parity siblings of the LLVM
+; backend's _debug entries) emit a FUNCTION-LEVEL external Source Map v3 (.wasm.map)
+; alongside the WAT, mapping each generated `(func …)` line back to its `.caap`
+; source line; the default (no-debug) WAT is byte-identical to before. The map is
+; an inspection / WAT-level aid, NOT binary-byte-accurate — for true source-level
+; wasm debugging use the LLVM backend (real DWARF). See the dbg_new / build_source_map
+; block in emit/wasm/emit.caap for the full honest-scope note.
+;
+; ── This file is the FACADE ──────────────────────────────────────────────────
+; The emitter is split into acyclic submodules under stdlib/backend/emit/wasm/
+; (each `(use)`d below in dependency order; the leaf `types` has no sibling dep):
+;   types        — wasm value types + struct memory layout (w_type / elem_bytes /
+;                  struct_size / field_info / w_unify / float_t? / diag …); leaf.
+;   instructions — the operator/instruction emitters (mat / w_binop / w_cmp /
+;                  w_cast / fresh_local! / seq_value / block_of / lower_bind);
+;                  they thread the `lower` trampoline as `self`, so they carry no
+;                  load-time dependency on the lowering layer.
+;   lowering     — string interning + $__strcat, call_indirect signature interning,
+;                  the `lower_call` head dispatcher, the `lower` trampoline, and
+;                  `w_entry` (a function's wasm signature from its defn marker).
+;   emit         — per-function WAT (emit_fn), the Source Map v3 debug channel, the
+;                  whole-module driver (emit_core), and the four public entries.
+; The (export …) below re-publishes the SAME public contract the one-file emitter
+; exposed: the hosted/library entries and their _debug (source-map) siblings.
+(module stdlib.backend.emit.wasm)
+
+; the public entry points live in the emit submodule; the facade re-exports them.
+(use stdlib.backend.emit.wasm.emit
+     emit_program emit_program_debug emit_module emit_module_debug)
+
+(export emit_program emit_program_debug emit_module emit_module_debug)

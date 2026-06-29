@@ -12,26 +12,40 @@
 //!   cargo bench
 //!   cargo bench -- --save-baseline baseline
 //!   cargo bench -- --baseline baseline
+//!   cargo bench -- --profile-time 10   (generates flamegraphs via pprof)
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use pprof::criterion::{Output, PProfProfiler};
 
-use caap_peg_port::{analyze_grammar, Grammar, PEGParser, ParserConfig};
+use caap_peg::{
+    analyze_grammar, parse_ast, Directive, Grammar, PEGParser, ParseCache, ParseDriver,
+    ParseEffect, ParseRequest, ParseView, ParserConfig,
+};
+
+/// Observe-only driver: returns `Proceed` for every effect. Used to measure the
+/// cost of attaching the Parse Effects Protocol vs. a plain parse.
+struct NoopDriver;
+impl ParseDriver for NoopDriver {
+    fn handle(&self, _effect: &ParseEffect<'_>, _view: &ParseView<'_>) -> Directive {
+        Directive::Proceed
+    }
+}
 
 // ── Grammar texts ────────────────────────────────────────────────────────────
 
 /// Mirrors `LITERAL_GRAMMAR` — single literal.
 fn literal_grammar() -> Grammar {
-    Grammar::new("start <- 'hello'").with_start_rule("start")
+    Grammar::trusted_new("start <- 'hello'").with_start_rule("start")
 }
 
 /// Mirrors `IDENT_LIST_GRAMMAR` — sep-plus of identifiers.
 fn ident_list_grammar() -> Grammar {
-    Grammar::new("start <- sep_plus(/[a-zA-Z]+/, ',')").with_start_rule("start")
+    Grammar::trusted_new("start <- sep_plus(/[a-zA-Z]+/, ',')").with_start_rule("start")
 }
 
 /// Mirrors `LR_EXPR_GRAMMAR` — arithmetic (simulated as right-assoc due to no LR in PEG).
 fn lr_expr_grammar() -> Grammar {
-    Grammar::new(
+    Grammar::trusted_new(
         "expr <- term ('+' term / '-' term)*\n\
          term <- factor ('*' factor / '/' factor)*\n\
          factor <- '(' expr ')' / /[0-9]+/",
@@ -41,7 +55,7 @@ fn lr_expr_grammar() -> Grammar {
 
 /// Mirrors `JSON_GRAMMAR`.
 fn json_grammar() -> Grammar {
-    Grammar::new(
+    Grammar::trusted_new(
         r#"value  <- object / array / string / number / 'null' / 'true' / 'false'
 object <- '{' sep_plus(member, ',')? '}'
 member <- string ':' value
@@ -54,13 +68,13 @@ number <- /-?[0-9]+(?:\.[0-9]+)?/"#,
 
 /// Mirrors `CHOICE_DISPATCHED_GRAMMAR` — 8 distinct-first-char literals.
 fn choice_dispatched_grammar() -> Grammar {
-    Grammar::new("start <- 'aaa' / 'bbb' / 'ccc' / 'ddd' / 'eee' / 'fff' / 'ggg' / 'hhh'")
+    Grammar::trusted_new("start <- 'aaa' / 'bbb' / 'ccc' / 'ddd' / 'eee' / 'fff' / 'ggg' / 'hhh'")
         .with_start_rule("start")
 }
 
 /// Mirrors `CHOICE_OVERLAP_GRAMMAR` — 8 literals sharing "ab" prefix.
 fn choice_overlap_grammar() -> Grammar {
-    Grammar::new("start <- 'abc' / 'abd' / 'abe' / 'abf' / 'abg' / 'abh' / 'abi' / 'abj'")
+    Grammar::trusted_new("start <- 'abc' / 'abd' / 'abe' / 'abf' / 'abg' / 'abh' / 'abi' / 'abj'")
         .with_start_rule("start")
 }
 
@@ -106,6 +120,13 @@ fn json_large() -> String {
         .map(|i| format!(r#"{{"id": {i}, "val": "item{i}"}}"#))
         .collect();
     format!("[{}]", items.join(", ")) // ~5 KB
+}
+
+/// Replace the single byte at `at` with `repl` (same length → delta 0).
+fn replace_byte(text: &str, at: usize, repl: char) -> String {
+    let mut out = text.to_string();
+    out.replace_range(at..at + 1, &repl.to_string());
+    out
 }
 
 // ── Helper: configs ──────────────────────────────────────────────────────────
@@ -236,9 +257,9 @@ fn bench_memo(c: &mut Criterion) {
     let small = json_small();
     let large = json_large();
     let cfg_small_on = config(small.len() + 64, true);
-    let cfg_small_off = config(small.len() + 64, false);
+    let cfg_small_off = config(small.len() * 50, false);
     let cfg_large_on = config(large.len() + 64, true);
-    let cfg_large_off = config(large.len() + 64, false);
+    let cfg_large_off = config(large.len() * 50, false);
 
     let mut group = c.benchmark_group("memo");
     group.bench_function("on_small", |b| {
@@ -334,8 +355,8 @@ fn bench_grammar_seal(c: &mut Criterion) {
 
     group.bench_function("simple", |b| {
         b.iter(|| {
-            let g =
-                Grammar::new("start <- a b\na <- 'hello'\nb <- 'world'").with_start_rule("start");
+            let g = Grammar::trusted_new("start <- a b\na <- 'hello'\nb <- 'world'")
+                .with_start_rule("start");
             black_box(analyze_grammar(&g))
         })
     });
@@ -359,24 +380,119 @@ fn bench_compile_overhead(c: &mut Criterion) {
 
     c.bench_function("compile_overhead/lr_expr_medium", |b| {
         b.iter(|| {
-            // Grammar::new() includes rule text parsing.
+            // Grammar::trusted_new() includes rule text parsing.
             let g = black_box(lr_expr_grammar());
             PEGParser.parse(&g, black_box(text.as_str()), black_box(&cfg))
         })
     });
 }
 
+fn bench_driver(c: &mut Criterion) {
+    // Confirms the protocol is ~zero-cost without a driver, and measures the
+    // overhead of an attached observe-only driver and of `parse_ast` (which runs
+    // an internal collector driver).
+    let grammar = lr_expr_grammar();
+    let text = lr_expr_medium();
+    let cfg = config(text.len() + 64, true);
+    let driver = NoopDriver;
+
+    let mut group = c.benchmark_group("driver");
+    group.bench_function("no_driver", |b| {
+        b.iter(|| PEGParser.parse(&grammar, black_box(text.as_str()), &cfg))
+    });
+    group.bench_function("noop_driver", |b| {
+        b.iter(|| {
+            PEGParser.parse_with_driver(&grammar, black_box(text.as_str()), &cfg, Some(&driver))
+        })
+    });
+    group.bench_function("parse_ast", |b| {
+        b.iter(|| parse_ast(&grammar, black_box(text.as_str()), None))
+    });
+    group.finish();
+}
+
+// ── 8. Incremental subtree reuse ──────────────────────────────────────────────
+
+fn bench_incremental(c: &mut Criterion) {
+    // Measures the incremental reparse cost (cache primed from the original
+    // text, then a one-character edit applied) against a full from-scratch
+    // parse. The JSON grammar has named recursive rules (`value`/`object`/
+    // `member`/…) invoked at many positions, so the position cache replays the
+    // untouched elements: both a head edit and a tail edit reparse only the one
+    // edited element and reuse the rest, ~6× faster than a full parse.
+    //
+    // This relies on a *tight* regex read-extent: `string`/`number` are
+    // multi-token regexes, and recording their examined interval as the exact
+    // automaton-death offset (rather than conservatively end-of-input) is what
+    // lets a tail edit avoid invalidating every preceding entry. The
+    // examined-extent tracking also keeps that reuse sound under lookahead.
+    let grammar = json_grammar();
+    let original = json_large();
+    let cfg = config(original.len() * 8 + 1024, true);
+
+    // Every object embeds the word "item" inside a quoted string value; flipping
+    // an 'm' to 'n' is a same-length, always-valid edit. `rfind` lands in the
+    // last element (tail), `find` in the first (head).
+    let tail_edit = replace_byte(&original, original.rfind('m').unwrap(), 'n');
+    let head_edit = replace_byte(&original, original.find('m').unwrap(), 'n');
+
+    // Prime a cache with the original text once; clone it per measured iteration.
+    let mut primed = ParseCache::default();
+    ParseRequest::new(&grammar)
+        .config(cfg.clone())
+        .run_incremental(&original, &mut primed)
+        .expect("priming parse should succeed");
+
+    let mut group = c.benchmark_group("incremental");
+    group.bench_function("full_parse", |b| {
+        b.iter(|| {
+            PEGParser.parse(
+                black_box(&grammar),
+                black_box(original.as_str()),
+                black_box(&cfg),
+            )
+        })
+    });
+    group.bench_function("reparse_tail_edit", |b| {
+        b.iter_batched(
+            || primed.clone(),
+            |mut cache| {
+                ParseRequest::new(black_box(&grammar))
+                    .config(cfg.clone())
+                    .run_incremental(black_box(tail_edit.as_str()), &mut cache)
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("reparse_head_edit", |b| {
+        b.iter_batched(
+            || primed.clone(),
+            |mut cache| {
+                ParseRequest::new(black_box(&grammar))
+                    .config(cfg.clone())
+                    .run_incremental(black_box(head_edit.as_str()), &mut cache)
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+}
+
 // ── Register ─────────────────────────────────────────────────────────────────
 
 criterion_group!(
-    benches,
-    bench_literal,
-    bench_literal_list,
-    bench_choice,
-    bench_lr_expr,
-    bench_memo,
-    bench_json,
-    bench_grammar_seal,
-    bench_compile_overhead,
+    name = benches;
+    config = Criterion::default().with_profiler(PProfProfiler::new(997, Output::Flamegraph(None)));
+    targets =
+        bench_literal,
+        bench_literal_list,
+        bench_choice,
+        bench_lr_expr,
+        bench_memo,
+        bench_json,
+        bench_grammar_seal,
+        bench_compile_overhead,
+        bench_driver,
+        bench_incremental,
 );
 criterion_main!(benches);

@@ -1,0 +1,150 @@
+; stdlib/semantics/session.caap — the unified compile-session context (audit #1).
+;
+; THE PROBLEM (audit #1): session-global mutable state is SCATTERED across the
+; stdlib — `target_ptr_bytes`/`strict_mode` (backend/prep), `current_target`
+; (backend/emit/llvm/debug), the pass `facts`/`schemas`/`registry`/`transforms`
+; (semantics/passes/registry), the per-file clike record (frontend/clike/state),
+; the type-pass harvest/counters (semantics/types/infer). Each subsystem owns its
+; own cells with its own ad-hoc `clear_*!`/`reset_*!`, and there is NO single place
+; that knows "what is the live session state" or "reset the session for a fresh
+; compile". A tool that wants a clean slate must know — and call — every scattered
+; clear by hand; a new stateful subsystem is invisible to the others.
+;
+; THE CONTRACT: ONE session context that
+;   (a) OWNS new mutable cells on behalf of subsystems (`session_cell!`), and
+;   (b) AGGREGATES every subsystem's reset under one named registry, so a single
+;       `session_reset!` re-initialises the whole session and `session_subsystems`
+;       is the live inventory of what holds state.
+; This is ADDITIVE / behaviour-preserving: existing cells and their `clear_*!`
+; keep working unchanged; the session sits ABOVE them as the lifecycle owner. It is
+; the foundation the rest of the #1 cluster builds on (e.g. #8 makes the pass facts
+; a per-run session cell so they auto-reset instead of needing a manual clear).
+;
+; Loaded EAGERLY in bootstrap (before the type layer) so every later subsystem —
+; eager (infer) or lazy (prep/llvm/clike/passes) — can attach to the one session.
+; Tier: rank 4 (semantics); importable by semantics (same tier) and backend/
+; frontend (higher). Depends on KERNEL builtins only, so it loads very early.
+(module stdlib.semantics.session)
+
+; ── owned cells ──────────────────────────────────────────────────────────────
+; _cells : name -> {"ref" <ref>, "init" <thunk>}. A subsystem that wants the
+; session to OWN a piece of state asks for a cell by name; the session creates it
+; once (init from the thunk) and hands back a STABLE ref. session_reset! mutates
+; that same ref in place (never replaces it), so a module-level `(bind x
+; (session_cell! …))` stays valid for the session lifetime.
+(bind _cells (map_of))
+; _cell_names : the cell names in registration order (so reset is deterministic
+; and we never depend on map-key iteration order).
+(bind _cell_names (list_of))
+
+; session_cell! — return the session-owned ref for `name`, creating it on first
+; call (its initial value is `(init_thunk)`). Idempotent: a second call with the
+; same name returns the SAME ref (the init_thunk is ignored), so two modules can
+; share one cell by agreeing on a name.
+(bind session_cell!
+  (lambda (name init_thunk)
+    (bind ((existing (get _cells name null)))
+      (if (eq existing null)
+        (bind ((cell (ref (init_thunk))))
+          (do
+            (assoc _cells name (assoc (map_of) "ref" cell "init" init_thunk))
+            (append _cell_names name)
+            cell))
+        (get existing "ref")))))
+
+; ── owned-cell contract (opt-in, audit #31) ──────────────────────────────────
+; _cell_meta : name -> {"owner" <string>, "shape_note" <string>}. Records the
+; declared owner of a cell that opts in via session_cell_owned!. Plain
+; session_cell! cells (and intentionally SHARED cells like
+; "backend.prep.strict_mode", which prep AND infer both create on purpose — the
+; audit-#15 tier bridge) leave no meta entry and stay namespace-shareable.
+(bind _cell_meta (map_of))
+
+; session_cell_owned! — like session_cell!, but DECLARES an owner for the cell so
+; an accidental name collision between two subsystems surfaces as an error instead
+; of a silent shared ref. Strictly OPT-IN and additive:
+;   • first claim records {owner, shape_note} and behaves exactly like session_cell!
+;   • a re-claim by the SAME owner is idempotent (returns the same ref)
+;   • a claim by a DIFFERENT owner RAISES (runtime_error) — a contract violation
+;     surfaces, never a silent share.
+; A cell created by plain session_cell! has no owner recorded, so the first
+; session_cell_owned! call adopts it; this never weakens the intentional shared
+; cells, which are only ever reached through plain session_cell!.
+;   owner       : the claiming subsystem's name (a string)
+;   name        : the cell name (the global session namespace key)
+;   init_thunk  : 0-arg producer of the cell's initial value
+;   ->          : the session-owned ref for `name`
+(bind session_cell_owned!
+  (lambda (owner name init_thunk)
+    (bind ((meta (get _cell_meta name null)))
+      (if (eq meta null)
+        (bind ((cell (session_cell! name init_thunk)))
+          (do
+            (assoc _cell_meta name (assoc (map_of) "owner" owner "shape_note" ""))
+            cell))
+        (if (eq (get meta "owner") owner)
+          (session_cell! name init_thunk)
+          (runtime_error (string_concat_many
+            "session_cell_owned!: cell '" name
+            "' is owned by '" (get meta "owner")
+            "', cannot be re-claimed by '" owner "'")))))))
+
+; ── subsystem reset registry ─────────────────────────────────────────────────
+; _subsystems : ordered list of {"name", "reset"} — every subsystem that holds
+; session state registers its reset here, so session_reset! is the ONE lifecycle
+; point and session_subsystems is the inventory. Used for state a subsystem keeps
+; in its OWN cells (in-place maps/lists like the pass fact store) rather than in a
+; session_cell — the subsystem's existing clear_*! becomes the reset thunk.
+(bind _subsystems (list_of))
+
+; session_register! — register a named subsystem with its reset thunk. Re-
+; registering a name REPLACES its reset (idempotent across reloads), so loading a
+; module twice does not double-run its reset.
+(bind session_register!
+  (lambda (name reset_thunk)
+    (do
+      (bind ((replaced (ref false)))
+        (do
+          (sequence_each _subsystems
+            (lambda (e)
+              (if (eq (get e "name") name)
+                (do (assoc e "reset" reset_thunk) (set_ref replaced true))
+                null)))
+          (if (not (deref replaced))
+            (append _subsystems
+              (assoc (map_of) "name" name "reset" reset_thunk))
+            null)))
+      null)))
+
+; session_subsystems — the live inventory: the names of every registered
+; state-holding subsystem, in registration order. The answer to "what holds
+; session state?" that did not exist before.
+(bind session_subsystems
+  (lambda ()
+    (bind ((out (list_of)))
+      (do (sequence_each _subsystems (lambda (e) (append out (get e "name")))) out))))
+
+; session_reset! — re-initialise the WHOLE session: every owned cell back to its
+; init value, then every registered subsystem reset. One call replaces the
+; scattered clear_passes! / reset_file_state! / clear_target! / clear_strict! …
+(bind session_reset!
+  (lambda ()
+    (do
+      (sequence_each _cell_names
+        (lambda (name)
+          (bind ((slot (get _cells name)))
+            (set_ref (get slot "ref") ((get slot "init"))))))
+      (sequence_each _subsystems (lambda (e) ((get e "reset"))))
+      null)))
+
+; session_cell_names — the owned-cell inventory (companion to session_subsystems).
+; Returns a DETACHED copy (mirroring session_subsystems): a caller may iterate or
+; mutate the result without corrupting the internal `_cell_names` registration
+; order that session_reset! walks.
+(bind session_cell_names
+  (lambda ()
+    (bind ((out (list_of)))
+      (do (sequence_each _cell_names (lambda (e) (append out e))) out))))
+
+(export session_cell! session_cell_owned! session_register! session_reset!
+        session_subsystems session_cell_names)

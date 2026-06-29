@@ -1,0 +1,396 @@
+; stdlib/lib/time.caap — calendar + duration arithmetic over epoch integers
+; (module stdlib.lib.time).
+;
+; PURE i64 math: the proleptic Gregorian calendar via Howard Hinnant's
+; branch-light `days_from_civil` / `civil_from_days`, plus UTC datetime
+; conversion and ISO-8601 (RFC-3339) formatting/parsing. Everything here is
+; total integer arithmetic — no host services, no timezone database. All
+; instants are UTC; epoch is 1970-01-01T00:00:00Z. Seconds and milliseconds are
+; plain ints (i64), which is ample for the unix range.
+;
+; The one impure helper, `now`, lives in stdlib.sys.time so the calendar core
+; stays free of capabilities; this module never reaches for the clock.
+(module stdlib.lib.time)
+
+; pad_left lives in lib/text (rank 2, the same tier as lib/time) — a fixed-width,
+; O(n) left zero-pad reused by the ISO formatters below in place of the old
+; hand-rolled O(n^2) string-concat loops. `(pad_left s width "0")` left-pads s
+; with '0' to `width`, and returns s unchanged when it is already that wide.
+(use stdlib.lib.text.format pad_left)
+
+; ── seconds-per-unit constants ──────────────────────────────────────────────
+(bind secs_per_minute 60)
+(bind secs_per_hour   3600)    ; 60 * 60
+(bind secs_per_day    86400)   ; 24 * 60 * 60
+
+; ── leap year ───────────────────────────────────────────────────────────────
+
+; is_leap? — is `year` a leap year in the proleptic Gregorian calendar?
+;   year : a (possibly negative) civil year
+;   ->   : true when divisible by 4 and (not by 100, or by 400)
+(defn is_leap? ((year int)) bool
+  (and (eq (int_mod year 4) 0)
+       (or (ne (int_mod year 100) 0)
+           (eq (int_mod year 400) 0))))
+
+; ── civil <-> days (Howard Hinnant) ─────────────────────────────────────────
+
+; days_from_civil — days since 1970-01-01 for the civil date (y, m, d).
+;   y : year, m : month 1..12, d : day 1..31
+;   -> : signed day count (0 for 1970-01-01; negative before the epoch)
+; Hinnant's algorithm shifts the year so the leap day lands at the END of the
+; internal era (March-based year), making the day-of-year formula branch-free.
+(defn days_from_civil ((y int) (m int) (d int)) int
+  (bind ((yy (if (le m 2) (int_sub y 1) y))          ; treat Jan/Feb as prior year
+         ; era — the 400-year cycle index (floored toward -inf for yy < 0)
+         (era (int_div (if (ge yy 0) yy (int_sub yy 399)) 400))
+         (yoe (int_sub yy (int_mul era 400)))        ; year-of-era  [0, 399]
+         ; doy — day-of-year with March = 0 (the leap day falls at the tail)
+         (doy (int_add
+                (int_div (int_add (int_mul 153
+                          (if (gt m 2) (int_sub m 3) (int_add m 9))) 2) 5)
+                (int_sub d 1)))
+         (doe (int_add (int_sub (int_add (int_mul yoe 365)
+                          (int_div yoe 4)) (int_div yoe 100)) doy)))  ; day-of-era [0,146096]
+    ; era*146097 absolute days, minus the 719468-day offset to 1970-01-01
+    (int_sub (int_add (int_mul era 146097) doe) 719468)))
+
+; civil_from_days — the civil date for `days` since 1970-01-01.
+;   days : a signed day count
+;   ->   : a map { "year", "month", "day" } (the inverse of days_from_civil)
+(defn civil_from_days ((days int)) (map string int)
+  (bind ((z (int_add days 719468))                   ; shift epoch to 0000-03-01
+         (era (int_div (if (ge z 0) z (int_sub z 146096)) 146097))
+         (doe (int_sub z (int_mul era 146097)))       ; day-of-era    [0, 146096]
+         (yoe (int_div (int_sub (int_sub (int_add doe (int_div doe 36524))
+                          (int_div doe 1460)) (if (eq doe 146096) 1 0))  ; guard last day
+                       365))                           ; year-of-era   [0, 399]
+         (y (int_add yoe (int_mul era 400)))
+         (doy (int_sub doe (int_sub (int_add (int_mul 365 yoe)
+                          (int_div yoe 4)) (int_div yoe 100))))   ; day-of-year [0, 365]
+         (mp (int_div (int_add (int_mul 5 doy) 2) 153))           ; month March=0 [0, 11]
+         (d (int_add (int_sub doy (int_div (int_add (int_mul 153 mp) 2) 5)) 1)) ; day 1..31
+         (m (if (lt mp 10) (int_add mp 3) (int_sub mp 9))))       ; month 1..12
+    (assoc (map_of)
+      "year" (if (le m 2) (int_add y 1) y)
+      "month" m
+      "day" d)))
+
+; day_of_week — weekday for a day count, 0 = Sunday .. 6 = Saturday.
+;   days : days since 1970-01-01 (which was a Thursday)
+;   ->   : 0..6, Sunday-origin (a positive modulo, total for negative `days`)
+(defn day_of_week ((days int)) int
+  ; 1970-01-01 is Thursday = 4; shift, then a non-negative mod 7
+  (int_mod (int_add (int_mod (int_add days 4) 7) 7) 7))
+
+; ── unix seconds <-> datetime ───────────────────────────────────────────────
+
+; floor_div / floor_mod — division/remainder rounding toward -infinity, so the
+; time-of-day fields stay in [0, unit) even for negative (pre-epoch) seconds.
+(defn floor_div ((a int) (b int)) int
+  (bind ((q (int_div a b)) (r (int_sub a (int_mul q b))))
+    (if (and (ne r 0) (ne (lt r 0) (lt b 0))) (int_sub q 1) q)))
+(defn floor_mod ((a int) (b int)) int
+  (int_sub a (int_mul (floor_div a b) b)))
+
+; datetime_from_unix — broken-down UTC time for a unix timestamp.
+;   secs : seconds since 1970-01-01T00:00:00Z (may be negative)
+;   ->   : a map { "year","month","day","hour","minute","second" }
+(defn datetime_from_unix ((secs int)) (map string int)
+  (bind ((days (floor_div secs secs_per_day))            ; whole days (floored)
+         (rem (floor_mod secs secs_per_day))             ; second-of-day [0, 86399]
+         (cal (civil_from_days days))
+         (hour (int_div rem secs_per_hour))
+         (minute (int_div (int_mod rem secs_per_hour) secs_per_minute))
+         (second (int_mod rem secs_per_minute)))
+    (assoc (map_of)
+      "year" (get cal "year")
+      "month" (get cal "month")
+      "day" (get cal "day")
+      "hour" hour
+      "minute" minute
+      "second" second)))
+
+; unix_from_datetime — unix timestamp for a broken-down UTC datetime.
+;   dt : a map with "year","month","day" and optional "hour"/"minute"/"second"
+;   -> : seconds since the epoch (the inverse of datetime_from_unix)
+(defn unix_from_datetime ((dt (map string int))) int
+  (bind ((days (days_from_civil (get dt "year") (get dt "month") (get dt "day"))))
+    (int_add (int_mul days secs_per_day)
+      (int_add (int_mul (get dt "hour" 0) secs_per_hour)
+        (int_add (int_mul (get dt "minute" 0) secs_per_minute)
+          (get dt "second" 0))))))
+
+; ── durations (plain int milliseconds) ──────────────────────────────────────
+; A Duration is just an int count of milliseconds. The helpers below are thin,
+; total wrappers so call sites read in their intended unit; no opaque type.
+
+; duration — construct a Duration of `ms` milliseconds (identity; the unit tag).
+(defn duration ((ms int)) int ms)
+
+; to_* — a Duration converted DOWN to a coarser unit (truncating int division).
+(defn to_seconds ((ms int)) int (int_div ms 1000))
+(defn to_minutes ((ms int)) int (int_div ms 60000))      ; 1000 * 60
+(defn to_hours   ((ms int)) int (int_div ms 3600000))    ; 1000 * 60 * 60
+(defn to_days    ((ms int)) int (int_div ms 86400000))   ; 1000 * 60 * 60 * 24
+
+; from_* — a count of a coarser unit converted UP to a Duration (milliseconds).
+(defn from_seconds ((s int)) int (int_mul s 1000))
+(defn from_minutes ((m int)) int (int_mul m 60000))
+(defn from_hours   ((h int)) int (int_mul h 3600000))
+(defn from_days    ((d int)) int (int_mul d 86400000))
+
+; duration_add / duration_sub — sum / difference of two Durations (ms).
+(defn duration_add ((a int) (b int)) int (int_add a b))
+(defn duration_sub ((a int) (b int)) int (int_sub a b))
+
+; duration_compare — -1 / 0 / 1 as `a` is shorter / equal / longer than `b`.
+(defn duration_compare ((a int) (b int)) int
+  (cond ((lt a b) -1) ((gt a b) 1) (else 0)))
+
+; ── ISO-8601 / RFC-3339 (UTC) ───────────────────────────────────────────────
+
+; pad2 / pad4 — zero-pad a NON-NEGATIVE int to 2 / 4 digits, via lib/text's
+; pad_left (an O(n) repeat-then-concat; the old in-line loops were O(n^2)).
+; Behaviour is identical: a value already ≥ the width is returned unchanged.
+(defn pad2 ((n int)) string (pad_left (int_to_string n) 2 "0"))
+(defn pad4 ((n int)) string (pad_left (int_to_string n) 4 "0"))
+
+; format_iso8601 — render a UTC datetime map as "YYYY-MM-DDThh:mm:ssZ".
+;   dt : a map { "year","month","day","hour","minute","second" }
+;   -> : a fixed-width zero-padded UTC timestamp string (the trailing Z = UTC)
+(defn format_iso8601 ((dt (map string int))) string
+  (string_concat_many
+    (pad4 (get dt "year"))  "-" (pad2 (get dt "month"))  "-" (pad2 (get dt "day"))
+    "T"
+    (pad2 (get dt "hour" 0)) ":" (pad2 (get dt "minute" 0)) ":" (pad2 (get dt "second" 0))
+    "Z"))
+
+; ── fractional seconds (milliseconds) ────────────────────────────────────────
+; RFC-3339 allows a fractional-second part after the seconds: "…ss.fff". This
+; module's calendar fields are whole seconds; the fraction is carried as a
+; SEPARATE optional "millis" field (0..999) on the datetime map, so the existing
+; whole-second format/parse stay byte-identical and a caller opts in explicitly.
+
+; frac3 — render a millis field as the ".fff" fractional suffix, or "" for 0.
+; A non-zero count is zero-padded to exactly three digits ("7" -> ".007"); 0
+; (or an absent field) yields no suffix at all, matching RFC-3339's option to
+; omit the fraction entirely (so a clean second still prints "…ss", not "…ss.000").
+;   millis : 0..999 — milliseconds past the whole second
+;   ->     : ".fff" (three digits) or "" when millis is 0
+(defn frac3 ((millis int)) string
+  (if (eq millis 0) "" (string_concat_many "." (pad_left (int_to_string millis) 3 "0"))))
+
+; format_iso8601_millis — render a UTC datetime map as "YYYY-MM-DDThh:mm:ss[.fff]Z",
+; appending the fractional second only when the map's optional "millis" field is
+; non-zero. With millis 0 / absent this is exactly format_iso8601 (the trailing
+; Z is preserved), so it is a strict superset of the whole-second formatter.
+;   dt : a datetime map { "year"…"second" } plus an optional "millis" (0..999)
+;   -> : an RFC-3339 UTC timestamp, with ".fff" present iff millis is non-zero
+(defn format_iso8601_millis ((dt (map string int))) string
+  (string_concat_many
+    (pad4 (get dt "year"))  "-" (pad2 (get dt "month"))  "-" (pad2 (get dt "day"))
+    "T"
+    (pad2 (get dt "hour" 0)) ":" (pad2 (get dt "minute" 0)) ":" (pad2 (get dt "second" 0))
+    (frac3 (get dt "millis" 0))
+    "Z"))
+
+; ── fixed UTC offsets ────────────────────────────────────────────────────────
+; RFC-3339 allows a zone OFFSET in place of the "Z": "+02:00", "-05:00". There
+; is no timezone database here and no notion of "today" — an offset is a FIXED
+; signed shift between local wall-clock and UTC, nothing more (no DST, no rules).
+; The convention is the RFC's: a local instant equals UTC PLUS its offset, so
+;   utc = local - offset.
+
+; offset_suffix — render a "+HH:MM" / "-HH:MM" zone suffix for `offset_minutes`,
+; or "Z" when the offset is zero (the UTC spelling). The sign and magnitude are
+; split so a negative offset reads "-05:00", not "+-5:...".
+;   offset_minutes : signed minutes east of UTC (e.g. +120 = "+02:00")
+;   ->             : the zone suffix string
+(defn offset_suffix ((offset_minutes int)) string
+  (if (eq offset_minutes 0) "Z"
+    (bind ((sign (if (lt offset_minutes 0) "-" "+"))
+           (mag  (int_abs offset_minutes))
+           (oh   (int_div mag 60))
+           (om   (int_mod mag 60)))
+      (string_concat_many sign (pad2 oh) ":" (pad2 om)))))
+
+; format_iso8601_offset — render `dt` as a LOCAL wall-clock timestamp carrying a
+; fixed `offset_minutes` zone suffix: "YYYY-MM-DDThh:mm:ss±hh:mm" (or a trailing
+; "Z" when the offset is zero, matching format_iso8601). The datetime fields are
+; the LOCAL wall-clock — this does NOT shift them; pass the wall-clock you want
+; printed and the offset it is expressed in.
+;   dt             : a datetime map { "year"…"second" } (the local wall-clock)
+;   offset_minutes : signed minutes east of UTC for the printed suffix
+;   ->             : the offset-suffixed timestamp string
+(defn format_iso8601_offset ((dt (map string int)) (offset_minutes int)) string
+  (string_concat_many
+    (pad4 (get dt "year"))  "-" (pad2 (get dt "month"))  "-" (pad2 (get dt "day"))
+    "T"
+    (pad2 (get dt "hour" 0)) ":" (pad2 (get dt "minute" 0)) ":" (pad2 (get dt "second" 0))
+    (offset_suffix offset_minutes)))
+
+; parse_offset_minutes — read the zone suffix that begins at index 19 of an
+; ISO-8601 timestamp and return its offset as signed minutes east of UTC. "Z"
+; (or an empty/absent suffix) is 0; a WELL-FORMED "+HH:MM" / "-HH:MM" is parsed
+; sign-first. This is TOTAL: a malformed/truncated zone ("+", "+02", "+0500"
+; without the colon) is treated as 0 rather than raising — the slices the parse
+; needs are taken only once the zone is known to be at least "±HH:MM" wide, so
+; string_to_int never meets a short/empty slice.
+;   s  : the full timestamp string
+;   -> : signed minutes (0 for UTC)
+(defn parse_offset_minutes ((s string)) int
+  (bind ((zone (if (gt (size s) 19) (string_slice s 19 (size s)) "")))
+    (cond
+      ((eq zone "") 0)
+      ((string_starts_with zone "Z") 0)
+      ; require the full "±HH:MM" shape: a sign, then ≥6 chars, with the colon
+      ; where it belongs. Anything shorter or mis-shaped is taken as UTC (0).
+      ((and (or (string_starts_with zone "+") (string_starts_with zone "-"))
+            (ge (size zone) 6)
+            (eq (string_slice zone 3 4) ":"))
+        (bind ((sign (if (string_starts_with zone "-") -1 1))
+               (oh   (string_to_int (string_slice zone 1 3)))
+               (om   (string_to_int (string_slice zone 4 6))))
+          (int_mul sign (int_add (int_mul oh 60) om))))
+      (else 0))))
+
+; parse_iso8601 — parse a fixed-width "YYYY-MM-DDThh:mm:ss" timestamp WITH its
+; optional zone suffix, returning a UTC datetime map. A trailing "Z" (or no
+; suffix) is UTC and the fields pass through unchanged (the historical
+; behaviour). A fixed "+HH:MM" / "-HH:MM" offset is APPLIED: the local
+; wall-clock is shifted to UTC (utc = local - offset), so two timestamps that
+; name the same instant in different zones parse to the SAME UTC map. There is
+; no timezone database — the offset is taken literally as written.
+;   s  : an RFC-3339 string with an optional Z / ±HH:MM zone
+;   -> : a UTC datetime map { "year"…"second" }
+; Fields are sliced by fixed character offset (the format is fixed-width) and
+; each parsed with string_to_int, which tolerates leading zeros.
+(defn parse_iso8601 ((s string)) (map string int)
+  (bind ((wall (assoc (map_of)
+                 "year"   (string_to_int (string_slice s 0 4))
+                 "month"  (string_to_int (string_slice s 5 7))
+                 "day"    (string_to_int (string_slice s 8 10))
+                 "hour"   (string_to_int (string_slice s 11 13))
+                 "minute" (string_to_int (string_slice s 14 16))
+                 "second" (string_to_int (string_slice s 17 19))))
+         (off (parse_offset_minutes s)))
+    ; UTC = local wall-clock minus the offset. Offset 0 (Z/no-zone) leaves the
+    ; instant and the broken-down fields exactly as written.
+    (if (eq off 0)
+      wall
+      (datetime_from_unix
+        (int_sub (unix_from_datetime wall) (int_mul off secs_per_minute))))))
+
+; ── fractional-second parsing ────────────────────────────────────────────────
+
+; ascii_digit? — is the 1-char string `c` an ASCII decimal digit '0'..'9'? Tested
+; by its single UTF-8 byte being in 48..57 (kernel has no string ordering op, and
+; this avoids a string_to_int try/catch per character).
+;   c  : a 1-character string
+;   -> : true iff c is exactly one '0'..'9'
+(defn ascii_digit? ((c string)) bool
+  (bind ((bs (bytes_to_list (string->bytes c))))
+    (and (eq (size bs) 1)
+         (ge (get bs 0) 48)
+         (le (get bs 0) 57))))
+
+; parse_fraction_millis — read the OPTIONAL ".fff…" fraction that, when present,
+; begins at index 19 of a timestamp (right after the whole seconds) and return it
+; as whole milliseconds (0..999). This is TOTAL: a timestamp with no fraction (a
+; "Z"/offset/end-of-string at index 19, or a string too short to reach it) yields
+; 0. Only the first three fractional digits are kept (millisecond resolution);
+; 1- or 2-digit fractions are scaled to thousandths (".5" -> 500, ".05" -> 50).
+;   s  : the full timestamp string
+;   -> : milliseconds in [0, 999] (0 when there is no fractional part)
+(defn parse_fraction_millis ((s string)) int
+  (if (le (size s) 19) 0
+    (if (ne (string_slice s 19 20) ".") 0
+      ; walk the digits after the dot (index 20…) until a non-digit / end
+      (bind ((i (ref 20)) (n (size s)) (acc (ref 0)) (taken (ref 0)) (go (ref true)))
+        (do
+          (while (and (deref go) (lt (deref i) n))
+            (bind ((c (string_slice s (deref i) (int_add (deref i) 1))))
+              (if (ascii_digit? c)
+                (do
+                  ; keep only the first three digits; later digits are consumed
+                  ; (to find the zone) but do not change the millisecond value
+                  (when (lt (deref taken) 3)
+                    (do
+                      (set_ref acc (int_add (int_mul (deref acc) 10) (string_to_int c)))
+                      (set_ref taken (int_add (deref taken) 1))))
+                  (set_ref i (int_add (deref i) 1)))
+                (set_ref go false))))
+          ; scale a short fraction up to thousandths: 1 digit ->*100, 2 ->*10
+          (cond
+            ((eq (deref taken) 1) (int_mul (deref acc) 100))
+            ((eq (deref taken) 2) (int_mul (deref acc) 10))
+            (else (deref acc))))))))
+
+; fraction_end — the index just past the optional ".fff…" fraction (i.e. where
+; the zone suffix begins). With no fraction this is 19, so the whole-second
+; parse paths are unaffected; with a fraction it skips the dot and its digits.
+;   s  : the full timestamp string
+;   -> : the start index of the zone suffix (19 when there is no fraction)
+(defn fraction_end ((s string)) int
+  (if (le (size s) 19) (size s)
+    (if (ne (string_slice s 19 20) ".") 19
+      (bind ((i (ref 20)) (n (size s)) (go (ref true)))
+        (do
+          (while (and (deref go) (lt (deref i) n))
+            (bind ((c (string_slice s (deref i) (int_add (deref i) 1))))
+              (if (ascii_digit? c)
+                (set_ref i (int_add (deref i) 1))
+                (set_ref go false))))
+          (deref i))))))
+
+; parse_iso8601_millis — like parse_iso8601, but ALSO reads an optional ".fff"
+; fractional second into a "millis" field (0..999) on the returned map, and
+; understands a zone suffix that follows the fraction ("…ss.fffZ", "…ss.fff+02:00").
+; A whole-second timestamp parses to millis 0; a Z/no-zone instant keeps its wall
+; fields verbatim; an offset is applied to UTC exactly as parse_iso8601 does (the
+; whole-second instant is shifted, then the millis are reattached unchanged — the
+; offset is whole minutes, so it never crosses a sub-second boundary).
+;   s  : an RFC-3339 string with optional ".fff" fraction and optional Z/±HH:MM
+;   -> : a UTC datetime map { "year"…"second", "millis" }
+(defn parse_iso8601_millis ((s string)) (map string int)
+  (bind ((millis (parse_fraction_millis s))
+         ; the zone begins after any fraction; read its offset from that point
+         (zstart (fraction_end s))
+         (zone (if (lt zstart (size s)) (string_slice s zstart (size s)) ""))
+         (off (cond
+                ((eq zone "") 0)
+                ((string_starts_with zone "Z") 0)
+                ((and (or (string_starts_with zone "+") (string_starts_with zone "-"))
+                      (ge (size zone) 6)
+                      (eq (string_slice zone 3 4) ":"))
+                  (bind ((sign (if (string_starts_with zone "-") -1 1))
+                         (oh   (string_to_int (string_slice zone 1 3)))
+                         (om   (string_to_int (string_slice zone 4 6))))
+                    (int_mul sign (int_add (int_mul oh 60) om))))
+                (else 0)))
+         (wall (assoc (map_of)
+                 "year"   (string_to_int (string_slice s 0 4))
+                 "month"  (string_to_int (string_slice s 5 7))
+                 "day"    (string_to_int (string_slice s 8 10))
+                 "hour"   (string_to_int (string_slice s 11 13))
+                 "minute" (string_to_int (string_slice s 14 16))
+                 "second" (string_to_int (string_slice s 17 19)))))
+    (if (eq off 0)
+      (assoc wall "millis" millis)
+      (assoc
+        (datetime_from_unix
+          (int_sub (unix_from_datetime wall) (int_mul off secs_per_minute)))
+        "millis" millis))))
+
+(export is_leap?
+        days_from_civil civil_from_days day_of_week
+        datetime_from_unix unix_from_datetime
+        floor_div floor_mod
+        duration to_seconds to_minutes to_hours to_days
+        from_seconds from_minutes from_hours from_days
+        duration_add duration_sub duration_compare
+        pad2 pad4 format_iso8601 parse_iso8601
+        offset_suffix format_iso8601_offset parse_offset_minutes
+        frac3 format_iso8601_millis
+        ascii_digit? parse_fraction_millis fraction_end parse_iso8601_millis)

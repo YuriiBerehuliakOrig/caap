@@ -1,0 +1,105 @@
+; stdlib/lib/test.caap — in-language test assertions (module stdlib.lib.test).
+; Tests are .caap files using these helpers; loading a test file runs its
+; assertions. On mismatch an assertion throws a message carrying the label AND
+; the actual/expected values (via value_to_string), so a failure reads:
+;   FAIL: map+sum (expected 12, got 11)
+; On success an assertion returns null, so several may sit in one `do` block;
+; the thrown message is the test runner's failure signal (a caught throw = a
+; failed test). `eq` is the kernel's structural equality (deep on aggregates).
+(module stdlib.lib.test)
+
+; assert_eq — pass when `actual` equals `expected`; else throw a labelled
+; FAIL message naming both values.
+;   actual / expected : the produced value and the value the test asserts
+;   label             : a short name for the case (appears in the message)
+;   ->                : null on success (the assertion throws on failure)
+(bind assert_eq
+  (lambda (actual expected label)
+    (if (eq actual expected)
+      null
+      (throw (string_concat_many
+        "FAIL: " label
+        " (expected " (value_to_string expected)
+        ", got " (value_to_string actual) ")")))))
+
+; assert_true — pass when `cond` is truthy; else throw a labelled FAIL message.
+;   cond  : the value asserted to be truthy
+;   label : a short name for the case (appears in the message)
+;   ->    : null on success (the assertion throws on failure)
+(bind assert_true
+  (lambda (cond label)
+    (if cond
+      null
+      (throw (string_concat_many
+        "FAIL: " label " (expected truthy, got " (value_to_string cond) ")")))))
+
+; assert_false — pass when `cond` is falsy; else throw a labelled FAIL message.
+;   cond  : the value asserted to be falsy
+;   label : a short name for the case (appears in the message)
+;   ->    : null on success (the assertion throws on failure)
+(bind assert_false
+  (lambda (cond label)
+    (if cond
+      (throw (string_concat_many
+        "FAIL: " label " (expected falsy, got " (value_to_string cond) ")"))
+      null)))
+
+; assert_ne — pass when `actual` is NOT structurally equal to `unexpected`; else
+; throw. Uses value_eq (deep/structural), so two equal-but-distinct lists or maps
+; count as equal — the negation a test usually wants. (Kernel `eq` is by IDENTITY
+; for aggregates, which would let two equal lists spuriously satisfy a `!=`.)
+;   actual / unexpected : the produced value and the value it must differ from
+;   label               : a short name for the case
+;   ->                  : null on success (the assertion throws on failure)
+(bind assert_ne
+  (lambda (actual unexpected label)
+    (if (value_eq actual unexpected)
+      (throw (string_concat_many
+        "FAIL: " label " (expected != " (value_to_string unexpected)
+        ", got " (value_to_string actual) ")"))
+      null)))
+
+; assert_nil — pass when `x` is null; else throw a labelled FAIL message.
+;   x     : the value asserted to be null
+;   label : a short name for the case
+;   ->    : null on success (the assertion throws on failure)
+(bind assert_nil
+  (lambda (x label)
+    (if (eq x null)
+      null
+      (throw (string_concat_many
+        "FAIL: " label " (expected nil, got " (value_to_string x) ")")))))
+
+; assert_throws — pass when calling `thunk` (a 0-arg lambda) throws; else throw.
+; The thunk runs inside try/catch; ANY caught value (an explicit `throw` OR an
+; evaluation error) counts as the expected failure, so this is the positive form
+; of "expect a failure". A thunk that returns normally fails the assertion.
+;   thunk : a 0-arg producer expected to throw
+;   label : a short name for the case
+;   ->    : null on success (the assertion throws when the thunk did NOT throw)
+(bind assert_throws
+  (lambda (thunk label)
+    (bind ((threw (try (do (thunk) false) (catch e true))))
+      (if threw
+        null
+        (throw (string_concat_many
+          "FAIL: " label
+          " (expected the thunk to throw, but it returned normally)"))))))
+
+; assert_approx — pass when |a - b| <= eps; else throw. The inexact comparison
+; `assert_eq` cannot make: for floats, uses float_abs on the difference. The
+; message shows both values and the tolerance.
+;   a / b : the two (float) values to compare
+;   eps   : the inclusive absolute tolerance
+;   label : a short name for the case
+;   ->    : null on success (the assertion throws on failure)
+(bind assert_approx
+  (lambda (a b eps label)
+    (if (le (float_abs (float_sub a b)) eps)
+      null
+      (throw (string_concat_many
+        "FAIL: " label " (expected " (value_to_string b)
+        " +/- " (value_to_string eps) ", got " (value_to_string a) ")")))))
+
+(export assert_eq assert_true assert_false assert_ne assert_nil
+        assert_throws assert_approx)

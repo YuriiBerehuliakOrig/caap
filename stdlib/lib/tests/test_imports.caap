@@ -1,0 +1,71 @@
+; stdlib/lib/tests/test_imports.caap — unused-import analysis over raw forms.
+
+;; @area: passes
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.imports check_forms)
+(use stdlib.syntax.ast sym calln)
+(use stdlib.lib.collections.sequence any?)
+
+(do
+  (bind ((has (lambda (fs n) (any? fs (lambda (f) (string_contains f n))))))
+    (do
+      ; ── (use demo.mod a b) but only a referenced -> b unused ──
+      (assert_true
+        (has (check_forms (list_of
+               (calln "use" (list_of (sym "demo.mod") (sym "a") (sym "b")))
+               (sym "a")))
+             "unused import `b`")
+        "unused use-symbol flagged")
+
+      ; ── both used -> clean ──
+      (assert_eq
+        (size (check_forms (list_of
+                 (calln "use" (list_of (sym "demo.mod") (sym "a") (sym "b")))
+                 (calln "do" (list_of (sym "a") (sym "b"))))))
+        0
+        "all imports used is clean")
+
+      ; ── an unused (import mod alias) ──
+      (assert_true
+        (has (check_forms (list_of
+               (calln "import" (list_of (sym "demo.mod") (sym "al")))
+               (sym "other")))
+             "unused import `al`")
+        "unused import alias flagged")
+
+      ; ── re_export is never flagged (it re-publishes) ──
+      (assert_eq
+        (size (check_forms (list_of
+                 (calln "re_export" (list_of (sym "demo.mod") (sym "x"))))))
+        0
+        "re_export is not an unused import")
+
+      ; ── used only via (export …) is not unused ──
+      (assert_eq
+        (size (check_forms (list_of
+                 (calln "use" (list_of (sym "demo.mod") (sym "k")))
+                 (calln "export" (list_of (sym "k"))))))
+        0
+        "import used only by export counts as used")
+
+      ; ── a reference buried in a nested lambda body still counts as used
+      ; (names_set walks the whole tree) ──
+      (assert_eq
+        (size (check_forms (list_of
+                 (calln "use" (list_of (sym "demo.mod") (sym "deep")))
+                 (calln "bind" (list_of (sym "f")
+                   (calln "lambda" (list_of
+                     (calln "x" (list_of))
+                     (calln "deep" (list_of (sym "x"))))))))))
+        0
+        "import referenced only inside a nested lambda is used")
+
+      ; ── (use mod) with NO symbols imports nothing -> no findings ──
+      (assert_eq
+        (size (check_forms (list_of
+                 (calln "use" (list_of (sym "demo.mod")))
+                 (sym "whatever"))))
+        0
+        "symbol-less use imports nothing"))))

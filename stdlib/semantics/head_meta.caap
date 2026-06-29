@@ -1,0 +1,135 @@
+; stdlib/semantics/head_meta.caap — the SINGLE-SOURCE table of per-head
+; optimization metadata (module stdlib.semantics.head_meta).
+;
+; THREE optimization passes each carry their own hand-written whitelist of
+; kernel heads they may act on:
+;   - constfold.caap  `pure_heads`       — pure heads yielding an immutable
+;                                          scalar, foldable when args are literal.
+;   - dce.caap        `total_pure_heads` — pure + total heads, safe to drop an
+;                                          unused binding to.
+;   - licm.caap       `pure_total_heads` — the curated "total for EVERY input"
+;                                          scalar heads, safe to hoist onto a
+;                                          loop's zero-trip path.
+; Those three lists overlap heavily and encode the SAME underlying per-head
+; facts at three different cut points. This module factors those facts into ONE
+; table so the three lists are DERIVABLE from it, and a drift test
+; (stdlib/lib/tests/test_head_meta.caap) proves each pass's list still matches
+; its derivation. This is ADDITIVE: it does NOT rewire any pass — the passes
+; keep their own literal lists; head_meta is the reference the drift guard
+; checks them against.
+;
+; Axes (per head; any axis not set defaults to FALSE on lookup):
+;   pure            — a pure function of its arguments: no effect, result fully
+;                     determined by the args. (`println`, `set_ref`, `ref` are NOT.)
+;   total           — the DCE notion of total: safe to drop an unused binding to,
+;                     because on a real program's inputs it does not suppress an
+;                     error a later pass must preserve. Excludes the input-dependent
+;                     partial heads dce refuses to drop (int_div/int_mod/shifts/
+;                     string_to_int) and size. NOTE: this is WEAKER than the
+;                     "total on EVERY input AND every arity" bar dead_store.caap
+;                     uses ({eq,ne,list_of} only) — int_add (overflow) and map_of
+;                     (odd arity) are `total` HERE but NOT dead_store-total. A
+;                     single boolean cannot serve both notions; this axis encodes
+;                     dce's, which the three derivations below need.
+;   scalar_result   — returns an IMMUTABLE scalar (int / bool / string). FALSE
+;                     for the collection builders (list_of/map_of/string_chars),
+;                     whose result is a fresh MUTABLE object.
+;   may_throw       — can throw on SOME input (overflow / wrong-type / out-of-
+;                     range / parse failure). FALSE for the structural / truthiness
+;                     heads licm treats as total for every input (eq/ne/not/
+;                     value_type). CAVEAT: not/value_type are arity-1 and DO throw
+;                     on a wrong arity — licm tolerates them only because licm_pure?
+;                     ARITY-GATES them separately; this axis matches licm's (arity-
+;                     gated) view, so a consumer of may_throw? must apply the same
+;                     arity check before trusting not/value_type never to throw.
+;   allocates_fresh — yields a freshly-allocated object each call. (Informational
+;                     here — only the three collection builders this union touches
+;                     are tagged; the canonical fresh-allocation registry is
+;                     semantics/types/effects.caap `fresh_heads`, which is broader.
+;                     No derivation below reads this axis.)
+;   returns_mutable — the returned object is mutable (in-place mutation visible
+;                     to later evaluations if the node were shared). Informational;
+;                     no derivation reads it.
+;
+; Derivations the drift test pins (over the UNION of the three lists):
+;   constfold pure_heads      == { h : pure? AND scalar_result? }
+;   dce       total_pure_heads == { h : pure? AND total? }
+;   licm      pure_total_heads == { h : total? AND scalar_result? AND (not may_throw?) }
+(module stdlib.semantics.head_meta)
+
+; meta — build an axis map from a list of "axis-name" strings; every named axis
+; is set true, every unnamed axis defaults to false on lookup.
+(bind meta
+  (lambda (axes)
+    (bind ((m (map_of)))
+      (do (for a axes (assoc m a true)) m))))
+
+; head_metadata — the single source of truth: head name -> axis map. Heads are
+; grouped by their axis profile; the comment on each group is the rationale.
+(bind head_metadata
+  (bind ((t (map_of)))
+    (do
+      ; ── pure scalar arithmetic / bitwise, TOTAL (overflow/type throw, but the
+      ; dce notion of total accepts those: a real program's inputs don't make an
+      ; unused (int_add a b) the thing that must surface an error). may_throw,
+      ; because they DO throw on overflow / a non-int arg — which is why licm
+      ; (never-throw-on-any-input) excludes them.
+      (for h (list_of "int_add" "int_sub" "int_mul" "int_neg"
+                      "int_and" "int_or" "int_xor" "int_not")
+        (assoc t h (meta (list_of "pure" "total" "scalar_result" "may_throw"))))
+      ; ── pure scalar arithmetic that is PARTIAL on its inputs: div/mod throw on
+      ; a zero divisor, shifts on an out-of-range count. NOT total (dce refuses to
+      ; drop an unused binding to one — dropping it would suppress that throw).
+      (for h (list_of "int_div" "int_mod" "int_shl" "int_shr")
+        (assoc t h (meta (list_of "pure" "scalar_result" "may_throw"))))
+      ; ── eq / ne: IDENTITY equality (lists/maps/closures/refs by reference; the
+      ; structural twin is value_eq), returning a bool on ANY pair of values at
+      ; ANY arity. Pure, total, scalar, and TOTAL FOR EVERY INPUT (never throw) —
+      ; the licm-grade heads.
+      (for h (list_of "eq" "ne")
+        (assoc t h (meta (list_of "pure" "total" "scalar_result"))))
+      ; ── not: truthiness, returns a bool on ANY value. Never throws.
+      (assoc t "not" (meta (list_of "pure" "total" "scalar_result")))
+      ; ── value_type: returns a type-tag string for ANY value. Never throws —
+      ; same licm-grade profile as eq/ne/not.
+      (assoc t "value_type" (meta (list_of "pure" "total" "scalar_result")))
+      ; ── ordered comparisons: pure, total (dce drops them), scalar bool — but
+      ; they THROW comparing incomparable types, so NOT licm-grade.
+      (for h (list_of "lt" "gt" "le" "ge")
+        (assoc t h (meta (list_of "pure" "total" "scalar_result" "may_throw"))))
+      ; ── total string queries / builders yielding an immutable scalar
+      ; (string / bool). Pure + total; may throw on a wrong-type / out-of-range arg.
+      (for h (list_of "string_concat" "string_concat_many" "int_to_string"
+                      "string_starts_with" "string_ends_with" "string_contains"
+                      "string_slice")
+        (assoc t h (meta (list_of "pure" "total" "scalar_result" "may_throw"))))
+      ; ── string_to_int: pure scalar, but PARTIAL (parse failure) — NOT total.
+      (assoc t "string_to_int" (meta (list_of "pure" "scalar_result" "may_throw")))
+      ; ── size: pure scalar int, but PARTIAL (throws on a non-sized value) — NOT
+      ; total (dce refuses to drop it; constfold still folds a closed literal).
+      (assoc t "size" (meta (list_of "pure" "scalar_result" "may_throw")))
+      ; ── collection builders: pure and TOTAL, but the result is a FRESH MUTABLE
+      ; object, NOT an immutable scalar. constfold excludes them (folding would
+      ; bake one shared object into the IR); dce drops an unused one freely.
+      ; string_chars throws on a non-string arg (may_throw); list_of/map_of are
+      ; total for every input (never throw).
+      (assoc t "string_chars"
+        (meta (list_of "pure" "total" "allocates_fresh" "returns_mutable" "may_throw")))
+      (for h (list_of "list_of" "map_of")
+        (assoc t h (meta (list_of "pure" "total" "allocates_fresh" "returns_mutable"))))
+      t)))
+
+; ── axis query helpers: (h) -> bool, defaulting to false for an unknown head
+; or an unset axis. `axis?` is the shared lookup; the six named helpers wrap it.
+(bind axis?
+  (lambda (h ax)
+    (eq (get (get head_metadata h (map_of)) ax false) true)))
+(bind pure?            (lambda (h) (axis? h "pure")))
+(bind total?           (lambda (h) (axis? h "total")))
+(bind scalar_result?   (lambda (h) (axis? h "scalar_result")))
+(bind allocates_fresh? (lambda (h) (axis? h "allocates_fresh")))
+(bind returns_mutable? (lambda (h) (axis? h "returns_mutable")))
+(bind may_throw?       (lambda (h) (axis? h "may_throw")))
+
+(export head_metadata
+        pure? total? scalar_result? allocates_fresh? returns_mutable? may_throw?)

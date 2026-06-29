@@ -1,0 +1,66 @@
+; stdlib/lib/tests/test_tiers.caap — tier / layering check.
+
+;; @area: passes
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.tiers rank_of check_forms)
+(use stdlib.syntax.ast sym calln)
+(use stdlib.lib.collections.sequence any?)
+
+(do
+  (bind (
+    (has (lambda (fs n) (any? fs (lambda (f) (string_contains f n)))))
+    (mod (lambda (name) (calln "module" (list_of (sym name)))))
+    (use1 (lambda (m s) (calln "use" (list_of (sym m) (sym s)))))
+  )
+    (do
+      ; ── ranks ──
+      (assert_eq (rank_of "stdlib.backend.emit.llvm") 5 "backend rank 5")
+      (assert_eq (rank_of "stdlib.frontend.clike") 5 "frontend rank 5")
+      (assert_eq (rank_of "stdlib.storage.binary") 5 "storage rank 5 (top of tower)")
+      (assert_eq (rank_of "stdlib.semantics.types.registry") 4 "semantics rank 4")
+      (assert_eq (rank_of "stdlib.syntax.ast") 2 "syntax rank 2 (foundation)")
+      (assert_eq (rank_of "stdlib.sys.fs") 3 "sys rank 3")
+      (assert_eq (rank_of "stdlib.lib.collections.map") 2 "lib rank 2")
+      (assert_eq (rank_of "stdlib.expand") 0 "engine rank 0")
+
+      ; ── the `stdlib.` prefix is normalized: a short facade name ranks the
+      ; same as its fully-qualified form ──
+      (assert_eq (rank_of "sys.fs") (rank_of "stdlib.sys.fs")
+        "short facade name ranks like its qualified form")
+
+      ; ── violation: lib importing backend (upward) ──
+      (assert_true
+        (has (check_forms (list_of (mod "stdlib.lib.collections.foo")
+                                   (use1 "stdlib.backend.emit.llvm" "x")))
+             "must not import")
+        "lib -> backend upward edge flagged")
+
+      ; ── clean: lib -> lib ──
+      (assert_eq
+        (size (check_forms (list_of (mod "stdlib.lib.collections.foo")
+                                    (use1 "stdlib.lib.collections.map" "clone"))))
+        0
+        "lib -> lib is fine")
+
+      ; ── allowlisted exception: derive -> types ──
+      (assert_eq
+        (size (check_forms (list_of (mod "stdlib.semantics.passes.derive")
+                                    (use1 "stdlib.semantics.types.registry" "resolve"))))
+        0
+        "derive -> types is a documented exception")
+
+      ; ── second allowlisted exception: the tier-0 analyze service -> lib ──
+      (assert_eq
+        (size (check_forms (list_of (mod "stdlib.analyze")
+                                    (use1 "stdlib.syntax.ast" "loc"))))
+        0
+        "analyze (tier 0) -> lib is a documented exception")
+
+      ; ── downward: kits -> lib is fine ──
+      (assert_eq
+        (size (check_forms (list_of (mod "stdlib.backend.foo")
+                                    (use1 "stdlib.lib.collections.map" "clone"))))
+        0
+        "backend -> lib (downward) is fine"))))

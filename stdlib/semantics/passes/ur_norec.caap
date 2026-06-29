@@ -1,0 +1,74 @@
+; stdlib/semantics/passes/ur_norec.caap — NO-RECURSION analysis pass (module
+; stdlib.semantics.passes.ur_norec).
+;
+; A freestanding kernel (urun) is a FIXED, HEAPLESS image: threads run on
+; hand-built stacks carved into a static region, and there is no stack-overflow
+; trap. A (transitively) recursive function therefore grows the stack without
+; bound and corrupts memory at RUNTIME with NO diagnostic. This pass turns "no
+; recursion" into a STATIC, build-time property of the image: any recursive
+; definition aborts native codegen.
+;
+; It is SELF-CONTAINED (it does not reuse the loader's `callgraph` pass): at the
+; NATIVE gate the located forms are marker-led `(do <marker> (bind name value))`,
+; for which the loader's `def_of` returns null by design — so callgraph would see
+; zero definitions here. We decode each form with `decode_defn` (which reads the
+; marker-led shape), build a name->callees graph from the free NAME references in
+; each body, and flag any definition that can reach ITSELF. The reference set is a
+; conservative over-approximation (a free name that merely shadows a definition
+; counts as an edge), which only ever flags MORE — the safe direction for a gate.
+(module stdlib.semantics.passes.ur_norec)
+
+(use stdlib.syntax.ast name? name_of walk)
+(use stdlib.semantics.passes.monomorph decode_defn)
+(use stdlib.semantics.passes.registry install_pass! note!)
+
+; reaches? — can `from` reach `target` over the call edges, following callees
+; (DFS, `seen` guards against cycles among OTHER nodes). Called as
+; (reaches? edges nm nm (map_of)) it answers "is nm (transitively) recursive?".
+(bind reaches?
+  (lambda (edges from target seen)
+    (bind ((found (ref false)))
+      (do
+        (for c (get edges from (list_of))
+          (when (not (deref found))
+            (if (eq c target)
+              (set_ref found true)
+              (when (eq (get seen c) null)
+                (do (assoc seen c true)
+                    (when (reaches? edges c target seen) (set_ref found true)))))))
+        (deref found)))))
+
+; run — index every definition (name -> its located node), build the call graph
+; (name -> referenced definition names in its body), and emit a finding for each
+; recursive definition.
+(bind run
+  (lambda (located sink)
+    (bind ((defs (map_of)) (vals (map_of)) (edges (map_of)))
+      (do
+        (for f located
+          (bind ((d (decode_defn (get f "node"))))
+            (when (not (eq d null))
+              (do (assoc defs (get d "name") (get f "node"))
+                  (assoc vals (get d "name") (get d "value"))))))
+        (for nm (map_keys defs)
+          (bind ((es (map_of)))
+            (do
+              ; walk the body (the bound lambda), recording references to OTHER
+              ; definitions — including `nm` itself for a direct self-call.
+              (walk (get vals nm)
+                (lambda (n)
+                  (when (and (name? n) (not (eq (get defs (name_of n)) null)))
+                    (assoc es (name_of n) true))))
+              (assoc edges nm (map_keys es)))))
+        (for nm (map_keys defs)
+          (when (reaches? edges nm nm (map_of))
+            (note! sink "ur-norec" (get defs nm)
+              (string_concat_many "recursion is forbidden in the freestanding urun "
+                "kernel: `" nm "` is (transitively) recursive — unbounded stack "
+                "growth would overflow a thread's fixed stack"))))))))
+
+; register! — idempotent install. Self-contained: no producer dependency.
+(bind register!
+  (lambda () (install_pass! "ur-norec" (lambda (located sink) (run located sink)))))
+
+(export run register!)

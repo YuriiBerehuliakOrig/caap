@@ -1,0 +1,72 @@
+# CI for the `caap-peg` (+ `caap-peg-derive`) crates.
+#
+# Scoped to peg on purpose: peg is kept fmt/clippy/test/doc clean and MSRV-pinned,
+# so it gets a green gate independent of the rest of the workspace. Extend with a
+# workspace job once the other crates meet the same bar.
+name: peg-ci
+
+on:
+  push:
+    paths: ["peg/**", "peg-derive/**", ".github/workflows/peg-ci.yml"]
+  pull_request:
+    paths: ["peg/**", "peg-derive/**", ".github/workflows/peg-ci.yml"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt -p caap-peg -p caap-peg-derive -- --check
+
+  clippy:
+    name: clippy -D warnings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p caap-peg --all-targets -- -D warnings
+      - run: cargo clippy -p caap-peg --all-features --all-targets -- -D warnings
+      - run: cargo clippy -p caap-peg-derive --all-targets -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # default (lean) build, then the full feature set (derive/recovery/transaction).
+      - run: cargo test -p caap-peg
+      - run: cargo test -p caap-peg --all-features
+
+  docs:
+    name: rustdoc (deny missing_docs)
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The crate is #![deny(missing_docs)]; RUSTDOCFLAGS=-D warnings also fails on
+      # broken intra-doc links.
+      - run: cargo doc -p caap-peg --all-features --no-deps
+
+  msrv:
+    name: MSRV 1.82
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.82.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p caap-peg --all-features

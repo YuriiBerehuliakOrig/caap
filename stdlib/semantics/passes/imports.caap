@@ -1,0 +1,56 @@
+; stdlib/semantics/passes/imports.caap — unused-import analysis (module
+; stdlib.semantics.passes.imports).
+;
+; The loader CONSUMES `(use …)` / `(import …)` directives into scope bindings
+; before user passes run, so this cannot be a register_pass! over `located` — it
+; works on the RAW top-level forms (directives intact), like a project linter:
+;
+;   check_forms forms  -> findings   (the testable core; forms = raw specs)
+;   check_file  path   -> findings   (reads + decomposes a module file)
+;
+; An import is unused when its bound symbol is never referenced by any body or
+; `export` form. `(re_export …)` is always "used" (it re-publishes), so it is
+; never flagged. Run it as a tool over a tree (see the dogfood) for hygiene.
+(module stdlib.semantics.passes.imports)
+
+(use stdlib.syntax.ast name_of head_is? args_of arg loc)
+(use stdlib.syntax.ir names_set)
+(use stdlib.semantics.passes.registry finding_at)
+(use stdlib.semantics.passes.source_read read_leading_forms)
+
+; check_forms — unused-import findings over a module's raw top-level forms.
+(bind check_forms
+  (lambda (forms)
+    (bind ((findings (list_of)) (uses (map_of)) (imports (list_of)))
+      (do
+        ; pass 1 — record imported symbols; collect name uses from everything else
+        (for f forms
+          (cond
+            ((head_is? f "use")
+              (bind ((mod (name_of (arg f 0))))
+                (sequence_each (sequence_range 1 (size (args_of f)))
+                  (lambda (i)
+                    (append imports (assoc (map_of)
+                      "name" (name_of (arg f i)) "mod" mod "node" f))))))
+            ((head_is? f "import")
+              (append imports (assoc (map_of)
+                "name" (name_of (arg f 1)) "mod" (name_of (arg f 0)) "node" f)))
+            ((head_is? f "re_export") null)     ; re-published => used
+            ((head_is? f "module") null)        ; the module name is not a use
+            (else
+              (for k (map_keys (names_set f)) (assoc uses k true)))))
+        ; pass 2 — any imported symbol never referenced is unused
+        (for imp imports
+          (when (not (eq (get uses (get imp "name") false) true))
+            (append findings
+              (finding_at "imports" (loc (get imp "node"))
+                (string_concat_many "unused import `" (get imp "name")
+                  "` from `" (get imp "mod") "`")))))
+        findings))))
+
+; check_file — read a module file's raw top-level forms and check them.
+; The raw-form read is the shared sanctioned loader-bypass (source_read).
+(bind check_file
+  (lambda (path) (check_forms (read_leading_forms path))))
+
+(export check_forms check_file)

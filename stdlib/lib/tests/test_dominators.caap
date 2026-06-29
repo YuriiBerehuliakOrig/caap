@@ -1,0 +1,199 @@
+; stdlib/lib/tests/test_dominators.caap — dominators, immediate dominators, and
+; the dominance frontier over a CFG. Driven over hand-built AST like
+; test_dataflow: a straight-line `(do …)`, an `(if c t e)` DIAMOND (the entry
+; dominates the merge; the two arms dominate neither each other nor the merge),
+; and a `(while c body)` LOOP (the header dominates the body, and the header is
+; in its own dominance frontier). Block ids come from build_cfg's layout, which
+; we re-derive from the CFG structure (entry successors / single successor) so
+; the assertions read structurally rather than by magic number.
+
+;; @area: passes
+;; @kind: regression
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.dominators
+  dominators dominates? strictly_dominates? idom idom_of dominance_frontier)
+(use stdlib.semantics.dataflow
+  build_cfg cfg_block_ids cfg_succ cfg_pred cfg_entry)
+(use stdlib.syntax.ast sym calln)
+(use stdlib.lib.collections.sequence any?)
+
+(do
+  (bind (
+    ; a use of a name (e.g. as a call arg): (use x) mentions x
+    (use1 (lambda (x) (calln "use" (list_of (sym x)))))
+    ; does list `xs` contain `v`?
+    (has? (lambda (xs v) (any? xs (lambda (e) (eq e v)))))
+    ; do all block ids of `cfg` satisfy `pred`?
+    (all_ids (lambda (res cfg pred)
+      (bind ((ok (ref true)))
+        (do (for id (cfg_block_ids cfg) (unless (pred id) (set_ref ok false)))
+            (deref ok)))))
+    ; the first successor of `id` in `cfg` satisfying `pred` (or null)
+    (find_succ (lambda (cfg id pred)
+      (bind ((found (ref null)))
+        (do
+          (for s (cfg_succ cfg id)
+            (when (and (eq (deref found) null) (pred s)) (set_ref found s)))
+          (deref found)))))
+  )
+    (do
+      ; ════════════════════════════════════════════════════════════════════
+      ; 1. STRAIGHT-LINE (do a b c) — the entry dominates every block
+      ; ════════════════════════════════════════════════════════════════════
+      ; build_cfg keeps straight-line code in one block: ENTRY (0) flows to
+      ; EXIT (1). The entry dominates all; idom(EXIT) = ENTRY.
+      (bind (
+        (body (calln "do" (list_of (use1 "a") (use1 "b") (use1 "c"))))
+        (res (dominators body))
+        (cfg (get res "cfg"))
+        (entry (cfg_entry cfg))
+      )
+        (do
+          ; a block always dominates ITSELF
+          (assert_true (dominates? res entry entry)
+            "straight-line: a block dominates itself")
+          (assert_true (not (strictly_dominates? res entry entry))
+            "straight-line: a block does NOT strictly-dominate itself")
+          ; the entry dominates every block (it is on every path)
+          (assert_true
+            (all_ids res cfg (lambda (id) (dominates? res entry id)))
+            "straight-line: the entry dominates every block")
+          ; the entry has no immediate dominator
+          (assert_eq (idom_of res entry) null
+            "straight-line: the entry has no immediate dominator")))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 2. DIAMOND (if c (use a) (use b)) — the entry dominates the merge, the
+      ;    two arms dominate neither each other nor the merge; the arms' DF is
+      ;    exactly the merge block (Cytron et al.: where a φ goes).
+      ; ════════════════════════════════════════════════════════════════════
+      ; Layout: ENTRY(0) forks to the THEN arm and the ELSE arm (its two
+      ; successors); both arms flow to a single MERGE block; the merge flows to
+      ; EXIT. We read the arm ids off the entry's successor list and the merge
+      ; off an arm's (single) successor — no magic numbers.
+      (bind (
+        (body (calln "if" (list_of (sym "c") (use1 "a") (use1 "b"))))
+        (res (dominators body))
+        (cfg (get res "cfg"))
+        (entry (cfg_entry cfg))
+        (arms (cfg_succ cfg entry))
+        (then_arm (get arms 0))
+        (else_arm (get arms 1))
+        (merge (get (cfg_succ cfg then_arm) 0))
+      )
+        (do
+          ; the fork really is a two-way branch
+          (assert_eq (size arms) 2 "diamond: the entry forks two ways")
+          ; both arms reconverge on the SAME merge block
+          (assert_eq (get (cfg_succ cfg else_arm) 0) merge
+            "diamond: both arms reconverge on the merge block")
+
+          ; ── domination ──
+          ; the entry dominates the merge (every path through the diamond
+          ; passes the entry)
+          (assert_true (dominates? res entry merge)
+            "diamond: the entry dominates the merge")
+          ; but the entry does NOT dominate the merge STRICTLY-via an arm: each
+          ; arm dominates only itself among the diamond's interior — it does NOT
+          ; dominate the merge (the OTHER arm is a path that skips it)
+          (assert_true (not (dominates? res then_arm merge))
+            "diamond: the then-arm does NOT dominate the merge")
+          (assert_true (not (dominates? res else_arm merge))
+            "diamond: the else-arm does NOT dominate the merge")
+          ; the two arms do not dominate each other (disjoint paths)
+          (assert_true (not (dominates? res then_arm else_arm))
+            "diamond: the then-arm does NOT dominate the else-arm")
+          (assert_true (not (dominates? res else_arm then_arm))
+            "diamond: the else-arm does NOT dominate the then-arm")
+
+          ; ── immediate dominators ──
+          ; each arm's idom is the entry (the entry is the closest dominator)
+          (assert_eq (idom_of res then_arm) entry
+            "diamond: idom(then-arm) = entry")
+          (assert_eq (idom_of res else_arm) entry
+            "diamond: idom(else-arm) = entry")
+          ; the merge's idom is the entry too (NOT an arm — neither dominates it)
+          (assert_eq (idom_of res merge) entry
+            "diamond: idom(merge) = entry (not an arm)")
+          ; the same answer comes from the whole-body idom map
+          (assert_eq (get (idom body) (int_to_string merge)) entry
+            "diamond: idom map agrees that idom(merge) = entry")
+
+          ; ── dominance frontier ──
+          ; DF(then-arm) = DF(else-arm) = { merge } : an arm dominates a pred of
+          ; the merge (itself) but does not strictly dominate the merge, so the
+          ; merge is on each arm's frontier — exactly where a φ would sit.
+          (bind ((df (dominance_frontier res)))
+            (do
+              ; DF(then-arm) = exactly { merge }: one element, and it is merge
+              (assert_eq (size (get df (int_to_string then_arm))) 1
+                "diamond: DF(then-arm) has exactly one block")
+              (assert_true (has? (get df (int_to_string then_arm)) merge)
+                "diamond: DF(then-arm) = { merge }")
+              (assert_eq (size (get df (int_to_string else_arm))) 1
+                "diamond: DF(else-arm) has exactly one block")
+              (assert_true (has? (get df (int_to_string else_arm)) merge)
+                "diamond: DF(else-arm) = { merge }")
+              ; the entry strictly dominates the merge, so the merge is NOT on
+              ; the entry's frontier
+              (assert_true (not (has? (get df (int_to_string entry)) merge))
+                "diamond: the merge is NOT on the entry's dominance frontier")))))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 3. LOOP (while c (use body)) — the header dominates the body, and the
+      ;    header sits in its own dominance frontier (the back-edge target).
+      ; ════════════════════════════════════════════════════════════════════
+      ; Layout: ENTRY(0) flows to the loop HEADER; the header forks to the BODY
+      ; (which back-edges to the header) and to an AFTER block; after flows to
+      ; EXIT. We read the header off the entry's single successor, the body off
+      ; the header's successor that has a back-edge to the header.
+      (bind (
+        (body_node (calln "while" (list_of (sym "c") (use1 "body"))))
+        (res (dominators body_node))
+        (cfg (get res "cfg"))
+        (entry (cfg_entry cfg))
+        (header (get (cfg_succ cfg entry) 0))
+        ; the loop body is the header successor that branches BACK to the header
+        (body_blk
+          (find_succ cfg header
+            (lambda (s) (has? (cfg_succ cfg s) header))))
+      )
+        (do
+          ; the header is a genuine join: the entry AND the back-edge reach it
+          (assert_true (ge (size (cfg_pred cfg header)) 2)
+            "loop: the header has >= 2 predecessors (entry + back-edge)")
+          ; the body really back-edges to the header
+          (assert_true (has? (cfg_succ cfg body_blk) header)
+            "loop: the body back-edges to the header")
+
+          ; ── domination ──
+          ; the header dominates the body (every path to the body goes through
+          ; the header)
+          (assert_true (dominates? res header body_blk)
+            "loop: the header dominates the body")
+          (assert_true (strictly_dominates? res header body_blk)
+            "loop: the header STRICTLY dominates the body")
+          ; the entry dominates the header (and everything)
+          (assert_true (dominates? res entry header)
+            "loop: the entry dominates the header")
+          ; the body does NOT dominate the header (the first iteration reaches
+          ; the header without the body)
+          (assert_true (not (dominates? res body_blk header))
+            "loop: the body does NOT dominate the header")
+
+          ; ── immediate dominators ──
+          ; the header's idom is the entry; the body's idom is the header
+          (assert_eq (idom_of res header) entry "loop: idom(header) = entry")
+          (assert_eq (idom_of res body_blk) header "loop: idom(body) = header")
+
+          ; ── dominance frontier ──
+          ; the header is in its OWN dominance frontier: the body (which the
+          ; header dominates) has an edge back to the header, and the header
+          ; does not STRICTLY dominate itself — the loop signature.
+          (bind ((df (dominance_frontier res)))
+            (do
+              (assert_true (has? (get df (int_to_string header)) header)
+                "loop: the header is in its own dominance frontier")
+              (assert_true (has? (get df (int_to_string body_blk)) header)
+                "loop: the header is on the body's dominance frontier"))))))))

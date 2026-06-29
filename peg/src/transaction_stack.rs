@@ -1,3 +1,6 @@
+//! [`GrammarTransactionStack`] — a nestable stack of grammar transactions
+//! (the `transaction` feature) for grouping edits with savepoint semantics.
+
 use crate::grammar::Grammar;
 use crate::mutation::{diff_grammars, GrammarDiff, MutationOutcome};
 use crate::transaction::{GrammarTransaction, TransactionError};
@@ -15,8 +18,8 @@ use crate::transaction::{GrammarTransaction, TransactionError};
 /// # Usage
 ///
 /// ```
-/// # use caap_peg_port::{Grammar, GrammarTransactionStack};
-/// let grammar = Grammar::new("root <- 'x'").with_start_rule("root");
+/// # use caap_peg::{Grammar, GrammarTransactionStack};
+/// let grammar = Grammar::trusted_new("root <- 'x'").with_start_rule("root");
 /// let mut stack = GrammarTransactionStack::new(grammar);
 ///
 /// stack.begin();
@@ -37,6 +40,7 @@ impl GrammarTransactionStack {
         Self::with_options(grammar, true)
     }
 
+    /// Build a stack over `grammar` with configurable strict validation.
     pub fn with_options(grammar: Grammar, strict: bool) -> Self {
         Self {
             committed: grammar,
@@ -94,7 +98,7 @@ impl GrammarTransactionStack {
             let mut merged = committed_grammar.clone();
             merged.thaw();
             parent.replace_working(merged);
-            parent.append_operations(outcome.grammar_ops_placeholder());
+            parent.append_operations(outcome.grammar_ops_placeholder())?;
         } else {
             self.committed = committed_grammar.clone();
         }
@@ -105,10 +109,9 @@ impl GrammarTransactionStack {
 
     /// Roll back the top-of-stack transaction, discarding its changes.
     pub fn rollback(&mut self) -> Grammar {
-        if self.stack.is_empty() {
+        let Some(tx) = self.stack.pop() else {
             return self.committed.clone();
-        }
-        let tx = self.stack.pop().unwrap();
+        };
         let _base = tx.rollback();
         let current = self.current().clone();
         self.last_outcome = Some(MutationOutcome {
@@ -131,7 +134,7 @@ impl GrammarTransactionStack {
     /// - If no transaction is open, a new one is created, used, committed,
     ///   and the committed grammar is stored in `self.committed`.
     /// - If a transaction is already open, `f` operates on the top-of-stack
-    ///   transaction without nesting (consistent with Python's `stack_mutate`).
+    ///   transaction without nesting.
     pub fn mutate<F>(&mut self, f: F) -> Result<Grammar, TransactionError>
     where
         F: FnOnce(&mut GrammarTransaction) -> Result<(), TransactionError>,
@@ -147,7 +150,11 @@ impl GrammarTransactionStack {
             Ok(grammar)
         } else {
             // Operate on the existing top-of-stack without committing
-            let tx = self.stack.last_mut().unwrap();
+            let Some(tx) = self.stack.last_mut() else {
+                return Err(TransactionError::AlreadyFinalized(
+                    "no open transaction".to_string(),
+                ));
+            };
             f(tx)?;
             let grammar = tx.current().clone();
             self.last_outcome = Some(MutationOutcome {
@@ -180,7 +187,7 @@ mod tests {
     use crate::grammar::Grammar;
 
     fn base() -> Grammar {
-        Grammar::new("root <- 'x'").with_start_rule("root")
+        Grammar::trusted_new("root <- 'x'").with_start_rule("root")
     }
 
     #[test]

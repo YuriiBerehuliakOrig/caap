@@ -1,0 +1,152 @@
+; stdlib/lib/tests/test_gen.caap — in-language tests for lib/gen.
+;
+; gen builds composable random generators over stdlib.lib.random's pure,
+; seedable LCG, so every draw below is DETERMINISTIC: the pinned values are the
+; EXACT results produced from make_rng(42) (captured once). Loading this file
+; runs the assertions; a thrown "FAIL: …" is the failure signal. value_eq (not
+; bare eq) is used for lists/tuples because kernel `eq` is IDENTITY on lists.
+
+;; @area: numeric
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true assert_throws)
+(use stdlib.lib.random make_rng)
+(use stdlib.lib.gen
+  gen_const gen_int gen_bool gen_choose
+  gen_map gen_bind gen_one_of gen_frequency
+  gen_tuple gen_list)
+
+(do
+  ; ── gen_const: always the same value, rng still advances ────────────────────
+  (bind ((r0 (make_rng 42))
+         (c ((gen_const "X") r0)))
+    (do
+      (assert_eq (get c "value") "X" "gen_const yields the fixed value")
+      (assert_true (not (eq (get c "rng") r0)) "gen_const advances the rng")))
+
+  ; ── gen_int: uniform in the half-open [lo, hi); pinned + in-range ───────────
+  (assert_eq (get ((gen_int 10 20) (make_rng 42)) "value") 14
+    "gen_int(10,20) pinned draw from seed 42")
+  (assert_true
+    (bind ((v (get ((gen_int 0 100) (make_rng 99)) "value")))
+      (and (le 0 v) (lt v 100)))
+    "gen_int draws stay in [lo, hi)")
+  (assert_eq (get ((gen_int 5 5) (make_rng 42)) "value") 5
+    "gen_int collapses an empty range to lo")
+  ; same seed -> same draw (determinism)
+  (assert_eq
+    (get ((gen_int 0 1000) (make_rng 7)) "value")
+    (get ((gen_int 0 1000) (make_rng 7)) "value")
+    "gen_int is deterministic per seed")
+
+  ; ── gen_bool: a bare generator yielding a bool ──────────────────────────────
+  (assert_eq (get (gen_bool (make_rng 42)) "value") false
+    "gen_bool pinned draw from seed 42")
+  (assert_true
+    (bind ((v (get (gen_bool (make_rng 3)) "value")))
+      (or (eq v true) (eq v false)))
+    "gen_bool yields a bool")
+
+  ; ── gen_choose: picks AMONG the candidates; empty -> null ───────────────────
+  (assert_eq (get ((gen_choose (list_of "a" "b" "c")) (make_rng 42)) "value") "c"
+    "gen_choose pinned pick from seed 42")
+  (assert_true
+    (bind ((v (get ((gen_choose (list_of 10 20 30 40)) (make_rng 5)) "value")))
+      (or (eq v 10) (or (eq v 20) (or (eq v 30) (eq v 40)))))
+    "gen_choose returns one of the candidates")
+  (assert_eq (get ((gen_choose (list_of)) (make_rng 1)) "value") null
+    "gen_choose on empty -> null")
+
+  ; ── gen_map: transforms the value (fmap), leaving threading intact ──────────
+  (assert_eq (get ((gen_map (gen_int 0 10) (lambda (x) (int_mul x 2))) (make_rng 42)) "value") 8
+    "gen_map doubles the underlying int draw (4 -> 8)")
+  ; gen_map preserves the rng of the underlying generator
+  (assert_true
+    (bind ((base (gen_int 0 10))
+           (r0 (make_rng 13)))
+      (eq (get ((gen_map base (lambda (x) (int_add x 1))) r0) "rng")
+          (get (base r0) "rng")))
+    "gen_map threads the underlying rng unchanged")
+
+  ; ── gen_bind: the second generator depends on the first draw ────────────────
+  ; (gen_int 1 4) draws 3 from seed 42, so we build a 3-element bool list
+  (assert_true
+    (value_eq
+      (get ((gen_bind (gen_int 1 4) (lambda (n) (gen_list gen_bool n))) (make_rng 42)) "value")
+      (list_of true true false))
+    "gen_bind feeds the first draw (3) into a length-3 list generator")
+
+  ; ── gen_one_of: delegates to one of the generators; empty -> null ───────────
+  (assert_eq
+    (get ((gen_one_of (list_of (gen_const "p") (gen_const "q") (gen_const "r"))) (make_rng 42)) "value")
+    "r" "gen_one_of pinned pick from seed 42")
+  (assert_true
+    (bind ((v (get ((gen_one_of (list_of (gen_const 1) (gen_const 2))) (make_rng 8)) "value")))
+      (or (eq v 1) (eq v 2)))
+    "gen_one_of runs one of the member generators")
+  (assert_eq (get ((gen_one_of (list_of)) (make_rng 1)) "value") null
+    "gen_one_of on empty -> null")
+
+  ; ── gen_frequency: weights bias the pick; empty/zero-total -> null ──────────
+  ; with weights 1:99 the heavily-weighted "common" is picked from seed 42
+  (assert_eq
+    (get ((gen_frequency (list_of (list_of 1 (gen_const "rare"))
+                                  (list_of 99 (gen_const "common")))) (make_rng 42)) "value")
+    "common" "gen_frequency picks the heavily-weighted generator (seed 42)")
+  ; across many seeds the 1:99 split is overwhelmingly "common" (no rare-only run)
+  (assert_true
+    (bind ((commons (ref 0)))
+      (do
+        (sequence_each (sequence_range 0 200)
+          (lambda (s)
+            (if (eq (get ((gen_frequency (list_of (list_of 1 (gen_const "rare"))
+                                                  (list_of 99 (gen_const "common")))) (make_rng s)) "value")
+                    "common")
+              (set_ref commons (int_add (deref commons) 1))
+              null)))
+        ; with a 1:99 split, "common" should dominate (well over half of 200)
+        (gt (deref commons) 150)))
+    "gen_frequency respects the weights (1:99 picks common most of the time)")
+  (assert_eq (get ((gen_frequency (list_of)) (make_rng 1)) "value") null
+    "gen_frequency on empty -> null")
+  (assert_eq
+    (get ((gen_frequency (list_of (list_of 0 (gen_const "a")) (list_of 0 (gen_const "b")))) (make_rng 1)) "value")
+    null "gen_frequency with a zero total -> null")
+  (assert_throws
+    (lambda ()
+      ((gen_frequency (list_of (list_of -1 (gen_const "bad"))
+                               (list_of 2 (gen_const "ok"))))
+        (make_rng 1)))
+    "gen_frequency rejects negative weights")
+
+  ; ── gen_tuple: runs each gen in order, collecting values (a fixed shape) ─────
+  (assert_true
+    (value_eq
+      (get ((gen_tuple (list_of (gen_int 0 100) gen_bool (gen_const "k"))) (make_rng 42)) "value")
+      (list_of 94 true "k"))
+    "gen_tuple pinned tuple from seed 42")
+  (assert_eq
+    (size (get ((gen_tuple (list_of (gen_int 0 9) (gen_int 0 9))) (make_rng 5)) "value"))
+    2 "gen_tuple has one slot per generator")
+
+  ; ── gen_list: a fixed-length list of elem draws ─────────────────────────────
+  (assert_true
+    (value_eq
+      (get ((gen_list gen_bool 5) (make_rng 42)) "value")
+      (list_of false true true false false))
+    "gen_list pinned 5-bool list from seed 42")
+  (assert_eq
+    (size (get ((gen_list (gen_int 0 100) 7) (make_rng 3)) "value"))
+    7 "gen_list yields exactly `len` elements")
+  (assert_eq
+    (size (get ((gen_list gen_bool 0) (make_rng 3)) "value"))
+    0 "gen_list of length 0 is empty")
+
+  ; ── determinism across the whole module: same seed -> identical structure ───
+  (assert_true
+    (value_eq
+      (get ((gen_tuple (list_of (gen_int 0 50) gen_bool (gen_list (gen_int 0 9) 3))) (make_rng 123)) "value")
+      (get ((gen_tuple (list_of (gen_int 0 50) gen_bool (gen_list (gen_int 0 9) 3))) (make_rng 123)) "value"))
+    "a fixed seed reproduces an identical composite draw")
+
+  true)

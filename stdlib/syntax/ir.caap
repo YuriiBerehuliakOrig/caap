@@ -1,0 +1,626 @@
+; stdlib/syntax/ir.caap — tree REWRITING over kernel AST (module stdlib.syntax.ir).
+;
+; lib/ast knows the SHAPE of nodes (readers + builders); this module is the
+; OPERATIONS layer a middle-end lives on: traverse a tree rebuilding it,
+; replace nodes, substitute names, form new subtrees from old ones. Rewrites
+; are PURE — a transform returns a new tree, the input is never mutated — so
+; the same machinery is safe at compile time (inside forms/passes) and at
+; runtime (build → rewrite → eval_ir/render).
+;
+; ── the rewrite vocabulary (single entry point) ─────────────────────────────
+; One coherent surface; reach for the most specific that fits:
+;   traversal     transform           bottom-up rebuild, a per-node fn
+;   substitution  subst / subst_safe  name→spec inlining (safe = capture-avoiding)
+;   matching      match_node / rule   tree-shaped patterns, `?x` capture vars
+;   rewriting     rewrite / rewrite_fix    rule lists, one pass / to a fixpoint
+;   analysis      free_names / names_used / names_set / node_eq
+;   hygiene       gensym / rename_all       fresh names, alpha-renaming
+; (replace_heads is `transform` keyed by call head; rewrite_traced is `rewrite`
+; plus a per-application log — both convenience, not separate substrates.)
+;
+; ── where this sits among the three rewriting levels ────────────────────────
+; Three layers compute new trees; THIS module is the shared pure substrate the
+; other two stand on (it imports neither — they import the operations from here):
+;   expander.define_form (boot/expander.caap)
+;       per-HEAD syntax: registers (ctx node)->node, run at EXPANSION on each
+;       call of that head. The sugar layer; ZERO of it survives into the IR.
+;   lib.syntax.ir              ← here
+;       the operations a form's or a pass's body USES to build the replacement
+;       (transform/subst/match_node/rewrite/…). Pure: input tree never mutated.
+;   passes.install_transform (semantics/passes/registry.caap)
+;       whole-MODULE rewrites, runs AFTER expansion and BEFORE the check gate;
+;       mutates in place via `(assoc f "node" <new>)` — and that <new> is what
+;       this module's transform/rewrite computed. Granularity define_form can't
+;       reach (instrumenters, project-local lowerings, module-wide peepholes).
+;
+; ── span inheritance (C3) ───────────────────────────────────────────────────
+; ctfe_spec_with_span re-stamps a node's ROOT span from a donor node (or a span
+; map; `null` clears it). transform/subst donate the ORIGINAL node's span onto
+; every rebuilt call, so a tree that came from source keeps its locations under
+; rewriting and diagnostics stay pin-pointed. Two boundaries, by design:
+;   - leaf names/literals are returned as-is (they already carry their span);
+;   - freshly SYNTHESIZED nodes (a rewrite TEMPLATE's root, a binder rebuilt by
+;     subst_safe / rename_all for hygiene) carry their own build-time span —
+;     usually none. Source spans propagate; invented structure does not borrow a
+;     location it never had. (See the C3 test in lib/tests/test_ir.caap.)
+(module stdlib.syntax.ir)
+
+(use stdlib.syntax.ast call? name? literal? string_lit? name_of literal_of
+     head_of args_of items_of bind_pairs call walk)
+(use stdlib.lib.collections.sequence map all? range find contains? drop prepend)
+(use stdlib.lib.core.equal deep_eq)
+(use stdlib.lib.collections.map clone delete!)
+(use stdlib.syntax.render render)
+
+; transform — bottom-up rewrite of a tree.
+;   node : the root spec
+;   f    : (node) -> replacement spec | null (null = keep the node)
+;   ->   : the new tree (input never mutated)
+; Children are rebuilt FIRST, then `f` sees the rebuilt node — so a folding
+; rule observes already-folded arguments ((int_add 1 (int_add 2 3)) folds in
+; one pass). The bottom-up substrate every other rewriter here is built on.
+(bind transform_walk
+  (lambda (self node f)
+    (bind (
+      (rebuilt
+        (if (call? node)
+          ; rebuilt nodes inherit the original's span (C3, see header) — so
+          ; located diagnostics survive rewriting
+          (ctfe_spec_with_span
+            (call (self self (syntax_call_callee node) f)
+                  (map (args_of node) (lambda (a) (self self a f))))
+            node)
+          node))
+      (r (f rebuilt))
+    )
+      (if (eq r null) rebuilt r))))
+(bind transform
+  (lambda (node f) (transform_walk transform_walk node f)))
+
+; segment_var? — a SEGMENT pattern variable (`?xs..`): captures a SLICE of an
+; argument list (any number of arguments) instead of one node.
+(bind segment_var?
+  (lambda (n)
+    (bind ((nm (name_of n)))
+      (and (not (eq nm null))
+           (and (string_starts_with nm "?") (string_ends_with nm ".."))))))
+
+; subst — substitute NAME nodes from a map, everywhere in the tree.
+;   node     : the root spec
+;   bindings : map of identifier -> replacement spec, or -> LIST of specs
+;              (a segment capture), which SPLICES into its argument list
+; The classic inliner/specializer step. Names absent from the map stay
+; untouched; a spliced segment outside argument position is a certain error.
+(bind subst_walk
+  (lambda (self node b)
+    (cond
+      ((name? node)
+        (bind ((r (get b (name_of node))))
+          (cond
+            ((eq r null) node)
+            ((eq (value_type r) "list")
+              (throw (string_concat_many
+                "subst: segment `" (name_of node)
+                "` can only be spliced into an argument list")))
+            (else r))))
+      ((call? node)
+        (ctfe_spec_with_span
+          (call (self self (syntax_call_callee node) b)
+            (bind ((out (list_of)))
+              (do
+                (for a (args_of node)
+                  (bind (
+                    (nm (name_of a))
+                    (r (if (eq nm null) null (get b nm)))
+                  )
+                    (if (and (not (eq r null)) (eq (value_type r) "list"))
+                      (for item r (append out item))
+                      (append out (self self a b)))))
+                out)))
+          node))
+      (else node))))
+(bind subst
+  (lambda (node bindings) (subst_walk subst_walk node bindings)))
+
+; replace_heads — rewrite calls by HEAD name from a rules map.
+;   node  : the root spec
+;   rules : map of head identifier -> (call_node) -> replacement | null
+;   ->    : the new tree
+; Sugar over transform for the common "pattern-match on the head" rewriter
+; (renames, lowerings, peephole rules keyed by operation). For value-shaped
+; patterns (capture vars, literals in argument position) reach for `rewrite`.
+(bind replace_heads
+  (lambda (node rules)
+    (transform node
+      (lambda (n)
+        (bind ((h (if (call? n) (name_of (syntax_call_callee n)) null)))
+          (bind ((rule (if (eq h null) null (get rules h))))
+            (if (eq rule null) null (rule n))))))))
+
+; ── structural equality / analysis / hygiene ────────────────────────────────
+
+; node_eq — structural equality of two trees: names by identifier, literals by
+; deep value, calls by callee + args pairwise. SPANS are ignored — equality is
+; by shape, so a rewritten tree compares equal to its source.
+;   a, b : two specs
+;   ->   : bool
+; The comparator rewriters and their tests live on it; also what makes
+; NONLINEAR patterns work (a repeated `?x` must capture equal subtrees) and how
+; rewrite_fix detects "no change".
+(bind node_eq_walk
+  (lambda (self a b)
+    (cond
+      ((and (name? a) (name? b)) (eq (name_of a) (name_of b)))
+      ((and (literal? a) (literal? b)) (deep_eq (literal_of a) (literal_of b)))
+      ((and (call? a) (call? b))
+        (and (self self (syntax_call_callee a) (syntax_call_callee b))
+             (and (eq (size (args_of a)) (size (args_of b)))
+                  (all? (range 0 (size (args_of a)))
+                    (lambda (i)
+                      (self self (get (args_of a) i)
+                                 (get (args_of b) i)))))))
+      (else false))))
+(bind node_eq
+  (lambda (a b) (node_eq_walk node_eq_walk a b)))
+
+; names_used — every name identifier appearing in the tree (with duplicates,
+; in visit order; -> a list of strings). The CONSERVATIVE capture check: a
+; substitution is safe when the inserted tree's names don't collide with ANY
+; name used under a binder — stricter than free-variable analysis, never wrong.
+(bind names_used
+  (lambda (node)
+    (bind ((out (list_of)))
+      (do
+        (walk node
+          (lambda (n)
+            (bind ((nm (name_of n)))
+              (when (not (eq nm null)) (append out nm)))))
+        out))))
+
+; names_set — the SET (name->true) of every name read in `node`; the membership
+; form of names_used, for "is this name used here?" queries (the shared
+; primitive analysis passes build on instead of re-walking name nodes).
+(bind names_set
+  (lambda (node)
+    (bind ((s (map_of)))
+      (do
+        (walk node
+          (lambda (n)
+            (bind ((nm (name_of n)))
+              (when (not (eq nm null)) (assoc s nm true)))))
+        s))))
+
+; gensym — a fresh name ("prefix__gN") for let-insertion/unrolling and the
+; alpha-renaming subst_safe leans on. The `__g` spelling never appears in
+; written source (the checker's naming rules would flag it), so counter
+; freshness suffices for hygiene.
+;   prefix : a readable stem for the generated name
+;   ->     : a never-before-returned identifier string
+(bind gensym_counter (ref 0))
+(bind gensym
+  (lambda (prefix)
+    (do
+      (set_ref gensym_counter (int_add (deref gensym_counter) 1))
+      (string_concat_many prefix "__g" (int_to_string (deref gensym_counter))))))
+
+; ── pattern rules ───────────────────────────────────────────────────────────
+; A pattern is an ORDINARY tree where a name starting with `?` is a variable:
+;   (int_add ?x 0)  matches any int_add whose second arg is the literal 0,
+;                   capturing the first arg as "?x".
+; Bindings keep the full `?x` key, so a TEMPLATE instantiates with plain
+; subst — patterns, templates and rewriting share one substrate.
+
+; pattern_var? — a SCALAR pattern variable (`?x` but not a `?xs..` segment).
+(bind pattern_var?
+  (lambda (n)
+    (bind ((nm (name_of n)))
+      (and (not (eq nm null))
+           (and (string_starts_with nm "?")
+                (not (string_ends_with nm "..")))))))
+
+; list_node_eq — pairwise node_eq of two spec lists (nonlinear segments).
+(bind list_node_eq
+  (lambda (xs ys)
+    (and (eq (size xs) (size ys))
+         (all? (range 0 (size xs))
+           (lambda (i) (node_eq (get xs i) (get ys i)))))))
+
+; seg_index — position of the single segment variable among pattern args
+; (-1 = none). TWO segments in one list are rejected as a certain error: this is
+; an INHERENT ambiguity, not a missing feature. `(f ?a.. ?b..)` against
+; `(f 1 2 3)` admits many splits (a=[] b=[1 2 3], a=[1] b=[2 3], …) with no
+; principled boundary, so the only safe behaviour is to reject rather than pick
+; one arbitrarily. (A fixed separator between the two — `(f ?a.. X ?b..)` — would
+; disambiguate, but match_args splits on a single segment and that extension is
+; out of scope; reach for two rules or an explicit separator instead.)
+(bind seg_index
+  (lambda (pargs)
+    (bind ((idx (ref -1)))
+      (do
+        (for i (range 0 (size pargs))
+          (when (segment_var? (get pargs i))
+            (do
+              (when (not (eq (deref idx) -1))
+                (throw "match: at most one segment variable per argument list"))
+              (set_ref idx i))))
+        (deref idx)))))
+
+; match_args — argument lists, with at most one `?xs..` segment: the fixed
+; prefix/suffix match pairwise, the middle slice is the segment's capture.
+(bind match_args
+  (lambda (mself pargs nargs b)
+    (bind ((si (seg_index pargs)))
+      (if (eq si -1)
+        (if (not (eq (size pargs) (size nargs)))
+          null
+          (bind ((failed (map_of)))
+            (do
+              (for i (range 0 (size pargs))
+                (when (eq (mself mself (get pargs i)
+                                       (get nargs i) b) null)
+                  (assoc failed "v" true)))
+              (if (eq (get failed "v") null) b null))))
+        (bind (
+          (n_pre si)
+          (n_post (int_sub (int_sub (size pargs) si) 1))
+        )
+          (if (lt (size nargs) (int_add n_pre n_post))
+            null
+            (bind ((failed (map_of)) (seg (list_of)))
+              (do
+                (for i (range 0 n_pre)
+                  (when (eq (mself mself (get pargs i)
+                                         (get nargs i) b) null)
+                    (assoc failed "v" true)))
+                (for i (range 0 n_post)
+                  (when (eq (mself mself
+                              (get pargs (int_add si (int_add i 1)))
+                              (get nargs
+                                   (int_add (int_sub (size nargs) n_post) i)) b) null)
+                    (assoc failed "v" true)))
+                (for i (range n_pre (int_sub (size nargs) n_post))
+                  (append seg (get nargs i)))
+                (if (not (eq (get failed "v") null))
+                  null
+                  (bind (
+                    (nm (name_of (get pargs si)))
+                    (prev (get b nm))
+                  )
+                    (cond
+                      ((eq prev null) (do (assoc b nm seg) b))
+                      ((list_node_eq prev seg) b)
+                      (else null))))))))))))
+
+; match_node — match `node` against `pattern`.
+;   pattern : a tree where `?x` is a scalar var and `?xs..` a segment var
+;   node    : the candidate subtree
+;   ->      : bindings map ("?x" -> captured subtree, "?xs.." -> list) | null
+; A repeated variable must capture structurally equal subtrees (node_eq). The
+; bindings feed straight into `subst` to instantiate a template.
+(bind match_walk
+  (lambda (self pattern node b)
+    (cond
+      ((pattern_var? pattern)
+        (bind ((prev (get b (name_of pattern))))
+          (cond
+            ((eq prev null) (do (assoc b (name_of pattern) node) b))
+            ((node_eq prev node) b)
+            (else null))))
+      ((name? pattern)
+        (if (eq (name_of pattern) (name_of node)) b null))
+      ((literal? pattern)
+        (if (and (literal? node)
+                 (deep_eq (literal_of pattern) (literal_of node)))
+          b null))
+      ((call? pattern)
+        (if (not (call? node))
+          null
+          (bind ((r (self self (syntax_call_callee pattern)
+                               (syntax_call_callee node) b)))
+            (if (eq r null) null
+              (match_args self (args_of pattern) (args_of node) b)))))
+      (else null))))
+(bind match_node
+  (lambda (pattern node)
+    (match_walk match_walk pattern node (map_of))))
+
+; rule — one rewrite rule (sugar for the {pattern, template} record).
+;   pattern  : the tree to match (with `?`-vars)
+;   template : the tree to instantiate with the captured bindings
+;   ->       : { "pattern": …, "template": … } for `rewrite` / `rewrite_fix`
+(bind rule
+  (lambda (pattern template)
+    (assoc (map_of) "pattern" pattern "template" template)))
+
+; rewrite — apply pattern rules over the whole tree, bottom-up: at each
+; (already-rebuilt) node the FIRST matching rule's template is instantiated
+; with the captured bindings. One pass; use `rewrite_fix` when rules feed each
+; other and you want convergence.
+;   node / rules : the tree and a list of `rule` records
+;   ->           : the rewritten tree (one bottom-up pass)
+(bind rewrite
+  (lambda (node rules)
+    (transform node
+      (lambda (n)
+        (bind ((hit (find rules
+                      (lambda (r) (not (eq (match_node (get r "pattern") n)
+                                           null))))))
+          (if (eq hit null) null
+            (subst (get hit "template")
+                   (match_node (get hit "pattern") n))))))))
+
+; ── binder-aware scope machinery ────────────────────────────────────────────
+; The kernel's binding forms, as this layer understands them:
+;   (lambda PARAMS body…)     PARAMS = literal tuple of strings | call of names
+;   (bind name value rest…)   flat let*: `name` scopes over the rest
+;   (bind "n1" v1 … body…)    canonical merged bind (string-literal pairs)
+
+; binder_params — a lambda's parameter NAME strings (either kernel shape).
+(bind binder_params
+  (lambda (pnode)
+    (bind ((out (list_of)))
+      (do
+        (cond
+          ((literal? pnode)
+            (bind ((v (literal_of pnode)))
+              (when (not (eq v null))
+                (for p v
+                  (when (eq (value_type p) "string") (append out p))))))
+          ((call? pnode)
+            (for item (items_of pnode)
+              (bind ((nm (name_of item)))
+                (when (not (eq nm null)) (append out nm)))))
+          (else null))
+        out))))
+
+; free_names — names not bound WITHIN the tree (lambda params and both bind
+; shapes are scoped; everything else — including call heads like int_add —
+; refers outward and is free). Deduplicated, in first-use order.
+(bind free_walk
+  (lambda (self node bound out)
+    (cond
+      ((name? node)
+        (bind ((nm (name_of node)))
+          (when (and (not (eq (get bound nm) true))
+                     (not (contains? out nm)))
+            (append out nm))))
+      ((call? node)
+        (bind ((h (head_of node)) (args (args_of node)))
+          (cond
+            ((eq h "lambda")
+              (bind ((child (clone bound)))
+                (do
+                  (for p (binder_params (get args 0))
+                    (assoc child p true))
+                  (for k (range 1 (size args))
+                    (self self (get args k) child out)))))
+            ((and (eq h "bind") (name? (get args 0)))
+              (bind ((child (clone bound)))
+                (do
+                  (self self (get args 1) bound out)
+                  (assoc child (name_of (get args 0)) true)
+                  (for k (range 2 (size args))
+                    (self self (get args k) child out)))))
+            ((and (eq h "bind") (string_lit? (get args 0)))
+              (bind ((bp (bind_pairs node)) (child (clone bound)))
+                (do
+                  ; let*: each value sees the names bound before it
+                  (for p (get bp "pairs" (list_of))
+                    (do
+                      (self self (get p "value") child out)
+                      (assoc child (get p "name") true)))
+                  (for b (get bp "body" (list_of))
+                    (self self b child out)))))
+            (else
+              (do
+                (self self (syntax_call_callee node) bound out)
+                (for a args (self self a bound out)))))))
+      (else null))))
+(bind free_names
+  (lambda (node)
+    (bind ((out (list_of)))
+      (do (free_walk free_walk node (map_of) out) out))))
+
+; rename_all — uniformly rename ONE identifier across a tree, INCLUDING
+; binder positions (lambda param entries, flat-bind names, canonical-bind
+; string-literal names). Uniform renaming to a FRESH name (gensym) is alpha-safe
+; even across inner rebinders of the same identifier; the hygiene primitive
+; subst_safe uses to dodge capture.
+;   node     : the spec
+;   from, to : the identifier to rename and its replacement
+;   ->       : the renamed tree
+(bind rename_params
+  (lambda (pnode from to)
+    (cond
+      ((literal? pnode)
+        (bind ((v (literal_of pnode)))
+          (if (eq v null) pnode
+            (syntax_literal
+              (map v (lambda (p) (if (eq p from) to p)))))))
+      ((call? pnode)
+        (bind ((names (map (items_of pnode)
+                        (lambda (it)
+                          (bind ((nm (name_of it)))
+                            (syntax_name (if (eq nm from) to nm)))))))
+          (call (get names 0) (drop names 1))))
+      (else pnode))))
+(bind rename_walk
+  (lambda (self node from to)
+    (cond
+      ((name? node)
+        (if (eq (name_of node) from) (syntax_name to) node))
+      ((call? node)
+        (bind ((h (head_of node)) (args (args_of node)))
+          (if (eq h "lambda")
+            (call (syntax_call_callee node)
+              (prepend (rename_params (get args 0) from to)
+                       (map (drop args 1)
+                            (lambda (a) (self self a from to)))))
+            (call (self self (syntax_call_callee node) from to)
+              (bind ((out (list_of)))
+                (do
+                  (for a args
+                    (append out
+                      (if (and (eq h "bind") (string_lit? a)
+                               (eq (literal_of a) from))
+                        (syntax_literal to)
+                        (self self a from to))))
+                  out))))))
+      (else node))))
+(bind rename_all
+  (lambda (node from to) (rename_walk rename_walk node from to)))
+
+; subst_safe — capture-AVOIDING substitution (plain-name inlining):
+;   - a name REBOUND by a binder is not substituted inside it (shadowing)
+;   - a binder whose name collides with the replacements' free names is
+;     alpha-renamed (gensym) before descending
+; Use for inlining hand-built shapes; the `?x`-keyed rewrite path needs none
+; of this (no source binder can bind a `?` name). Canonical string-binds get
+; the shadowing rule only.
+;   node     : the root spec
+;   bindings : map of identifier -> replacement spec (LIST = segment splice)
+;   ->       : the substituted tree
+; Unlike `subst`, the binders it rebuilds for hygiene are fresh structure and
+; carry no donated span (see the C3 note in the header).
+(bind binder_guard
+  ; shared shadow+rename step: returns {live, node} — the bindings that
+  ; remain in force under the binder, and the (possibly renamed) node.
+  (lambda (node b bound_names)
+    (bind ((live (clone b)) (cur (ref node)))
+      (do
+        (for p bound_names
+          (when (contains live p) (delete! live p)))
+        (when (gt (size live) 0)
+          (bind ((collide (map_of)))
+            (do
+              (for k (map_keys live)
+                (bind ((v (get live k)))
+                  (for nm (if (eq (value_type v) "list")
+                            (bind ((acc (list_of)))
+                              (do (for item v
+                                    (for n2 (names_used item) (append acc n2)))
+                                  acc))
+                            (names_used v))
+                    (assoc collide nm true))))
+              (for p bound_names
+                (when (eq (get collide p) true)
+                  (set_ref cur (rename_all (deref cur) p (gensym p))))))))
+        (assoc (map_of) "live" live "node" (deref cur))))))
+
+(bind subst_safe_walk
+  (lambda (self node b)
+    (cond
+      ((name? node)
+        (bind ((r (get b (name_of node))))
+          (cond
+            ((eq r null) node)
+            ((eq (value_type r) "list")
+              (throw (string_concat_many
+                "subst_safe: segment `" (name_of node)
+                "` can only be spliced into an argument list")))
+            (else r))))
+      ((call? node)
+        (bind ((h (head_of node)))
+          (cond
+            ((eq h "lambda")
+              (bind ((g (binder_guard node b
+                          (binder_params (get (args_of node) 0)))))
+                (bind ((live (get g "live")) (n2 (get g "node")))
+                  (if (eq (size live) 0) n2
+                    (call (syntax_call_callee n2)
+                      (prepend (get (args_of n2) 0)
+                               (map (drop (args_of n2) 1)
+                                    (lambda (a) (self self a live)))))))))
+            ((and (eq h "bind") (name? (get (args_of node) 0)))
+              (bind ((g (binder_guard node b
+                          (list_of (name_of (get (args_of node) 0))))))
+                (bind ((live (get g "live")) (n2 (get g "node")))
+                  (call (syntax_call_callee n2)
+                    (bind ((out (list_of (get (args_of n2) 0)
+                                         (self self (get (args_of n2) 1) b))))
+                      (do
+                        (for k (range 2 (size (args_of n2)))
+                          (append out
+                            (self self (get (args_of n2) k) live)))
+                        out))))))
+            ((and (eq h "bind") (string_lit? (get (args_of node) 0)))
+              ; canonical bind: shadowing only — each pair's value uses the
+              ; let* scope so far; the bound name drops out of `live` after
+              (bind ((bp (bind_pairs node)) (live (clone b)) (out (list_of)))
+                (do
+                  (for p (get bp "pairs" (list_of))
+                    (do
+                      (append out (syntax_literal (get p "name")))
+                      (append out (self self (get p "value") (clone live)))
+                      (when (contains live (get p "name"))
+                        (delete! live (get p "name")))))
+                  (for b2 (get bp "body" (list_of))
+                    (append out (self self b2 live)))
+                  (call (syntax_call_callee node) out))))
+            (else
+              (call (self self (syntax_call_callee node) b)
+                (bind ((out (list_of)))
+                  (do
+                    (for a (args_of node)
+                      (bind ((nm (name_of a))
+                             (r (if (eq nm null) null (get b nm))))
+                        (if (and (not (eq r null)) (eq (value_type r) "list"))
+                          (for item r (append out item))
+                          (append out (self self a b)))))
+                    out)))))))
+      (else node))))
+(bind subst_safe
+  (lambda (node bindings) (subst_safe_walk subst_safe_walk node bindings)))
+
+; ── fixpoint + traced rewriting ─────────────────────────────────────────────
+
+; rewrite_fix — rewrite to a FIXPOINT (rules that feed each other converge
+; across passes); diverging rule sets are a certain error, not a hang.
+;   node / rules : the tree and a list of `rule` records
+;   ->           : the converged tree (throws after 100 non-converging passes)
+(bind rewrite_fix
+  (lambda (node rules)
+    (bind ((cur (ref node)) (steps (ref 0)) (done (ref false)))
+      (do
+        (while (and (not (deref done)) (lt (deref steps) 100))
+          (bind ((nxt (rewrite (deref cur) rules)))
+            (if (node_eq nxt (deref cur))
+              (set_ref done true)
+              (do
+                (set_ref cur nxt)
+                (set_ref steps (int_add (deref steps) 1))))))
+        (if (deref done)
+          (deref cur)
+          (throw "rewrite_fix: no fixpoint after 100 passes (diverging rules?)"))))))
+
+; rewrite_traced — rewrite + a TRACE of every application, for debugging
+; rule sets.
+;   node / rules : the tree and a list of `rule` records
+;   ->           : { "result": tree, "trace": [{ "rule", "before", "after" }…] }
+;                  where each trace field is render-ed source text
+(bind rewrite_traced
+  (lambda (node rules)
+    (bind ((trace (list_of)))
+      (bind ((result
+        (transform node
+          (lambda (n)
+            (bind ((hit (find rules
+                          (lambda (r)
+                            (not (eq (match_node (get r "pattern") n)
+                                     null))))))
+              (if (eq hit null) null
+                (bind ((after (subst (get hit "template")
+                                     (match_node (get hit "pattern") n))))
+                  (do
+                    (append trace
+                      (assoc (map_of)
+                        "rule" (render (get hit "pattern"))
+                        "before" (render n)
+                        "after" (render after)))
+                    after))))))))
+        (assoc (map_of) "result" result "trace" trace)))))
+
+(export transform subst subst_safe replace_heads
+        node_eq names_used names_set free_names gensym rename_all
+        pattern_var? segment_var? match_node rule rewrite
+        rewrite_fix rewrite_traced)

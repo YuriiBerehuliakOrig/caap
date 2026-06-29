@@ -1,0 +1,215 @@
+; stdlib/lib/text/string.caap — string helpers (module stdlib.lib.text.string).
+;
+; Clean-named facades over the kernel string_* builtins, plus derived helpers.
+; Indices are character indices; find returns null on a miss.
+(module stdlib.lib.text.string)
+
+(use stdlib.lib.collections.option some none)
+
+; ── facades over kernel string_* ────────────────────────────────────────────
+; Builtins are first-class values, so a facade is just a rename.
+(bind split        string_split)        ; (s sep) -> list of parts
+(bind trim         string_trim)         ; (s) -> s without surrounding whitespace
+(bind upcase       string_upcase)       ; (s) -> UPPER
+(bind downcase     string_downcase)     ; (s) -> lower
+(bind replace      string_replace)      ; (s from to) -> s with all `from` -> `to`
+(bind repeat       string_repeat)       ; (s n) -> s repeated n times
+(bind lines        string_lines)        ; (s) -> list of lines
+(bind slice        string_slice)        ; (s start [end]) -> substring
+(bind find         string_find)         ; (s needle [start]) -> index | null
+(bind contains?    string_contains)     ; (s needle) -> bool
+(bind starts_with? string_starts_with)  ; (s prefix) -> bool
+(bind ends_with?   string_ends_with)    ; (s suffix) -> bool
+(bind concat       string_concat_many)  ; (s…) -> joined
+(bind to_string    value_to_string)     ; (any value) -> its string form
+
+; ── derived helpers ─────────────────────────────────────────────────────────
+(defn length ((s string)) int (size s))
+(defn empty? ((s string)) bool (eq (size s) 0))
+
+; char_at — the 1-character string at `i`.
+;   s : the string
+;   i : 0-based character index
+;   -> : a 1-char string, or null when `i` is out of range
+(bind char_at
+  (lambda (s i)
+    (bind ((c (string_slice s i (int_add i 1))))
+      (if (eq c "") null c))))
+
+; parse_int — parse a base-10 integer, totally.
+;   s  : the candidate string (surrounding whitespace is ignored)
+;   -> : (some n) on success, (none) when `s` is not an integer
+; kernel `try` catches the parser's evaluation error, so the kernel parser IS
+; the validator — exactly what it accepts, we accept (no hand-kept character
+; pre-scan that could drift from it).
+(bind parse_int
+  (lambda (s)
+    (try (some (string_to_int (string_trim s)))
+      (catch e (none)))))
+
+; parse_float — parse a decimal float, totally (same contract as parse_int).
+;   s  : the candidate string
+;   -> : (some f) on success, (none) when `s` is not a number
+(bind parse_float
+  (lambda (s)
+    (try (some (string_to_float (string_trim s)))
+      (catch e (none)))))
+
+; chars — explode a string into a list of 1-character strings.
+;   s  : a string
+;   -> : ["h" "i" …]
+; kernel string_chars is O(n) and unicode-aware (the per-index slice loop
+; this replaced re-scanned the string on every call)
+(bind chars string_chars)
+
+; pad_left / pad_right — pad `s` with `fill` (a 1-char string) to width `w`.
+; Returns `s` unchanged when already at least `w` wide.
+;   s / w / fill : the string, target width, and pad character
+(defn pad_left ((s string) (w int) (fill string)) string
+  (if (ge (size s) w) s
+    (string_concat_many (string_repeat fill (int_sub w (size s))) s)))
+(defn pad_right ((s string) (w int) (fill string)) string
+  (if (ge (size s) w) s
+    (string_concat_many s (string_repeat fill (int_sub w (size s))))))
+
+; rfind — index of the LAST occurrence of `needle` in `s`, or null on a miss.
+; The kernel string_find only scans forward from a start, so we walk every hit
+; (each lookup resumes one char past the previous match) and keep the last.
+;   s / needle : the haystack and a non-empty search string
+;   ->         : the 0-based char index of the final match, or null
+(bind rfind
+  (lambda (s needle)
+    (if (eq needle "") null
+      (bind ((last (ref null)) (from (ref 0)) (go (ref true)))
+        (do
+          (while (deref go)
+            (bind ((hit (string_find s needle (deref from))))
+              (if (eq hit null)
+                (set_ref go false)
+                (do
+                  (set_ref last hit)
+                  (set_ref from (int_add hit 1))))))
+          (deref last))))))
+
+; strip_prefix / strip_suffix — drop `affix` from the front / back of `s` when
+; present; return `s` unchanged when it does not start / end with `affix`.
+;   s / affix : the string and the prefix/suffix to remove
+(defn strip_prefix ((s string) (affix string)) string
+  (if (string_starts_with s affix)
+    (string_slice s (size affix) (size s))
+    s))
+(defn strip_suffix ((s string) (affix string)) string
+  (if (string_ends_with s affix)
+    (string_slice s 0 (int_sub (size s) (size affix)))
+    s))
+
+; splitn — split `s` on `sep` into AT MOST `n` parts: the first n-1 separators
+; split, and the remainder (separators and all) is the final part. n <= 0 yields
+; the empty list; n = 1 yields the whole string as a single part.
+;   s / sep / n : the string, a non-empty separator, and the max part count
+;   ->          : a list of 1..n parts
+; An empty separator has no split point (and the kernel string_find rejects an
+; empty needle), so it degrades to the whole string as a single part.
+(bind splitn
+  (lambda (s sep n)
+    (if (le n 0) (list_of)
+      (if (eq sep "") (list_of s)
+      (bind ((out (list_of)) (rest (ref s)) (k (ref 1)))
+        (do
+          (while (lt (deref k) n)
+            (bind ((cut (string_find (deref rest) sep)))
+              (if (eq cut null)
+                (set_ref k n)                       ; no more separators: stop
+                (do
+                  (append out (string_slice (deref rest) 0 cut))
+                  (set_ref rest
+                    (string_slice (deref rest) (int_add cut (size sep)) (size (deref rest))))
+                  (set_ref k (int_add (deref k) 1))))))
+          (append out (deref rest))
+          out))))))
+
+; split_whitespace — split `s` on runs of ASCII whitespace (space, tab, newline,
+; carriage return), dropping the empty parts so leading/trailing/repeated runs
+; never yield "" tokens.
+;   s  : the string
+;   -> : a list of non-empty word tokens (empty list for all-whitespace / "")
+; The current token accumulates its chars in a LOCAL list, joined once at each
+; whitespace boundary (O(n) overall) rather than per-char string_concat_many onto
+; a growing string (O(n^2)). A fresh `cur` list per token keeps tokens distinct.
+(bind split_whitespace
+  (lambda (s)
+    (bind ((cs (string_chars s)) (n (size cs)) (out (list_of))
+           (cur (ref (list_of))) (i (ref 0)))
+      (do
+        (while (lt (deref i) n)
+          (bind ((c (get cs (deref i) "")))
+            (do
+              (if (or (eq c " ") (or (eq c "\t") (or (eq c "\n") (eq c "\r"))))
+                (if (eq (size (deref cur)) 0)
+                  null
+                  (do (append out (sequence_join (deref cur) "")) (set_ref cur (list_of))))
+                (append (deref cur) c))
+              (set_ref i (int_add (deref i) 1)))))
+        (if (eq (size (deref cur)) 0) null (append out (sequence_join (deref cur) "")))
+        out))))
+
+; replace_first — replace only the FIRST occurrence of `from` with `to`
+; (the kernel string_replace replaces ALL). Returns `s` unchanged on a miss or
+; when `from` is empty.
+;   s / from / to : the string, a non-empty search, and its replacement
+(bind replace_first
+  (lambda (s from to)
+    (if (eq from "") s
+      (bind ((at (string_find s from)))
+        (if (eq at null) s
+          (string_concat_many
+            (string_slice s 0 at)
+            to
+            (string_slice s (int_add at (size from)) (size s))))))))
+
+; replace_n — replace AT MOST the first `count` occurrences of `from` with `to`,
+; scanning left-to-right (the kernel string_replace replaces ALL; replace_first
+; replaces one). Returns `s` unchanged when `from` is empty or `count <= 0`.
+; Each replacement resumes scanning AFTER the inserted `to`, so a `to` that
+; itself contains `from` is not re-matched (same non-overlapping rule as the
+; kernel replacer). Output fragments accumulate in a list joined once (O(n)).
+;   s / from / to : the string, a non-empty search, and its replacement
+;   count         : the maximum number of replacements
+(bind replace_n
+  (lambda (s from to count)
+    (if (or (eq from "") (le count 0)) s
+      (bind ((out (list_of)) (rest (ref s)) (left (ref count)) (go (ref true)))
+        (do
+          (while (deref go)
+            (bind ((at (string_find (deref rest) from)))
+              (if (or (eq at null) (le (deref left) 0))
+                (set_ref go false)
+                (do
+                  (append out (string_slice (deref rest) 0 at))
+                  (append out to)
+                  (set_ref rest
+                    (string_slice (deref rest)
+                      (int_add at (size from)) (size (deref rest))))
+                  (set_ref left (int_sub (deref left) 1))))))
+          (append out (deref rest))
+          (sequence_join out ""))))))
+
+; replace_last — replace only the LAST occurrence of `from` with `to`
+; (the mirror of replace_first). Returns `s` unchanged on a miss or when `from`
+; is empty. Uses rfind to locate the final match.
+;   s / from / to : the string, a non-empty search, and its replacement
+(bind replace_last
+  (lambda (s from to)
+    (if (eq from "") s
+      (bind ((at (rfind s from)))
+        (if (eq at null) s
+          (string_concat_many
+            (string_slice s 0 at)
+            to
+            (string_slice s (int_add at (size from)) (size s))))))))
+
+(export split trim upcase downcase replace repeat lines slice find
+        contains? starts_with? ends_with? concat to_string
+        length empty? char_at chars pad_left pad_right parse_int parse_float
+        rfind strip_prefix strip_suffix splitn split_whitespace replace_first
+        replace_n replace_last)

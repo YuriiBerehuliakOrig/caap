@@ -2,8 +2,9 @@
 
 use std::rc::Rc;
 
+use crate::error::{CaapError, CaapResult};
 use crate::ir::NodeId;
-use crate::semantic::SemanticEntry;
+use crate::semantic::{CapabilityName, SemanticEntry};
 use crate::values::HostObject;
 
 #[derive(Debug)]
@@ -13,7 +14,7 @@ pub struct NodeBridgeValue {
 }
 
 impl NodeBridgeValue {
-    pub fn new(unit: Rc<dyn HostObject>, node_id: NodeId) -> Self {
+    pub(crate) fn new(unit: Rc<dyn HostObject>, node_id: NodeId) -> Self {
         Self { unit, node_id }
     }
 
@@ -49,7 +50,7 @@ impl SemanticEntryBridgeValue {
 
 impl HostObject for SemanticEntryBridgeValue {
     fn type_name(&self) -> &'static str {
-        "semantic-entry"
+        "semantic_entry"
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -59,26 +60,26 @@ impl HostObject for SemanticEntryBridgeValue {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostCapabilityBridgeValue {
-    capability_kind: String,
+    capability_kind: CapabilityName,
 }
 
 impl HostCapabilityBridgeValue {
-    pub fn new(capability_kind: impl Into<String>) -> Result<Self, String> {
+    pub fn new(capability_kind: impl Into<String>) -> CaapResult<Self> {
         let capability_kind = capability_kind.into();
-        if capability_kind.is_empty() {
-            return Err("host capability kind must be non-empty".to_string());
-        }
+        let capability_kind = CapabilityName::new(&capability_kind).map_err(|error| {
+            CaapError::host(format!("host capability kind is invalid: {error}"))
+        })?;
         Ok(Self { capability_kind })
     }
 
     pub fn capability_kind(&self) -> &str {
-        &self.capability_kind
+        self.capability_kind.as_str()
     }
 }
 
 impl HostObject for HostCapabilityBridgeValue {
     fn type_name(&self) -> &'static str {
-        "host-capability"
+        "host_capability"
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -95,7 +96,7 @@ mod tests {
 
     impl HostObject for DummyUnit {
         fn type_name(&self) -> &'static str {
-            "dummy-unit"
+            "dummy_unit"
         }
 
         fn as_any(&self) -> &dyn std::any::Any {
@@ -109,17 +110,17 @@ mod tests {
         let bridge = NodeBridgeValue::new(Rc::clone(&unit), 42);
         assert_eq!(bridge.node_id(), 42);
         assert_eq!(bridge.type_name(), "node");
-        assert_eq!(bridge.unit.type_name(), "dummy-unit");
+        assert_eq!(bridge.unit.type_name(), "dummy_unit");
     }
 
     #[test]
     fn host_capability_rejects_empty_kind() {
         assert!(HostCapabilityBridgeValue::new("").is_err());
         assert_eq!(
-            HostCapabilityBridgeValue::new("host_services")
+            HostCapabilityBridgeValue::new("sys")
                 .unwrap()
                 .capability_kind(),
-            "host_services"
+            "sys"
         );
     }
 }

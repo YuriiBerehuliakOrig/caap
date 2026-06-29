@@ -1,0 +1,156 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  ur_list — a reusable INTRUSIVE singly-linked FIFO list (module
+//  stdlib.urun.ur_list), a C++-style GENERIC STRUCT-CONTAINER `List<T, lf>` over
+//  the node type `T` and the link FIELD `lf` it threads through. The scheduler's
+//  object-wait queues (a semaphore's waiter list, a queue's send/recv lists), the
+//  scheduler's ready/delayed lists and the timer's active list are all the same
+//  intrusive-FIFO mechanics, hand-duplicated per module before this. Here it lives
+//  once and is MONOMORPHIZED per (T, field) instantiation by the native-generics
+//  passes (semantics/passes/{monomorph,struct_monomorph}), so each caller still
+//  gets concrete, zero-overhead code — byte-for-byte the old hand-written links.
+//
+//  `T type` and `lf field` are COMPILE-TIME parameters declared as PHANTOM fields
+//  of the struct, so they ride IN THE TYPE: a holder declares its list as
+//  `List<UR_THREAD, ur_thread_suspend_next>` (a struct field or a module global)
+//  ONCE, and every operation takes just its address `&list` and DEDUCES both the
+//  node type AND the link field from that declared type (the preresolve pass, C++
+//  template argument deduction). No type, no field name at the call site. The pass
+//  specializes `node->lf` into a direct field access. There is NO allocation — the
+//  link lives inside the node (intrusive), as a freestanding kernel needs.
+//
+//  A null link / empty list is the 0 address (`0 as T*`); identity is compared
+//  at pointer width via `uptr` (no 32-bit truncation). A field read goes through
+//  an explicit `ptr_to_int` (the generic body cannot prove `p->lf` is a pointer
+//  before specialization, so the surface's auto-`ptr_to_int` does not fire).
+(surface stdlib.frontend.clike stdlib.urun.ur_list)
+
+// ── a LIST and a NODE are DIFFERENT first-class types ────────────────────────
+// `Node<T>` is the intrusive HOOK (FreeRTOS ListItem_t analogue): the per-element
+// link cell, embedded by VALUE in each element that participates in a list. An
+// element in SEVERAL lists at once (UR_THREAD: ready + suspend + delayed) embeds
+// SEVERAL distinct `Node<T>` hooks. `List<T, lf>` is the CONTAINER (the head
+// anchor); `lf` names WHICH hook of the element this list threads through. Both
+// are single-pointer types — `Node<T>` IS `{ next }`, `List<T,lf>` IS `{ head }` —
+// so the layout is byte-identical to a bare link, but the model is honest: the
+// container holds a typed `List<…>`, the node holds a typed `Node<…>`.
+Node struct export = {
+  T type,
+  next T*,
+}
+
+// The C++-style container: the list HEAD lives inside a `List<T, lf>` the caller
+// holds (as a struct field or global); every operation takes `List<T, lf>*` and
+// reaches an element's hook through `(&node->lf)->next` (the hook's address, then
+// its `next`). Both the node TYPE and the hook FIELD are deduced from the
+// `List<T, lf>*` argument. The `lf field` parameter is OPTIONAL: `List<T>` (no
+// field) defaults the hook to the conventional name `next` (see UR_TIMER, in one
+// list), applied to the type spelling by the monomorph passes (pad_omitted_fields).
+List struct export = {
+  T type,
+  lf field,
+  head T*,
+  tail T*,        // cached last node, so a FIFO push is O(1) instead of an O(n)
+}                 // tail walk under masked interrupts (kept in sync by every op)
+
+// initialise an empty list.
+ur_list_init (T type, lf field, self List<T, lf>*) i32 export = {
+  self->head = 0 as T*
+  self->tail = 0 as T*
+  0
+}
+// is the list empty?
+ur_list_empty (T type, lf field, self List<T, lf>*) bool export = {
+  cast(ptr_to_int(self->head), uptr) == 0
+}
+// peek the head (or null).
+ur_list_head (T type, lf field, self List<T, lf>*) T* export = {
+  self->head
+}
+// replace the head (for domain-specific reorders, e.g. prioritize). A reorder can
+// move the old tail, so recompute it (the prioritize path is already O(n)).
+ur_list_set_head (T type, lf field, self List<T, lf>*, h T*) i32 export = {
+  self->head = h
+  if cast(ptr_to_int(self->head), uptr) == 0 {
+    self->tail = 0 as T*
+  } else {
+    q mut T* = self->head
+    while cast(ptr_to_int((&q->lf)->next), uptr) != 0 {
+      q = (&q->lf)->next
+    }
+    self->tail = q
+  }
+  0
+}
+// append `node` to the TAIL (FIFO) — O(1) via the cached tail.
+ur_list_push (T type, lf field, self List<T, lf>*, node T*) i32 export = {
+  (&node->lf)->next = 0 as T*
+  if cast(ptr_to_int(self->head), uptr) == 0 {
+    self->head = node
+    self->tail = node
+  } else {
+    t mut T* = self->tail
+    (&t->lf)->next = node
+    self->tail = node
+  }
+  0
+}
+// prepend `node` to the HEAD (LIFO / unordered) — node links to the old head and
+// becomes the new head. Used where insertion order is irrelevant (the delayed
+// list, a one-shot timer list), so the O(n) tail walk is avoided.
+ur_list_push_front (T type, lf field, self List<T, lf>*, node T*) i32 export = {
+  if cast(ptr_to_int(self->head), uptr) == 0 {
+    self->tail = node          // into an empty list — node is also the tail
+  } else {
+    0
+  }
+  (&node->lf)->next = self->head
+  self->head = node
+  0
+}
+// unlink `target` by identity (no-op if absent); the removed node's link is nulled.
+ur_list_remove (T type, lf field, self List<T, lf>*, target T*) i32 export = {
+  if cast(ptr_to_int(self->head), uptr) == 0 {
+    0
+  } else {
+    if cast(ptr_to_int(self->head), uptr) == target as uptr {
+      self->head = (&target->lf)->next
+      (&target->lf)->next = 0 as T*
+    } else {
+      p mut T* = self->head
+      while scan cast(ptr_to_int((&p->lf)->next), uptr) != 0 {
+        if cast(ptr_to_int((&p->lf)->next), uptr) == target as uptr {
+          (&p->lf)->next = (&target->lf)->next
+          (&target->lf)->next = 0 as T*
+          break scan
+        } else {
+          p = (&p->lf)->next
+        }
+      }
+    }
+    // the unlinked node may have BEEN the tail — recompute it (remove is O(n)).
+    if cast(ptr_to_int(self->head), uptr) == 0 {
+      self->tail = 0 as T*
+    } else {
+      q mut T* = self->head
+      while cast(ptr_to_int((&q->lf)->next), uptr) != 0 {
+        q = (&q->lf)->next
+      }
+      self->tail = q
+    }
+    0
+  }
+}
+// remove and return the head (or null) — dequeue. O(1); clears tail if emptied.
+ur_list_pop (T type, lf field, self List<T, lf>*) T* export = {
+  h mut T* = self->head
+  if cast(ptr_to_int(h), uptr) != 0 {
+    self->head = (&h->lf)->next
+    (&h->lf)->next = 0 as T*
+    if cast(ptr_to_int(self->head), uptr) == 0 {
+      self->tail = 0 as T*
+    } else {
+      0
+    }
+  }
+  h
+}

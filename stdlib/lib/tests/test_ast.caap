@@ -1,0 +1,98 @@
+; stdlib/lib/test_ast.caap — in-language tests for lib/ast.
+
+;; @area: syntax
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq)
+(use stdlib.syntax.ast
+  sym lit calln lam seq if3 eval_ir eval_with bind_pairs
+  call? name? literal? string_lit? int_lit? float_lit? lit_null?
+  name_of literal_of head_of head_is? args_of arg items_of walk)
+
+(bind n_name (syntax_name "foo"))
+(bind n_lit  (syntax_literal 42))
+(bind n_slit (syntax_literal "s"))
+(bind n_flit (syntax_literal 1.5))
+(bind n_nlit (syntax_literal null))
+(bind n_call (syntax_call (syntax_name "f") (list_of n_lit n_name)))
+
+(do
+  (assert_eq (call? n_call) true  "call? yes")
+  (assert_eq (call? n_lit)  false "call? no")
+  (assert_eq (name? n_name) true  "name?")
+  (assert_eq (literal? n_lit) true "literal?")
+  (assert_eq (string_lit? n_slit) true  "string_lit? yes")
+  (assert_eq (string_lit? n_lit)  false "string_lit? no (int)")
+  (assert_eq (int_lit? n_lit)   true  "int_lit? yes")
+  (assert_eq (int_lit? n_flit)  false "int_lit? no (float)")
+  (assert_eq (int_lit? n_name)  false "int_lit? no (name)")
+  (assert_eq (float_lit? n_flit) true  "float_lit? yes")
+  (assert_eq (float_lit? n_lit)  false "float_lit? no (int)")
+  (assert_eq (lit_null? n_nlit)  true  "lit_null? yes")
+  (assert_eq (lit_null? n_lit)   false "lit_null? no (int)")
+  (assert_eq (name_of n_name) "foo" "name_of")
+  (assert_eq (name_of n_lit)  null  "name_of wrong kind -> null")
+  (assert_eq (literal_of n_lit) 42 "literal_of")
+  (assert_eq (head_of n_call) "f" "head_of")
+  (assert_eq (head_is? n_call "f") true  "head_is? yes")
+  (assert_eq (head_is? n_call "g") false "head_is? no")
+  (assert_eq (size (args_of n_call)) 2 "args_of count")
+  (assert_eq (literal_of (arg n_call 0)) 42 "arg 0")
+  (assert_eq (size (items_of n_call)) 3 "items_of = callee + args")
+  (assert_eq
+    (bind ((count (ref 0)))
+      (do
+        (walk n_call (lambda (x) (set_ref count (int_add (deref count) 1))))
+        (deref count)))
+    4 "walk visits all 4 nodes")
+
+  ; ── builders: runtime IR construction round-trips through the readers ──
+  (assert_eq (name_of (sym "x")) "x" "sym builds a name")
+  (assert_eq (literal_of (lit 42)) 42 "lit builds a literal")
+  (assert_eq (head_of (calln "f" (list_of (lit 1)))) "f" "calln builds a call")
+
+  ; build (int_add 1 2) at runtime and evaluate it
+  (assert_eq (eval_ir (calln "int_add" (list_of (lit 1) (lit 2)))) 3
+    "built call evaluates")
+
+  ; build (lambda (x) (int_mul x x)) at runtime, eval to a FUNCTION, call it
+  (assert_eq
+    (bind ((sq (eval_ir (lam (list_of "x")
+                  (calln "int_mul" (list_of (sym "x") (sym "x")))))))
+      (sq 7))
+    49 "built lambda is callable")
+
+  ; runtime CODEGEN: unroll pow(x, n) for fixed n=3 into nested int_mul IR,
+  ; then eval the specialized function — built from DATA in a loop
+  (assert_eq
+    (bind ((body (ref (sym "x"))) (k (ref 1)))
+      (do
+        (while (lt (deref k) 3)
+          (do
+            (set_ref body (calln "int_mul" (list_of (sym "x") (deref body))))
+            (set_ref k (int_add (deref k) 1))))
+        (bind ((pow3 (eval_ir (lam (list_of "x") (deref body)))))
+          (pow3 3))))
+    27 "runtime-unrolled pow3")
+
+  ; if3 + seq shapes evaluate
+  (assert_eq (eval_ir (if3 (lit true) (lit 1) (lit 2))) 1 "if3 evaluates")
+  (assert_eq (eval_ir (seq (list_of (lit 1) (lit 9)))) 9 "seq -> last value")
+
+  ; bind_pairs: the canonical merged bind decomposes into pairs + body
+  (bind ((bp (bind_pairs (calln "bind"
+               (list_of (lit "a") (lit 1) (lit "b") (lit 2) (sym "a"))))))
+    (do
+      (assert_eq (size (get bp "pairs")) 2 "bind_pairs: two pairs")
+      (assert_eq (get (get (get bp "pairs") 1) "name") "b"
+        "bind_pairs: pair names")
+      (assert_eq (size (get bp "body")) 1 "bind_pairs: body tail")))
+  (assert_eq (bind_pairs (calln "do" (list_of (lit 1)))) null
+    "bind_pairs: null on another shape")
+
+  ; eval_with: a tree with free names runs against a VALUE environment
+  (assert_eq
+    (eval_with (calln "int_add" (list_of (sym "a") (sym "b")))
+               (assoc (map_of) "a" 40 "b" 2))
+    42 "eval_with binds free names to values")
+  true)

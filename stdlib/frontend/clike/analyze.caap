@@ -1,0 +1,272 @@
+; stdlib/frontend/clike/analyze.caap — the LSP VIEW of a clike file for
+; stdlib.frontend.clike: definitions (token-derived, exact spans), diagnostics
+; (from a real lowering attempt), and semantic tokens (the instrumented parser's
+; own emissions + the string-aware `//` line-comment tokens).
+;
+; This module is a pure CONSUMER at the top of the call graph — nothing in the
+; lowerer depends back on it. It is parameterized by a small service map `A`
+; supplied by the facade: the facade still owns the parser, the semantic-token
+; sink ref, and the lowering entry point; this file owns only the analysis walk.
+;   A = {parse_forms_at, clike_units, lower_program_at, sem_token_sink}
+; (sem_token_sink is the facade's shared ref — armed here around one real lower so
+; the instrumented parser's st_emit! writes land in it, then drained + disarmed.)
+(module stdlib.frontend.clike.analyze)
+
+; token accessors + split_commas come from the tokens leaf (a clean lower dep),
+; so analysis reads the ParsedForm token tree exactly as the lowerer does.
+(use stdlib.frontend.clike.tokens
+     tkind tval titems tsym? tlist? split_commas)
+
+; tspan6 — a token's 6-field span map (start/end + start_line/col + end_line/col),
+; null for a missing token.
+(bind tspan6
+  (lambda (t)
+    (bind ((sp (if (eq t null) null (get t "span"))))
+      (if (eq sp null) null
+        (assoc (map_of)
+          "start" (get sp "start" 0)
+          "end" (get sp "end" 0)
+          "start_line" (get sp "start_line" 0)
+          "start_col" (get sp "start_col" 0)
+          "end_line" (get sp "end_line" 0)
+          "end_col" (get sp "end_col" 0))))))
+
+; analyze_calls — name+parens pairs anywhere under the token list: the call
+; sites, with the callee token's span and one span per comma-separated arg.
+(bind analyze_calls
+  (lambda (self toks out)
+    (bind ((i (ref 0)))
+      (while (lt (deref i) (size toks))
+        (bind (
+          (t (get toks (deref i)))
+          (nxt (get toks (int_add (deref i) 1)))
+        )
+          (do
+            (cond
+              ((and (tsym? t null) (tlist? nxt "paren"))
+                (do
+                  (append out
+                    (assoc (map_of)
+                      "name" (tval t)
+                      "span" (tspan6 t)
+                      "args"
+                      (bind ((spans (list_of)))
+                        (do
+                          (for grp (split_commas (titems nxt))
+                            (bind ((sp (tspan6 (get grp 0))))
+                              (when (not (eq sp null)) (append spans sp))))
+                          spans))))
+                  (self self (titems nxt) out)
+                  (set_ref i (int_add (deref i) 2))))
+              ((eq (tkind t) "list")
+                (do
+                  (self self (titems t) out)
+                  (set_ref i (int_add (deref i) 1))))
+              (else (set_ref i (int_add (deref i) 1))))))))))
+
+; ── line-comment tokens (the ONE category the parser cannot supply) ──────────
+; The clike lexer skips its comments (whatever `set_comment` declared) as trivia,
+; so they never reach the parser. Rather than RE-ENCODE the comment delimiter (or
+; the string-quote / escape rules) here, comments are derived from the LEXER's own
+; coverage: it tokenises every piece of code — strings included, so a `//` inside
+; a "…" literal is part of a string TOKEN — and skips only whitespace + comments.
+; Therefore, on any line, the comment is simply the non-whitespace that follows
+; the last token, to end of line. No delimiter, quote or escape is hardcoded.
+; (clike declares LINE comments only, so per-line "after the last token" is exact.)
+;
+; token_line_ends — recurse the lexer token tree; return a map
+;   line(1-based) -> the largest end-col any leaf (atom) token reaches on that line.
+(bind mark_end!
+  (lambda (acc ln ec)
+    (when (and (gt ln 0) (gt ec (get acc ln 0))) (assoc acc ln ec))))
+(bind token_line_ends
+  (lambda (toks acc)
+    (do
+      (for t toks
+        (bind ((sp (tspan6 t)))
+          (when (not (eq sp null))
+            (if (eq (tkind t) "list")
+              (do
+                ; a ( ) { } [ ] token: its OWN one-char delimiters are not leaves —
+                ; cover the opener on the start line and the closer on the end line,
+                ; then recurse for the inner atoms.
+                (mark_end! acc (get sp "start_line" 0) (int_add (get sp "start_col" 0) 1))
+                (mark_end! acc (get sp "end_line" 0) (get sp "end_col" 0))
+                (token_line_ends (titems t) acc))
+              (mark_end! acc (get sp "start_line" 0) (get sp "end_col" 0))))))
+      acc)))
+
+; scan_line_comments — [{span, type:"comment", …}] for the trailing comment on
+; each line: the run from the first non-whitespace AFTER the last token to EOL.
+; `toks` is the lexer's top-level token stream (empty when the lex failed, in
+; which case nothing is flagged — never the whole file).
+(bind scan_line_comments
+  (lambda (text toks)
+    (bind ((out (list_of)) (lines (string_split text "\n"))
+           (ends (token_line_ends toks (map_of))) (ln (ref 0)))
+      (do
+        (while (lt (deref ln) (size lines))
+          (bind ((chars (string_chars (get lines (deref ln))))
+                 (n (size chars))
+                 (code_end (get ends (int_add (deref ln) 1) 0))   ; 1-based, exclusive
+                 (i (ref (if (gt code_end 0) (int_sub code_end 1) 0)))
+                 (cstart (ref null)))
+            (do
+              ; first non-whitespace at/after the last token on the line
+              (while (and (lt (deref i) n) (eq (deref cstart) null))
+                (bind ((c (get chars (deref i))))
+                  (if (or (eq c " ") (or (eq c "\t") (eq c "\r")))
+                    (set_ref i (int_add (deref i) 1))
+                    (set_ref cstart (deref i)))))
+              (when (not (eq (deref cstart) null))
+                (append out (assoc (map_of)
+                  "span" (assoc (map_of)
+                    "start" 0 "end" 0
+                    "start_line" (int_add (deref ln) 1)
+                    "start_col" (int_add (deref cstart) 1)
+                    "end_line" (int_add (deref ln) 1)
+                    "end_col" (int_add n 1))
+                  "type" "comment" "mods" (list_of))))
+              (set_ref ln (int_add (deref ln) 1)))))
+        out))))
+
+; ── analyzer frame ──────────────────────────────────────────────────────────
+(bind append_parse_error_diag!
+  (lambda (path pr diags)
+    (append diags
+      (string_concat_many path ": " (value_to_string (get pr "error"))))))
+
+(bind collect_definitions!
+  (lambda (toks defs)
+    (bind ((i (ref 0)))
+      (while (lt (deref i) (size toks))
+        (bind (
+          (t (get toks (deref i)))
+          (ps (get toks (int_add (deref i) 1)))
+          (blk (get toks (int_add (deref i) 4)))
+        )
+          (cond
+            ; the surface header
+            ((and (tlist? t "paren")
+                  (tsym? (get (titems t) 0) "surface"))
+              (set_ref i (int_add (deref i) 1)))
+            ; name (params) type = { body }
+            ((and (tsym? t null)
+                  (and (tlist? ps "paren") (tlist? blk "brace")))
+              (bind ((e (assoc (map_of)
+                          "name" (tval t)
+                          "kind" "function"
+                          "span" (tspan6 t)
+                          "form_span" (tspan6 t)
+                          "params"
+                          (bind ((names (list_of)))
+                            (do
+                              (for grp (split_commas (titems ps))
+                                (bind ((nm (get grp 0)))
+                                  (when (tsym? nm null)
+                                    (append names (tval nm)))))
+                              names))))
+                     (calls (list_of)))
+                (do
+                  (analyze_calls analyze_calls (titems blk) calls)
+                  (assoc e "calls" calls)
+                  (append defs e)
+                  (set_ref i (int_add (deref i) 5)))))
+            (else (set_ref i (int_add (deref i) 1)))))))))
+
+; collect_lower_semantic_tokens! — ONE real lower feeds BOTH channels: its located
+; findings go to diagnostics, and — with the sink armed — the INSTRUMENTED parser
+; emits semantic tokens AS IT PARSES. The sink ref + the lowering entry point are
+; the facade's (passed in A); the sink is null during real codegen.
+(bind collect_lower_semantic_tokens!
+  (lambda (A text path diags)
+    (bind ((sink (get A "sem_token_sink"))
+           (lower_program_at (get A "lower_program_at")))
+      (do
+        (set_ref sink (list_of))
+        (bind ((lr (lower_program_at text path)))
+          (unless (get lr "ok" false)
+            (append diags
+              (string_concat_many path ": " (get lr "error" "")))))
+        (bind ((toks (deref sink)))
+          (do
+            (set_ref sink null)
+            toks))))))
+
+(bind append_comment_tokens!
+  (lambda (text pr toks)
+    (when (get pr "ok" false)
+      ; comment tokens are derived from the lexer's coverage (no delimiter
+      ; hardcoded). Only when lex/parse succeeded — otherwise the token stream
+      ; is incomplete and every line would look like a comment.
+      (bind ((form0 (get (get pr "forms" (list_of)) 0 null))
+             (lextoks (if (eq form0 null) (list_of) (titems form0))))
+        (for ct (scan_line_comments text lextoks) (append toks ct))))))
+
+; ── declaration-derived definitions ─────────────────────────────────────────
+; collect_definitions! above recognizes only the richer function shape
+; `name (params) type = {body}` at fixed offsets, so it misses globals + locals,
+; enum members, type declarations, and any function carrying modifiers /
+; a pointer return (e.g. `f (x T) T* export = {…}`). But the INSTRUMENTED lower
+; already marks EVERY declared name with a `[declaration]` semantic token, keyed
+; off the parser + symbol table. So derive the rest of the go-to-def index from
+; those SAME tokens — one classification, no parallel hardcoded patterns. The
+; richer type/function defs already collected (carrying params + calls) win; a
+; name not yet present is added as a basic def with the token's exact span.
+(bind decl_token_kind
+  (lambda (ty)
+    (cond
+      ((eq ty "variable") "variable")     ; globals AND locals
+      ((eq ty "function") "function")     ; incl. modifier/pointer-return fns
+      ((eq ty "enumMember") "variable")   ; navigable enum members
+      ((eq ty "type") "class")            ; (already collected; deduped below)
+      (else null))))
+
+(bind has_def_named?
+  (lambda (defs nm)
+    (not (eq (sequence_find defs (lambda (d) (eq (get d "name") nm))) null))))
+
+(bind token_is_declaration?
+  (lambda (t)
+    (not (eq (sequence_find (get t "mods" (list_of))
+               (lambda (m) (eq m "declaration"))) null))))
+
+(bind derive_decl_defs!
+  (lambda (toks defs)
+    (for t toks
+      (when (token_is_declaration? t)
+        (bind ((kind (decl_token_kind (get t "type")))
+               (nm (get t "text")))
+          (when (and (not (eq kind null))
+                     (not (eq nm null))
+                     (not (has_def_named? defs nm)))
+            (append defs
+              (assoc (map_of)
+                "name" nm "kind" kind
+                "span" (get t "span") "form_span" (get t "span")))))))))
+
+; analyze_program — TEXT (+ its path, for messages) -> {definitions, diagnostics,
+; tokens}. Definitions never depend on a clean lowering; diagnostics carry the
+; lowerer's located findings; tokens is the parser/symbol-derived highlighting
+; plus the string-aware `//` line-comment tokens. `A` supplies the facade's
+; parser (parse_forms_at + clike_units), lowering entry, and sink ref. The facade
+; wraps this as the public 2-arg `analyze_program`.
+(bind analyze_program_impl
+  (lambda (A text path)
+    (bind (
+      (defs (list_of))
+      (diags (list_of))
+      (pr ((get A "parse_forms_at") ((get A "clike_units")) text null path))
+    )
+      (do
+        (if (not (get pr "ok" false))
+          (append_parse_error_diag! path pr diags)
+          (bind ((toks (titems (get (get pr "forms" (list_of)) 0))))
+            (collect_definitions! toks defs)))
+        (bind ((toks (collect_lower_semantic_tokens! A text path diags)))
+          (do
+            (append_comment_tokens! text pr toks)
+            (derive_decl_defs! toks defs)
+            (assoc (map_of) "definitions" defs "diagnostics" diags "tokens" toks)))))))
+
+(export analyze_program_impl)

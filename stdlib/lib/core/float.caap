@@ -1,0 +1,166 @@
+; stdlib/lib/core/float.caap — pure floating-point helpers (module stdlib.lib.core.float).
+;
+; The real/f64 sibling of the integer-only math.caap. A thorough facade over the
+; kernel's float builtins (sqrt/sin/.../pow/float_add/...), plus the derived
+; numerics the kernel does not ship (cbrt, hypot, trunc, clamp, lerp, log_base,
+; degree conversions). All pure — foldable at compile time exactly like runtime.
+;
+; Naming note: the bare passthroughs are `bind`-renames, NOT `defn` wrappers. A
+; `(defn sqrt ((x float)) float (sqrt x))` would make the body's `sqrt` resolve to
+; the module-local definition (infinite recursion); `(bind sqrt sqrt)` instead
+; captures the kernel builtin's value before the local binding shadows the name
+; (the same facade idiom as collections/sequence.caap). The kernel builtins
+; already carry their own (float)->float signatures, so a typed wrapper would add
+; only indirection. The DERIVED helpers below do not collide with a kernel name,
+; so they stay typed `defn`. Floats are the kernel f64; literals carry a decimal
+; point so they lex as floats; lt/gt/le/ge/eq are kernel-polymorphic over floats.
+(module stdlib.lib.core.float)
+
+; ── constants ────────────────────────────────────────────────────────────────
+; pi / e / tau — the usual transcendentals (tau = 2*pi).
+(bind pi  3.141592653589793)
+(bind e   2.718281828459045)
+(bind tau 6.283185307179586)
+
+; ── facades over kernel float builtins (bind-renames) ────────────────────────
+; Roots & powers.
+(bind sqrt sqrt)          ; (x)   principal square root (nan for x < 0)
+(bind pow  pow)           ; (x y) x raised to y
+; Rounding.
+(bind floor floor)        ; (x)   toward -inf
+(bind ceil  ceil)         ; (x)   toward +inf
+(bind round round)        ; (x)   to nearest (half away from zero)
+; Magnitude / pairwise extrema.
+(bind fabs float_abs)     ; (x)   absolute value
+(bind fmin float_min)     ; (a b) the smaller
+(bind fmax float_max)     ; (a b) the larger
+; Trigonometry & exponentials (radians).
+(bind sin sin) (bind cos cos) (bind tan tan)
+(bind asin asin) (bind acos acos) (bind atan atan)
+(bind atan2 atan2)        ; (y x) angle of (x, y)
+(bind exp exp)            ; (x)   e^x
+(bind ln    log)          ; (x)   natural log (kernel `log` IS ln)
+(bind log2  log2)         ; (x)   base-2 log
+(bind log10 log10)        ; (x)   base-10 log
+; Classification.
+(bind is_nan? float_nan?) ; (x)   is x NaN?
+(bind is_inf? float_inf?) ; (x)   is x +/-inf?
+; Int bridges.
+(bind to_int float_to_int) ; (x)  truncate toward zero to int
+(bind of_int int_to_float) ; (n)  widen int to float
+
+; ── derived numerics (real library code) ─────────────────────────────────────
+
+; cbrt — real cube root. pow is undefined for a negative base with a fractional
+; exponent (it returns nan), so the sign is handled explicitly: the cube root of
+; a negative is the negation of the cube root of its magnitude. cbrt(0.0) = 0.0.
+(defn cbrt ((x float)) float
+  (if (lt x 0.0)
+    (float_sub 0.0 (pow (float_sub 0.0 x) (float_div 1.0 3.0)))
+    (pow x (float_div 1.0 3.0))))
+
+; hypot — sqrt(x*x + y*y), the Euclidean length of (x, y).
+(defn hypot ((x float) (y float)) float
+  (sqrt (float_add (float_mul x x) (float_mul y y))))
+
+; trunc — round toward zero: floor for x >= 0, ceil for x < 0.
+(defn trunc ((x float)) float
+  (if (lt x 0.0) (ceil x) (floor x)))
+
+; clamp — `x` confined to [lo, hi] (lo <= hi assumed).
+(defn clamp ((x float) (lo float) (hi float)) float
+  (fmax lo (fmin x hi)))
+
+; signum — -1.0, 0.0 or 1.0 by the sign of `x` (0.0 for exactly zero).
+(defn signum ((x float)) float
+  (cond ((lt x 0.0) -1.0) ((gt x 0.0) 1.0) (else 0.0)))
+
+; copysign — magnitude of `x` with the sign of `y`.
+;   y < 0 -> -|x|, otherwise |x| (treats y = 0.0 as positive).
+(defn copysign ((x float) (y float)) float
+  (if (lt y 0.0) (float_sub 0.0 (fabs x)) (fabs x)))
+
+; lerp — linear interpolation: a + (b - a) * t (t in [0,1] interpolates).
+(defn lerp ((a float) (b float) (t float)) float
+  (float_add a (float_mul (float_sub b a) t)))
+
+; log_base — logarithm of `x` in an arbitrary base `b`: ln(x) / ln(b).
+(defn log_base ((x float) (b float)) float
+  (float_div (ln x) (ln b)))
+
+; is_finite? — neither NaN nor infinite.
+(defn is_finite? ((x float)) bool
+  (and (not (is_nan? x)) (not (is_inf? x))))
+
+; deg_to_rad / rad_to_deg — degree <-> radian conversion.
+(defn deg_to_rad ((d float)) float
+  (float_mul d (float_div 3.141592653589793 180.0)))
+(defn rad_to_deg ((r float)) float
+  (float_mul r (float_div 180.0 3.141592653589793)))
+
+; expm1 — exp(x) - 1. The direct `(exp x) - 1` form (the kernel ships no
+; dedicated expm1, and a Taylor refinement is not worth the size); it loses
+; precision near x = 0 where exp(x) ~ 1, but is exact enough for ordinary use
+; and exact at x = 0 (exp(0) = 1 -> 0.0). Pair with `log1p` (its inverse).
+(defn expm1 ((x float)) float
+  (float_sub (exp x) 1.0))
+
+; log1p — ln(1 + x). The direct `ln(1 + x)` form (no kernel ln1p); like expm1
+; it trades a little precision near x = 0 for simplicity, and is exact at
+; x = 0 (ln(1) = 0). The inverse of `expm1`.
+(defn log1p ((x float)) float
+  (ln (float_add 1.0 x)))
+
+; ── hyperbolic functions (built from exp) ────────────────────────────────────
+; sinh — (e^x - e^-x) / 2. Odd: sinh(0) = 0.
+(defn sinh ((x float)) float
+  (float_div (float_sub (exp x) (exp (float_sub 0.0 x))) 2.0))
+
+; cosh — (e^x + e^-x) / 2. Even: cosh(0) = 1.
+(defn cosh ((x float)) float
+  (float_div (float_add (exp x) (exp (float_sub 0.0 x))) 2.0))
+
+; tanh — sinh(x) / cosh(x) = (e^2x - 1) / (e^2x + 1). Odd: tanh(0) = 0,
+; asymptotes to +/-1. Computed from a single e^2x to halve the exp calls.
+(defn tanh ((x float)) float
+  (bind ((e2x (exp (float_mul 2.0 x))))
+    (float_div (float_sub e2x 1.0) (float_add e2x 1.0))))
+
+; ── inverse hyperbolic functions (logarithmic forms) ─────────────────────────
+; asinh — ln(x + sqrt(x*x + 1)). Defined for all reals; asinh(0) = 0.
+(defn asinh ((x float)) float
+  (ln (float_add x (sqrt (float_add (float_mul x x) 1.0)))))
+
+; acosh — ln(x + sqrt(x*x - 1)). Domain x >= 1 (nan below); acosh(1) = 0.
+(defn acosh ((x float)) float
+  (ln (float_add x (sqrt (float_sub (float_mul x x) 1.0)))))
+
+; atanh — 0.5 * ln((1 + x) / (1 - x)). Domain |x| < 1 (diverges at +/-1);
+; atanh(0) = 0.
+(defn atanh ((x float)) float
+  (float_mul 0.5 (ln (float_div (float_add 1.0 x) (float_sub 1.0 x)))))
+
+; sign_f — sign of `x` as -1.0 / 0.0 / 1.0; the float-named alias of `signum`
+; (the survey's expected spelling). Same semantics: 0.0 for exactly zero.
+(defn sign_f ((x float)) float
+  (signum x))
+
+; approx_eq — |a - b| <= eps. The right way to compare floats (never ==).
+(defn approx_eq ((a float) (b float) (eps float)) bool
+  (le (fabs (float_sub a b)) eps))
+
+; NOTE on inf / nan constants: this kernel's `float_div` THROWS on a zero
+; divisor (verified), so the idiomatic `(float_div 1.0 0.0)` cannot seed an
+; `inf` constant — those are deliberately omitted. Non-finite values ARE
+; reachable for tests when needed: `(pow 10.0 400.0)` overflows to +inf and
+; `(sqrt -1.0)` yields nan (both already used by test_float / classification).
+
+(export pi e tau
+        sqrt cbrt hypot pow
+        floor ceil round trunc
+        fabs fmin fmax clamp signum sign_f copysign lerp
+        sin cos tan asin acos atan atan2 exp ln log2 log10 log_base
+        expm1 log1p sinh cosh tanh asinh acosh atanh
+        is_nan? is_inf? is_finite?
+        deg_to_rad rad_to_deg approx_eq
+        to_int of_int)

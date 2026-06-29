@@ -1,0 +1,74 @@
+; stdlib/lib/test_set.caap — in-language tests for lib/set.
+
+;; @area: collections
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.core.equal deep_eq)
+(use stdlib.lib.collections.set set_of set_has? set_size set_empty? set_items set_add set_remove
+     set_union set_intersection set_difference set_symmetric_difference set_filter
+     set_map set_fold set_any? set_all? set_partition
+     set_subset? set_superset? set_equal? set_disjoint?)
+
+(do
+  (bind ((s (set_of (list_of "a" "b" "a"))))
+    (do
+      (assert_eq (set_size s) 2 "duplicates collapse")
+      (assert_eq (set_empty? s) false "non-empty set")
+      (assert_true (set_empty? (set_of (list_of))) "empty set")
+      (assert_true (set_has? s "a") "membership")
+      (assert_eq (set_has? s "z") false "absence")
+      (assert_eq (set_size (set_add s "c")) 3 "add is fresh")
+      (assert_eq (set_size s) 2 "add did not mutate")
+      (assert_eq (set_size (set_remove s "a")) 1 "remove")))
+  (bind ((a (set_of (list_of "x" "y"))) (b (set_of (list_of "y" "z"))))
+    (do
+      (assert_eq (set_size (set_union a b)) 3 "union")
+      (assert_true (deep_eq (set_items (set_intersection a b)) (list_of "y")) "intersection")
+      (assert_true (deep_eq (set_items (set_difference a b)) (list_of "x")) "difference")
+      ; symmetric difference: in exactly one of a, b -> {x, z}
+      (assert_eq (set_size (set_symmetric_difference a b)) 2 "sym-diff size")
+      (assert_true (set_has? (set_symmetric_difference a b) "x") "sym-diff has x")
+      (assert_eq (set_has? (set_symmetric_difference a b) "y") false "sym-diff drops shared y")
+      ; set_filter keeps a subset
+      (assert_true (deep_eq (set_items (set_filter a (lambda (e) (eq e "x")))) (list_of "x")) "filter")
+      (assert_true (set_subset? (set_of (list_of "y")) b) "subset")
+      (assert_eq (set_subset? a b) false "not subset")
+      (assert_true (set_superset? b (set_of (list_of "y"))) "superset")
+      (assert_eq (set_disjoint? a b) false "overlapping not disjoint")
+      (assert_true (set_disjoint? (set_of (list_of "p")) (set_of (list_of "q"))) "disjoint")
+      (assert_true (set_equal? a (set_of (list_of "y" "x"))) "set_equal? order-independent")
+      (assert_eq (set_equal? a b) false "set_equal? different")))
+  ; ── higher-order: map / fold / any? / all? / partition ──────────────────────
+  (bind ((s (set_of (list_of "apple" "ant" "bee"))))
+    (do
+      ; set_map preserves size when f is injective (upcase)
+      (assert_true (set_equal? (set_map s (lambda (e) (string_upcase e)))
+                               (set_of (list_of "APPLE" "ANT" "BEE")))
+                   "set_map (injective) maps every element")
+      (assert_eq (set_size s) 3 "set_map did not mutate the source")
+      ; set_map SHRINKS on collision: first-char of {apple,ant,bee} -> {a, b}
+      (bind ((heads (set_map s (lambda (e) (string_slice e 0 1)))))
+        (do
+          (assert_eq (set_size heads) 2 "set_map collisions collapse (shrinks)")
+          (assert_true (set_has? heads "a") "set_map collision image has a")
+          (assert_true (set_has? heads "b") "set_map collision image has b")))
+      ; set_fold accumulates over all elements (count via fold)
+      (assert_eq (set_fold s 0 (lambda (acc e) (int_add acc 1))) 3 "set_fold visits every element")
+      (assert_eq (set_fold (set_of (list_of)) 7 (lambda (acc e) (int_add acc 1))) 7 "set_fold on empty -> init")
+      ; set_any? / set_all?
+      (assert_true (set_any? s (lambda (e) (eq e "ant"))) "set_any? finds a member")
+      (assert_eq (set_any? s (lambda (e) (eq e "zzz"))) false "set_any? false when none match")
+      (assert_eq (set_any? (set_of (list_of)) (lambda (e) true)) false "set_any? on empty -> false")
+      (assert_true (set_all? s (lambda (e) (eq (string_slice e 0 1) (string_slice e 0 1)))) "set_all? holds")
+      (assert_eq (set_all? s (lambda (e) (eq e "ant"))) false "set_all? false when one fails")
+      (assert_true (set_all? (set_of (list_of)) (lambda (e) false)) "set_all? on empty -> true")
+      ; set_partition -> {yes, no}
+      (bind ((parts (set_partition s (lambda (e) (eq (string_slice e 0 1) "a")))))
+        (do
+          (assert_eq (set_size (get parts "yes")) 2 "partition yes = a-words")
+          (assert_eq (set_size (get parts "no")) 1 "partition no = the rest")
+          (assert_true (set_has? (get parts "yes") "apple") "partition yes has apple")
+          (assert_true (set_has? (get parts "no") "bee") "partition no has bee")
+          (assert_eq (set_size s) 3 "set_partition did not mutate the source")))))
+  true)

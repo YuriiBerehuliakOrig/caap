@@ -1,0 +1,137 @@
+; stdlib/lib/diag/error.caap — the structured error protocol
+; (module stdlib.lib.diag.error).
+;
+; Kernel `try` catches two channels: `throw`n VALUES and evaluation errors
+; ({message, category} maps). This module gives both one standard shape, so
+; every catcher can dispatch uniformly:
+;
+;   {"__error__" true, "code" <string>, "message" <string>, "data" <map|null>}
+;
+; `code` is a diagnostic id ("stdlib.json.parse", documented in
+; stdlib.lib.diag.registry), `message` is for humans, `data` carries
+; machine-readable context (a map, or null). Raise with `raise!`, normalize
+; anything a catch receives with `as_error`.
+(module stdlib.lib.diag.error)
+
+; ── constructor ─────────────────────────────────────────────────────────────
+
+; make_error — build the standard error value (does not throw).
+;   code    : the diagnostic id ("stdlib.json.encode")
+;   message : the human-readable text
+;   data    : machine-readable context (a map), or null
+;   ->      : the protocol error map
+(defn make_error ((code string) (message string) (data any)) map
+  (assoc (map_of)
+    "__error__" true
+    "code" code
+    "message" message
+    "data" data))
+
+; ── predicate ───────────────────────────────────────────────────────────────
+
+; error? — is `v` a protocol error value (a map carrying "__error__" true)?
+;   v  : any value (a raw catch binding is fine)
+;   -> : bool
+(bind error?
+  (lambda (v)
+    (and (eq (value_type v) "map") (eq (get v "__error__" false) true))))
+
+; ── accessors (total: a default on non-errors, so catch sites stay simple) ──
+
+; error_code — the code of `e`, or "" when `e` is not a protocol error.
+(bind error_code    (lambda (e) (get e "code" "")))
+; error_message — the human text of `e`, or "" when `e` carries none.
+(bind error_message (lambda (e) (get e "message" "")))
+; error_data — the context map of `e`, or null when `e` carries none.
+(bind error_data    (lambda (e) (get e "data")))
+
+; ── data enrichment (immutable; an error gains context as it propagates) ─────
+
+; with_data — a COPY of `err` whose data map carries one more `key -> value`.
+; The protocol-error shape is preserved; a null or absent data map is treated as
+; an empty map, so callers may enrich an error that started with no context.
+; `err` is never mutated — `map_merge` yields a FRESH data map — so a caught
+; error can be re-thrown with extra breadcrumbs without disturbing whatever else
+; holds the original.
+;   err   : a protocol error (a make_error / raise! value)
+;   key   : the data field name (string)
+;   value : the value to record under it
+;   ->    : a fresh protocol error with err's code/message and the enriched data
+(bind with_data
+  (lambda (err key value)
+    (bind ((data (error_data err)))
+      (make_error (error_code err) (error_message err)
+        (map_merge
+          (if (eq (value_type data) "map") data (map_of))
+          (assoc (map_of) key value))))))
+
+; map_data — a COPY of `err` whose data map is replaced by (f data). `f` is
+; handed the current data map (an empty map when there is none) and returns the
+; new data map; the result is a fresh error so `err` is untouched. Use it to
+; transform the whole context at once (merge a map, derive a field, …) where
+; with_data's single key/value is too coarse. `f` is trusted to return a map.
+;   err : a protocol error
+;   f   : a (map)->map transform over the data map
+;   ->  : a fresh protocol error carrying (f data) as its data
+(bind map_data
+  (lambda (err f)
+    (bind ((data (error_data err)))
+      (make_error (error_code err) (error_message err)
+        (f (if (eq (value_type data) "map") data (map_of)))))))
+
+; ── raise / normalize ───────────────────────────────────────────────────────
+
+; raise! — build a protocol error and `throw` it (a catch receives it intact).
+;   code / message / data : as for make_error
+(bind raise!
+  (lambda (code message data)
+    (throw (make_error code message data))))
+
+; as_error — normalize ANYTHING a catch receives into the protocol shape:
+;   - a protocol error passes through unchanged
+;   - a kernel evaluation error ({message, category}) becomes
+;     code "caap.eval" (category preserved in data)
+;   - any other thrown value becomes code "caap.thrown" with the value in data
+;   e  : the value a `catch` bound (protocol error, eval-error map, or anything)
+;   -> : a protocol error map (always; never throws)
+(bind as_error
+  (lambda (e)
+    (cond
+      ((error? e) e)
+      ((and (eq (value_type e) "map") (contains e "message"))
+        (make_error "caap.eval" (get e "message" "")
+          (assoc (map_of) "category" (get e "category"))))
+      (else
+        (make_error "caap.thrown" (value_to_string e)
+          (assoc (map_of) "value" e))))))
+
+; ── cause chaining (data-only: an underlying error recorded under "cause") ─────
+
+; with_cause — a COPY of `err` whose data map records `cause` under the "cause"
+; key, building a chain of underlying errors WITHOUT throwing. `cause` is stored
+; as data (typically itself a protocol error, but any value is accepted), so the
+; whole chain stays inspectable and serializable. `err` is never mutated — the
+; data map is rebuilt by `with_data` — so attaching a cause is as safe as any
+; other enrichment. Reach the recorded cause back with `error_cause`.
+;   err   : a protocol error (a make_error / raise! value)
+;   cause : the underlying error/value to record as its cause
+;   ->    : a fresh protocol error carrying cause under data "cause"
+(bind with_cause
+  (lambda (err cause)
+    (with_data err "cause" cause)))
+
+; error_cause — the underlying cause recorded on `err` by with_cause, or null
+; when none was attached (or `err` carries no data). Like the other error_*
+; accessors it expects a protocol error (or any value with a map/null "data"); a
+; caller walks a cause chain by re-applying error_cause to each non-null result
+; and stopping at the first null.
+;   err : a protocol error
+;   ->  : the recorded cause value, or null
+(bind error_cause
+  (lambda (err)
+    (bind ((data (error_data err)))
+      (if (eq (value_type data) "map") (get data "cause") null))))
+
+(export make_error error? error_code error_message error_data
+        with_data map_data raise! as_error
+        with_cause error_cause)

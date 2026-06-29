@@ -1,0 +1,185 @@
+; stdlib/lib/collections/multiset.caap — a bag / multiset (element→count) over
+; ARBITRARY structural keys (module stdlib.lib.collections.multiset).
+;
+; A multiset (bag) records, for each element, how many times it occurs (its
+; MULTIPLICITY). Unlike a set, an element may appear more than once; unlike a
+; list, order is not retained — only the per-element count. This module lifts
+; the structural-key hash map `lib/collections/dict` (keyed by the kernel
+; value_hash, resolved by value_eq) so the elements may be ANY value — ints,
+; strings, and even DISTINCT-but-structurally-equal lists/maps collapse to one
+; element (e.g. `[1 2]` used as a key).
+;
+; Representation: a `dict` mapping element→POSITIVE-count. The invariant is that
+; no key ever carries a count <= 0 — `ms_remove*` drops a key the instant its
+; count reaches zero, so `ms_distinct`/`ms_elements` see only present elements.
+;
+; Two BINARY merges with different arithmetic are offered, documented at their
+; definitions:
+;   - `ms_union`   uses the MAX of the two counts  (set-union semantics: an
+;                  element appears as many times as in whichever bag holds more).
+;   - `ms_sum`     uses the SUM of the two counts  (additive / disjoint-union:
+;                  multiplicities ADD).
+;   - `ms_intersection` uses the MIN of the two counts.
+;   - `ms_difference`   subtracts b's counts from a's, FLOORED at 0.
+;
+; Every operation is PURE (mirrors lib/collections/{dict,set}): a derived
+; multiset is a FRESH dict; inputs are never mutated. Internal `out`/list
+; accumulators are the function's own fresh state, so mutating them is
+; effect-free.
+(module stdlib.lib.collections.multiset)
+
+(use stdlib.lib.collections.dict
+     dict_new dict_get dict_put dict_del dict_has? dict_entries dict_keys dict_size)
+(use stdlib.lib.collections.sequence fold sort_by take concat range)
+
+; ── internal helpers (private; not exported) ────────────────────────────────
+
+; ms__imax / ms__imin — pairwise int max / min (no kernel int_max/int_min).
+;   a / b : two ints
+;   ->    : the larger / smaller
+(bind ms__imax (lambda (a b) (if (gt a b) a b)))
+(bind ms__imin (lambda (a b) (if (lt a b) a b)))
+
+; ms__set_count — a fresh multiset with element `x`'s count SET to `n`; a count
+; of `n <= 0` DROPS the key (the positive-count invariant). The pivot used by
+; every mutator and merge.
+;   ms / x / n : a multiset, the structural element, and its new count
+;   ->         : a fresh multiset (ms untouched)
+(bind ms__set_count
+  (lambda (ms x n)
+    (if (gt n 0) (dict_put ms x n) (dict_del ms x))))
+
+; ── construction & queries ──────────────────────────────────────────────────
+
+; ms_new — a fresh empty multiset.
+;   -> : an empty multiset
+(bind ms_new (lambda () (dict_new)))
+
+; ms_count — the multiplicity of `x` (0 when absent).
+;   ms / x : a multiset and a candidate element
+;   ->     : int (>= 0)
+(bind ms_count (lambda (ms x) (dict_get ms x 0)))
+
+; ms_contains? — does `x` occur at least once in `ms`?
+;   ms / x : a multiset and a candidate element
+;   ->     : bool
+(bind ms_contains? (lambda (ms x) (dict_has? ms x)))
+
+; ms_add_n — a fresh multiset with `n` more of `x` (n may be 0 — a no-op — or
+; negative, in which case it REMOVES, flooring at 0 and dropping at 0).
+;   ms / x / n : a multiset, the element, and the delta to add
+;   ->         : a fresh multiset (ms untouched)
+(bind ms_add_n
+  (lambda (ms x n) (ms__set_count ms x (int_add (ms_count ms x) n))))
+
+; ms_add — a fresh multiset with one more of `x`.
+;   ms / x : a multiset and the element to add
+;   ->     : a fresh multiset (ms untouched)
+(bind ms_add (lambda (ms x) (ms_add_n ms x 1)))
+
+; ms_remove_n — a fresh multiset with `n` fewer of `x`; the count never goes
+; below 0, and reaching 0 DROPS the key.
+;   ms / x / n : a multiset, the element, and the count to remove
+;   ->         : a fresh multiset (ms untouched)
+(bind ms_remove_n
+  (lambda (ms x n) (ms__set_count ms x (ms__imax 0 (int_sub (ms_count ms x) n)))))
+
+; ms_remove — a fresh multiset with one fewer of `x` (dropping the key at 0).
+;   ms / x : a multiset and the element to remove one of
+;   ->     : a fresh multiset (ms untouched)
+(bind ms_remove (lambda (ms x) (ms_remove_n ms x 1)))
+
+; ms_of — a multiset from a list, COUNTING duplicates (each occurrence is +1).
+;   xs : a list of elements (any structural values)
+;   -> : a fresh multiset
+(bind ms_of
+  (lambda (xs) (fold xs (ms_new) (lambda (acc x) (ms_add acc x)))))
+
+; ── aggregate views ─────────────────────────────────────────────────────────
+
+; ms_size — the TOTAL count: the sum of every element's multiplicity.
+;   ms : a multiset
+;   -> : int (>= 0)
+(bind ms_size
+  (lambda (ms)
+    (fold (dict_entries ms) 0 (lambda (acc e) (int_add acc (get e 1))))))
+
+; ms_distinct — the number of DISTINCT elements (regardless of multiplicity).
+;   ms : a multiset
+;   -> : int (>= 0)
+(bind ms_distinct (lambda (ms) (dict_size ms)))
+
+; ms_elements — the distinct elements as a list (order unspecified).
+;   ms : a multiset
+;   -> : a list of elements
+(bind ms_elements (lambda (ms) (dict_keys ms)))
+
+; ms_to_list — every element repeated `count` times (a flat list; order
+; unspecified, but each element's run is contiguous).
+;   ms : a multiset
+;   -> : a list of length (ms_size ms)
+(bind ms_to_list
+  (lambda (ms)
+    (bind ((out (list_of)))
+      (do
+        (for e (dict_entries ms)
+          (for _ (range 0 (get e 1)) (append out (get e 0))))
+        out))))
+
+; ms_most_common — the top-`k` [element count] pairs by count DESCENDING (ties
+; in unspecified order). `k` larger than the number of distinct elements yields
+; them all.
+;   ms / k : a multiset and how many pairs to return
+;   ->     : a list of 2-element [element count] lists, count-descending
+(bind ms_most_common
+  (lambda (ms k)
+    ; sort_by is ASCENDING, so order by the NEGATED count to get descending.
+    (take (sort_by (dict_entries ms) (lambda (e) (int_sub 0 (get e 1)))) k)))
+
+; ── binary combinations (pure; each yields a fresh multiset) ─────────────────
+; Each folds over the union of both bags' elements, applying a per-element
+; arithmetic over `(count_in_a, count_in_b)` (absent => 0). The positive-count
+; invariant of `ms__set_count` drops any element whose combined count is 0.
+
+; ms__merge — the shared engine: for every element of `a` or `b`, store
+; `(combine count_a count_b)`. b's elements already counted via a's pass simply
+; re-store the same value (combine inputs are unchanged), so no dedup is needed.
+;   a / b / combine : two multisets and (int int) -> int
+;   ->              : a fresh multiset
+(bind ms__merge
+  (lambda (a b combine)
+    (bind ((all_keys (concat (ms_elements a) (ms_elements b))))
+      (fold all_keys (ms_new)
+        (lambda (acc x)
+          (ms__set_count acc x (combine (ms_count a x) (ms_count b x))))))))
+
+; ms_union — set-union semantics: each element's count is the MAX of its counts
+; in `a` and `b` (an element appears as many times as in whichever bag has more).
+;   a / b : two multisets
+;   ->    : a fresh multiset
+(bind ms_union (lambda (a b) (ms__merge a b ms__imax)))
+
+; ms_sum — additive / disjoint-union: each element's count is the SUM of its
+; counts in `a` and `b` (multiplicities ADD).
+;   a / b : two multisets
+;   ->    : a fresh multiset
+(bind ms_sum (lambda (a b) (ms__merge a b int_add)))
+
+; ms_intersection — each element's count is the MIN of its counts in `a` and `b`
+; (so an element absent from either is dropped, count 0).
+;   a / b : two multisets
+;   ->    : a fresh multiset
+(bind ms_intersection (lambda (a b) (ms__merge a b ms__imin)))
+
+; ms_difference — a's counts minus b's counts, FLOORED at 0 (an element removed
+; more than it occurs in `a` simply vanishes).
+;   a / b : two multisets
+;   ->    : a fresh multiset
+(bind ms_difference
+  (lambda (a b) (ms__merge a b (lambda (ca cb) (ms__imax 0 (int_sub ca cb))))))
+
+(export ms_new ms_of ms_add ms_add_n ms_remove ms_remove_n
+        ms_count ms_contains?
+        ms_size ms_distinct ms_elements ms_to_list
+        ms_most_common
+        ms_union ms_sum ms_intersection ms_difference)

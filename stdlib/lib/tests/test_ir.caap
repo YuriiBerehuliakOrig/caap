@@ -1,0 +1,207 @@
+; stdlib/lib/test_ir.caap — in-language tests for lib/ir (tree rewriting).
+
+;; @area: syntax
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq)
+(use stdlib.syntax.ir transform subst subst_safe replace_heads
+  node_eq names_used free_names gensym match_node rule rewrite
+  rewrite_fix rewrite_traced)
+(use stdlib.syntax.ast sym lit call calln lam eval_ir literal_of name_of head_of args_of arg)
+
+(do
+  ; ── transform: a USER-WRITTEN constant folder over the tree ──
+  ; bottom-up, so nested folds happen in ONE pass:
+  ; (int_add (int_add 1 2) (int_mul 2 3)) -> (lit 9)
+  (bind (
+    (lit_int?
+      (lambda (n) (eq (value_type (literal_of n)) "int")))
+    (fold_consts
+      (lambda (tree)
+        (transform tree
+          (lambda (n)
+            (if (and (or (eq (head_of n) "int_add") (eq (head_of n) "int_mul"))
+                     (and (lit_int? (arg n 0)) (lit_int? (arg n 1))))
+              (lit (if (eq (head_of n) "int_add")
+                     (int_add (literal_of (arg n 0)) (literal_of (arg n 1)))
+                     (int_mul (literal_of (arg n 0)) (literal_of (arg n 1)))))
+              null)))))
+    (tree (calln "int_add"
+            (list_of (calln "int_add" (list_of (lit 1) (lit 2)))
+                     (calln "int_mul" (list_of (lit 2) (lit 3))))))
+  )
+    (do
+      (assert_eq (literal_of (fold_consts tree)) 9
+        "constant folder collapses the whole tree to a literal")
+      ; the input tree is NOT mutated — it still evaluates
+      (assert_eq (eval_ir tree) 9 "transform is pure: input intact")
+
+      ; a partially foldable tree keeps the dynamic part
+      (bind ((t2 (fold_consts
+                   (calln "int_add"
+                     (list_of (calln "int_add" (list_of (lit 1) (lit 2)))
+                              (sym "x"))))))
+        (do
+          (assert_eq (head_of t2) "int_add" "dynamic part survives")
+          (assert_eq (literal_of (arg t2 0)) 3 "static part folded")))))
+
+  ; ── subst: inline parameters, then evaluate ──
+  ; body = (int_mul x (int_add x y)); x->3 y->4 => 3*(3+4) = 21
+  (bind ((body (calln "int_mul"
+                 (list_of (sym "x")
+                          (calln "int_add" (list_of (sym "x") (sym "y")))))))
+    (assert_eq
+      (eval_ir (subst body (assoc (map_of) "x" (lit 3) "y" (lit 4))))
+      21 "subst inlines names, result evaluates"))
+
+  ; ── subst + transform = a runtime SPECIALIZER ──
+  ; specialize (lambda (x y) (int_mul x y)) at y=10: substitute, rebuild the
+  ; 1-arg lambda, eval to a callable
+  (bind (
+    (body (calln "int_mul" (list_of (sym "x") (sym "y"))))
+    (times10 (eval_ir (lam (list_of "x")
+                        (subst body (assoc (map_of) "y" (lit 10))))))
+  )
+    (assert_eq (times10 7) 70 "specialized function from rewriting"))
+
+  ; ── node_eq: structural equality of trees ──
+  (assert_eq
+    (node_eq (calln "f" (list_of (lit 1) (sym "a")))
+             (calln "f" (list_of (lit 1) (sym "a"))))
+    true "node_eq same shape")
+  (assert_eq
+    (node_eq (calln "f" (list_of (lit 1))) (calln "f" (list_of (lit 2))))
+    false "node_eq differs in a literal")
+
+  ; ── names_used + gensym ──
+  (assert_eq
+    (size (names_used (calln "int_add" (list_of (sym "x") (sym "y")))))
+    3 "names_used counts head + leaves")
+  (assert_eq
+    (eq (gensym "tmp") (gensym "tmp"))
+    false "gensym is fresh each call")
+
+  ; ── match_node: capture, mismatch, nonlinear ──
+  (bind ((b (match_node (calln "int_add" (list_of (sym "?x") (lit 0)))
+                        (calln "int_add" (list_of (sym "n") (lit 0))))))
+    (assert_eq (name_of (get b "?x")) "n" "match captures ?x"))
+  (assert_eq
+    (match_node (calln "int_add" (list_of (sym "?x") (lit 0)))
+                (calln "int_add" (list_of (sym "n") (lit 1))))
+    null "literal mismatch -> no match")
+  (assert_eq
+    (match_node (calln "int_sub" (list_of (sym "?x") (sym "?x")))
+                (calln "int_sub" (list_of (sym "a") (sym "b"))))
+    null "nonlinear ?x must repeat equal subtrees")
+
+  ; ── rewrite: declarative peephole rules ──
+  ; x+0 -> x, x*1 -> x, x-x -> 0; one bottom-up pass cleans the whole tree
+  (bind (
+    (rules (list_of
+      (rule (calln "int_add" (list_of (sym "?x") (lit 0))) (sym "?x"))
+      (rule (calln "int_mul" (list_of (sym "?x") (lit 1))) (sym "?x"))
+      (rule (calln "int_sub" (list_of (sym "?x") (sym "?x"))) (lit 0))))
+    (messy (calln "int_add"
+             (list_of
+               (calln "int_mul"
+                 (list_of (calln "int_add" (list_of (lit 7) (lit 0))) (lit 1)))
+               (calln "int_sub" (list_of (sym "k") (sym "k"))))))
+  )
+    (do
+      ; ((7+0)*1) + (k-k)  ->  7 + 0  ->  7 … the OUTER x+0 needs the inner
+      ; rewrites first; bottom-up gives all of it in one pass
+      (assert_eq (literal_of (rewrite messy rules)) 7
+        "peephole rules cascade bottom-up to a literal")
+      (assert_eq (head_of (arg messy 1)) "int_sub"
+        "rewrite is pure: the input tree keeps its k-k subtree")))
+
+  ; ── segments: `?xs..` captures a SLICE, the template splices it back ──
+  ; wrap a variadic call: (do ?body..) with a prologue prepended
+  (bind ((b (match_node (calln "do" (list_of (sym "?body..")))
+                        (calln "do" (list_of (lit 1) (lit 2) (lit 3))))))
+    (do
+      (assert_eq (size (get b "?body..")) 3 "segment captures the slice")
+      (assert_eq
+        (eval_ir (subst (calln "do" (list_of (lit 100) (sym "?body.."))) b))
+        3 "template splices the captured slice back")))
+
+  ; prefix/suffix around a segment: (f ?pre.. ?last) — last fixed
+  (bind ((b2 (match_node
+               (calln "list_of" (list_of (sym "?init..") (lit 9)))
+               (calln "list_of" (list_of (lit 1) (lit 2) (lit 9))))))
+    (assert_eq (size (get b2 "?init..")) 2 "segment with fixed suffix"))
+  (assert_eq
+    (match_node (calln "list_of" (list_of (sym "?init..") (lit 9)))
+                (calln "list_of" (list_of (lit 1) (lit 2) (lit 8))))
+    null "fixed suffix must still match")
+
+  ; splice in a rewrite rule: instrument every do-block with a leading 0
+  (bind ((r_instr (rewrite
+                    (calln "do" (list_of (lit 5) (lit 6)))
+                    (list_of (rule (calln "do" (list_of (sym "?b..")))
+                                   (calln "do" (list_of (lit 0) (sym "?b.."))))))))
+    (do
+      (assert_eq (size (args_of r_instr)) 3 "splice re-inserts the slice")
+      (assert_eq (eval_ir r_instr) 6 "spliced program still evaluates")))
+
+  ; ── free_names: binder-aware (vs names_used which counts everything) ──
+  (bind ((tree (lam (list_of "x") (calln "int_add" (list_of (sym "x") (sym "y"))))))
+    (do
+      (assert_eq (size (free_names tree)) 2 "free: int_add + y (x is bound)")
+      (assert_eq (get (free_names tree) 1) "y" "y is free")))
+
+  ; ── subst_safe: shadowing + capture avoidance ──
+  ; shadowing: x rebound by the lambda — the inner x must NOT be substituted
+  (bind ((shadowed (subst_safe (lam (list_of "x") (sym "x"))
+                               (assoc (map_of) "x" (lit 42)))))
+    (assert_eq ((eval_ir shadowed) 7) 7
+      "shadowed name untouched (naive subst would freeze it to 42)"))
+
+  ; capture: inline an OUTER `x` into a lambda whose param is also `x` —
+  ; the param must be alpha-renamed, not capture the insertion
+  (bind (
+    (inner (lam (list_of "x")
+             (calln "int_add" (list_of (sym "x") (sym "y")))))
+    (inlined (subst_safe inner (assoc (map_of) "y" (sym "x"))))
+    ; outer x = 10; inner called with 1 -> 1 + 10 = 11 (capture would give 2)
+    (outer (eval_ir (lam (list_of "x")
+             (call inlined (list_of (lit 1))))))
+  )
+    (assert_eq (outer 10) 11 "capture avoided via alpha-rename"))
+
+  ; ── rewrite_fix: rules that need a second pass converge ──
+  ; double(x) -> x+x, then x+x with x literal folds via a second rule pass
+  (bind ((fixed (rewrite_fix
+                  (calln "double" (list_of (calln "double" (list_of (lit 3)))))
+                  (list_of
+                    (rule (calln "double" (list_of (sym "?x")))
+                          (calln "int_add" (list_of (sym "?x") (sym "?x"))))))))
+    (assert_eq (eval_ir fixed) 12 "nested double unrolled to fixpoint"))
+
+  ; ── rewrite_traced: see which rule fired where ──
+  (bind ((tr (rewrite_traced
+               (calln "int_add" (list_of (lit 7) (lit 0)))
+               (list_of (rule (calln "int_add" (list_of (sym "?x") (lit 0)))
+                              (sym "?x"))))))
+    (do
+      (assert_eq (literal_of (get tr "result")) 7 "traced result")
+      (assert_eq (size (get tr "trace")) 1 "one application traced")
+      (assert_eq (get (get (get tr "trace") 0) "after") "7"
+        "trace renders before/after")))
+
+  ; ── C3: rewriting PRESERVES spans (located diagnostics survive) ──
+  (bind ((stamped (ctfe_spec_with_span
+                    (calln "int_add" (list_of (lit 1) (lit 2)))
+                    (assoc (map_of) "start" 0 "end" 9 "start_line" 9
+                      "start_col" 5 "end_line" 9 "end_col" 14))))
+    (bind ((kept (transform stamped (lambda (n) null))))
+      (assert_eq (get (ctfe_spec_span kept) "start_line" 0) 9
+        "transform keeps the original span on rebuilt nodes")))
+
+  ; ── replace_heads: rename an operation across the tree ──
+  (bind ((renamed (replace_heads
+                    (calln "plus" (list_of (lit 20) (calln "plus" (list_of (lit 10) (lit 12)))))
+                    (assoc (map_of) "plus"
+                      (lambda (n) (calln "int_add" (args_of n)))))))
+    (assert_eq (eval_ir renamed) 42 "replace_heads lowers a user op"))
+  true)

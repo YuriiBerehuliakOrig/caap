@@ -1,0 +1,142 @@
+; stdlib/boot/gate.caap — the load-time GATE, as an ordered phase registry
+; MODULE IDENTITY: a RAW bootstrap script (run via ctfe_compiler_execute_bootstrap_file /
+; run_expanded BEFORE the `module` form is a bound name), so it carries NO `(module …)`
+; form — adding one would raise `unknown name: module`. Its registry identity is set
+; explicitly via ctfe_compiler_register_value. Allowlisted in stdlib/CONVENTIONS.md +
+; stdlib_module_identity_check (caap/tests/stdlib_governance_tests.rs).
+; (module stdlib.gate).
+;
+; The pipeline-as-data responsibility, extracted from the loader so any tool that
+; wants the same per-form check/type/passes sweep can reuse it. The gate is a
+; FIXED pipeline — semantic check, then (when present) the type pass, then (when
+; present) user passes — but the SEQUENCE itself is data (`gate_phases`); `checked`
+; merely walks it. `make` binds the gate over the semantic checker the orchestrator
+; already resolved (phase 1's host), returning the `checked` driver that closes over
+; `gate_phases` + that checker + the ambient `compiler` handle. The module is a pure
+; function collection: it holds no loader state.
+(do
+  (bind (
+    ; ── the ordered phase registry ──────────────────────────────────────────────
+    ; Each phase entry:
+    ;   name       : a human label (diagnostics / introspection)
+    ;   lookup_key : the module to resolve by name (ctfe_compiler_lookup_value),
+    ;                or null when the phase is already BOUND (the semantic checker)
+    ;   optional?  : true  -> a module that is absent OR still half-built (its
+    ;                         exports null, the two-phase placeholder) is simply
+    ;                         skipped; false -> the phase always runs
+    ;   run        : (lambda (host ctx)) — `host` is the resolved module value (or,
+    ;                for a null lookup_key, the bound phase value), `ctx` is the
+    ;                shared gate context {located, importer, base_scope, type_env,
+    ;                sink}. Each `run` reads the PRECISE export it needs and keeps
+    ;                its own null-discipline, so adding a phase never disturbs another.
+    ; A registered phase fails loads exactly like a built-in one (findings land in
+    ; `sink`). Default order is identical to the historical hardcoded pipeline —
+    ; eval=native parity rides on that.
+    (gate_phases
+      (list_of
+        ; 1. SEMANTIC CHECK — typos in names, wrong arity (builtins + user
+        ;    lambdas). Always present (bound above), so lookup_key is null.
+        (assoc (map_of)
+          "name" "check" "lookup_key" null "optional?" false
+          "run"
+          (lambda (host ctx)
+            (host (get ctx "located") (get ctx "base_scope") (get ctx "sink"))))
+        ; 2. TYPE PASS — joins once stdlib.semantics.types.infer is loaded (bootstrap
+        ;    eager-loads it right after the loader). Guard the FUNCTIONS, not
+        ;    just the module: while infer itself is loading its name resolves
+        ;    to the two-phase placeholder (an empty map) whose entries are
+        ;    still null. The walk returns its harvest — paired sig records with
+        ;    settled effects — which register_sigs! files under the module.
+        (assoc (map_of)
+          "name" "types" "lookup_key" "stdlib.semantics.types.infer" "optional?" true
+          "run"
+          (lambda (host ctx)
+            (when_let (cmt (get host "check_module_types"))
+              (bind ((harvest (cmt (get ctx "located")
+                                   (get ctx "type_env") (get ctx "sink"))))
+                ((get host "register_sigs!") (get ctx "importer") harvest)))))
+        ; 3. USER PASSES — stdlib.semantics.passes.registry, looked up by name
+        ;    exactly like the type pass. A registered analysis fails loads like
+        ;    any built-in phase; a session that never loads the kit pays
+        ;    nothing.
+        (assoc (map_of)
+          "name" "passes" "lookup_key" "stdlib.semantics.passes.registry"
+          "optional?" true
+          "run"
+          (lambda (host ctx)
+            (when_let (rp (get host "run_passes"))
+              (rp (get ctx "located") (get ctx "sink")))))))
+
+    ; make — bind the gate over `check_forms` (phase 1's host, resolved by the
+    ; orchestrator from stdlib.check). Returns `checked` + `gate_phases`.
+    ; checked — the load-time gate over a module's EXPANDED top-level forms: the
+    ; semantic checker and (once the type pass is loaded) the type pass run per
+    ; form, so every finding carries that form's source location. Findings are
+    ; APPENDED to `sink`; the caller decides when to fail. Drives `gate_phases` in
+    ; order: resolve each phase's host (a by-name lookup, or the bound value for a
+    ; null lookup_key), skip an absent OPTIONAL phase, else run it.
+    ;   located    : [{node, loc}] the expanded forms, in source order
+    ;   importer   : the module name (or path), for signature registration
+    ;   base_scope : names visible from outside the body (the import params)
+    ;   type_env   : initial name->type env (seeded from use-import sigs)
+    ;   sink       : the module's findings list
+    (make
+      (lambda (check_forms)
+        (bind (
+          (checked
+            (lambda (located importer base_scope type_env sink)
+              (bind ((ctx
+                       (assoc (map_of)
+                         "located" located "importer" importer
+                         "base_scope" base_scope "type_env" type_env "sink" sink)))
+                (do
+                  (for phase gate_phases
+                    (with_map phase (
+                      (lookup_key "lookup_key")
+                      (optional? "optional?")
+                      (run "run")
+                    )
+                      ; a null lookup_key names a phase already BOUND (the semantic
+                      ; checker); otherwise resolve the module by name
+                      (bind ((host (if (eq lookup_key null)
+                                     check_forms
+                                     (ctfe_compiler_lookup_value compiler lookup_key null))))
+                        ; an OPTIONAL phase whose module is absent is skipped; its
+                        ; `run` still null-checks the precise export it needs
+                        (if (and optional? (eq host null))
+                          null
+                          (run host ctx)))))
+                  null))))
+        )
+          (do
+            ; validate the phase registry ONCE, at construction: a malformed
+            ; entry (a missing string `name` / callable `run`, or a DUPLICATE
+            ; phase name that would silently double-run or shadow another) is a
+            ; hard diagnostic, not a quiet pass. Additive — the built-in registry
+            ; is well-formed, so this never fires for it; it only guards future
+            ; phase additions from a silent missing-arg / double-register slip.
+            (bind ((seen (map_of)))
+              (for phase gate_phases
+                (bind (
+                  (nm (get phase "name"))
+                  (run (get phase "run"))
+                )
+                  (do
+                    (when (not (eq (value_type nm) "string"))
+                      (runtime_error
+                        "stdlib.gate: a phase entry is missing a string \"name\""))
+                    (when (not (eq (value_type run) "callable"))
+                      (runtime_error
+                        (string_concat_many
+                          "stdlib.gate: phase \"" nm
+                          "\" is missing a callable \"run\"")))
+                    (when (contains seen nm)
+                      (runtime_error
+                        (string_concat_many
+                          "stdlib.gate: duplicate phase \"" nm
+                          "\" (each phase name must be registered once)")))
+                    (assoc seen nm true)))))
+            (assoc (map_of) "checked" checked "gate_phases" gate_phases)))))
+  )
+    (ctfe_compiler_register_value compiler "stdlib.gate"
+      (assoc (map_of) "make" make "gate_phases" gate_phases))))

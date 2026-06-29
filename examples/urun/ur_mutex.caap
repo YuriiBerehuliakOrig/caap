@@ -1,0 +1,134 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  ur_mutex — a MUTUAL-EXCLUSION lock with PRIORITY INHERITANCE (module
+//  stdlib.urun.ur_mutex). The analogue of URun's ur_mutex_*. Unlike the counting
+//  semaphore, a mutex has an OWNER, and that ownership is what lets it bound
+//  priority inversion: when a high-priority thread blocks on a mutex held by a
+//  lower-priority owner, the owner INHERITS the blocker's priority so it can run
+//  and release promptly, instead of being starved by unrelated mid-priority
+//  threads (the classic Mars-Pathfinder inversion). On release the owner's base
+//  priority is restored and the lock is handed to the highest-priority waiter.
+//
+//  Built on the same parts as the semaphore: a generic intrusive waiter list, the
+//  suspend/cleanup engine, and the scheduler's existing ur_thread_priority_change
+//  (remove + reinsert at the new priority). `owner == 0` means unlocked.
+//
+//  LIMITATIONS (documented): non-recursive (the owner re-locking deadlocks); a
+//  waiter that TIMES OUT does not retroactively lower a boost it caused (the
+//  owner stays boosted until release — a safe over-approximation, not the minimal
+//  inherited priority). These match a teaching mutex; a production one would add
+//  recursion + a boost re-computation on timeout.
+(surface stdlib.frontend.clike stdlib.urun.ur_mutex)
+
+use stdlib.urun.ur_scheduler (UR_THREAD, ur_thread_current, _ur_thread_resume, _ur_thread_suspend_timed, _ur_list_prioritize_inplace)
+use stdlib.urun.ur_port (ur_interrupt_save, ur_interrupt_restore, ur_pend_switch)
+use stdlib.urun.ur_status (UR_SUCCESS, UR_NO_INSTANCE, UR_NO_WAIT)
+use stdlib.urun.ur_list (List, ur_list_init, ur_list_empty, ur_list_push, ur_list_remove, ur_list_pop)
+use stdlib.urun.ur_thread (ur_thread_priority_change)
+
+// A mutex: the owner (a UR_THREAD* as an address, 0 = free), the owner's priority
+// at lock time (the restore target after any inheritance), and a FIFO waiter list
+// reordered by priority at hand-off time.
+UR_MUTEX struct export = {
+  ur_mutex_owner u32,           // owning UR_THREAD* (0 = unlocked)
+  ur_mutex_owner_prio u32,      // owner's base priority (PI restore target)
+  ur_mutex_waiters List<UR_THREAD, ur_thread_suspend_next>
+}
+
+ur_mutex_create (m UR_MUTEX*) i32 export = {
+  m->ur_mutex_owner = 0
+  m->ur_mutex_owner_prio = 0
+  ur_list_init(&m->ur_mutex_waiters)
+  UR_SUCCESS
+}
+
+// unlink t from the waiter list. `m` is a PARAMETER here so the generic-list
+// type/field deduction can read it — the cleanup callback's `m` is a LOCAL (cast
+// from suspend_control), which the deduction cannot, so it must route through this
+// wrapper (the same reason the semaphore unlinks via _sem_unlink).
+_mtx_unlink (m UR_MUTEX*, t UR_THREAD*) i32 = {
+  ur_list_remove(&m->ur_mutex_waiters, t)
+}
+// suspend-cleanup: a timed-out / aborted waiter unlinks itself from THIS mutex's
+// waiter list and records that the lock was not acquired. (The boost it may have
+// granted the owner is left in place until release — see the header limitation.)
+_ur_mutex_cleanup (t UR_THREAD*) i32 = {
+  m UR_MUTEX* = t->ur_thread_suspend_control as UR_MUTEX*
+  _mtx_unlink(m, t)
+  t->ur_thread_suspend_status = UR_NO_INSTANCE
+  0
+}
+
+// lock: take a free mutex, or honour the wait option. On contention, INHERIT —
+// boost the owner to the caller's priority if the caller outranks it — then block.
+ur_mutex_get (m UR_MUTEX*, wait u32) i32 export = {
+  prev u32 = ur_interrupt_save()
+  cur UR_THREAD* = ur_thread_current()
+  cur_addr u32 = cast(ptr_to_int(cur), u32)
+  if cur_addr == 0 {
+    ur_interrupt_restore(prev)
+    UR_NO_INSTANCE
+  } else {
+    if m->ur_mutex_owner == 0 {
+      m->ur_mutex_owner = cur_addr
+      m->ur_mutex_owner_prio = cur->ur_thread_priority
+      ur_interrupt_restore(prev)
+      UR_SUCCESS
+    } else {
+      if wait == UR_NO_WAIT() {
+        ur_interrupt_restore(prev)
+        UR_NO_INSTANCE
+      } else {
+        // PRIORITY INHERITANCE: a lower priority NUMBER is a higher priority, so the
+        // caller outranks the owner when its number is smaller. Boost the owner to
+        // the caller's level so it can finish and release rather than be preempted by
+        // unrelated mid-priority work.
+        owner UR_THREAD* = m->ur_mutex_owner as UR_THREAD*
+        if cur->ur_thread_priority < owner->ur_thread_priority {
+          ur_thread_priority_change(owner, cur->ur_thread_priority)
+        } else {
+          0
+        }
+        ur_list_push(&m->ur_mutex_waiters, cur)
+        _ur_thread_suspend_timed(cur,
+          fn_ptr(_ur_mutex_cleanup) as u32,
+          cast(ptr_to_int(m), u32), wait)
+        ur_pend_switch()
+        ur_interrupt_restore(prev)
+        cur->ur_thread_suspend_status
+      }
+    }
+  }
+}
+
+// unlock: only the owning thread may release. A non-owner / pre-scheduler call
+// returns the existing "not available" status, UR_NO_INSTANCE. On a valid release,
+// restore the owner's base priority (undo inheritance), then either hand the lock
+// to the highest-priority waiter or mark it free.
+ur_mutex_put (m UR_MUTEX*) i32 export = {
+  prev u32 = ur_interrupt_save()
+  cur UR_THREAD* = ur_thread_current()
+  cur_addr u32 = cast(ptr_to_int(cur), u32)
+  if m->ur_mutex_owner == 0 || cur_addr == 0 || m->ur_mutex_owner != cur_addr {
+    ur_interrupt_restore(prev)
+    UR_NO_INSTANCE
+  } else {
+    owner UR_THREAD* = m->ur_mutex_owner as UR_THREAD*
+    if owner->ur_thread_priority != m->ur_mutex_owner_prio {
+      ur_thread_priority_change(owner, m->ur_mutex_owner_prio)
+    } else {
+      0
+    }
+    if !ur_list_empty(&m->ur_mutex_waiters) {
+      _ur_list_prioritize_inplace(&m->ur_mutex_waiters)      // highest-priority waiter first
+      nxt UR_THREAD* = ur_list_pop(&m->ur_mutex_waiters)
+      m->ur_mutex_owner = cast(ptr_to_int(nxt), u32)
+      m->ur_mutex_owner_prio = nxt->ur_thread_priority
+      nxt->ur_thread_suspend_status = UR_SUCCESS
+      _ur_thread_resume(nxt)                                  // pends a switch if it outranks us
+    } else {
+      m->ur_mutex_owner = 0
+    }
+    ur_interrupt_restore(prev)
+    UR_SUCCESS
+  }
+}

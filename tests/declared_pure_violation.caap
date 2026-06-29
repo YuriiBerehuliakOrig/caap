@@ -1,0 +1,9 @@
+; tests/declared_pure_violation.caap — `pure` declared at the name
+; while the body certainly mutates; the declaration is VERIFIED against the
+; inference, so this is a load-time error.
+(module stdlib.fixtures.declared_pure_violation)
+
+(defn bad ((x int)) int pure
+  (do (append (list_of) x) x))
+
+(export bad)

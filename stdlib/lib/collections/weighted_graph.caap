@@ -1,0 +1,295 @@
+; stdlib/lib/collections/weighted_graph.caap — weighted graph + Dijkstra/Bellman-Ford/Kruskal MST.
+;
+; A WEIGHTED DIRECTED GRAPH is a plain map
+;   {node -> [ {"to": succ, "weight": w} … ] }
+; where nodes are STRING keys and weights are numeric (ints). The adjacency
+; list of a node is its list of outgoing edges; a node with no entry has no
+; outgoing edges (queries are TOTAL). Every edit is PURE — it returns a FRESH
+; graph and never mutates its argument.
+;
+; The shortest-path algorithms return a record with a "dist" map (node -> cost)
+; and a "prev" map (node -> predecessor on a shortest path). UNREACHED nodes are
+; ABSENT from both maps (there is no +inf sentinel — "not present" means
+; unreachable / infinite distance). The source maps to cost 0 and has no prev.
+;
+;   wg_dijkstra      — non-negative weights only (uses the sorted min-heap)
+;   wg_bellman_ford  — handles negative weights; reports a negative-cycle flag
+;   wg_kruskal_mst   — minimum spanning tree, graph treated as UNDIRECTED
+(module stdlib.lib.collections.weighted_graph)
+
+(use stdlib.lib.collections.sorted heap_new heap_push heap_pop heap_peek)
+(use stdlib.lib.collections.union_find
+  uf_new uf_make_set uf_union uf_connected?)
+(use stdlib.lib.collections.sequence each fold sort_by reverse)
+
+; ── internal helpers ─────────────────────────────────────────────────────────
+
+; esc — escape double quotes for DOT output.
+(bind esc
+  (lambda (s) (string_replace s "\"" "\\\"")))
+
+; copy_edges — a fresh copy of a node's edge list (records reused; they are
+; immutable here). Lets us copy a graph without aliasing the backing lists.
+(bind copy_edges
+  (lambda (edges)
+    (bind ((out (list_of)))
+      (do (each edges (lambda (e) (append out e))) out))))
+
+; copy_graph — a fresh graph with every adjacency list independently allocated.
+(bind copy_graph
+  (lambda (g)
+    (bind ((out (map_of)))
+      (do
+        (for n (map_keys g) (assoc out n (copy_edges (get g n (list_of)))))
+        out))))
+
+; dist_cmp — order [dist node] pairs by their distance (index 0). Used as the
+; per-op comparator for the min-heap, so the cheapest frontier entry pops first.
+(bind dist_cmp
+  (lambda (a b)
+    (bind ((da (get a 0)) (db (get b 0)))
+      (cond ((lt da db) -1) ((lt db da) 1) (else 0)))))
+
+; ── construction / edits (pure) ──────────────────────────────────────────────
+
+; wg_new — an empty weighted graph.
+(bind wg_new (lambda () (map_of)))
+
+; wg_add_edge — a fresh graph with the DIRECTED edge from -> to (weight w)
+; added. Both endpoints are auto-created if absent, so the result is always
+; well-formed (`to` may be an isolated node with no outgoing edges).
+;   g / from / to / w : the graph, the two endpoints, the edge weight
+;   ->                : a fresh graph (input untouched)
+(bind wg_add_edge
+  (lambda (g from to w)
+    (bind ((out (copy_graph g)))
+      (do
+        (unless (contains out from) (assoc out from (list_of)))
+        (unless (contains out to)   (assoc out to   (list_of)))
+        (append (get out from) (assoc (map_of) "to" to "weight" w))
+        out))))
+
+; wg_add_undirected — a fresh graph with BOTH directed edges a->b and b->a
+; (each weight w) added.
+;   g / a / b / w : the graph, the two endpoints, the edge weight
+;   ->            : a fresh graph (input untouched)
+(bind wg_add_undirected
+  (lambda (g a b w)
+    (wg_add_edge (wg_add_edge g a b w) b a w)))
+
+; wg_nodes — the declared nodes (the adjacency map's keys).
+(bind wg_nodes (lambda (g) (map_keys g)))
+
+; wg_edges — the outgoing edge list [{to,weight}…] of `node`, or [] when
+; `node` is unknown.
+(bind wg_edges (lambda (g node) (get g node (list_of))))
+
+; ── rendering ────────────────────────────────────────────────────────────────
+
+; wg_to_dot — the graph as a DOT digraph with each edge labelled by its weight.
+;   g     : the weighted graph
+;   title : the digraph name
+;   ->    : DOT source text
+(bind wg_to_dot
+  (lambda (g title)
+    (bind ((out (ref (string_concat_many "digraph \"" (esc title) "\" {\n"))))
+      (do
+        (for n (map_keys g)
+          (do
+            (set_ref out (string_concat_many (deref out) "  \"" (esc n) "\";\n"))
+            (each (get g n (list_of))
+              (lambda (e)
+                (set_ref out (string_concat_many
+                  (deref out) "  \"" (esc n) "\" -> \"" (esc (get e "to"))
+                  "\" [label=\"" (int_to_string (get e "weight")) "\"];\n"))))))
+        (string_concat_many (deref out) "}\n")))))
+
+; ── Dijkstra (non-negative weights) ──────────────────────────────────────────
+
+; wg_dijkstra — single-source shortest paths from `source`, weights MUST be
+; non-negative. Lazy-deletion variant: the frontier is the sorted min-heap of
+; [dist node] pairs; a popped entry whose recorded dist exceeds the node's best
+; known dist is STALE and skipped. Unreached nodes are ABSENT from the result.
+;   g / source : the graph and the start node
+;   ->         : {"dist": {node->cost}, "prev": {node->pred}}
+(bind wg_dijkstra
+  (lambda (g source)
+    (bind ((dist (map_of))
+           (prev (map_of))
+           (frontier (ref (heap_push (heap_new) (list_of 0 source) dist_cmp))))
+      (do
+        (assoc dist source 0)
+        ; main loop: pop the cheapest frontier entry until the heap drains
+        (while (gt (size (deref frontier)) 0)
+          (bind ((popped (heap_pop (deref frontier) dist_cmp))
+                 (pair (get popped "value"))
+                 (h2   (get popped "heap")))
+            (do
+              (set_ref frontier h2)
+              (bind ((d (get pair 0)) (u (get pair 1)))
+                ; skip stale entries: a later, smaller dist already settled `u`
+                (unless (gt d (get dist u d))
+                  (each (get g u (list_of))
+                    (lambda (e)
+                      (bind ((v  (get e "to"))
+                             (nd (int_add d (get e "weight"))))
+                        ; relax: shorter path to v via u?
+                        (when (or (not (contains dist v))
+                                  (lt nd (get dist v nd)))
+                          (do
+                            (assoc dist v nd)
+                            (assoc prev v u)
+                            (set_ref frontier
+                              (heap_push (deref frontier)
+                                (list_of nd v) dist_cmp))))))))))))
+        (assoc (map_of) "dist" dist "prev" prev)))))
+
+; ── path reconstruction ──────────────────────────────────────────────────────
+
+; reconstruct — the node list source..target from a `prev` map, or [] when
+; `target` is not reachable (absent from prev and not the source itself).
+(bind reconstruct
+  (lambda (prev source target)
+    (if (and (not (eq target source)) (not (contains prev target)))
+        (list_of)                                  ; unreachable
+        (bind ((rev (list_of)) (cur (ref target)) (done (ref false)))
+          (do
+            (while (not (deref done))
+              (do
+                (append rev (deref cur))
+                (if (eq (deref cur) source)
+                    (set_ref done true)
+                    (set_ref cur (get prev (deref cur))))))
+            (reverse rev))))))                      ; flip to source..target
+
+; wg_shortest_path — the node list source..target on a shortest path (Dijkstra),
+; or [] when target is unreachable. Returns [source] when source == target.
+;   g / source / target : the graph and the two endpoints
+;   ->                  : a list of nodes (empty when unreachable)
+(bind wg_shortest_path
+  (lambda (g source target)
+    (bind ((res  (wg_dijkstra g source))
+           (prev (get res "prev"))
+           (dist (get res "dist")))
+      (if (not (contains dist target))
+          (list_of)                                 ; never reached
+          (reconstruct prev source target)))))
+
+; ── Bellman-Ford (negative weights, negative-cycle detection) ────────────────
+
+; wg_bellman_ford — single-source shortest paths allowing NEGATIVE weights.
+; Classic V-1 relaxation rounds, then one extra round to detect a reachable
+; negative cycle. Unreached nodes are ABSENT from dist/prev.
+;   g / source : the graph and the start node
+;   ->         : {"dist", "prev", "negative_cycle": bool}
+(bind wg_bellman_ford
+  (lambda (g source)
+    (bind ((dist (map_of))
+           (prev (map_of))
+           (nodes (map_keys g))
+           (n (size nodes)))
+      (do
+        (assoc dist source 0)
+        ; relax_round — one full sweep over every edge; returns true if any
+        ; distance improved this sweep (used for early exit and for cycle test).
+        (bind ((relax_round
+                 (lambda ()
+                   (bind ((changed (ref false)))
+                     (do
+                       (for u nodes
+                         (when (contains dist u)
+                           (each (get g u (list_of))
+                             (lambda (e)
+                               (bind ((v  (get e "to"))
+                                      (nd (int_add (get dist u) (get e "weight"))))
+                                 (when (or (not (contains dist v))
+                                           (lt nd (get dist v)))
+                                   (do
+                                     (assoc dist v nd)
+                                     (assoc prev v u)
+                                     (set_ref changed true))))))))
+                       (deref changed))))))
+          (do
+            ; V-1 rounds (early-exit when a full sweep makes no change)
+            (bind ((i (ref 0)) (active (ref true)))
+              (while (and (lt (deref i) (int_sub n 1)) (deref active))
+                (do
+                  (set_ref active (relax_round))
+                  (set_ref i (int_add (deref i) 1)))))
+            ; one extra round: any further relaxation ⇒ a reachable negative cycle
+            (assoc (map_of)
+              "dist" dist
+              "prev" prev
+              "negative_cycle" (relax_round))))))))
+
+; ── Kruskal MST (graph treated as UNDIRECTED) ────────────────────────────────
+
+; edge_key — a canonical, order-independent key for the undirected edge {a,b},
+; so symmetric directed edges a->b and b->a collapse to one. Lexicographic min
+; first; the " " separator keeps the two halves apart for the dedup map.
+(bind edge_key
+  (lambda (a b)
+    (if (le a b)
+        (string_concat_many a " " b)
+        (string_concat_many b " " a))))
+
+; undirected_edges — the deduplicated undirected edge set of `g` as a list of
+; {from,to,weight} records. Symmetric directed edges collapse to one; on a
+; duplicate key the SMALLEST weight wins (a parallel cheaper edge is preferred).
+(bind undirected_edges
+  (lambda (g)
+    (bind ((seen (map_of)))               ; edge_key -> {from,to,weight}
+      (do
+        (for u (map_keys g)
+          (each (get g u (list_of))
+            (lambda (e)
+              (bind ((v (get e "to"))
+                     (w (get e "weight"))
+                     (k (edge_key u v)))
+                (when (not (eq u v))       ; ignore self-loops in an MST
+                  (if (contains seen k)
+                      (when (lt w (get (get seen k) "weight"))
+                        (assoc seen k (assoc (map_of) "from" u "to" v "weight" w)))
+                      (assoc seen k
+                        (assoc (map_of) "from" u "to" v "weight" w))))))))
+        (bind ((out (list_of)))
+          (do (for k (map_keys seen) (append out (get seen k))) out))))))
+
+; wg_kruskal_mst — a minimum spanning tree (the graph treated as UNDIRECTED),
+; as a list of {from,to,weight} edges. Greedy Kruskal: sort the deduplicated
+; undirected edges by ascending weight and add each edge whose endpoints are
+; not yet connected (union-find over the string node keys). For a disconnected
+; graph this yields a minimum spanning FOREST.
+;   g  : the weighted graph
+;   -> : the MST edge list [{from,to,weight}…]
+(bind wg_kruskal_mst
+  (lambda (g)
+    (bind ((edges (sort_by (undirected_edges g) (lambda (e) (get e "weight"))))
+           (uf (ref (uf_new)))
+           (mst (list_of)))
+      (do
+        ; seed every node as its own singleton set
+        (for n (map_keys g) (set_ref uf (uf_make_set (deref uf) n)))
+        (each edges
+          (lambda (e)
+            (bind ((a (get e "from")) (b (get e "to"))
+                   (chk (uf_connected? (deref uf) a b)))
+              (do
+                (set_ref uf (get chk "uf"))           ; thread compression forward
+                (unless (get chk "value")             ; not yet connected ⇒ keep
+                  (do
+                    (set_ref uf (uf_union (deref uf) a b))
+                    (append mst e)))))))
+        mst))))
+
+; wg_mst_weight — the total weight of an MST edge list (a convenience over
+; wg_kruskal_mst's result).
+;   edges : a list of {from,to,weight} records
+;   ->    : the summed weight (0 for an empty list)
+(bind wg_mst_weight
+  (lambda (edges)
+    (fold edges 0 (lambda (acc e) (int_add acc (get e "weight"))))))
+
+(export wg_new wg_add_edge wg_add_undirected wg_nodes wg_edges wg_to_dot
+        wg_dijkstra wg_shortest_path wg_bellman_ford
+        wg_kruskal_mst wg_mst_weight)

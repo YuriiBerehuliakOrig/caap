@@ -1,0 +1,73 @@
+; stdlib/lib/tests/test_generics.caap — A2 type variables (parametric
+; polymorphism). Two halves:
+;   1. the registry's structural helpers (type_var?/ctor_of/type_args/subst_type)
+;      as plain value assertions;
+;   2. a generic `defn` that the TYPE PASS must accept and instantiate per call
+;      — its mere clean load proves unification did not false-flag, and the
+;      runtime results prove the polymorphic function behaves identically for
+;      every element type.
+
+;; @area: types
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq)
+(use stdlib.semantics.types.registry type_var? ctor_of type_args subst_type known_type?)
+
+; ── a generic library function: the ROADMAP A2 headline ─────────────────────
+; (list T) in and out — T unifies with the argument's element type at each
+; call. The type pass checks this signature; a wrong-arity or ill-typed body
+; would fail the load before any assertion runs.
+(defn id_list ((xs (list T))) (list T) xs)
+
+; a two-parameter generic where both lists share the element variable: passing
+; lists of DIFFERENT concrete element types is what a stricter use would catch,
+; but here every call is homogeneous, so it instantiates cleanly.
+(defn pair_first ((a (list T)) (b (list T))) T (get a 0))
+
+; a generic over a MAP: key/value variables bound independently.
+(defn first_key ((m (map K V))) K (get (map_keys m) 0))
+
+(do
+  ; ── 1. structural helpers ─────────────────────────────────────────────────
+  (assert_eq (type_var? "T") true "single uppercase letter is a type var")
+  (assert_eq (type_var? "K") true "K is a type var")
+  (assert_eq (type_var? "int") false "int is a concrete type, not a var")
+  (assert_eq (type_var? "Point") false "CamelCase is not a single-letter var")
+  (assert_eq (type_var? "list<T>") false "a parameterized spelling is not a var")
+  (assert_eq (type_var? null) false "null is not a var")
+  ; a single uppercase letter that IS registered stops being a var (additive)
+  (assert_eq (known_type? "T") false "T names no registered type")
+
+  (assert_eq (ctor_of "list<int>") "list" "ctor of list<int>")
+  (assert_eq (ctor_of "map<string,u8>") "map" "ctor of map<…>")
+  (assert_eq (ctor_of "int") null "a bare type has no constructor")
+  (assert_eq (ctor_of "T") null "a bare variable has no constructor")
+
+  (assert_eq (get (type_args "list<int>") 0) "int" "type_args of list<int>")
+  (assert_eq (size (type_args "map<string,list<u8>>")) 2 "two top-level args")
+  (assert_eq (get (type_args "map<string,list<u8>>") 1) "list<u8>"
+    "nested arg kept whole (depth-0 split)")
+  (assert_eq (type_args "int") null "a bare type has no args")
+
+  ; substitution rebuilds spellings, recursively
+  (assert_eq (subst_type "T" (assoc (map_of) "T" "int")) "int" "bare var subst")
+  (assert_eq (subst_type "list<T>" (assoc (map_of) "T" "int")) "list<int>"
+    "parameterized result instantiated")
+  (assert_eq
+    (subst_type "map<K,list<V>>"
+      (assoc (map_of) "K" "string" "V" "u8"))
+    "map<string,list<u8>>" "nested substitution")
+  (assert_eq (subst_type "list<T>" (map_of)) "list<T>"
+    "unbound variable stays itself")
+  (assert_eq (subst_type "int" (assoc (map_of) "T" "u8")) "int"
+    "a concrete type is unaffected by substitution")
+
+  ; ── 2. the generic functions RUN polymorphically ──────────────────────────
+  ; concrete element types are preserved through instantiation — the same
+  ; function over ints and over strings.
+  (assert_eq (get (id_list (list_of 1 2 3)) 1) 2 "id_list over ints")
+  (assert_eq (get (id_list (list_of "a" "b")) 0) "a" "id_list over strings")
+  (assert_eq (pair_first (list_of 10 20) (list_of 30 40)) 10 "pair_first ints")
+  (assert_eq (pair_first (list_of "x") (list_of "y")) "x" "pair_first strings")
+  (assert_eq (first_key (assoc (map_of) "only" 7)) "only" "first_key of a map")
+  true)

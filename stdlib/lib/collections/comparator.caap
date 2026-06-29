@@ -1,0 +1,76 @@
+; stdlib/lib/collections/comparator.caap — composable comparator combinators.
+; (module stdlib.lib.collections.comparator).
+;
+; A comparator is `(lambda (a b) -1|0|1)` — the same contract as the kernel
+; `value_compare` (exposed as `deep_compare` in lib/core/equal) and `int_cmp` in
+; lib/collections/sorted. This module is the ALGEBRA over that contract: build a
+; comparator from a key projection, reverse one, chain several into a tie-broken
+; lexicographic order, and apply one to pick min/max/clamp. Pure; every result is
+; a fresh closure or value. The natural order is `deep_compare` (a total structural
+; order over any values), so these compose with heaps, ordered maps, and sorts.
+(module stdlib.lib.collections.comparator)
+
+(use stdlib.lib.core.equal deep_compare)
+(use stdlib.lib.collections.sequence fold)
+
+; ── the natural order ─────────────────────────────────────────────────────────
+
+; natural — the total structural order over any two values (-1/0/1).
+(bind natural deep_compare)
+
+; ── building comparators ──────────────────────────────────────────────────────
+
+; reverse — flip a comparator's direction (descending from ascending).
+;   cmp : a comparator
+;   ->  : (lambda (a b) (cmp b a))
+(bind reverse (lambda (cmp) (lambda (a b) (cmp b a))))
+
+; by_key — compare two values by a projection, ordered by `natural`.
+;   keyfn : (x) -> the comparison key
+;   ->    : a comparator over x's
+(bind by_key (lambda (keyfn) (lambda (a b) (deep_compare (keyfn a) (keyfn b)))))
+
+; by_key_with — like by_key but compares the projected keys with `cmp`.
+;   keyfn : (x) -> key ; cmp : a comparator over keys
+(bind by_key_with
+  (lambda (keyfn cmp) (lambda (a b) (cmp (keyfn a) (keyfn b)))))
+
+; then_by — `cmp1`, breaking ties (a 0 result) with `cmp2`.
+;   -> : a comparator that is cmp1, then cmp2 on equality
+(bind then_by
+  (lambda (cmp1 cmp2)
+    (lambda (a b)
+      (bind ((r (cmp1 a b)))
+        (if (eq r 0) (cmp2 a b) r)))))
+
+; lexicographic — chain a list of comparators, each breaking the previous one's
+;   ties (left to right). The empty list is the all-equal comparator.
+;   cmps : [comparator…]
+(bind lexicographic
+  (lambda (cmps)
+    (fold cmps (lambda (a b) 0) (lambda (acc c) (then_by acc c)))))
+
+; ── applying a comparator ─────────────────────────────────────────────────────
+
+; min_with / max_with — the lesser / greater of two values under `cmp`
+;   (min_with keeps `a` on a tie; max_with keeps `a` on a tie — both stable to a).
+(bind min_with (lambda (cmp a b) (if (le (cmp a b) 0) a b)))
+(bind max_with (lambda (cmp a b) (if (ge (cmp a b) 0) a b)))
+
+; clamp_with — restrict `x` to the inclusive range [lo, hi] under `cmp`.
+(bind clamp_with
+  (lambda (cmp x lo hi) (max_with cmp lo (min_with cmp x hi))))
+
+; least / greatest — the minimum / maximum of a non-empty list under `cmp`
+;   (returns null for an empty list).
+(bind least
+  (lambda (cmp xs)
+    (if (eq (size xs) 0) null
+      (fold xs (get xs 0) (lambda (acc x) (min_with cmp acc x))))))
+(bind greatest
+  (lambda (cmp xs)
+    (if (eq (size xs) 0) null
+      (fold xs (get xs 0) (lambda (acc x) (max_with cmp acc x))))))
+
+(export natural reverse by_key by_key_with then_by lexicographic
+        min_with max_with clamp_with least greatest)

@@ -1,3 +1,3 @@
 [workspace]
-members = ["caap", "peg"]
+members = ["caap", "caap-cli", "caap-lsp", "caap-dap", "peg", "peg-derive", "caap-sys-runtime", "caap-sys-runtime-ffi"]
 resolver = "2"

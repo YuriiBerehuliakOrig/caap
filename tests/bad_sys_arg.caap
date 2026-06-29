@@ -1,0 +1,10 @@
+; tests/bad_sys_arg.caap — sys facades file their
+; TYPED surface with the type pass (declare_ops!), so a wrong argument type at
+; an importer's call site is a certain load-time error.
+(module stdlib.fixtures.bad_sys_arg)
+
+(use sys.io write)
+
+(bind k (write 42))
+
+(export k)

@@ -1,0 +1,287 @@
+; stdlib/backend/emit/llvm/types.caap — CAAP type name <-> LLVM type lowering and
+; the DWARF composite/derived/array type builders (module
+; stdlib.backend.emit.llvm.types).
+;
+; The scalar/struct/pointer type-mapping helpers (ll_type / ll_of / render_t /
+; ptr_to_struct? / ptr_elem_of / float_repr / int_bits / ll_to_caap …) and the
+; "full"-debug composite layer (di_type_bytes / di_composite! / di_array!) are
+; interleaved deliberately: di_composite! USES ptr_to_struct?/ptr_elem_of, so they
+; live in one leaf. ptr_cell + field_lookup (the pointer value record and the
+; struct field reader) close out this layer. It depends only on the debug leaf
+; (for the DWARF metadata-node builders) — no forward reference.
+
+; ── type-mapping helpers (CAAP type name <-> LLVM type) ──────────────────────
+(module stdlib.backend.emit.llvm.types)
+
+(use stdlib.semantics.types.registry pointer? ptr_elem enum_backing)
+(use stdlib.lib.collections.sequence index_of map)
+(use stdlib.backend.codegen_common ptr_struct_name)
+(use stdlib.lib.text.buffer buf_new push_str to_string)
+(use stdlib.backend.emit.llvm.debug
+     di_alloc! di_node! di_ref di_basic_encoding di_basic!)
+
+; ll_type — a stdlib type name as an LLVM type, or null when unsupported.
+(bind ll_type
+  (lambda (t)
+    (case t
+      ("int" "i32") ("i32" "i32") ("u32" "i32")
+      ("i64" "i64") ("u64" "i64") ("uptr" "i64")
+      ("i16" "i16") ("u16" "i16")
+      ("i8" "i8")   ("u8" "i8")
+      ("bool" "i1")
+      ("float" "double") ("f64" "double") ("f32" "float")
+      (else null))))
+
+; unsigned? — the widening rule for a CAAP type name (zext for u*, sext else)
+; — comes from backend/codegen_common (shared with the wasm backend's div/shr
+; signedness). NULL-safe there; the (get a "ct" "i") defaults below stay so a
+; bare literal with no recorded CAAP type reads as signed.
+
+; float_ll? — is an LLVM scalar type a floating-point type?
+(bind float_ll?
+  (lambda (ll) (or (eq ll "float") (eq ll "double"))))
+
+; hex16 — a 64-bit integer as exactly 16 uppercase hex digits (big-endian).
+(bind hex16
+  (lambda (n)
+    (bind (
+      (digits "0123456789ABCDEF")
+      (out (buf_new))
+      (i (ref 15))
+    )
+      (do
+        (while (ge (deref i) 0)
+          (do
+            (push_str out
+              (string_slice digits
+                (int_and (int_shr n (int_mul (deref i) 4)) 15)
+                (int_add (int_and (int_shr n (int_mul (deref i) 4)) 15) 1)))
+            (set_ref i (int_sub (deref i) 1))))
+        (to_string out)))))
+
+; float_repr — a CAAP float value as an LLVM float constant. LLVM's text
+; parser rejects an integer-looking constant for a float type AND a decimal
+; that is not exactly representable (notably for `float`). The canonical
+; `0xHHHHHHHHHHHHHHHH` form — the raw IEEE-754 double bit pattern — is exact
+; and version-independent, so it is emitted for every float literal. (Float
+; literals default to f64; the bits are the double pattern, which LLVM also
+; accepts for an f32-representable `float`.)
+(bind float_repr
+  (lambda (v)
+    (string_concat_many "0x" (hex16 (float_to_bits v)))))
+
+; int_bits — bit width of an LLVM integer type ("i1"/"i8"/…/"i64"), or 0.
+(bind int_bits
+  (lambda (ll)
+    (case ll ("i1" 1) ("i8" 8) ("i16" 16) ("i32" 32) ("i64" 64) (else 0))))
+
+; ll_to_caap — an LLVM scalar type as the CAAP type NAME that describes it for
+; DWARF (di_basic_encoding keys on CAAP names). Used to give a `bind`-local a
+; concrete DWARF type when its value record carries no CAAP type (`ct` null —
+; arithmetic results do not track one). i8/i16/i32/i64 already share their CAAP
+; spelling; i1->bool, double->float, float->f32. null for a non-scalar (a struct
+; "%Name" / a pointer) — those describe via the struct/pointer composite path,
+; not here. Signedness is unknown for a bare result, so the signed `i*` form is
+; chosen (matches the backend's signed-default for untyped arithmetic).
+(bind ll_to_caap
+  (lambda (ll)
+    (case ll
+      ("i1" "bool") ("i8" "i8") ("i16" "i16") ("i32" "i32") ("i64" "i64")
+      ("double" "float") ("float" "f32")
+      (else null))))
+
+; render_t — a value-record type as LLVM source text ("str" is the internal
+; sentinel for the runtime string aggregate).
+(bind render_t
+  (lambda (t) (if (eq t "str") "{ ptr, i64 }" t)))
+
+; ptr_to_struct? — is `t` a `ptr_<StructName>` for a program struct? (The
+; registry only knows ptr_<scalar>; struct pointers are program-defined.) The
+; underlying name extraction is shared with the wasm backend
+; (codegen_common/ptr_struct_name).
+(bind ptr_to_struct?
+  (lambda (t structs) (not (eq (ptr_struct_name t structs) null))))
+
+; ptr_elem_of — the element CAAP type of any pointer type name (scalar via the
+; registry, or `ptr_<StructName>` for a program struct), or null.
+(bind ptr_elem_of
+  (lambda (t structs)
+    (cond
+      ((pointer? t) (ptr_elem t))
+      ((ptr_to_struct? t structs) (string_slice t 4))
+      (else null))))
+
+; ll_of — like ll_type, plus program structs (-> "%Name"), pointer types
+; (scalar OR struct -> the opaque "ptr"), and "string" (-> the "str" sentinel).
+(bind ll_of
+  (lambda (t structs)
+    (cond
+      ((not (eq (get structs t) null)) (string_concat_many "%" t))
+      ((pointer? t) "ptr")
+      ((ptr_to_struct? t structs) "ptr")
+      ((eq t "string") "str")
+      ; an enum lowers as its backing int (UR_STATE -> i32): native codegen has no
+      ; first-class enum types, so resolve the enum NAME to its backing here.
+      ((not (eq (enum_backing t) null)) (ll_type (enum_backing t)))
+      (else (ll_type t)))))
+
+; ── DWARF composite types ("full" leg; placed here so it can use ptr_to_struct?
+; / ptr_elem_of, defined just above — no forward reference) ───────────────────
+; di_type_bytes — the byte size of a CAAP type for DWARF: a scalar/pointer via
+; the basic-encoding table (a pointer is 8 bytes), or a struct's NATURAL-layout
+; size (the running sum of its member sizes — no inter-field padding). Unknown
+; types size to 0. The struct size/offsets assume packed/natural layout, which
+; matches the LLVM `%S = type {…}` for non-padded structs; it is descriptive
+; DWARF, never load-bearing for codegen.
+(bind di_type_bytes
+  (lambda (ct structs)
+    (cond
+      ((eq ct null) 0)
+      ((not (eq (di_basic_encoding ct) null))
+        (int_div (get (di_basic_encoding ct) "size") 8))
+      ((or (pointer? ct) (ptr_to_struct? ct structs)) 8)
+      ((not (eq (get structs ct) null))
+        (bind ((total (ref 0)))
+          (do
+            (sequence_each (get structs ct (list_of))
+              (lambda (f)
+                (set_ref total
+                  (int_add (deref total)
+                           (di_type_bytes (get f "type") structs)))))
+            (deref total))))
+      (else 0))))
+
+; di_composite! — the cached composite/derived DWARF type id for a struct or
+; pointer CAAP type (the "full" leg), or null when undescribable.
+;   struct   -> !DICompositeType(DW_TAG_structure_type) + a !DIDerivedType
+;               (DW_TAG_member) per field (natural-layout size/offset)
+;   pointer  -> !DIDerivedType(DW_TAG_pointer_type, baseType: <pointee>)
+; The cache prevents a cyclic struct (a self-referential ptr_<S> field) from
+; recursing forever: the struct's id is registered BEFORE its members are
+; described, so a back-edge resolves to the in-progress id.
+(bind di_composite!
+  (lambda (dbg ct structs)
+    (if (eq ct null) null
+      (bind ((cached (get (get dbg "composite") ct)))
+        (if (not (eq cached null)) cached
+          (cond
+            ; a pointer (scalar ptr_<scalar> or a ptr_<Struct>): a pointer_type
+            ; deriving from the pointee's described type (null pointee = void*)
+            ((or (pointer? ct) (ptr_to_struct? ct structs))
+              (bind (
+                (pointee (ptr_elem_of ct structs))
+                (id (di_alloc! dbg))
+              )
+                (do
+                  (assoc (get dbg "composite") ct id)
+                  (bind ((base (if (eq pointee null) "null"
+                                 (bind ((b (di_basic! dbg pointee)))
+                                   (if (not (eq b null)) (di_ref b)
+                                     (bind ((c (di_composite! dbg pointee structs)))
+                                       (if (eq c null) "null" (di_ref c))))))))
+                    (append (get dbg "meta")
+                      (string_concat_many "!" (int_to_string id)
+                        " = !DIDerivedType(tag: DW_TAG_pointer_type, baseType: "
+                        base ", size: 64)")))
+                  id)))
+            ; a program struct: a structure_type with a member per field
+            ((not (eq (get structs ct) null))
+              (bind (
+                (id (di_alloc! dbg))
+                (members (list_of))
+                (offset (ref 0))
+              )
+                (do
+                  ; register the id FIRST so a self-referential field resolves
+                  (assoc (get dbg "composite") ct id)
+                  (sequence_each (get structs ct (list_of))
+                    (lambda (f)
+                      (bind (
+                        (ftype (get f "type"))
+                        (fbytes (di_type_bytes ftype structs))
+                        (fbase
+                          (bind ((b (di_basic! dbg ftype)))
+                            (if (not (eq b null)) (di_ref b)
+                              (bind ((c (di_composite! dbg ftype structs)))
+                                (if (eq c null) "null" (di_ref c))))))
+                        (mid (di_node! dbg
+                               (string_concat_many
+                                 "!DIDerivedType(tag: DW_TAG_member, name: \""
+                                 (get f "name" "?") "\", baseType: " fbase
+                                 ", size: " (int_to_string (int_mul fbytes 8))
+                                 ", offset: " (int_to_string (int_mul (deref offset) 8))
+                                 ")")))
+                      )
+                        (do
+                          (append members (di_ref mid))
+                          (set_ref offset (int_add (deref offset) fbytes))))))
+                  (bind ((elts (di_node! dbg
+                                 (string_concat_many "!{"
+                                   (sequence_join members ", ") "}"))))
+                    (append (get dbg "meta")
+                      (string_concat_many "!" (int_to_string id)
+                        " = !DICompositeType(tag: DW_TAG_structure_type, name: \""
+                        ct "\", size: "
+                        (int_to_string (int_mul (di_type_bytes ct structs) 8))
+                        ", elements: " (di_ref elts) ")")))
+                  id)))
+            (else null)))))))
+
+; di_array! — a !DICompositeType(DW_TAG_array_type) for an `array_local`'s
+; [N x elem] buffer: baseType is the element's DWARF type (a DIBasicType for a
+; scalar, else its composite/derived type), size is N*elemsize bits, and a
+; single !DISubrange(count: N) gives the bound. Returns the array type's id, or
+; null when the element is UNDESCRIBABLE — the caller then falls back to the
+; decayed-pointer description (an array over a `null` baseType would make LLVM's
+; DWARF backend dereference a null type and crash, so never emit one). Not
+; cached: an `array_local` length is a literal at one call site, so each array
+; local is its own type (no recursion / no cycle to break).
+(bind di_array!
+  (lambda (dbg n elemct structs)
+    (bind ((base (bind ((b (di_basic! dbg elemct)))
+                   (if (not (eq b null)) (di_ref b)
+                     (bind ((c (di_composite! dbg elemct structs)))
+                       (if (eq c null) null (di_ref c)))))))
+      (if (eq base null) null
+        (bind (
+          (elembytes (di_type_bytes elemct structs))
+          (sub (di_node! dbg
+                 (string_concat_many
+                   "!DISubrange(count: " (int_to_string n) ")")))
+          (elts (di_node! dbg
+                  (string_concat_many "!{" (di_ref sub) "}")))
+        )
+          (di_node! dbg
+            (string_concat_many
+              "!DICompositeType(tag: DW_TAG_array_type, baseType: " base
+              ", size: " (int_to_string (int_mul (int_mul n elembytes) 8))
+              ", elements: " (di_ref elts) ")")))))))
+
+; ptr_cell — a pointer VALUE record (same shape as a ref cell, so deref/
+; set_ref/ptr_read/ptr_write all reach it). `elem` is the LLVM element text
+; (a struct element renders as "%Name"); `elemct` is the CAAP element type.
+;   repr / elemct / structs : the pointer, its CAAP element, the struct table
+(bind ptr_cell
+  (lambda (repr elemct structs)
+    (assoc (map_of)
+      "repr" repr "type" "ptr"
+      "elem" (ll_of elemct structs) "elemct" elemct "ct" elemct)))
+
+; field_lookup — a struct field's {idx, ftype} by name, or throws (the one
+; reader of the field layout, shared by `get` and `field_ptr`).
+(bind field_lookup
+  (lambda (structs sname kv)
+    (bind (
+      (fields (get structs sname (list_of)))
+      (idx (index_of (map fields (lambda (f) (get f "name"))) kv))
+    )
+      (if (eq idx -1)
+        (throw (string_concat_many
+          "native codegen: struct `" sname "` has no field `" kv "`"))
+        (assoc (map_of)
+          "idx" idx
+          "ftype" (get (get fields idx) "type"))))))
+
+(export ll_type float_ll? hex16 float_repr int_bits ll_to_caap render_t
+        ptr_to_struct? ptr_elem_of ll_of di_type_bytes di_composite! di_array!
+        ptr_cell field_lookup)

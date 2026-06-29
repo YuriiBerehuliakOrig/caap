@@ -1,0 +1,70 @@
+; stdlib/lib/tests/test_test.caap — in-language tests for lib/test's assertions.
+;
+; The assertions THROW on failure and return null on success, so this file tests
+; them from both sides: a passing case must return null (and not throw), and a
+; failing case must throw. `threw?` runs a 0-arg thunk under try/catch and
+; reports whether it threw — the meta-harness used throughout. We deliberately do
+; NOT lean on the very helpers under test to check themselves (assert_throws is
+; validated against this independent `threw?`).
+
+;; @area: core
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test
+     assert_eq assert_true assert_false assert_ne assert_nil
+     assert_throws assert_approx)
+
+; threw? — true iff calling `thunk` (0-arg) throws; the independent oracle.
+(bind threw?
+  (lambda (thunk) (try (do (thunk) false) (catch e true))))
+
+(do
+  ; ── assert_eq / assert_true (the pre-existing pair) ──────────────────────────
+  (assert_eq (assert_eq 1 1 "eq pass returns null") null "assert_eq pass -> null")
+  (assert_true (threw? (lambda () (assert_eq 1 2 "x"))) "assert_eq mismatch throws")
+  (assert_eq (assert_true true "true pass returns null") null "assert_true pass -> null")
+  (assert_true (threw? (lambda () (assert_true false "x"))) "assert_true on falsy throws")
+
+  ; ── assert_false ─────────────────────────────────────────────────────────────
+  (assert_eq (assert_false false "false pass") null "assert_false on falsy -> null")
+  (assert_eq (assert_false null "false on null") null "assert_false on null (falsy) -> null")
+  (assert_true (threw? (lambda () (assert_false true "x"))) "assert_false on truthy throws")
+  (assert_true (threw? (lambda () (assert_false 1 "x"))) "assert_false on a truthy int throws")
+
+  ; ── assert_ne (structural, NOT identity) ─────────────────────────────────────
+  (assert_eq (assert_ne 1 2 "ne pass") null "assert_ne distinct -> null")
+  (assert_true (threw? (lambda () (assert_ne 1 1 "x"))) "assert_ne equal scalars throws")
+  ; structural: two DISTINCT lists with equal contents count as equal -> throws
+  (assert_true (threw? (lambda () (assert_ne (list_of 1 2 3) (list_of 1 2 3) "x")))
+    "assert_ne sees structural equality of two distinct lists")
+  ; genuinely different lists pass
+  (assert_eq (assert_ne (list_of 1 2 3) (list_of 1 2 4) "ne lists differ") null
+    "assert_ne on differing lists -> null")
+
+  ; ── assert_nil ───────────────────────────────────────────────────────────────
+  (assert_eq (assert_nil null "nil pass") null "assert_nil on null -> null")
+  (assert_true (threw? (lambda () (assert_nil 0 "x"))) "assert_nil on 0 throws (0 is not nil)")
+  (assert_true (threw? (lambda () (assert_nil false "x"))) "assert_nil on false throws")
+  (assert_true (threw? (lambda () (assert_nil "" "x"))) "assert_nil on empty string throws")
+
+  ; ── assert_throws (BOTH a throwing and a non-throwing thunk) ─────────────────
+  ; a thunk that throws -> assert_throws passes (returns null)
+  (assert_eq (assert_throws (lambda () (throw "boom")) "thrower passes") null
+    "assert_throws on a throwing thunk -> null")
+  ; an evaluation error (not an explicit throw) also counts as a throw
+  (assert_eq (assert_throws (lambda () (get null "k")) "eval error passes") null
+    "assert_throws catches an evaluation error too")
+  ; a thunk that returns normally -> assert_throws itself THROWS (the failure)
+  (assert_true (threw? (lambda () (assert_throws (lambda () 42) "x")))
+    "assert_throws on a non-throwing thunk throws")
+
+  ; ── assert_approx (floats within a tolerance) ────────────────────────────────
+  (assert_eq (assert_approx 1.0 1.0 0.001 "exact") null "assert_approx exact -> null")
+  (assert_eq (assert_approx 1.0001 1.0 0.001 "within eps") null
+    "assert_approx within tolerance -> null")
+  ; the boundary is inclusive (|a-b| == eps passes)
+  (assert_eq (assert_approx 1.5 1.0 0.5 "boundary") null
+    "assert_approx at exactly eps -> null (inclusive)")
+  (assert_true (threw? (lambda () (assert_approx 1.0 2.0 0.001 "x")))
+    "assert_approx beyond tolerance throws")
+  true)

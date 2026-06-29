@@ -1,0 +1,10 @@
+; tests/const_sys_impure.caap — the catalog marks
+; io.println impure; the effect rides the declared signature into the const
+; guard, which refuses to run the side effect at expansion time.
+(module stdlib.fixtures.const_sys_impure)
+
+(use sys.io println)
+
+(bind k (const (println "x")))
+
+(export k)

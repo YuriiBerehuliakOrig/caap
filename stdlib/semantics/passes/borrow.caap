@@ -1,0 +1,167 @@
+; stdlib/semantics/passes/borrow.caap — a Rust-style ownership/borrow analysis
+; (module stdlib.semantics.passes.borrow).
+;
+; The SOUND CORE of borrow checking, as a flow pass over the AST — no
+; lifetime inference (research-grade), but real affine ownership + the
+; aliasing rule, with lexically-scoped borrows. Three primitives express
+; the discipline (they are inert markers the analysis reads; a value flows
+; through unchanged at run time):
+;
+;   (move x)              consume x — afterwards any use of x is an error
+;   (borrow x body…)      SHARED borrow of x for body: x stays readable, but
+;                         cannot be moved or mutably borrowed inside
+;   (borrow_mut x body…)  EXCLUSIVE borrow of x for body: x cannot be read,
+;                         moved, or borrowed (shared or mut) inside
+;
+; Enforced rules (sound on the disciplined subset; see ROADMAP):
+;   1. move/use after move
+;   2. one `&mut` XOR any number of `&` (no shared-mutable aliasing)
+;   3. a borrow may not outlive its lexical scope (borrows end at body end)
+;
+; `check` returns located findings (data); `register!` installs it as a
+; load-time pass via lib/passes (then a borrow violation fails the load
+; like any built-in phase). Most useful for the NATIVE subset (manual
+; memory, no GC) — the one place ownership safety actually pays.
+;
+; Boundaries (deliberate, sound-by-conservatism):
+;   - move/borrow track a NAME, not an arbitrary place: `(move (deref p))` is
+;     not a borrow finding — pointer places are semantics/passes/alias's job, and its
+;     points-to taints aliases of a moved name here (cm), which covers the case
+;     that matters (move through one pointer, use through another).
+;   - LIFETIME INFERENCE (NLL, `'a` params, variance) is out of scope; borrows
+;     are lexical (they end at the body of `borrow`/`borrow_mut`).
+(module stdlib.semantics.passes.borrow)
+
+(use stdlib.syntax.ast call? name? head_of callee args_of arg name_of)
+(use stdlib.lib.collections.map clone)
+(use stdlib.semantics.passes.registry note! install_pass!)
+(use stdlib.semantics.passes.alias class_map)
+
+; ── the primitives (inert at run time; the analysis reads them) ──────────────
+; A value flows through unchanged — borrowing is a STATIC discipline, not a
+; runtime cost. The closure form `(borrow_mut x (lambda (r) …))` mirrors
+; Rust: `r` is the borrowed handle, used in the body instead of `x`.
+(bind move       (lambda (x) x))               ; consume x, yield it
+(bind borrow     (lambda (x f) (f x)))         ; shared borrow: f gets &x
+(bind borrow_mut (lambda (x f) (f x)))         ; exclusive borrow: f gets &mut x
+
+
+; mark_moved — consume `x` AND every pointer-alias of it: borrow tracks a move by
+; name, but semantics/passes/alias's points-to (cm: name -> pointer-class-id) tells us
+; which OTHER names refer to the same object, so a later use of an alias is also
+; a use-after-move. Plain affine moves (cm has no entry) just mark the one name.
+(bind mark_moved
+  (lambda (moved cm x)
+    (do
+      (assoc moved x true)
+      (bind ((cls (get cm x)))
+        (when (not (eq cls null))
+          (for other (map_keys cm)
+            (when (eq (get cm other) cls) (assoc moved other true))))))))
+
+; walk — the flow pass.
+;   self     : recursion idiom
+;   node     : the form under analysis
+;   borrows  : map name -> "shared" | "mut" — borrows ACTIVE here (lexical;
+;              passed by value, so it pops automatically on return)
+;   moved    : map name -> true — moved bindings (shared, flows FORWARD)
+;   findings : the diagnostics list (shared)
+;   cm       : name -> pointer-class-id (cross-alias facts from semantics/passes/alias)
+(bind walk
+  (lambda (self node borrows moved findings cm)
+    (cond
+      ; a bare use of a name
+      ((name? node)
+        (bind ((nm (name_of node)))
+          (do
+            (when (eq (get moved nm false) true)
+              (note! findings "borrow" node
+                (string_concat_many "use after move of `" nm "`")))
+            (when (eq (get borrows nm) "mut")
+              (note! findings "borrow" node
+                (string_concat_many "`" nm
+                  "` is mutably borrowed here — cannot use it"))))))
+      ((call? node)
+        (bind ((h (head_of node)))
+          (cond
+            ; ── move x ──
+            ((eq h "move")
+              (bind ((x (name_of (arg node 0))))
+                (cond
+                  ((eq x null) null)
+                  ((eq (get moved x false) true)
+                    (note! findings "borrow" node
+                      (string_concat_many "use after move of `" x "`")))
+                  ((not (eq (get borrows x) null))
+                    (note! findings "borrow" node
+                      (string_concat_many "cannot move `" x
+                        "` while it is borrowed")))
+                  (else (mark_moved moved cm x)))))
+            ; ── borrow x body… / borrow_mut x body… ──
+            ((or (eq h "borrow") (eq h "borrow_mut"))
+              (bind (
+                (x (name_of (arg node 0)))
+                (kind (if (eq h "borrow_mut") "mut" "shared"))
+              )
+                (do
+                  (cond
+                    ((eq x null) null)
+                    ((eq (get moved x false) true)
+                      (note! findings "borrow" node
+                        (string_concat_many "use after move of `" x "`")))
+                    ((and (eq kind "mut") (not (eq (get borrows x) null)))
+                      (note! findings "borrow" node
+                        (string_concat_many "cannot mutably borrow `" x
+                          "`: it is already borrowed")))
+                    ((and (eq kind "shared") (eq (get borrows x) "mut"))
+                      (note! findings "borrow" node
+                        (string_concat_many "cannot borrow `" x
+                          "`: it is already mutably borrowed")))
+                    (else null))
+                  ; the borrow is ACTIVE for the body only (lexical scope):
+                  ; a fresh borrow map, discarded when this returns
+                  (bind ((child (clone borrows)))
+                    (do
+                      (when (not (eq x null)) (assoc child x kind))
+                      (for k (sequence_range 1 (size (args_of node)))
+                        (self self (arg node k) child moved findings cm)))))))
+            ; ── any other call (do/bind/if/calls): recurse into children ──
+            (else
+              (do
+                (self self (callee node) borrows moved findings cm)
+                (for a (args_of node)
+                  (self self a borrows moved findings cm)))))))
+      (else null))))
+
+; check — borrow-analyze ONE body form.
+;   body : the form to analyze (a defn body, or any expression)
+;   ->   : list of located findings (a "borrow: path:line:col: msg" each)
+; The cross-alias facts (`cm`) come from semantics/passes/alias up front, so a move
+; through one pointer name taints every aliased name for the forward walk.
+(bind check
+  (lambda (body)
+    (bind ((findings (list_of)) (moved (map_of)) (cm (class_map body)))
+      (do
+        (walk walk body (map_of) moved findings cm)
+        findings))))
+
+; check_module — analyze a loader `located` list (the pass entry shape): each
+; top-level form's tree is `check`ed (its defn bodies are reached by the walk)
+; and findings join the sink.
+;   located : [{node, loc}] the module's expanded top-level forms
+;   sink    : the findings list to append to
+;   ->      : null
+(bind check_module
+  (lambda (located sink)
+    (for f located
+      (for finding (check (get f "node"))
+        (append sink finding)))))
+
+; register! — install borrow checking as a load-time pass (idempotent). After
+; this, every subsequently loaded module with a borrow violation fails its load,
+; exactly like a built-in phase.
+;   -> : null
+(bind register!
+  (lambda () (install_pass! "borrow" (lambda (located sink) (check_module located sink)))))
+
+(export move borrow borrow_mut check check_module register!)

@@ -1,0 +1,76 @@
+; stdlib/lib/tests/test_match_check.caap — dead match-arm analysis.
+
+;; @area: passes
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.match_check check)
+(use stdlib.semantics.passes.registry fact!)
+(use stdlib.syntax.ast sym lit calln call loc)
+(use stdlib.lib.collections.sequence any?)
+
+(do
+  (bind (
+    (has (lambda (fs n) (any? fs (lambda (f) (string_contains f n)))))
+    ; an arm (pat body): a call whose CALLEE is the pattern
+    (arm (lambda (pat body) (call pat (list_of body))))
+  )
+    (do
+      ; ── duplicate literal arm: (match x (0 "a") (0 "b")) ──
+      (assert_true
+        (has (check (calln "match"
+               (list_of (sym "x")
+                 (arm (lit 0) (lit "a"))
+                 (arm (lit 0) (lit "b")))))
+             "duplicate arm")
+        "duplicate literal arm flagged")
+
+      ; ── unreachable after catch-all: (match x (_ "a") (1 "b")) ──
+      (assert_true
+        (has (check (calln "match"
+               (list_of (sym "x")
+                 (arm (sym "_") (lit "a"))
+                 (arm (lit 1) (lit "b")))))
+             "unreachable arm")
+        "arm after catch-all flagged")
+
+      ; ── clean: distinct literals then a trailing catch-all ──
+      (assert_eq
+        (size (check (calln "match"
+                 (list_of (sym "x")
+                   (arm (lit 0) (lit "a"))
+                   (arm (lit 1) (lit "b"))
+                   (arm (sym "_") (lit "c"))))))
+        0
+        "distinct arms + trailing catch-all is clean")
+
+      ; ── robustness: a malformed arm-less match is a NO-OP, not a
+      ; `sequence_range 1 0` throw that would mask the real error ──
+      (assert_eq (size (check (calln "match" (list_of)))) 0
+        "headless (match) yields no findings")
+      (assert_eq (size (check (calln "match" (list_of (sym "x"))))) 0
+        "subject-only (match) yields no findings")
+
+      ; ── EXHAUSTIVENESS: simulate the type pass publishing an enum's variant
+      ; values for a spanned match (keyed by source loc) ──
+      (bind ((sp1 (map_of "start" 0 "end" 1 "start_line" 7 "start_col" 3
+                          "end_line" 7 "end_col" 9 "path" "demo.caap"))
+             (incomplete (ctfe_spec_with_span
+                           (calln "match" (list_of (sym "c") (arm (lit 0) (lit "a"))))
+                           sp1)))
+        (do
+          (fact! "match_enum" (loc incomplete) (list_of 0 1 2))
+          (assert_true (has (check incomplete) "uncovered enum value(s)")
+            "non-exhaustive enum match flagged")))
+
+      (bind ((sp2 (map_of "start" 0 "end" 1 "start_line" 9 "start_col" 3
+                          "end_line" 9 "end_col" 9 "path" "demo.caap"))
+             (complete (ctfe_spec_with_span
+                         (calln "match" (list_of (sym "c")
+                           (arm (lit 0) (lit "a")) (arm (lit 1) (lit "b"))
+                           (arm (lit 2) (lit "c"))))
+                         sp2)))
+        (do
+          (fact! "match_enum" (loc complete) (list_of 0 1 2))
+          (assert_eq (size (check complete)) 0
+            "match covering every variant value is exhaustive"))))))

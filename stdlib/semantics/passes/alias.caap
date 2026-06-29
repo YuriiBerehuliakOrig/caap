@@ -1,0 +1,272 @@
+; stdlib/semantics/passes/alias.caap — CROSS-ALIAS (points-to) analysis
+; (module stdlib.semantics.passes.alias).
+;
+; The companion that semantics/passes/borrow could not be: borrow tracks a (move x) by
+; the EXACT name it was written on; it cannot see that two raw pointers refer to
+; the SAME object, so a manual-memory move through one name and a use through an
+; alias slips past it. alias.caap adds that — a Steensgaard-style unification
+; points-to over the native pointer vocabulary (ptr_read / ptr_write / field_ptr
+; / ptr_add / int_to_ptr / cast / ref / deref). Two names ALIAS when their cells
+; land in one union-find class. A `(move a)` taints a's whole class, so a use of
+; any aliased name afterwards is a finding (use-after-move THROUGH an alias).
+;
+; Copy-type discipline: aliasing only matters for POINTERS. A union-find class is
+; flagged "pointer" when any member is used in a pointer context (a field_ptr /
+; ptr_read / ptr_add base, an int_to_ptr or a (ref x) result, or a ptr_write
+; target); the bit propagates through unification. A use-after-move is reported
+; ONLY for a pointer class, so a plain value copy (`r = b` for an int) is never a
+; false positive.
+;
+; Field-insensitive (all fields of an object collapse to one cell), flow-
+; insensitive for the aliasing and flow-sensitive for the move (the forward
+; walk), so it OVER-approximates aliases — the safe direction for a checker.
+; Field-/flow-sensitive points-to and int_to_ptr round-trips stay on the roadmap.
+(module stdlib.semantics.passes.alias)
+
+(use stdlib.syntax.ast
+  call? name? name_of callee args_of arg bind_pairs def_of)
+(use stdlib.semantics.passes.registry note! install_pass!)
+
+; safe_head — the head NAME of a call, or null. Tolerates a call with a
+; null/non-name callee (e.g. the `()` empty param list of a 0-arity defn), which
+; would otherwise crash name_of with "syntax-kind expects syntax".
+(bind safe_head
+  (lambda (node)
+    (if (and (call? node)
+             (and (not (eq (callee node) null)) (name? (callee node))))
+      (name_of (callee node))
+      null)))
+
+; ── union-find with points-to + a per-class POINTER bit (Steensgaard) ────────
+
+; new_st — a fresh, empty analysis state (the four union-find tables + a cell
+; counter). Cell ids are ints; map keys are their `int_to_string` (maps key on
+; strings). One state serves a whole body across both passes.
+(bind new_st
+  (lambda ()
+    (assoc (map_of)
+      "parent" (map_of)     ; cellid(string) -> parent cellid(int)
+      "pt"     (map_of)     ; root cellid(string) -> pointee cellid(int)
+      "ptr"    (map_of)     ; root cellid(string) -> true when the class is a POINTER
+      "names"  (map_of)     ; name -> cellid
+      "n"      (ref 0))))
+
+; fresh — allocate a new, unattached cell id (its own class).
+(bind fresh
+  (lambda (st)
+    (bind ((c (deref (get st "n"))))
+      (do (set_ref (get st "n") (int_add c 1)) c))))
+
+; find — iterative climb to the representative.
+(bind find
+  (lambda (st c)
+    (bind ((cur (ref c)))
+      (do
+        (while (not (eq (get (get st "parent") (int_to_string (deref cur))) null))
+          (set_ref cur (get (get st "parent") (int_to_string (deref cur)))))
+        (deref cur)))))
+
+; mark_ptr — flag the class of cell `c` as holding a pointer.
+(bind mark_ptr
+  (lambda (st c)
+    (assoc (get st "ptr") (int_to_string (find st c)) true)))
+
+; class_ptr? — is the class of cell `c` a pointer class?
+(bind class_ptr?
+  (lambda (st c)
+    (eq (get (get st "ptr") (int_to_string (find st c)) false) true)))
+
+; unify — merge two cells' classes AND (recursively) their pointees, carrying the
+; pointer bit forward to the surviving root.
+(bind unify
+  (lambda (self st a b)
+    (bind ((ra (find st a)) (rb (find st b)))
+      (when (not (eq ra rb))
+        (do
+          (assoc (get st "parent") (int_to_string ra) rb)
+          (when (eq (get (get st "ptr") (int_to_string ra)) true)
+            (assoc (get st "ptr") (int_to_string rb) true))
+          (bind (
+            (pa (get (get st "pt") (int_to_string ra)))
+            (pb (get (get st "pt") (int_to_string rb)))
+          )
+            (cond
+              ((and (not (eq pa null)) (not (eq pb null))) (self self st pa pb))
+              ((not (eq pa null)) (assoc (get st "pt") (int_to_string rb) pa))
+              (else null))))))))
+
+; pts — the cell `*c` points to (created lazily).
+(bind pts
+  (lambda (st c)
+    (bind ((r (find st c)) (pr (get (get st "pt") (int_to_string (find st c)))))
+      (if (not (eq pr null))
+        pr
+        (bind ((f (fresh st)))
+          (do (assoc (get st "pt") (int_to_string r) f) f))))))
+
+; cell_of — the cell for a name (created lazily, stable across both passes).
+(bind cell_of
+  (lambda (st nm)
+    (bind ((c (get (get st "names") nm)))
+      (if (not (eq c null))
+        c
+        (bind ((f (fresh st)))
+          (do (assoc (get st "names") nm f) f))))))
+
+; ── evaluating a value expression to the cell it denotes ─────────────────────
+; The pointer-producing heads ALSO mark the class they touch as a pointer (so a
+; later move over an alias of it can be flagged).
+(bind eval_ptr
+  (lambda (self st node)
+    (cond
+      ((eq node null) (fresh st))
+      ((name? node) (cell_of st (name_of node)))
+      ((call? node)
+        (bind ((h (safe_head node)))
+          (cond
+            ((eq h "deref")    (pts st (self self st (arg node 0))))
+            ((eq h "ptr_read")
+              (bind ((c (self self st (arg node 0))))
+                (do (mark_ptr st c) (pts st c))))
+            ((eq h "ref")
+              ; (ref x) yields an ADDRESS of x: a fresh cell c whose pointee is
+              ; x's cell, and c itself is a pointer class (so a move through an
+              ; alias of the address is caught, like int_to_ptr).
+              (bind ((c (fresh st)))
+                (do
+                  (mark_ptr st c)
+                  (unify unify st (pts st c) (self self st (arg node 0)))
+                  c)))
+            ((eq h "ptr_add")
+              (bind ((c (self self st (arg node 0)))) (do (mark_ptr st c) c)))
+            ((eq h "field_ptr")
+              (bind ((c (self self st (arg node 0)))) (do (mark_ptr st c) c)))
+            ((eq h "cast")      (self self st (arg node 0)))
+            ((eq h "int_to_ptr")
+              (bind ((c (fresh st))) (do (mark_ptr st c) c)))
+            (else (fresh st)))))
+      (else (fresh st)))))
+
+; ── pass 1: build the alias classes over a body ──────────────────────────────
+; build — walk `node`, unifying the cells that an assignment makes alias (a bind
+; pair / set_ref / ptr_write) and marking pointer classes at the pointer ops, so
+; afterwards two names share a class iff they may refer to one object. Flow-
+; insensitive: it visits the whole tree, accumulating into `st`.
+;   self : recursion idiom    st : the analysis state    node : the form
+;   ->   : null
+(bind build
+  (lambda (self st node)
+    (when (and (not (eq node null)) (call? node))
+      (bind ((h (safe_head node)))
+        (cond
+          ((eq h "bind")
+            (bind ((bp (bind_pairs node)) (df (def_of node)))
+              (cond
+                ((not (eq bp null))
+                  (do
+                    (for p (get bp "pairs")
+                      (do
+                        (unify unify st (cell_of st (get p "name"))
+                                       (eval_ptr eval_ptr st (get p "value")))
+                        (build self st (get p "value"))))
+                    (for b (get bp "body") (self self st b))))
+                ((not (eq df null))
+                  (do
+                    (unify unify st (cell_of st (get df "name"))
+                                   (eval_ptr eval_ptr st (get df "value")))
+                    (build self st (get df "value"))))
+                (else
+                  (for a (args_of node) (self self st a))))))
+          ((eq h "set_ref")
+            (do
+              (unify unify st (pts st (cell_of st (name_of (arg node 0))))
+                             (eval_ptr eval_ptr st (arg node 1)))
+              (for a (args_of node) (self self st a))))
+          ((eq h "ptr_write")
+            (do
+              (mark_ptr st (eval_ptr eval_ptr st (arg node 0)))
+              (unify unify st (pts st (eval_ptr eval_ptr st (arg node 0)))
+                             (eval_ptr eval_ptr st (arg node 1)))
+              (for a (args_of node) (self self st a))))
+          ; pointer-op STATEMENTS (not just value positions): mark the base.
+          ((or (eq h "ptr_read") (or (eq h "field_ptr") (eq h "ptr_add")))
+            (do
+              (mark_ptr st (eval_ptr eval_ptr st (arg node 0)))
+              (for a (args_of node) (self self st a))))
+          (else
+            (do
+              (when (not (eq (callee node) null)) (self self st (callee node)))
+              (for a (args_of node) (self self st a)))))))))
+
+; ── pass 2: forward walk — use-after-move through a POINTER alias ────────────
+; movedClasses : class-rep id (string) -> true, set on (move x), flows forward.
+(bind check_walk
+  (lambda (self st node movedClasses findings)
+    (cond
+      ((eq node null) null)
+      ((name? node)
+        (bind ((cell (cell_of st (name_of node))))
+          (when (and (eq (get movedClasses (int_to_string (find st cell)) false) true)
+                     (class_ptr? st cell))
+            (note! findings "alias" node
+              (string_concat_many "use after move of `" (name_of node)
+                "` (or an alias of it)")))))
+      ((call? node)
+        (bind ((h (safe_head node)))
+          (if (eq h "move")
+            (bind ((x (arg node 0)))
+              (when (and (not (eq x null)) (name? x))
+                (assoc movedClasses
+                  (int_to_string (find st (cell_of st (name_of x)))) true)))
+            (do
+              (when (not (eq (callee node) null))
+                (self self st (callee node) movedClasses findings))
+              (for a (args_of node)
+                (self self st a movedClasses findings))))))
+      (else null))))
+
+; check — alias-analyze ONE body form: build the classes (pass 1), then forward-
+; walk for a use-after-move through a pointer alias (pass 2).
+;   node : the form to analyze
+;   ->   : list of located findings (an "alias: path:line:col: msg" each)
+(bind check
+  (lambda (node)
+    (bind ((st (new_st)) (findings (list_of)))
+      (do
+        (build build st node)
+        (check_walk check_walk st node (map_of) findings)
+        findings))))
+
+; check_module — the loader pass entry: `check` every located form into the sink.
+;   located : [{node, loc}] the module's expanded top-level forms
+;   sink    : the findings list to append to
+;   ->      : null
+(bind check_module
+  (lambda (located sink)
+    (for f located
+      (for finding (check (get f "node"))
+        (append sink finding)))))
+
+; class_map — the cross-alias FACTS for one body: {name -> class-id} over the
+; names whose class is a POINTER class (so two names alias iff they map to the
+; same id). The integration point for borrow — it taints a move's whole class.
+(bind class_map
+  (lambda (node)
+    (bind ((st (new_st)) (out (map_of)))
+      (do
+        (build build st node)
+        (for nm (map_keys (get st "names"))
+          (bind ((cell (get (get st "names") nm)))
+            (when (class_ptr? st cell)
+              (assoc out nm (int_to_string (find st cell))))))
+        out))))
+
+; register! — install cross-alias analysis as a load-time pass (idempotent).
+;   -> : null
+(bind register!
+  (lambda () (install_pass! "alias" (lambda (located sink) (check_module located sink)))))
+
+; Public surface: the analysis contract — check / check_module, the class_map
+; points-to facts borrow reads, and the pass installer. The union-find internals
+; (find / unify / pts / cell_of / eval_ptr / build) stay private to this module.
+(export check check_module class_map register!)

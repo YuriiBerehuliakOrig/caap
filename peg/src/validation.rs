@@ -1,20 +1,28 @@
+//! Static grammar validation: [`validate_grammar`] produces a
+//! [`ValidationReport`] of [`ValidationIssue`]s (errors and warnings) found by
+//! analysing a grammar without parsing input.
+
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::{analyze_grammar, GrammarAnalysis};
 use crate::grammar::Grammar;
-use crate::parser::{has_char_terminal_from_source, has_token_ref_from_source};
-use crate::parser_imports::extract_import_aliases_from_source;
+use crate::parser_analysis::{has_char_terminal_in_expr, has_token_ref_in_expr};
+use crate::parser_imports::{extract_import_aliases_from_expr, metadata_import_targets};
 
 // ── Severity ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+/// The severity of a [`ValidationIssue`].
 pub enum Severity {
+    /// A correctness error.
     Error,
+    /// A non-fatal warning.
     Warning,
 }
 
 impl Severity {
+    /// The severity as a lowercase string.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Error => "error",
@@ -34,7 +42,9 @@ impl std::fmt::Display for Severity {
 /// A single validation finding attached to a grammar.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ValidationIssue {
+    /// The finding message.
     pub message: String,
+    /// Error or warning.
     pub severity: Severity,
     /// Optional rule name the issue concerns.
     pub rule: Option<String>,
@@ -78,30 +88,38 @@ impl std::fmt::Display for ValidationIssue {
 /// Aggregated validation results for a single grammar.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ValidationReport {
+    /// Optional human-readable label for the grammar.
     pub label: Option<String>,
+    /// All findings, errors and warnings.
     pub issues: Vec<ValidationIssue>,
+    /// The underlying grammar analysis.
     pub analysis: GrammarAnalysis,
 }
 
 impl ValidationReport {
+    /// Whether the grammar passed (no errors).
     pub fn ok(&self) -> bool {
         !self.issues.iter().any(|i| i.severity == Severity::Error)
     }
 
+    /// Iterate the error-severity issues.
     pub fn errors(&self) -> impl Iterator<Item = &ValidationIssue> {
         self.issues.iter().filter(|i| i.severity == Severity::Error)
     }
 
+    /// Iterate the warning-severity issues.
     pub fn warnings(&self) -> impl Iterator<Item = &ValidationIssue> {
         self.issues
             .iter()
             .filter(|i| i.severity == Severity::Warning)
     }
 
+    /// Number of errors.
     pub fn error_count(&self) -> usize {
         self.errors().count()
     }
 
+    /// Number of warnings.
     pub fn warning_count(&self) -> usize {
         self.warnings().count()
     }
@@ -128,8 +146,7 @@ impl std::fmt::Display for ValidationReport {
 
 /// Options controlling validation behaviour.
 ///
-/// Mirrors the `lint`/`strict`/`emit_warnings` parameters of Python's
-/// `validate_grammar()`.
+/// Mirrors the `lint`/`strict`/`emit_warnings` parameters of `validate_grammar()`.
 #[derive(Clone, Debug, Default)]
 pub struct ValidationOptions {
     /// When `true`, all issues are reported as warnings (lint mode).
@@ -141,20 +158,24 @@ pub struct ValidationOptions {
 }
 
 impl ValidationOptions {
+    /// Default validation options.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Treat all issues as warnings (lint mode).
     pub fn with_lint(mut self) -> Self {
         self.lint = true;
         self
     }
 
+    /// Return `Err` if any errors are found.
     pub fn with_strict(mut self) -> Self {
         self.strict = true;
         self
     }
 
+    /// Attach a human-readable label.
     pub fn with_label(mut self, label: impl Into<String>) -> Self {
         self.label = Some(label.into());
         self
@@ -175,7 +196,7 @@ pub fn validate_grammar_with_label(grammar: &Grammar, label: Option<&str>) -> Va
     validate_grammar_with_options(grammar, &opts).unwrap_or_else(|r| *r)
 }
 
-/// Full-featured entry point matching Python's `validate_grammar()` signature.
+/// Full-featured validation entry point.
 ///
 /// Returns `Ok(report)` when there are no errors (or `lint=true`).
 /// Returns `Err(report)` when `strict=true` and there are errors.
@@ -187,6 +208,7 @@ pub fn validate_grammar_with_options(
     let mut issues: Vec<ValidationIssue> = Vec::new();
 
     check_duplicates(&analysis, &mut issues);
+    check_invalid_rule_sources(&analysis, &mut issues);
     check_start_rule(grammar, &analysis, &mut issues);
     check_missing_refs(&analysis, &mut issues);
     check_unreachable(&analysis, &mut issues);
@@ -201,6 +223,7 @@ pub fn validate_grammar_with_options(
     check_overlapping_prefixes(&analysis, &mut issues);
     check_unproductive_rules(&analysis, &mut issues);
     check_unused_actions(grammar, &analysis, &mut issues);
+    check_grammar_config_metadata_types(grammar, &mut issues);
     check_indentation_external_lexer(grammar, &mut issues);
     check_metadata_owners(grammar, &analysis, &mut issues);
     check_recovery_metadata_keys(grammar, &mut issues);
@@ -236,6 +259,16 @@ fn check_duplicates(analysis: &GrammarAnalysis, issues: &mut Vec<ValidationIssue
             format!("rule '{dup}' is defined more than once"),
             Some(dup),
             "duplicate_rule",
+        ));
+    }
+}
+
+fn check_invalid_rule_sources(analysis: &GrammarAnalysis, issues: &mut Vec<ValidationIssue>) {
+    for (rule, message) in &analysis.invalid_rules {
+        issues.push(ValidationIssue::error(
+            format!("rule '{rule}' has invalid source: {message}"),
+            Some(rule),
+            "invalid_rule_source",
         ));
     }
 }
@@ -431,7 +464,7 @@ fn check_metadata_owners(
 
 const RECOVERY_METADATA_KEYS: &[&str] = &["recover_sync_tokens", "recover_sync_regex"];
 
-/// Warn when metadata uses deprecated recovery config keys.
+/// Error when metadata uses unsupported recovery config keys.
 fn check_recovery_metadata_keys(grammar: &Grammar, issues: &mut Vec<ValidationIssue>) {
     let mut owners: Vec<&str> = grammar.metadata.keys().map(|k| k.as_str()).collect();
     owners.sort_unstable();
@@ -454,7 +487,7 @@ fn check_recovery_metadata_keys(grammar: &Grammar, issues: &mut Vec<ValidationIs
                 } else {
                     Some(owner)
                 };
-                issues.push(ValidationIssue::warning(
+                issues.push(ValidationIssue::error(
                     format!(
                         "metadata for '{owner}' uses unsupported recovery config key(s) {rendered}; \
                          pass sync_tokens/sync_regex to recover_parse instead"
@@ -505,10 +538,10 @@ fn check_mixed_terminal_modes(grammar: &Grammar, issues: &mut Vec<ValidationIssu
     let mut has_tok = false;
     let mut has_char = false;
     for rule in &grammar.rules {
-        if has_token_ref_from_source(&rule.source) {
+        if has_token_ref_in_expr(rule.expr()) {
             has_tok = true;
         }
-        if has_char_terminal_from_source(&rule.source) {
+        if has_char_terminal_in_expr(rule.expr()) {
             has_char = true;
         }
         if has_tok && has_char {
@@ -527,7 +560,7 @@ fn check_mixed_terminal_modes(grammar: &Grammar, issues: &mut Vec<ValidationIssu
 
 /// Warn when a grammar action entry has no matching rule.
 ///
-/// Python equivalent: `analysis.unused_actions` check.
+/// Equivalent to the `analysis.unused_actions` check.
 fn check_unused_actions(
     grammar: &Grammar,
     _analysis: &GrammarAnalysis,
@@ -557,12 +590,12 @@ fn check_indentation_external_lexer(grammar: &Grammar, issues: &mut Vec<Validati
     let grammar_meta = grammar.metadata.get("__grammar__");
     let indentation_on = grammar_meta
         .and_then(|m| m.get("indentation"))
-        .map(|v| !matches!(v, serde_json::Value::String(s) if s == "off"))
+        .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let has_external_lexer = grammar_meta
         .and_then(|m| m.get("lexer"))
-        .map(|v| !v.is_null())
-        .unwrap_or(false);
+        .and_then(|v| v.as_str())
+        .is_some();
     if indentation_on && has_external_lexer {
         issues.push(ValidationIssue::error(
             "indentation-aware grammars cannot use an external lexer",
@@ -572,14 +605,130 @@ fn check_indentation_external_lexer(grammar: &Grammar, issues: &mut Vec<Validati
     }
 }
 
+fn check_grammar_config_metadata_types(grammar: &Grammar, issues: &mut Vec<ValidationIssue>) {
+    let Some(grammar_meta) = grammar.metadata.get("__grammar__") else {
+        return;
+    };
+
+    expect_metadata_string(grammar_meta, "trivia", issues);
+    expect_metadata_string_or_null(grammar_meta, "lexer", issues);
+    expect_metadata_bool(grammar_meta, "indentation", issues);
+    expect_metadata_bool(grammar_meta, "strict_actions", issues);
+    expect_metadata_string_array(grammar_meta, "hard_keywords", issues);
+    expect_metadata_string_array(grammar_meta, "soft_keywords", issues);
+}
+
+fn expect_metadata_string(
+    meta: &std::collections::HashMap<String, serde_json::Value>,
+    key: &str,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let Some(value) = meta.get(key) else {
+        return;
+    };
+    if !value.is_string() {
+        push_invalid_grammar_metadata_type(issues, key, "string", value);
+    }
+}
+
+fn expect_metadata_string_or_null(
+    meta: &std::collections::HashMap<String, serde_json::Value>,
+    key: &str,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let Some(value) = meta.get(key) else {
+        return;
+    };
+    if !value.is_string() && !value.is_null() {
+        push_invalid_grammar_metadata_type(issues, key, "string or null", value);
+    }
+}
+
+fn expect_metadata_bool(
+    meta: &std::collections::HashMap<String, serde_json::Value>,
+    key: &str,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let Some(value) = meta.get(key) else {
+        return;
+    };
+    if !value.is_boolean() {
+        push_invalid_grammar_metadata_type(issues, key, "bool", value);
+    }
+}
+
+fn expect_metadata_string_array(
+    meta: &std::collections::HashMap<String, serde_json::Value>,
+    key: &str,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let Some(value) = meta.get(key) else {
+        return;
+    };
+    let valid = value
+        .as_array()
+        .map(|items| items.iter().all(|item| item.is_string()))
+        .unwrap_or(false);
+    if !valid {
+        push_invalid_grammar_metadata_type(issues, key, "array of strings", value);
+    }
+}
+
+fn push_invalid_grammar_metadata_type(
+    issues: &mut Vec<ValidationIssue>,
+    key: &str,
+    expected: &'static str,
+    value: &serde_json::Value,
+) {
+    issues.push(ValidationIssue::error(
+        format!(
+            "__grammar__.{key} metadata must be {expected}, got {}",
+            metadata_value_type_name(value)
+        ),
+        None,
+        "invalid_grammar_metadata_type",
+    ));
+}
+
+fn metadata_value_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 fn check_import_aliases(grammar: &Grammar, issues: &mut Vec<ValidationIssue>) {
-    let known: std::collections::HashSet<&str> =
-        grammar.imports.keys().map(|k| k.as_str()).collect();
+    let mut known: std::collections::HashSet<String> = grammar.imports.keys().cloned().collect();
+    for alias in grammar.imports.keys() {
+        if alias.is_empty() {
+            issues.push(ValidationIssue::error(
+                "inline grammar import alias must be non-empty",
+                None,
+                "invalid_import_alias",
+            ));
+        }
+    }
+    match metadata_import_targets(grammar) {
+        Ok(imports) => {
+            known.extend(imports.into_iter().map(|(alias, _)| alias));
+        }
+        Err(error) => {
+            issues.push(ValidationIssue::error(
+                error.message,
+                None,
+                "invalid_import_metadata",
+            ));
+        }
+    }
     let mut rule_names: Vec<&str> = grammar.rules.iter().map(|r| r.name.as_str()).collect();
     rule_names.sort_unstable();
     for rule in &grammar.rules {
-        for alias in extract_import_aliases_from_source(&rule.source) {
-            if !known.contains(alias.as_str()) {
+        for alias in extract_import_aliases_from_expr(rule.expr()) {
+            if !known.contains(&alias) {
                 issues.push(ValidationIssue::error(
                     format!(
                         "rule '{}' references unknown import alias '{alias}'; add it via Grammar::add_import()",
@@ -606,7 +755,7 @@ mod tests {
             .map(|(n, s)| format!("{n} <- {s}"))
             .collect::<Vec<_>>()
             .join("\n");
-        Grammar::new(&text).with_start_rule(start)
+        Grammar::trusted_new(&text).with_start_rule(start)
     }
 
     #[test]
@@ -615,6 +764,12 @@ mod tests {
         let r = validate_grammar(&g);
         assert!(r.ok());
         assert_eq!(r.error_count(), 0);
+    }
+
+    #[test]
+    fn grammar_try_new_rejects_invalid_rule_source_before_validation() {
+        let err = Grammar::try_new("root <- [a").unwrap_err();
+        assert!(err.to_string().contains("unterminated character class"));
     }
 
     #[test]
@@ -629,24 +784,8 @@ mod tests {
 
     #[test]
     fn duplicate_rule_is_an_error() {
-        use crate::grammar::{GrammarRule, GrammarState};
-        use std::collections::HashMap;
-        let g = Grammar {
-            start_rule: "a".to_string(),
-            text: "a <- 'x'\na <- 'y'".to_string(),
-            metadata: HashMap::new(),
-            imports: HashMap::new(),
-            rules: vec![
-                GrammarRule::from_source("a", "'x'", Vec::new()),
-                GrammarRule::from_source("a", "'y'", Vec::new()),
-            ],
-            version: 1,
-            state: GrammarState {
-                sealed: false,
-                analysis_state: None,
-                version: 0,
-            },
-        };
+        // Two rules named `a` — duplicates are preserved by the text parser.
+        let g = Grammar::trusted_new("a <- 'x'\na <- 'y'").with_start_rule("a");
         let r = validate_grammar(&g);
         assert!(!r.ok());
         assert!(r
@@ -720,7 +859,7 @@ mod tests {
     #[test]
     fn unknown_metadata_owner_is_an_error() {
         use crate::mutation::add_rule;
-        let mut g = Grammar::new("root <- 'x'").with_start_rule("root");
+        let mut g = Grammar::trusted_new("root <- 'x'").with_start_rule("root");
         // Add metadata targeting a rule that doesn't exist.
         g.set_metadata_value("ghost_rule", "some_key", serde_json::Value::Null);
         let r = validate_grammar(&g);
@@ -733,7 +872,7 @@ mod tests {
 
     #[test]
     fn known_metadata_owner_does_not_trigger_error() {
-        let mut g = Grammar::new("root <- 'x'").with_start_rule("root");
+        let mut g = Grammar::trusted_new("root <- 'x'").with_start_rule("root");
         g.set_metadata_value("root", "some_key", serde_json::Value::Bool(true));
         let r = validate_grammar(&g);
         assert!(!r
@@ -743,7 +882,7 @@ mod tests {
 
     #[test]
     fn grammar_metadata_owner_is_allowed() {
-        let mut g = Grammar::new("root <- 'x'").with_start_rule("root");
+        let mut g = Grammar::trusted_new("root <- 'x'").with_start_rule("root");
         g.set_metadata_value(
             "__grammar__",
             "version",
@@ -756,8 +895,8 @@ mod tests {
     }
 
     #[test]
-    fn recovery_metadata_key_triggers_warning() {
-        let mut g = Grammar::new("root <- 'x'").with_start_rule("root");
+    fn recovery_metadata_key_triggers_error() {
+        let mut g = Grammar::trusted_new("root <- 'x'").with_start_rule("root");
         g.set_metadata_value(
             "__grammar__",
             "recover_sync_tokens",
@@ -765,13 +904,13 @@ mod tests {
         );
         let r = validate_grammar(&g);
         assert!(r
-            .warnings()
+            .errors()
             .any(|i| i.code.as_deref() == Some("unsupported_recovery_metadata")));
     }
 
     #[test]
     fn invalid_rule_prefixes_not_an_array_is_an_error() {
-        let mut g = Grammar::new("root <- 'x'").with_start_rule("root");
+        let mut g = Grammar::trusted_new("root <- 'x'").with_start_rule("root");
         g.set_metadata_value(
             "__grammar__",
             "invalid_rule_prefixes",
@@ -786,7 +925,7 @@ mod tests {
 
     #[test]
     fn invalid_rule_prefixes_array_of_strings_is_ok() {
-        let mut g = Grammar::new("root <- 'x'").with_start_rule("root");
+        let mut g = Grammar::trusted_new("root <- 'x'").with_start_rule("root");
         g.set_metadata_value(
             "__grammar__",
             "invalid_rule_prefixes",
@@ -801,7 +940,7 @@ mod tests {
     #[test]
     fn mixed_terminal_modes_triggers_error() {
         // Grammar that mixes tok() with a literal — should get mixed_terminal_modes error.
-        let g = Grammar::new("start <- tok(NAME) 'hello'").with_start_rule("start");
+        let g = Grammar::trusted_new("start <- tok(NAME) 'hello'").with_start_rule("start");
         let r = validate_grammar(&g);
         assert!(
             r.errors()
@@ -821,7 +960,7 @@ mod tests {
 
     #[test]
     fn pure_token_grammar_has_no_mixed_terminal_error() {
-        let g = Grammar::new("start <- tok(NAME) tok(OP)").with_start_rule("start");
+        let g = Grammar::trusted_new("start <- tok(NAME) tok(OP)").with_start_rule("start");
         let r = validate_grammar(&g);
         assert!(!r
             .errors()
@@ -830,7 +969,7 @@ mod tests {
 
     #[test]
     fn unknown_import_alias_triggers_error() {
-        let g = Grammar::new("start <- other::rule").with_start_rule("start");
+        let g = Grammar::trusted_new("start <- other::rule").with_start_rule("start");
         let r = validate_grammar(&g);
         assert!(
             r.errors()
@@ -841,8 +980,8 @@ mod tests {
 
     #[test]
     fn known_import_alias_is_accepted() {
-        let mut g = Grammar::new("start <- other::rule").with_start_rule("start");
-        let import = Grammar::new("rule <- 'x'").with_start_rule("rule");
+        let mut g = Grammar::trusted_new("start <- other::rule").with_start_rule("start");
+        let import = Grammar::trusted_new("rule <- 'x'").with_start_rule("rule");
         g.add_import("other", import);
         let r = validate_grammar(&g);
         assert!(!r
@@ -850,11 +989,47 @@ mod tests {
             .any(|i| i.code.as_deref() == Some("unknown_import_alias")));
     }
 
+    #[test]
+    fn empty_inline_import_alias_is_rejected_at_mutation_boundary() {
+        let mut g = Grammar::trusted_new("start <- root").with_start_rule("start");
+        let import = Grammar::trusted_new("root <- 'x'").with_start_rule("root");
+        let err = g.try_add_import("", import).unwrap_err();
+        assert!(
+            err.message.contains("import alias must be non-empty"),
+            "expected invalid import alias error, got {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn metadata_import_alias_is_accepted() {
+        let mut g = Grammar::trusted_new("start <- other::rule").with_start_rule("start");
+        g.set_metadata_value(
+            "__grammar__",
+            "imports",
+            serde_json::json!({"other": "registry.other"}),
+        );
+        let r = validate_grammar(&g);
+        assert!(!r
+            .errors()
+            .any(|i| i.code.as_deref() == Some("unknown_import_alias")));
+    }
+
+    #[test]
+    fn invalid_import_metadata_is_an_error() {
+        let mut g = Grammar::trusted_new("start <- other::rule").with_start_rule("start");
+        g.set_metadata_value("__grammar__", "imports", serde_json::json!(["other"]));
+        let r = validate_grammar(&g);
+        assert!(r
+            .errors()
+            .any(|i| i.code.as_deref() == Some("invalid_import_metadata")));
+    }
+
     // ── ValidationOptions ─────────────────────────────────────────────────
 
     #[test]
     fn lint_mode_converts_errors_to_warnings() {
-        let g = Grammar::new("root <- 'x'").with_start_rule("nonexistent");
+        let g = Grammar::trusted_new("root <- 'x'").with_start_rule("nonexistent");
         let opts = ValidationOptions::new().with_lint();
         let r = validate_grammar_with_options(&g, &opts).unwrap();
         assert!(r.ok(), "lint mode should not produce errors");
@@ -891,7 +1066,7 @@ mod tests {
 
     #[test]
     fn indentation_external_lexer_is_an_error() {
-        let mut g = Grammar::new("root <- 'x'").with_start_rule("root");
+        let mut g = Grammar::trusted_new("root <- 'x'").with_start_rule("root");
         g.set_metadata_value("__grammar__", "indentation", serde_json::Value::Bool(true));
         g.set_metadata_value(
             "__grammar__",
@@ -900,6 +1075,39 @@ mod tests {
         );
         let r = validate_grammar(&g);
         assert!(r
+            .errors()
+            .any(|i| i.code.as_deref() == Some("indentation_external_lexer")));
+    }
+
+    #[test]
+    fn invalid_grammar_config_metadata_types_are_errors() {
+        let mut g = Grammar::trusted_new("root <- 'x'").with_start_rule("root");
+        g.set_metadata_value("__grammar__", "trivia", serde_json::json!(false));
+        g.set_metadata_value("__grammar__", "lexer", serde_json::json!(123));
+        g.set_metadata_value("__grammar__", "indentation", serde_json::json!("off"));
+        g.set_metadata_value("__grammar__", "strict_actions", serde_json::json!("false"));
+        g.set_metadata_value("__grammar__", "hard_keywords", serde_json::json!(["if", 1]));
+        g.set_metadata_value("__grammar__", "soft_keywords", serde_json::json!("match"));
+
+        let r = validate_grammar(&g);
+        let invalid_type_errors = r
+            .errors()
+            .filter(|i| i.code.as_deref() == Some("invalid_grammar_metadata_type"))
+            .count();
+        assert_eq!(invalid_type_errors, 6);
+        assert!(r.errors().any(|i| i
+            .message
+            .contains("__grammar__.indentation metadata must be bool")));
+    }
+
+    #[test]
+    fn null_lexer_metadata_does_not_count_as_external_lexer() {
+        let mut g = Grammar::trusted_new("root <- 'x'").with_start_rule("root");
+        g.set_metadata_value("__grammar__", "indentation", serde_json::Value::Bool(true));
+        g.set_metadata_value("__grammar__", "lexer", serde_json::Value::Null);
+
+        let r = validate_grammar(&g);
+        assert!(!r
             .errors()
             .any(|i| i.code.as_deref() == Some("indentation_external_lexer")));
     }

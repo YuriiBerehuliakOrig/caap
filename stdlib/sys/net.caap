@@ -1,0 +1,81 @@
+; stdlib/sys/net.caap — facade for the host "net" library.
+;
+; FULL TCP + UDP surface, not a skeleton: the host caap-sys-runtime/net.rs
+; implements every op below over real sockets (TCP listen/accept/connect,
+; stream read/write, UDP bind/send/recv, poll, resolve, shutdown), and
+; verify_sys diffs this typed declaration against that live catalog — so the two
+; cannot drift. The whole net library is gated behind the `sys.net` capability:
+; the compile-time sandbox DENIES it, so a net op is null at CTFE and live only
+; in a runtime-phase evaluation that holds the grant.
+;
+; Two layers, one file (the boilerplate lives in stdlib.sys.wrap):
+;   1. The visible, TYPED surface (`ops`): each function with its parameters
+;      (name + type) and return type. verify_facade checks this against the
+;      catalog, so the declaration cannot drift.
+;   2. CALLABLE wrappers: dual-phase callables from boot/sys_grants.caap, with
+;      the capability handle partially applied. Each phase's sandbox policy
+;      gates behaviour. Without the grant the module still loads — wrappers are
+;      self-describing throwing stubs that raise "requires a sys grant" when
+;      called (declaration-only mode).
+; `make_facade` files the typed surface AND builds the wrapper bundle in one
+; step; each export reads its wrapper from that bundle.
+(module stdlib.sys.net)
+
+(use stdlib.sys.verify op p)
+(use stdlib.sys.wrap make_facade)
+
+(bind ops
+  (list_of
+    ; ── address helpers (pure: no socket, no capability effect) ──────────────
+    (op "host_port" (list_of (p "host" "string") (p "port" "int")) "string" "pure")
+    (op "is_ip" (list_of (p "address" "string")) "bool" "pure")
+    (op "is_loopback" (list_of (p "address" "string")) "bool" "pure")
+    (op "resolve" (list_of (p "address" "string")) "list<string>" "impure")
+    ; ── TCP ──────────────────────────────────────────────────────────────────
+    (op "listen" (list_of (p "spec" "map")) "listener_handle" "impure")
+    (op "accept" (list_of (p "listener" "listener_handle")) "socket_handle" "impure")
+    (op "connect" (list_of (p "spec" "map")) "socket_handle" "impure")
+    (op "read" (list_of (p "socket" "socket_handle") (p "max_bytes" "int")) "string" "impure")
+    (op "read_bytes" (list_of (p "socket" "socket_handle") (p "max_bytes" "int")) "bytes" "impure")
+    (op "write" (list_of (p "socket" "socket_handle") (p "text" "string")) "null" "impure")
+    (op "write_bytes" (list_of (p "socket" "socket_handle") (p "bytes" "bytes")) "null" "impure")
+    (op "shutdown" (list_of (p "socket" "socket_handle") (p "how" "string")) "null" "impure")
+    ; ── UDP ──────────────────────────────────────────────────────────────────
+    (op "udp_bind" (list_of (p "spec" "map")) "udp_handle" "impure")
+    (op "udp_send_to" (list_of (p "handle" "udp_handle") (p "data" "string") (p "address" "string")) "int" "impure")
+    (op "udp_recv_from" (list_of (p "handle" "udp_handle") (p "max_bytes" "int")) "map" "impure")
+    ; ── shared: lifecycle, readiness, addresses ──────────────────────────────
+    (op "close" (list_of (p "handle" "socket-handle|listener-handle")) "null" "impure")
+    (op "poll" (list_of (p "handles" "list<int>") (p "timeout_ms" "int")) "list<map>" "impure")
+    (op "local_addr" (list_of (p "handle" "listener-handle|socket-handle|udp-handle")) "string" "impure")
+    (op "peer_addr" (list_of (p "handle" "socket-handle|udp-handle")) "string" "impure")))
+
+; one call: file the typed surface AND build the wrapper bundle. Each export
+; below reads its (capability-applied, or null) callable from this bundle.
+(bind sys (make_facade "net" ops))
+
+(bind host_port     (get sys "host_port"))
+(bind is_ip         (get sys "is_ip"))
+(bind is_loopback   (get sys "is_loopback"))
+(bind resolve       (get sys "resolve"))
+(bind listen        (get sys "listen"))
+(bind accept        (get sys "accept"))
+(bind connect       (get sys "connect"))
+(bind read          (get sys "read"))
+(bind read_bytes    (get sys "read_bytes"))
+(bind write         (get sys "write"))
+(bind write_bytes   (get sys "write_bytes"))
+(bind shutdown      (get sys "shutdown"))
+(bind udp_bind      (get sys "udp_bind"))
+(bind udp_send_to   (get sys "udp_send_to"))
+(bind udp_recv_from (get sys "udp_recv_from"))
+(bind close         (get sys "close"))
+(bind poll          (get sys "poll"))
+(bind local_addr    (get sys "local_addr"))
+(bind peer_addr     (get sys "peer_addr"))
+
+(export ops
+        accept close connect host_port is_ip is_loopback
+        listen local_addr peer_addr poll read read_bytes
+        resolve shutdown udp_bind udp_recv_from udp_send_to write
+        write_bytes)

@@ -1,22 +1,43 @@
 [package]
-name = "caap-core-port"
+name = "caap-core"
 version = "0.1.0"
 edition = "2021"
-description = "Work-in-progress Rust port of CAAP core (IR + evaluator)."
-license = "MIT OR Apache-2.0"
+description = "Work-in-progress CAAP core implementation (IR + evaluator)."
+license = "Apache-2.0"
 
 [dependencies]
 blake2 = "0.10"
+# Runtime maps iterate in INSERTION order (principle #9 made observable):
+# map_keys/map_values and every map walk follow construction order, so struct
+# fields, emitted globals, … keep their declared order without sorting.
+indexmap = "2"
 libc = "0.2"
+libloading = "0.8"
+regex = "1.11"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 sha2 = "0.10"
+# Grow the native stack on demand in the recursive evaluator (eval.rs) instead
+# of demanding a huge fixed RUST_MIN_STACK from every embedder. rustc uses the
+# same approach (ensure_sufficient_stack).
+stacker = "0.1"
 thiserror = "1.0"
-caap-peg-port = { path = "../peg" }
+tracing = "0.1"
+caap-peg = { path = "../peg", features = ["recovery"] }
+caap-sys-runtime = { path = "../caap-sys-runtime" }
 
 [dev-dependencies]
+# Dual-phase equivalence law (tests/dual_phase_equivalence_tests.rs): generated
+# expressions must evaluate identically under CompileTime and Runtime phases.
+proptest = "1"
 static_assertions = "1.1"
+criterion = { version = "0.5", features = ["html_reports"] }
+pprof = { version = "0.13", features = ["flamegraph", "criterion"] }
 
 [lib]
-name = "caap_core_port"
+name = "caap_core"
 path = "src/lib.rs"
+
+[[bench]]
+name = "eval_query_bench"
+harness = false

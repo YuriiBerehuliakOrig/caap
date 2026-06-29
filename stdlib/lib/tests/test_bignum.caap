@@ -1,0 +1,86 @@
+; stdlib/lib/tests/test_bignum.caap — smoke (salvaged module; full coverage TBD).
+
+;; @area: numeric
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true assert_false assert_throws)
+(use stdlib.lib.numeric.bignum
+  bn_from_int bn_to_int bn_parse bn_add bn_sub bn_mul bn_pow_mod bn_cmp
+  bn_lcm bn_isqrt bn_egcd bn_modinv
+  bn_zero bn? bn_validate)
+(do
+  (assert_eq (bn_to_int (bn_add (bn_from_int 2) (bn_from_int 3))) 5 "2+3=5")
+  (assert_eq (bn_to_int (bn_mul (bn_from_int 12) (bn_from_int 12))) 144 "12*12=144")
+  (assert_eq (bn_to_int (bn_pow_mod (bn_from_int 2) (bn_from_int 10) (bn_from_int 1000))) 24 "2^10 mod 1000 = 24")
+  (assert_eq (bn_cmp (bn_from_int 5) (bn_from_int 7)) -1 "5<7")
+
+  ; ── bn_lcm ──
+  (assert_eq (bn_to_int (bn_lcm (bn_from_int 4) (bn_from_int 6))) 12 "lcm(4,6)=12")
+  (assert_eq (bn_to_int (bn_lcm (bn_from_int 0) (bn_from_int 7))) 0 "lcm(0,7)=0")
+  (assert_eq (bn_to_int (bn_lcm (bn_from_int 21) (bn_from_int 6))) 42 "lcm(21,6)=42")
+  (assert_eq (bn_to_int (bn_lcm (bn_from_int -4) (bn_from_int 6))) 12 "lcm(-4,6)=12 (non-negative)")
+
+  ; ── bn_isqrt ──
+  (assert_eq (bn_to_int (bn_isqrt (bn_from_int 144))) 12 "isqrt(144)=12")
+  (assert_eq (bn_to_int (bn_isqrt (bn_from_int 1000000))) 1000 "isqrt(1000000)=1000")
+  (assert_eq (bn_to_int (bn_isqrt (bn_from_int 2))) 1 "isqrt(2)=1")
+  (assert_eq (bn_to_int (bn_isqrt (bn_from_int 0))) 0 "isqrt(0)=0")
+  (assert_eq (bn_to_int (bn_isqrt (bn_from_int 1))) 1 "isqrt(1)=1")
+  (assert_eq (bn_to_int (bn_isqrt (bn_from_int 15))) 3 "isqrt(15)=3 (floor)")
+  (assert_eq (bn_to_int (bn_isqrt (bn_from_int 24))) 4 "isqrt(24)=4 (floor below 25)")
+  (assert_eq (bn_to_int (bn_isqrt (bn_from_int 25))) 5 "isqrt(25)=5 (exact)")
+  ; BIG case: a 20-digit number. floor sqrt(12345678901234567890) = 3513641828.
+  (assert_eq
+    (bn_cmp (bn_isqrt (bn_parse "12345678901234567890" 10))
+            (bn_from_int 3513641828))
+    0 "isqrt(12345678901234567890)=3513641828")
+  ; perfect 40-digit square: (10^20)^2 = 10^40 -> isqrt = 10^20 exactly.
+  (assert_eq
+    (bn_cmp (bn_isqrt (bn_parse "10000000000000000000000000000000000000000" 10))
+            (bn_parse "100000000000000000000" 10))
+    0 "isqrt(10^40)=10^20")
+
+  ; ── bn_egcd: a*x + b*y = g ──
+  (bind ((e1 (bn_egcd (bn_from_int 240) (bn_from_int 46))))
+    (do
+      (assert_eq (bn_to_int (get e1 "g")) 2 "gcd(240,46)=2")
+      (assert_eq
+        (bn_to_int (bn_add (bn_mul (bn_from_int 240) (get e1 "x"))
+                           (bn_mul (bn_from_int 46) (get e1 "y"))))
+        2 "egcd identity 240*x+46*y=2")))
+  (bind ((e2 (bn_egcd (bn_from_int 3) (bn_from_int 11))))
+    (assert_eq
+      (bn_to_int (bn_add (bn_mul (bn_from_int 3) (get e2 "x"))
+                         (bn_mul (bn_from_int 11) (get e2 "y"))))
+      1 "egcd identity 3*x+11*y=1"))
+
+  ; ── bn_modinv ──
+  (assert_eq (bn_to_int (bn_modinv (bn_from_int 3) (bn_from_int 11))) 4 "modinv(3,11)=4")
+  (assert_true (eq (bn_modinv (bn_from_int 2) (bn_from_int 4)) null) "modinv(2,4)=null (gcd!=1)")
+  ; large-modulus inverse: 17 * inv ≡ 1 (mod 1000000007). Verify by multiply+mod.
+  (bind ((inv (bn_modinv (bn_from_int 17) (bn_from_int 1000000007))))
+    (do
+      (assert_true (not (eq inv null)) "modinv(17, 1e9+7) exists")
+      (bind ((prod (bn_pow_mod (bn_mul (bn_from_int 17) inv)
+                               (bn_from_int 1) (bn_from_int 1000000007))))
+        (assert_eq (bn_to_int prod) 1 "modinv(17, 1e9+7) inverts: 17*inv mod m = 1"))))
+  ; BIG modulus: a 40-digit power of 10 plus 1; a = 1234567. Verify the inverse
+  ; property directly rather than hard-coding the (huge) inverse value.
+  (bind ((m (bn_parse "10000000000000000000000000000000000000001" 10))
+         (a (bn_from_int 1234567))
+         (inv (bn_modinv a m)))
+    (do
+      (assert_true (not (eq inv null)) "modinv with big modulus exists")
+      (bind ((prod (bn_pow_mod (bn_mul a inv) (bn_from_int 1) m)))
+        (assert_eq (bn_to_int prod) 1 "big modinv inverts: a*inv mod m = 1"))))
+
+  ; ── bn? / bn_validate (structural validators) ──
+  (assert_true (bn? (bn_from_int 5)) "bn? true for bn_from_int 5")
+  (assert_true (bn? (bn_zero)) "bn? true for bn_zero")
+  (assert_false (bn? 5) "bn? false for a non-map (int 5)")
+  ; malformed: sign 2 is outside {-1,0,1}
+  (assert_false (bn? (assoc (map_of) "sign" 2 "limbs" (list_of)))
+    "bn? false for sign=2 (out of range)")
+  (assert_eq (bn? (bn_validate (bn_from_int 7))) true "bn_validate returns a valid bignum")
+  (assert_throws (lambda () (bn_validate 5)) "bn_validate throws on a non-bignum")
+  true)

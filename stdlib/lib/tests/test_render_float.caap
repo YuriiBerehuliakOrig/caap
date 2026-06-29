@@ -1,0 +1,101 @@
+; stdlib/lib/tests/test_render_float.caap — float rendering round-trips + mkbind.
+;
+; render_value gained a float case (the BLOCKER: the wasm backend produces real
+; Float(f64) literals and render is the native-emit bridge). The reader only
+; yields a Float when the token carries a '.', 'e' or 'E', so a whole-valued
+; float must render with a forced ".0" — these tests pin BOTH the fractional and
+; whole-number paths by parsing the rendered text back and comparing kind+value.
+; mkbind builds the canonical merged bind that bind_pairs reads.
+
+;; @area: numeric
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.syntax.render render)
+(use stdlib.syntax.ast lit mkbind sym calln eval_ir bind_pairs literal_of)
+
+; roundtrip — render a float literal, re-read the text, return the read VALUE.
+;   f -> the float the rendered token parses back to (with a kind assertion)
+(bind roundtrip
+  (lambda (f)
+    ; ctfe_surface_parse_form reads its FIRST arg as the source text (the second
+    ; is required by arity but unused); it returns the parsed surface-form map.
+    (bind ((txt (render (lit f)))
+           (form (ctfe_surface_parse_form txt txt)))
+      (do
+        (assert_eq (get form "kind") "float"
+          (string_concat_many "render float re-reads as float, not " (get form "kind")
+            " (text " txt ")"))
+        (get form "value")))))
+
+(do
+  ; ── float rendering round-trips ──────────────────────────────────────────
+  ; fractional value: value_to_string already carries a '.', renders as-is
+  (assert_eq (roundtrip 1.5) 1.5 "1.5 round-trips")
+  (assert_eq (roundtrip 0.0000001) 0.0000001 "small fractional round-trips")
+  (assert_eq (roundtrip (float_div (int_to_float 1) (int_to_float 3)))
+             (float_div (int_to_float 1) (int_to_float 3))
+             "1/3 round-trips")
+  ; whole-valued floats: print as "3"/"0"/"-2" — render must force ".0" so they
+  ; re-read as floats, not ints (the round-trip-breaking case)
+  (assert_eq (roundtrip (int_to_float 3)) (int_to_float 3) "whole 3.0 round-trips")
+  (assert_eq (roundtrip (int_to_float 0)) (int_to_float 0) "whole 0.0 round-trips")
+  (assert_eq (roundtrip (int_to_float -2)) (int_to_float -2) "whole -2.0 round-trips")
+  (assert_eq (roundtrip (int_to_float 1000000)) (int_to_float 1000000)
+    "large whole float round-trips")
+
+  ; render forces a float-shaped token (a '.') for a whole value
+  (assert_true (string_contains (render (lit (int_to_float 3))) ".")
+    "render forces a '.' on a whole float")
+  ; …but leaves an already-fractional spelling untouched
+  (assert_eq (render (lit 1.5)) "1.5" "render keeps a fractional spelling")
+
+  ; the rendered float value is still parseable as a kernel literal in context
+  (assert_eq (render (calln "f" (list_of (lit (int_to_float 2)))))
+             "(f 2.0)" "float literal renders inside a call")
+
+  ; non-finite floats have NO source form (value_to_string spells them
+  ; "inf"/"NaN" — no kernel literal syntax) so render THROWS, like the renderer
+  ; does for tuples/maps/callables. inf via overflow, NaN via sqrt(-1).
+  (assert_true
+    (string_contains
+      (try (render (lit (float_mul 1e200 1e200))) (catch e e))
+      "no source form")
+    "render throws on +inf")
+  (assert_true
+    (string_contains
+      (try (render (lit (sqrt (int_to_float -1)))) (catch e e))
+      "no source form")
+    "render throws on NaN")
+
+  ; ── mkbind builds a loadable canonical merged bind ──────────────────────────
+  (bind ((node (mkbind
+                 (list_of (assoc (map_of) "name" "a" "value" (lit 1))
+                          (assoc (map_of) "name" "b" "value" (lit 2)))
+                 (list_of (calln "int_add" (list_of (sym "a") (sym "b")))))))
+    (do
+      ; round-trips through bind_pairs (the canonical reader)
+      (bind ((bp (bind_pairs node)))
+        (do
+          (assert_true (not (eq bp null)) "mkbind output is a canonical bind")
+          (assert_eq (size (get bp "pairs")) 2 "mkbind: two pairs")
+          (assert_eq (get (get (get bp "pairs") 0) "name") "a" "mkbind: first name")
+          (assert_eq (literal_of (get (get (get bp "pairs") 1) "value")) 2
+            "mkbind: second value")
+          (assert_eq (size (get bp "body")) 1 "mkbind: body tail")))
+      ; and it actually evaluates: (bind ("a" 1 "b" 2) (int_add a b)) -> 3
+      (assert_eq (eval_ir node) 3 "mkbind node evaluates")))
+
+  ; a single-pair mkbind still produces a canonical bind that evaluates
+  (bind ((one (mkbind (list_of
+                        (assoc (map_of) "name" "x" "value" (lit 41)))
+                      (list_of (calln "int_add"
+                                 (list_of (sym "x") (lit 1)))))))
+    (assert_eq (eval_ir one) 42 "single-pair mkbind evaluates"))
+
+  ; mkbind with NO pairs collapses to the body (no malformed `(bind <non-string>…)`)
+  (assert_eq (eval_ir (mkbind (list_of) (list_of (lit 7)))) 7
+    "empty-pairs mkbind collapses to the lone body spec")
+  (assert_eq (eval_ir (mkbind (list_of) (list_of (lit 1) (lit 99)))) 99
+    "empty-pairs mkbind wraps several body specs in (do …)")
+  true)

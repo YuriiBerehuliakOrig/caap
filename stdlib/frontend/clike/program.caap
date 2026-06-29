@@ -1,0 +1,174 @@
+; stdlib/frontend/clike/program.caap - clike program/module lowering frame.
+;
+; Owns lower_program_tokens/lower_program_at and program-level concerns: surface
+; headers, use declarations, module wrapping, exports, and main auto-call.
+(module stdlib.frontend.clike.program)
+
+(use stdlib.frontend.surface parse_forms_at)
+(use stdlib.frontend.clike.ast sym calln)
+(use stdlib.frontend.clike.sequence map prepend)
+(use stdlib.frontend.clike.grammar clike_units)
+(use stdlib.frontend.clike.tokens tval titems tsym? tlist? stamp split_commas)
+(use stdlib.frontend.clike.state reset_file_state! local_imports)
+(use stdlib.frontend.clike.decl_lower classify_named lower_named)
+
+; ── program lowering frame ──────────────────────────────────────────────────
+; Keep the top-level walk readable: declarations still lower through the
+; registry hooks above, while this frame owns only program-level concerns
+; (surface header, use declarations, module wrapping, and main auto-call).
+(bind new_lower_ctx
+  (lambda (toks)
+    (assoc (map_of)
+      "out" (list_of)
+      "pub" (list_of)
+      "toks" toks
+      "i" (ref 0)
+      "saw_main" (ref 0)
+      "mod_name" (ref null))))
+
+(bind clike_surface_header?
+  (lambda (t)
+    (and (tlist? t "paren")
+         (tsym? (get (titems t) 0) "surface"))))
+
+(bind clike_use_decl_at?
+  (lambda (toks i)
+    (and (tsym? (get toks i) "use")
+         (and (tsym? (get toks (int_add i 1)) null)
+              (tlist? (get toks (int_add i 2)) "paren")))))
+
+(bind lower_surface_header!
+  (lambda (ctx i)
+    (bind ((t (get (get ctx "toks") i))
+           (mod_name (get ctx "mod_name")))
+      (do
+        ; (surface kit mod.name) makes this clike file a module. A plain
+        ; (surface kit) stays an executable program and will auto-call main.
+        (when (tsym? (get (titems t) 2) null)
+          (set_ref mod_name (tval (get (titems t) 2))))
+        (int_add i 1)))))
+
+(bind record_use_imports!
+  (lambda (groups)
+    (for g groups
+      ; record each imported name (kind unknown until resolved) so type_known?
+      ; accepts it in TYPE position during THIS file's lowering, without making
+      ; it look like a local type in value position.
+      (assoc (local_imports) (tval (get g 0)) "unknown"))))
+
+(bind lower_use_decl!
+  (lambda (ctx i)
+    (bind ((toks (get ctx "toks"))
+           (t (get toks i))
+           (modtok (get toks (int_add i 1)))
+           (namelist (get toks (int_add i 2)))
+           (groups (split_commas (titems namelist)))
+           (out (get ctx "out")))
+      (do
+        (record_use_imports! groups)
+        (append out (stamp
+          (calln "use"
+            (prepend (sym (tval modtok))
+              (map groups (lambda (g) (sym (tval (get g 0)))))))
+          t))
+        (int_add i 3)))))
+
+(bind lower_named_item!
+  (lambda (ctx i)
+    (lower_named (classify_named (get ctx "toks") i) ctx)))
+
+(bind directive_handlers (list_of))
+
+(bind register_directive!
+  (lambda (name priority match lower)
+    (append directive_handlers
+      (assoc (map_of) "name" name "priority" priority
+                       "match" match "lower" lower))))
+
+(bind find_directive_handler
+  (lambda (ctx i)
+    (bind ((best (ref null)) (bestp (ref 1000000)))
+      (do
+        (for row directive_handlers
+          (when (and (lt (get row "priority") (deref bestp))
+                     ((get row "match") ctx i))
+            (do
+              (set_ref best row)
+              (set_ref bestp (get row "priority")))))
+        (deref best)))))
+
+(register_directive! "surface" 10
+  (lambda (ctx i) (clike_surface_header? (get (get ctx "toks") i)))
+  lower_surface_header!)
+(register_directive! "use" 20
+  (lambda (ctx i) (clike_use_decl_at? (get ctx "toks") i))
+  lower_use_decl!)
+
+(bind lower_top_item!
+  (lambda (ctx i)
+    (bind ((h (find_directive_handler ctx i)))
+      (if (eq h null)
+        (lower_named_item! ctx i)
+        ((get h "lower") ctx i)))))
+
+(bind finish_program_forms
+  (lambda (ctx)
+    (bind ((out (get ctx "out"))
+           (pub_names (get ctx "pub"))
+           (saw_main (get ctx "saw_main"))
+           (mod_name (get ctx "mod_name")))
+      ; a NAMED surface module wraps as (module n) ... (export ...), and does
+      ; NOT call main on load. An unnamed file keeps the program contract:
+      ; main runs and its value is the program's value.
+      (if (not (eq (deref mod_name) null))
+        (bind ((wrapped (list_of (calln "module"
+                          (list_of (sym (deref mod_name)))))))
+          (do
+            (for f2 out (append wrapped f2))
+            (append wrapped
+              (calln "export"
+                (bind ((nsyms (list_of)))
+                  (do (for nm pub_names (append nsyms (sym nm)))
+                      nsyms))))
+            (assoc (map_of) "ok" true "forms" wrapped)))
+        (do
+          (when (gt (deref saw_main) 0)
+            (append out (calln "main" (list_of))))
+          (assoc (map_of) "ok" true "forms" out))))))
+
+(bind lower_program_tokens
+  (lambda (toks)
+    (bind ((ctx (new_lower_ctx toks))
+           (i (get ctx "i")))
+      (do
+        (reset_file_state!)
+        (while (lt (deref i) (size toks))
+          (set_ref i (lower_top_item! ctx (deref i))))
+        (finish_program_forms ctx)))))
+
+(bind lower_error_result
+  (lambda (e)
+    (assoc (map_of) "ok" false
+      "error" (if (eq (value_type e) "map")
+                (get e "message" (value_to_string e))
+                (value_to_string e)))))
+
+; ── the entry: C-like TEXT -> stdlib surface forms ─────────────────────────
+;   text : a program — a sequence of named declarations (functions, struct/enum,
+;          globals/const, extern, plus any user-registered kind) interleaved with
+;          `use` imports, optionally led by a `(surface …)` module header
+;   ->   : {ok: true, forms: [spec…]} | {ok: false, error}
+; The forms are stdlib SURFACE forms (defn/bind/while/when/if/struct/enum/global) —
+; render them (render_program) into a loadable module/program, or hand them to
+; backend/driver compile_ir for a native binary.
+(bind lower_program_at
+  (lambda (text path)
+    (bind ((r (parse_forms_at (clike_units) text null path)))
+      (if (not (get r "ok" false))
+        r
+        (try
+          (lower_program_tokens (titems (get (get r "forms" (list_of)) 0)))
+          (catch e
+            (lower_error_result e)))))))
+
+(export lower_program_tokens lower_program_at)

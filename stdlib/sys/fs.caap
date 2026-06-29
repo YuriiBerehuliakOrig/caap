@@ -1,0 +1,108 @@
+; stdlib/sys/fs.caap — facade for the host "fs" library.
+;
+; Two layers, one file (the boilerplate lives in stdlib.sys.wrap):
+;   1. The visible, TYPED surface (`ops`): each function with its parameters
+;      (name + type) and return type. verify_facade checks this against the
+;      catalog, so the declaration cannot drift.
+;   2. CALLABLE wrappers: dual-phase callables from boot/sys_grants.caap, with
+;      the capability handle partially applied. Each phase's sandbox policy
+;      gates behaviour. Without the grant the module still loads — wrappers are
+;      self-describing throwing stubs that raise "requires a sys grant" when
+;      called (declaration-only mode).
+; `make_facade` files the typed surface AND builds the wrapper bundle in one
+; step; each export reads its wrapper from that bundle.
+(module stdlib.sys.fs)
+
+(use stdlib.sys.verify op p)
+(use stdlib.sys.wrap make_facade)
+
+(bind ops
+  (list_of
+    (op "append_bytes" (list_of (p "path" "string") (p "bytes" "bytes")) "null" "impure")
+    (op "append_text" (list_of (p "path" "string") (p "text" "string")) "null" "impure")
+    (op "canonicalize" (list_of (p "path" "string")) "string" "impure")
+    (op "close_dir" (list_of (p "handle" "dir_handle")) "null" "impure")
+    (op "close_file" (list_of (p "handle" "file_handle")) "null" "impure")
+    (op "copy_file" (list_of (p "source" "string") (p "target" "string")) "null" "impure")
+    (op "create_dir" (list_of (p "path" "string")) "null" "impure")
+    (op "create_dir_all" (list_of (p "path" "string")) "null" "impure")
+    (op "dir_list" (list_of (p "handle" "dir_handle")) "list<map>" "impure")
+    (op "exists" (list_of (p "path" "string")) "bool" "impure")
+    (op "file_flush" (list_of (p "handle" "file_handle")) "null" "impure")
+    (op "file_metadata" (list_of (p "handle" "file_handle")) "map" "impure")
+    (op "file_read_all_text" (list_of (p "handle" "file_handle")) "string" "impure")
+    (op "file_read_bytes" (list_of (p "handle" "file_handle") (p "max_bytes" "int")) "bytes" "impure")
+    (op "file_read_line" (list_of (p "handle" "file_handle")) "string|null" "impure")
+    (op "file_seek" (list_of (p "handle" "file_handle") (p "offset" "int") (p "whence" "string")) "int" "impure")
+    (op "file_write" (list_of (p "handle" "file_handle") (p "text" "string")) "null" "impure")
+    (op "file_write_bytes" (list_of (p "handle" "file_handle") (p "bytes" "bytes")) "null" "impure")
+    (op "hard_link" (list_of (p "source" "string") (p "target" "string")) "null" "impure")
+    (op "is_dir" (list_of (p "path" "string")) "bool" "impure")
+    (op "is_file" (list_of (p "path" "string")) "bool" "impure")
+    (op "list_dir" (list_of (p "path" "string")) "list<map>" "impure")
+    (op "metadata" (list_of (p "path" "string")) "map" "impure")
+    (op "open_dir" (list_of (p "path" "string")) "dir_handle" "impure")
+    (op "open_file" (list_of (p "spec" "map")) "file_handle" "impure")
+    (op "read_bytes" (list_of (p "path" "string")) "bytes" "impure")
+    (op "read_link" (list_of (p "path" "string")) "string" "impure")
+    (op "read_text" (list_of (p "path" "string")) "string" "impure")
+    (op "remove_dir" (list_of (p "path" "string")) "null" "impure")
+    (op "remove_dir_all" (list_of (p "path" "string")) "null" "impure")
+    (op "remove_file" (list_of (p "path" "string")) "null" "impure")
+    (op "rename" (list_of (p "source" "string") (p "target" "string")) "null" "impure")
+    (op "set_permissions" (list_of (p "path" "string") (p "mode" "int")) "null" "impure")
+    (op "set_readonly" (list_of (p "path" "string") (p "readonly" "bool")) "null" "impure")
+    (op "symlink" (list_of (p "target" "string") (p "link" "string")) "null" "impure")
+    (op "write_bytes" (list_of (p "path" "string") (p "bytes" "bytes")) "null" "impure")
+    (op "write_text" (list_of (p "path" "string") (p "text" "string")) "null" "impure")))
+
+; one call: file the typed surface AND build the wrapper bundle. Each export
+; below reads its (capability-applied, or null) callable from this bundle.
+(bind sys (make_facade "fs" ops))
+
+(bind append_bytes       (get sys "append_bytes"))
+(bind append_text        (get sys "append_text"))
+(bind canonicalize       (get sys "canonicalize"))
+(bind close_dir          (get sys "close_dir"))
+(bind close_file         (get sys "close_file"))
+(bind copy_file          (get sys "copy_file"))
+(bind create_dir         (get sys "create_dir"))
+(bind create_dir_all     (get sys "create_dir_all"))
+(bind dir_list           (get sys "dir_list"))
+(bind exists             (get sys "exists"))
+(bind file_flush         (get sys "file_flush"))
+(bind file_metadata      (get sys "file_metadata"))
+(bind file_read_all_text (get sys "file_read_all_text"))
+(bind file_read_bytes    (get sys "file_read_bytes"))
+(bind file_read_line     (get sys "file_read_line"))
+(bind file_seek          (get sys "file_seek"))
+(bind file_write         (get sys "file_write"))
+(bind file_write_bytes   (get sys "file_write_bytes"))
+(bind hard_link          (get sys "hard_link"))
+(bind is_dir             (get sys "is_dir"))
+(bind is_file            (get sys "is_file"))
+(bind list_dir           (get sys "list_dir"))
+(bind metadata           (get sys "metadata"))
+(bind open_dir           (get sys "open_dir"))
+(bind open_file          (get sys "open_file"))
+(bind read_bytes         (get sys "read_bytes"))
+(bind read_link          (get sys "read_link"))
+(bind read_text          (get sys "read_text"))
+(bind remove_dir         (get sys "remove_dir"))
+(bind remove_dir_all     (get sys "remove_dir_all"))
+(bind remove_file        (get sys "remove_file"))
+(bind rename             (get sys "rename"))
+(bind set_permissions    (get sys "set_permissions"))
+(bind set_readonly       (get sys "set_readonly"))
+(bind symlink            (get sys "symlink"))
+(bind write_bytes        (get sys "write_bytes"))
+(bind write_text         (get sys "write_text"))
+
+(export ops
+        append_bytes append_text canonicalize close_dir close_file copy_file
+        create_dir create_dir_all dir_list exists file_flush file_metadata
+        file_read_all_text file_read_bytes file_read_line file_seek file_write file_write_bytes
+        hard_link is_dir is_file list_dir metadata open_dir
+        open_file read_bytes read_link read_text remove_dir remove_dir_all
+        remove_file rename set_permissions set_readonly symlink write_bytes
+        write_text)

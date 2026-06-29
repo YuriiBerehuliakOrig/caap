@@ -1,0 +1,88 @@
+; stdlib/lib/tests/test_codegen_common.caap — the target-NEUTRAL codegen
+; helpers shared by backend/emit/llvm and backend/emit/wasm. These are the *decisions* both
+; backends make (signedness, width unification, op/comparison classification,
+; pointer-to-struct naming); testing them once here pins the single source of
+; truth that keeps the two emitters from drifting.
+
+;; @area: backend
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.backend.codegen_common
+     unsigned? unify_int binops sbinop_heads sbinop_index
+     cmp_heads cmp? eq_ne? fbinop_heads ptr_struct_name struct_name_of pointee_of)
+
+; assert_false — the missing negative companion of assert_true (lib/test only
+; exports the positive form); pass when `cond` is falsey.
+(bind assert_false (lambda (cond label) (assert_true (not cond) label)))
+
+(do
+  ; ── unsigned? — the `u`-prefix rule, null-safe ──
+  (assert_true  (unsigned? "u8")   "u8 is unsigned")
+  (assert_true  (unsigned? "u64")  "u64 is unsigned")
+  (assert_false (unsigned? "i32")  "i32 is signed")
+  (assert_false (unsigned? "int")  "int is signed")
+  (assert_false (unsigned? null)   "null type reads as signed (the safe default)")
+
+  ; ── unify_int — width unification; a literal (null) adopts the other side,
+  ; two literals take the 32-bit tag, two concrete widths must agree ──
+  (assert_eq (unify_int "i32" "i32" "i32" "t") "i32" "same width unifies")
+  (assert_eq (unify_int null  "i64" "i32" "t") "i64" "literal adopts the typed side")
+  (assert_eq (unify_int "i64" null  "i32" "t") "i64" "literal adopts (other order)")
+  (assert_eq (unify_int null  null  "i32" "t") "i32" "two literals default to the 32-bit tag")
+  ; a concrete width clash is a CERTAIN diagnostic (no silent corruption)
+  (assert_eq
+    (try (do (unify_int "i32" "i64" "i32" "wasm codegen") "NO_THROW")
+      (catch e (if (string_contains (value_to_string e) "mixed integer widths")
+                 "threw" "wrong message")))
+    "threw"
+    "a width mismatch throws a located diagnostic")
+
+  ; ── binops — the shared head -> base op-name table (identical across targets) ──
+  (assert_eq (get binops "int_add") "add" "int_add -> add")
+  (assert_eq (get binops "int_shl") "shl" "int_shl -> shl (signedness-agnostic)")
+  (assert_eq (get binops "int_xor") "xor" "int_xor -> xor")
+  (assert_eq (get binops "int_div" null) null "int_div is NOT a plain binop (it is signed-dependent)")
+
+  ; ── sbinop_index / sbinop_heads — the signed/unsigned slot rule ──
+  (assert_true (eq (get sbinop_heads "int_div" false) true) "int_div is signed-dependent")
+  (assert_true (eq (get sbinop_heads "int_shr" false) true) "int_shr is signed-dependent")
+  (assert_eq (sbinop_index "i32" "i32")  0 "two signed operands -> signed slot 0")
+  (assert_eq (sbinop_index "u32" "i32")  1 "either operand unsigned -> unsigned slot 1")
+  (assert_eq (sbinop_index "i32" "u64")  1 "either operand unsigned -> unsigned slot 1 (b)")
+  (assert_eq (sbinop_index null  null)   0 "two literals -> signed slot 0")
+
+  ; ── comparison classification ──
+  (assert_true  (cmp? "lt") "lt is a comparison")
+  (assert_true  (cmp? "ne") "ne is a comparison")
+  (assert_false (cmp? "int_add") "int_add is not a comparison")
+  (assert_true  (eq (get cmp_heads "ge" false) true) "ge in cmp_heads")
+  (assert_true  (eq_ne? "eq") "eq is signedness-agnostic")
+  (assert_true  (eq_ne? "ne") "ne is signedness-agnostic")
+  (assert_false (eq_ne? "lt") "lt branches on signedness/ordering")
+
+  ; ── float arithmetic head set ──
+  (assert_true  (eq (get fbinop_heads "float_add" false) true) "float_add is float arithmetic")
+  (assert_true  (eq (get fbinop_heads "float_div" false) true) "float_div is float arithmetic")
+  (assert_false (eq (get fbinop_heads "int_add" false) true)   "int_add is not float arithmetic")
+
+  ; ── pointer-to-struct naming (against a tiny structs table) ──
+  (bind ((structs (assoc (map_of)
+                    "Node" (list_of (assoc (map_of) "name" "v" "type" "i32"))
+                    "Point" (list_of (assoc (map_of) "name" "x" "type" "i32")))))
+    (do
+      (assert_eq (ptr_struct_name "ptr_Node" structs) "Node" "ptr_Node -> Node")
+      (assert_eq (ptr_struct_name "ptr_Missing" structs) null "unknown struct -> null")
+      (assert_eq (ptr_struct_name "ptr_u32" structs) null "a scalar pointer is not a struct pointer")
+      (assert_eq (ptr_struct_name "Node" structs) null "a bare struct name is not ptr_<S>")
+      (assert_eq (ptr_struct_name null structs) null "null type -> null")
+
+      ; struct_name_of accepts EITHER a struct value name or a pointer to it
+      (assert_eq (struct_name_of "Point" structs) "Point" "a struct value name resolves")
+      (assert_eq (struct_name_of "ptr_Point" structs) "Point" "a pointer to a struct resolves")
+      (assert_eq (struct_name_of "u32" structs) null "a scalar resolves to no struct")
+
+      ; pointee_of normalises any pointer type name to the type it points at
+      (assert_eq (pointee_of "ptr_Node" structs) "Node" "ptr_<Struct> -> the struct name")
+      (assert_eq (pointee_of "Node" structs) "Node" "a bare element name -> itself")
+      (assert_eq (pointee_of null structs) null "null -> null"))))

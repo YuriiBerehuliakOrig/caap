@@ -1,0 +1,99 @@
+; stdlib/lib/tests/test_source_read.caap — the shared raw-form reader
+; (stdlib.semantics.passes.source_read) AND the bare-gate's native-context skip
+; (audit #12 + #26).
+;
+; Part A — read_leading_forms returns EXACTLY the raw top-level forms the directive
+; passes used to read inline: the same heads, in source order, directives intact.
+; We read this very test file back (its own path) and assert the leading directive
+; heads. We also confirm a real pass (imports.check_file == check_forms over
+; read_leading_forms) sees the same forms by comparing finding counts.
+;
+; Part B — bare_gate.check_forms FLAGS an eval-context `(use stdlib.bare.X)` but
+; SKIPS (returns []) when the shared backend.prep.native_context cell is set true
+; (the flag prep flips while it inlines a native program's legitimate bare imports).
+;; @area: passes
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true assert_false)
+(use stdlib.semantics.passes.source_read read_leading_forms)
+(use stdlib.semantics.passes.bare_gate check_forms bare_imports?)
+(use stdlib.semantics.session session_cell!)
+(use stdlib.syntax.ast head_of sym calln lam)
+(use stdlib.lib.collections.sequence any?)
+
+(do
+  (bind (
+    ; has — does any finding string contain `n`?
+    (has (lambda (fs n) (any? fs (lambda (f) (string_contains f n)))))
+    ; native_ctx — the SAME shared cell prep writes and bare_gate reads. Grabbing
+    ; it by name returns the live ref (idempotent session_cell!), so the test can
+    ; flip the flag exactly as prep's with_native_context! does.
+    (native_ctx (session_cell! "backend.prep.native_context" (lambda () false)))
+    ; the loader API — module_path resolves a module NAME to its source path (so
+    ; the test never hardcodes a filesystem layout / cwd-relative path).
+    (loadapi (ctfe_compiler_lookup_value compiler "stdlib.load"))
+    (module_path (get loadapi "module_path"))
+  )
+    (do
+      ; ── Part A: read_leading_forms reads a module's RAW leading forms ──
+      ; sequence.caap opens with a `(module …)` directive then body forms; read
+      ; them back and assert the first raw top-level form is the `module` DIRECTIVE
+      ; (which the loader would otherwise consume — proof we read RAW forms, not the
+      ; loader's post-consumption body) and that more forms follow, in source order.
+      (bind ((seq_path (module_path "stdlib.lib.collections.sequence")))
+        (when (not (eq seq_path null))
+          (bind ((forms (read_leading_forms seq_path)))
+            (do
+              (assert_true (gt (size forms) 1)
+                "read_leading_forms returns the module's top-level forms")
+              (assert_eq (head_of (get forms 0)) "module"
+                "the first raw top-level form is the (module …) directive")))))
+
+      ; read_leading_forms over a real module agrees with what its pass reads:
+      ; imports.check_file IS check_forms over read_leading_forms, so reading the
+      ; SAME module by hand and running imports.check_forms yields the same count.
+      ; (We use sequence.caap — a clean lib module — so the count is a stable 0.)
+      (bind (
+        (imports ((get loadapi "load_module") "stdlib.semantics.passes.imports"))
+        (icheck_file (get imports "check_file"))
+        (icheck_forms (get imports "check_forms"))
+        (path (module_path "stdlib.lib.collections.sequence"))
+      )
+        (when (not (eq path null))
+          (assert_eq
+            (size (icheck_file path))
+            (size (icheck_forms (read_leading_forms path)))
+            "check_file == check_forms over read_leading_forms (same forms read)")))
+
+      ; ── Part B: bare_gate flags eval-context bare imports, skips in native ──
+      ; A hand-built unit that `(use stdlib.bare.sync …)` — an eval-context bare
+      ; import. With the native-context flag OFF it is FLAGGED.
+      (bind ((bare_forms (list_of
+                           (calln "module" (list_of (sym "demo")))
+                           (calln "use" (list_of (sym "stdlib.bare.sync")
+                                                 (sym "with_critical")))
+                           (calln "bind" (list_of (sym "main")
+                             (lam (list_of)
+                               (calln "with_critical" (list_of (sym "h")))))))))
+        (do
+          ; flag OFF (the default eval context) -> the gate fires
+          (set_ref native_ctx false)
+          (assert_true (bare_imports? bare_forms)
+            "eval context: a (use stdlib.bare.…) trips the gate")
+          (bind ((fs (check_forms bare_forms)))
+            (do
+              (assert_eq (size fs) 1 "exactly one finding for the one bare import")
+              (assert_true (has fs "stdlib.bare.sync")
+                "the eval-context finding names the offending bare module")))
+
+          ; flag ON (prep's native-inlining context) -> the gate SKIPS
+          (set_ref native_ctx true)
+          (assert_false (bare_imports? bare_forms)
+            "native context: the same bare import is NOT flagged (legit inlining)")
+          (assert_eq (size (check_forms bare_forms)) 0
+            "native context: check_forms returns no findings for a bare import")
+
+          ; restore the shared cell so the flag does not leak to later loads/tests
+          (set_ref native_ctx false)
+          (assert_true (bare_imports? bare_forms)
+            "flag restored: the gate fires again in eval context"))))))

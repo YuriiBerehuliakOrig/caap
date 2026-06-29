@@ -1,0 +1,14 @@
+[package]
+name = "caap-peg-derive"
+version = "0.1.0"
+edition = "2021"
+description = "#[derive(FromParseValue)] for caap-peg — maps a ParseValue into typed structs/enums."
+license = "Apache-2.0"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["derive"] }
+quote = "1"
+proc-macro2 = "1"

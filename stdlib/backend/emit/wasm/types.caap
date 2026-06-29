@@ -1,0 +1,122 @@
+; stdlib/backend/emit/wasm/types.caap — wasm value types + struct memory layout
+; (module stdlib.backend.emit.wasm.types).
+;
+; The TYPE/LAYOUT seam of the wasm emitter (split out of emit/wasm.caap): how a
+; stdlib type name maps to a wasm value type (w_type), the load/store op + byte
+; size of a pointer/field element (load_op/store_op/elem_bytes/field_*), the
+; memory-backed struct layout (struct_of/struct_size/field_info), the width-
+; unify rule shared with the LLVM backend (w_unify), the float-type predicate
+; (float_t?), and the one emitter diagnostic shape (diag). No `self` recursion
+; lives here — these are leaf helpers the instruction/lowering layers consume.
+(module stdlib.backend.emit.wasm.types)
+
+(use stdlib.semantics.types.registry pointer?)
+; target-neutral codegen decisions shared with backend/emit/llvm: how widths unify and
+; how a `ptr_<Struct>` resolves. Only the WAT *spelling* stays in the sibling
+; layers.
+(use stdlib.backend.codegen_common unify_int struct_name_of)
+
+(bind diag
+  (lambda (message)
+    (assoc (map_of)
+      "code" "stdlib.wasm.error"
+      "severity" "error"
+      "message" message
+      "node_name" "<wasm-emit>"
+      "path" "<program>")))
+
+; w_type — a stdlib type name as a wasm value type, or null when unsupported.
+; wasm has only i32/i64/f32/f64; every sub-i32 integer is an i32.
+(bind w_type
+  (lambda (t)
+    (case t
+      ("i8" "i32") ("u8" "i32") ("i16" "i32") ("u16" "i32")
+      ("i32" "i32") ("u32" "i32") ("int" "i32") ("bool" "i32")
+      ("i64" "i64") ("u64" "i64")
+      ("f32" "f32") ("f64" "f64") ("float" "f64")
+      ("uptr" "i32")                           ; pointer-width address on wasm32 (i32)
+      ("ptr" "i32")                            ; a bare pointer / function-table slot
+      ("string" "i32")                         ; an i32 pointer to a {ptr,len} header
+      (else (if (pointer? t) "i32" null)))))   ; a pointer is a wasm32 i32 address
+
+; elem_bytes / load_op / store_op — size and the load/store instruction for a
+; pointer's element type (sub-i32 ints widen/narrow with the right signedness).
+(bind elem_bytes
+  (lambda (e)
+    (case e
+      ("i8" 1) ("u8" 1) ("bool" 1) ("i16" 2) ("u16" 2)
+      ("i32" 4) ("u32" 4) ("int" 4) ("f32" 4)
+      ("i64" 8) ("u64" 8) ("f64" 8) ("float" 8)
+      ("uptr" 4) ("ptr" 4)
+      (else (if (pointer? e) 4 null)))))
+(bind load_op
+  (lambda (e)
+    (case e
+      ("i8" "i32.load8_s") ("u8" "i32.load8_u") ("bool" "i32.load8_u")
+      ("i16" "i32.load16_s") ("u16" "i32.load16_u")
+      ("i32" "i32.load") ("u32" "i32.load") ("int" "i32.load")
+      ("i64" "i64.load") ("u64" "i64.load")
+      ("f32" "f32.load") ("f64" "f64.load") ("float" "f64.load")
+      ("uptr" "i32.load") ("ptr" "i32.load")
+      (else (if (pointer? e) "i32.load" null)))))
+(bind store_op
+  (lambda (e)
+    (case e
+      ("i8" "i32.store8") ("u8" "i32.store8") ("bool" "i32.store8")
+      ("i16" "i32.store16") ("u16" "i32.store16")
+      ("i32" "i32.store") ("u32" "i32.store") ("int" "i32.store")
+      ("i64" "i64.store") ("u64" "i64.store")
+      ("f32" "f32.store") ("f64" "f64.store") ("float" "f64.store")
+      ("uptr" "i32.store") ("ptr" "i32.store")
+      (else (if (pointer? e) "i32.store" null)))))
+
+; unsigned? (drives div/mod/shr/cmp opcode) comes from backend/codegen_common.
+
+; ── struct layout (memory-backed: a struct value is an i32 pointer; a field
+; whose type is itself a struct is stored as a pointer, so values survive the
+; heap that never frees and nesting stays uniform) ───────────────────────────
+; struct_of — the struct name a type refers to: a struct name itself, or a
+; `ptr_<Struct>` (a struct value and a pointer to it share the i32-address
+; representation), else null. Shared with the LLVM backend as struct_name_of.
+(bind struct_of struct_name_of)
+(bind wt_of
+  (lambda (t structs)
+    (if (not (eq (struct_of t structs) null)) "i32" (w_type t))))
+(bind field_bytes
+  (lambda (ft structs) (if (not (eq (get structs ft) null)) 4 (elem_bytes ft))))
+(bind field_load
+  (lambda (ft structs) (if (not (eq (get structs ft) null)) "i32.load" (load_op ft))))
+(bind field_store
+  (lambda (ft structs) (if (not (eq (get structs ft) null)) "i32.store" (store_op ft))))
+(bind struct_size
+  (lambda (structs sname)
+    (bind ((tot (ref 0)))
+      (do
+        (for f (get structs sname (list_of))
+          (set_ref tot (int_add (deref tot) (field_bytes (get f "type") structs))))
+        (deref tot)))))
+; field_info — {offset, type} of `field` in struct `sname`, or null.
+(bind field_info
+  (lambda (structs sname field)
+    (bind ((off (ref 0)) (res (ref null)))
+      (do
+        (for f (get structs sname (list_of))
+          (do
+            (when (and (eq (get f "name") field) (eq (deref res) null))
+              (set_ref res (assoc (map_of) "offset" (deref off) "type" (get f "type"))))
+            (set_ref off (int_add (deref off) (field_bytes (get f "type") structs)))))
+        (deref res)))))
+
+; float_t? — is a wasm value type a floating-point type?
+(bind float_t? (lambda (t) (or (eq t "f32") (eq t "f64"))))
+
+; w_unify — the shared wasm width of two operand types (null = an int literal
+; that adopts the other side; two literals default to i32). The width logic is
+; shared with the LLVM backend (codegen_common/unify_int); only the diagnostic
+; voice ("wasm codegen:") and the 32-bit tag are wasm's.
+(bind w_unify (lambda (a b) (unify_int a b "i32" "wasm codegen")))
+
+
+(export diag w_type elem_bytes load_op store_op struct_of wt_of
+        field_bytes field_load field_store struct_size field_info
+        float_t? w_unify)

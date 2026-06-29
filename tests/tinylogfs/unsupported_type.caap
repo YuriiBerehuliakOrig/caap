@@ -1,0 +1,3 @@
+; negative: `f128` is not a supported field type.
+(use stdlib.storage.binary le_bytes)
+(storage Bad (record R 1 (field x f128)))

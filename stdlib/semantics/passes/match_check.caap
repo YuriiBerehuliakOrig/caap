@@ -1,0 +1,110 @@
+; stdlib/semantics/passes/match_check.caap — match-arm analysis (module
+; stdlib.semantics.passes.match_check).
+;
+; Three findings:
+;
+;   unreachable arm    any arm after a catch-all (`_` / a variable pattern) can
+;                      never match.
+;   duplicate arm      a literal pattern equal to an earlier one is dead.
+;   non-exhaustive     a match over an ENUM with no catch-all that leaves a
+;                      variant value uncovered. The type pass (types/infer)
+;                      publishes the scrutinee enum's variant VALUES on the fact
+;                      channel under "match_enum", keyed by the match's source
+;                      loc (the stable cross-pass key for detached specs); this
+;                      pass reads them back via fact_of and reports the gap.
+;
+; A `(match subj (pat body) …)` arm is a call whose CALLEE is the pattern; a
+; name pattern (incl. `_`) is a catch-all, a literal pattern matches one value.
+; A register_pass! over `located`.
+(module stdlib.semantics.passes.match_check)
+
+(use stdlib.syntax.ast call? name? literal? literal_of head_is? callee args_of walk loc)
+(use stdlib.semantics.passes.registry note! fact_of install_pass!)
+
+; check_exhaustive! — the shared exhaustiveness check for BOTH the enum and the
+; union case (they differed only in the fact channel and the wording). The type
+; pass publishes the required coverage set on `fact_ns` keyed by the match's loc;
+; without a catch-all every required value must appear in `seen` (the literal
+; patterns), else a single "uncovered <noun>: …" finding lists the gaps.
+;   findings : the sink           n        : the match node (the finding's loc)
+;   seen     : literal patterns   catchall : the catch-all ref
+;   fact_ns  : "match_enum" | "match_union"      noun : "enum value(s)" | "union member(s)"
+(bind check_exhaustive!
+  (lambda (findings n seen catchall fact_ns noun)
+    (bind ((required (fact_of fact_ns (loc n) null)))
+      (when (and (not (eq required null)) (not (deref catchall)))
+        ; gather the uncovered values into a buffer (a name not in `seen`),
+        ; then render them once: value_to_string over the gaps joined with
+        ; ", ". Same gaps, same order, same message — but no O(n^2) repeated
+        ; string_concat_many growing the accumulator each step.
+        (bind ((missing (list_of)))
+          (do
+            (for v required
+              (when (not (eq (get seen (value_to_string v) false) true))
+                (append missing v)))
+            (when (gt (size missing) 0)
+              (note! findings "match" n
+                (string_concat_many
+                  "non-exhaustive — uncovered " noun ": "
+                  (sequence_join
+                    (sequence_map missing (lambda (v) (value_to_string v)))
+                    ", "))))))))))
+
+; check — dead-arm findings over one form.
+(bind check
+  (lambda (node)
+    (bind ((findings (list_of)))
+      (do
+        (walk node
+          (lambda (n)
+            (when (head_is? n "match")
+              (bind ((arms (args_of n)) (catchall (ref false)) (seen (map_of)))
+                (do
+                  ; arg 0 is the subject; arms are args 1.. — guard the empty arm
+                  ; range so a malformed `(match)` (no subject) is a no-op here,
+                  ; not a `sequence_range 1 0` throw that masks the real error.
+                  (when (gt (size arms) 1)
+                    (sequence_each (sequence_range 1 (size arms))
+                      (lambda (i)
+                        (bind ((arm (get arms i))
+                               (pat (if (call? (get arms i))
+                                      (callee (get arms i)) null)))
+                          ; pat is the arm's pattern (a call's callee); a NAME
+                          ; pattern (incl. `_`) is a catch-all that makes every
+                          ; later arm unreachable, a LITERAL covers one value and
+                          ; a repeat of one is a dead duplicate.
+                          (cond
+                            ((deref catchall)
+                              (note! findings "match" arm
+                                "unreachable arm after a catch-all"))
+                            ((and (not (eq pat null)) (name? pat))
+                              (set_ref catchall true))
+                            ((and (not (eq pat null)) (literal? pat))
+                              (bind ((k (value_to_string (literal_of pat))))
+                                (if (eq (get seen k false) true)
+                                  (note! findings "match" arm
+                                    (string_concat_many "duplicate arm for `" k "`"))
+                                  (assoc seen k true))))
+                            (else null))))))
+                  ; EXHAUSTIVENESS (enum + union): the type pass publishes the
+                  ; required coverage on the fact channel keyed by source loc — an
+                  ; enum's variant VALUES under "match_enum", a union's MEMBER NAMES
+                  ; (matched by a string-literal pattern, so the SAME `seen` map
+                  ; covers them) under "match_union". Without a catch-all, every
+                  ; required value/name must be covered. One shared helper now.
+                  (check_exhaustive! findings n seen catchall "match_enum" "enum value(s)")
+                  (check_exhaustive! findings n seen catchall "match_union" "union member(s)"))))))
+        findings))))
+
+; check_module — the loader pass entry.
+(bind check_module
+  (lambda (located sink)
+    (for f located
+      (for finding (check (get f "node"))
+        (append sink finding)))))
+
+; register! — install match-arm analysis as a load-time pass (idempotent).
+(bind register!
+  (lambda () (install_pass! "match_check" (lambda (located sink) (check_module located sink)))))
+
+(export check check_module register!)

@@ -1,0 +1,245 @@
+; stdlib/semantics/passes/lint.caap — a small LINT suite as a load-time analysis
+; (module stdlib.semantics.passes.lint).
+;
+; Read-only walks over the EXPANDED AST that report located findings; `register!`
+; installs them via lib/passes.registry, so a finding fails the load like any
+; built-in phase. Five checks, each conservative (no false alarms on the
+; disciplined subset):
+;
+;   unused binding      a let-binding whose name is never read in its body or
+;                       later bindings  (top-level module binds — scope-threaded,
+;                       empty body — are exempt: they are the module's API)
+;   unused parameter    a lambda parameter never read in its body
+;   shadowing           a binding/parameter that hides an enclosing name
+;   unreachable code    a form after a DIVERGING form in the same `do` — a literal
+;                       `throw`/`leave`, or any form the type pass marked diverging
+;                       on the "diverges" fact channel (a call to a function whose
+;                       body always diverges, an exhaustive all-diverging match, …)
+;   constant condition  `(if <bool-literal> …)` / `(while false …)`
+;
+; Convention: a leading-underscore name (`_x`) is "intentionally unused" and is
+; never flagged for unused/shadow — the same escape hatch most linters give.
+(module stdlib.semantics.passes.lint)
+
+(use stdlib.syntax.ast
+  call? literal? literal_of head_is? callee args_of arg bool_lit? walk loc)
+(use stdlib.syntax.ir names_set)
+(use stdlib.semantics.passes.registry note! ignored? install_pass! fact_of)
+(use stdlib.lib.collections.map clone)
+
+; add_uses! — merge every NAME read in `node` into the set `seen`. The walk
+; itself lives in lib/ir (names_set); conservative — a captured name counts as
+; used, so it is never wrongly reported unused.
+(bind add_uses!
+  (lambda (seen node)
+    (for k (map_keys (names_set node)) (assoc seen k true))))
+
+; bind? — a canonical merged bind `(bind "n" v … body…)` (string-literal names).
+(bind bind? (lambda (n) (and (head_is? n "bind") (literal? (arg n 0)))))
+
+; bind_parts — {names: [str…], values: [node…], body: [node…]} of a canonical
+; bind, decomposed here (lib/ast `bind_pairs` returns name+value pairs; lint
+; also wants the raw body list and the name nodes' order).
+(bind bind_parts
+  (lambda (node)
+    (bind (
+      (args (args_of node))
+      (names (list_of)) (values (list_of)) (body (list_of))
+      (i (ref 0))
+    )
+      (do
+        (while (and (lt (int_add (deref i) 1) (size args))
+                    (literal? (get args (deref i)))
+                    (eq (value_type (literal_of (get args (deref i)))) "string"))
+          (do
+            (append names (literal_of (get args (deref i))))
+            (append values (get args (int_add (deref i) 1)))
+            (set_ref i (int_add (deref i) 2))))
+        (sequence_each (sequence_range (deref i) (size args))
+          (lambda (k) (append body (get args k))))
+        (assoc (map_of) "names" names "values" values "body" body)))))
+
+; ── unused bindings + unused parameters ─────────────────────────────────────
+; check_unused — flag a body-carrying bind whose name is never read (in a later
+; binding value or the body) and a lambda parameter never read in its body.
+; `_`-prefixed names opt out; a variadic `&rest` is read as `rest`.
+;   node findings : the form to walk, and the findings list to append to
+;   ->            : null
+(bind check_unused
+  (lambda (node findings)
+    (walk node
+      (lambda (n)
+        (cond
+          ; a let-binding WITH a body (top-level module binds have none)
+          ((and (bind? n) (gt (size (get (bind_parts n) "body" (list_of))) 0))
+            (bind (
+              (bp (bind_parts n))
+              (names (get bp "names")) (values (get bp "values")) (body (get bp "body"))
+            )
+              (sequence_each (sequence_range 0 (size names))
+                (lambda (i)
+                  (bind ((nm (get names i)))
+                    (when (not (ignored? nm))
+                      (bind ((seen (map_of)))
+                        (do
+                          ; later bindings' values + the body see this name
+                          (sequence_each (sequence_range (int_add i 1) (size values))
+                            (lambda (j) (add_uses! seen (get values j))))
+                          (for b body (add_uses! seen b))
+                          (when (not (eq (get seen nm false) true))
+                            (note! findings "lint" n
+                              (string_concat_many "unused binding `" nm "`")))))))))) )
+          ; a lambda's parameters
+          ((head_is? n "lambda")
+            (bind ((params (literal_of (arg n 0))) (seen (map_of)))
+              (when (not (eq params null))
+                (do
+                  (add_uses! seen (arg n 1))
+                  (for p params
+                    ; a variadic rest param is spelled `&args` but read as `args`
+                    (bind ((u (if (and (gt (size p) 0) (eq (string_slice p 0 1) "&"))
+                                (string_slice p 1 (size p)) p)))
+                      (when (and (not (ignored? u))
+                                 (not (eq (get seen u false) true)))
+                        (note! findings "lint" n
+                          (string_concat_many "unused parameter `" p "`")))))))))
+          (else null))))))
+
+; ── shadowing (scope-threaded walk) ─────────────────────────────────────────
+; check_shadow — flag a binding/parameter that hides a name already in scope.
+; A scope-threaded walk: each bind value is checked in the scope built so far,
+; so an earlier same-bind name is in scope for a later one (a duplicate within
+; one `bind` is caught too). `_`-prefixed names opt out.
+;   node findings : the form to walk, and the findings list to append to
+;   ->            : null
+(bind check_shadow
+  (lambda (node findings)
+    (bind (
+      (walk_s
+        (lambda (self n scope)
+          (cond
+            ((not (call? n)) null)
+            ((bind? n)
+              (bind ((bp (bind_parts n))
+                     (names (get bp "names")) (values (get bp "values"))
+                     (body (get bp "body")) (child (clone scope)))
+                (do
+                  (sequence_each (sequence_range 0 (size names))
+                    (lambda (i)
+                      (do
+                        ; the value is read in the scope built so far
+                        (self self (get values i) child)
+                        (bind ((nm (get names i)))
+                          (do
+                            (when (and (not (ignored? nm))
+                                       (eq (get child nm false) true))
+                              (note! findings "lint" n
+                                (string_concat_many "binding `" nm
+                                  "` shadows an enclosing name")))
+                            (assoc child nm true))))))
+                  (for b body (self self b child)))))
+            ((head_is? n "lambda")
+              (bind ((params (literal_of (arg n 0))) (child (clone scope)))
+                (do
+                  (when (not (eq params null))
+                    (for p params
+                      (do
+                        (when (and (not (ignored? p))
+                                   (eq (get child p false) true))
+                          (note! findings "lint" n
+                            (string_concat_many "parameter `" p
+                              "` shadows an enclosing name")))
+                        (assoc child p true))))
+                  (self self (arg n 1) child))))
+            (else
+              (do
+                (self self (callee n) scope)
+                (for a (args_of n) (self self a scope)))))))
+    )
+      (walk_s walk_s node (map_of)))))
+
+; ── unreachable code after a diverging form in a `do` ───────────────────────
+; check_unreachable — in any `do`, flag the form right after the FIRST diverging
+; form (a divergence makes the whole tail dead). A form diverges when it is a
+; literal non-local exit (`throw`/`leave` — caught syntactically, so the check
+; works even with no type pass) OR the type pass recorded it on the "diverges"
+; fact channel (a call to a function whose body always diverges, an exhaustive
+; all-diverging match/`if`, `runtime_error`, …), keyed by the form's source loc —
+; the same cross-pass key infer publishes under. One finding per dead REGION,
+; pointing at its first form (the rest of the block, and any branch `do`s reached
+; by `walk`, are covered by their own scans).
+;   node findings : the form to walk, and the findings list to append to
+;   ->            : null
+(bind diverging_form?
+  (lambda (n)
+    (or (head_is? n "throw")
+        (head_is? n "leave")
+        (eq (fact_of "diverges" (loc n) null) true))))
+(bind check_unreachable
+  (lambda (node findings)
+    (walk node
+      (lambda (n)
+        (when (head_is? n "do")
+          (bind ((as (args_of n)) (exit_at (ref -1)))
+            (do
+              (sequence_each (sequence_range 0 (size as))
+                (lambda (i)
+                  (when (and (eq (deref exit_at) -1)
+                             (diverging_form? (get as i)))
+                    (set_ref exit_at i))))
+              (when (and (not (eq (deref exit_at) -1))
+                         (lt (int_add (deref exit_at) 1) (size as)))
+                (note! findings "lint" (get as (int_add (deref exit_at) 1))
+                  "unreachable code after a diverging form")))))))))
+
+; ── constant condition ──────────────────────────────────────────────────────
+; check_const_cond — flag a literal-constant test: `(if <bool-lit> …)` (the test
+; is always true/false) and `(while false …)` (the body never runs). `(while
+; true …)` is intentionally NOT flagged — it is the idiomatic loop+`leave`.
+;   node findings : the form to walk, and the findings list to append to
+;   ->            : null
+(bind check_const_cond
+  (lambda (node findings)
+    (walk node
+      (lambda (n)
+        (cond
+          ((and (head_is? n "if") (bool_lit? (arg n 0)))
+            (note! findings "lint" n
+              (string_concat_many "constant condition: `if` test is always "
+                (if (literal_of (arg n 0)) "true" "false"))))
+          ((and (head_is? n "while") (bool_lit? (arg n 0))
+                (eq (literal_of (arg n 0)) false))
+            (note! findings "lint" n "`while false`: the loop body never runs"))
+          (else null))))))
+
+; ── entry points (the pass shape) ───────────────────────────────────────────
+
+; check — run every lint over ONE form; -> list of located findings.
+(bind check
+  (lambda (node)
+    (bind ((findings (list_of)))
+      (do
+        (check_unused node findings)
+        (check_shadow node findings)
+        (check_unreachable node findings)
+        (check_const_cond node findings)
+        findings))))
+
+; check_module — the loader pass entry: `check` every located form into the sink.
+;   located : [{node, loc}] the module's expanded top-level forms
+;   sink    : the findings list to append to
+;   ->      : null
+(bind check_module
+  (lambda (located sink)
+    (for f located
+      (for finding (check (get f "node"))
+        (append sink finding)))))
+
+; register! — install the lint suite as a load-time pass (idempotent). After
+; this, every subsequently loaded module is linted and any finding fails its load.
+;   -> : null
+(bind register!
+  (lambda () (install_pass! "lint" (lambda (located sink) (check_module located sink)))))
+
+(export check check_module register!
+        check_unused check_shadow check_unreachable check_const_cond)

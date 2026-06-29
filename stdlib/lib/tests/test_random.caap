@@ -1,0 +1,157 @@
+; stdlib/lib/tests/test_random.caap — in-language tests for lib/random.
+;
+; The generator is a fixed 32-bit LCG (Numerical Recipes constants), so its
+; output is fully reproducible: the values asserted below are the EXACT stream
+; produced by make_rng(42), captured once and pinned here. If the algorithm or
+; constants ever change these will (rightly) fail.
+
+;; @area: numeric
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.random
+  make_rng next next_int next_range next_bool
+  next_float next_gaussian choice weighted_choice shuffle sample)
+(use stdlib.lib.collections.sequence sort_by all? contains? length each)
+
+(do
+  ; ── determinism: the pinned 5-value stream from seed 42 ────────────────────
+  ; (value_eq, not assert_eq: kernel `eq` is IDENTITY on lists, so two distinct
+  ;  lists with equal contents are not `eq` — value_eq compares structurally.)
+  (assert_true
+    (value_eq
+      (bind ((r0 (make_rng 42))
+             (a (next r0))
+             (b (next (get a "rng")))
+             (c (next (get b "rng")))
+             (d (next (get c "rng")))
+             (e (next (get d "rng"))))
+        (list_of (get a "value") (get b "value") (get c "value")
+                 (get d "value") (get e "value")))
+      (list_of 189247094 1239701933 477931647 806724130 55112816))
+    "deterministic 5-value stream from seed 42")
+
+  ; ── same seed agrees, different seed differs ───────────────────────────────
+  (assert_eq
+    (get (next (make_rng 42)) "value")
+    (get (next (make_rng 42)) "value")
+    "same seed -> same first value")
+  (assert_true
+    (not (eq (get (next (make_rng 42)) "value")
+             (get (next (make_rng 7)) "value")))
+    "different seeds -> different first value")
+
+  ; ── next_int: in [0, n) ────────────────────────────────────────────────────
+  (assert_eq (get (next_int (make_rng 42) 10) "value") 4 "next_int(42,10) pinned")
+  (assert_true
+    (bind ((v (get (next_int (make_rng 99) 10) "value")))
+      (and (le 0 v) (lt v 10)))
+    "next_int in [0,10)")
+  (assert_eq (get (next_int (make_rng 5) 1) "value") 0 "next_int n=1 -> 0")
+
+  ; ── next_range: in [lo, hi) ────────────────────────────────────────────────
+  (assert_true
+    (bind ((v (get (next_range (make_rng 3) 100 110) "value")))
+      (and (le 100 v) (lt v 110)))
+    "next_range in [100,110)")
+  (assert_eq (get (next_range (make_rng 3) 50 50) "value") 50
+    "next_range empty span -> lo")
+
+  ; ── next_bool: a bool that advances the rng ────────────────────────────────
+  (assert_true
+    (bind ((nb (next_bool (make_rng 8)))
+           (v (get nb "value")))
+      (or (eq v true) (eq v false)))
+    "next_bool yields a bool")
+
+  ; ── choice: an element of the input list ───────────────────────────────────
+  (assert_true
+    (contains? (list_of 10 20 30 40)
+      (get (choice (make_rng 11) (list_of 10 20 30 40)) "value"))
+    "choice returns a member")
+  (assert_eq (get (choice (make_rng 1) (list_of)) "value") null
+    "choice on empty -> null")
+
+  ; ── shuffle: a permutation (same size, same elements) ──────────────────────
+  (assert_true
+    (value_eq (get (shuffle (make_rng 42) (list_of 1 2 3 4 5)) "value")
+              (list_of 4 3 1 2 5))
+    "shuffle(42, [1..5]) pinned permutation")
+  (assert_eq
+    (length (get (shuffle (make_rng 13) (list_of 1 2 3 4 5)) "value"))
+    5 "shuffle preserves length")
+  (assert_true
+    ; sorting the shuffled list recovers the original sorted list -> a permutation
+    (value_eq
+      (sort_by (get (shuffle (make_rng 13) (list_of 1 2 3 4 5)) "value")
+               (lambda (x) x))
+      (list_of 1 2 3 4 5))
+    "shuffle is a permutation (same elements)")
+
+  ; ── sample: k distinct members ─────────────────────────────────────────────
+  (assert_eq
+    (length (get (sample (make_rng 4) (list_of 1 2 3 4 5 6) 3) "value"))
+    3 "sample yields k elements")
+  (assert_true
+    (all? (get (sample (make_rng 4) (list_of 1 2 3 4 5 6) 3) "value")
+          (lambda (x) (contains? (list_of 1 2 3 4 5 6) x)))
+    "sample elements are members")
+  (assert_eq
+    ; distinctness: sorting the sample and the original-restricted set match by size
+    (length (get (sample (make_rng 4) (list_of 1 2 3 4 5 6) 3) "value"))
+    (length
+      (bind ((s (get (sample (make_rng 4) (list_of 1 2 3 4 5 6) 3) "value"))
+             (seen (list_of)))
+        (do
+          (each s (lambda (e) (unless (contains? seen e) (append seen e))))
+          seen)))
+    "sample elements are distinct")
+  (assert_eq
+    (length (get (sample (make_rng 9) (list_of 1 2 3) 10) "value"))
+    3 "sample k > size -> whole list")
+  (assert_eq
+    (length (get (sample (make_rng 9) (list_of 1 2 3) 0) "value"))
+    0 "sample k=0 -> empty")
+
+  ; ── next_float: uniform in [0, 1) ──────────────────────────────────────────
+  ; pinned: 189247094 / 2^31 = 0.08812504541128874 (the seed-42 first draw)
+  (bind near (lambda (a b) (lt (float_abs (float_sub a b)) 0.0000001)))
+  (assert_true (near (get (next_float (make_rng 42)) "value") 0.08812504541128874)
+    "next_float(42) pinned value")
+  (assert_true
+    (bind ((v (get (next_float (make_rng 99)) "value"))) (and (le 0.0 v) (lt v 1.0)))
+    "next_float in [0,1)")
+  ; same seed -> same float; the rng advances
+  (assert_true (near (get (next_float (make_rng 7)) "value")
+                     (get (next_float (make_rng 7)) "value"))
+    "next_float is deterministic per seed")
+
+  ; ── next_gaussian: a standard-normal draw (Box-Muller) ─────────────────────
+  ; pinned exact stream value for seed 42
+  (assert_true (near (get (next_gaussian (make_rng 42)) "value") -1.9493118775429705)
+    "next_gaussian(42) pinned value")
+  ; the rng advances twice (the returned state differs from one next_float step)
+  (assert_true
+    (not (eq (get (next_gaussian (make_rng 42)) "rng")
+             (get (next_float (make_rng 42)) "rng")))
+    "next_gaussian advances the rng (twice)")
+
+  ; ── weighted_choice: proportional pick + degenerate inputs ─────────────────
+  ; with weights [1,8,1] the heavily-weighted middle element is picked
+  (assert_eq
+    (get (weighted_choice (make_rng 5) (list_of "a" "b" "c") (list_of 1.0 8.0 1.0)) "value")
+    "b" "weighted_choice picks the heavily-weighted element (seed 5)")
+  ; the chosen value is always a member of xs
+  (assert_true
+    (contains? (list_of "a" "b" "c")
+      (get (weighted_choice (make_rng 17) (list_of "a" "b" "c") (list_of 2.0 3.0 5.0)) "value"))
+    "weighted_choice returns a member")
+  ; degenerate inputs all yield null (never throw)
+  (assert_eq (get (weighted_choice (make_rng 5) (list_of) (list_of)) "value") null
+    "weighted_choice on empty -> null")
+  (assert_eq (get (weighted_choice (make_rng 5) (list_of "a" "b") (list_of 1.0)) "value") null
+    "weighted_choice mismatched lengths -> null")
+  (assert_eq (get (weighted_choice (make_rng 5) (list_of "a" "b") (list_of 0.0 0.0)) "value") null
+    "weighted_choice zero total -> null")
+
+  true)

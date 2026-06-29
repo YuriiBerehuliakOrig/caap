@@ -1,0 +1,91 @@
+; stdlib/lib/tests/test_diag_convert.caap — in-language tests for
+; lib/diag/convert (the diagnostic-shape converters into the diag.bag shape).
+
+;; @area: diag
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.diag.bag code_of severity_of message_of span_of span)
+(use stdlib.lib.diag.error make_error)
+(use stdlib.lib.diag.convert error_to_diag string_to_diag backend_map_to_diag)
+
+(do
+  ; ── error_to_diag ──────────────────────────────────────────────────────────
+  ; code/message carry over; an explicit span and severity are preserved.
+  (bind ((e  (make_error "stdlib.json.parse" "unexpected token" (map_of)))
+         (sp (span 3 5 3 9 40 44))
+         (d  (error_to_diag e sp "warning")))
+    (do
+      (assert_true (eq (get d "diag" false) true)
+        "error_to_diag builds a tagged bag diagnostic")
+      (assert_eq (code_of d) "stdlib.json.parse" "error_to_diag keeps code")
+      (assert_eq (message_of d) "unexpected token" "error_to_diag keeps message")
+      (assert_eq (severity_of d) "warning" "error_to_diag keeps severity")
+      (assert_true (value_eq (span_of d) sp) "error_to_diag keeps span")))
+
+  ; a null severity defaults to "error"; a null span stays null.
+  (bind ((e2 (make_error "x.y" "boom" null))
+         (d2 (error_to_diag e2 null null)))
+    (do
+      (assert_eq (severity_of d2) "error" "error_to_diag defaults severity to error")
+      (assert_eq (code_of d2) "x.y" "error_to_diag keeps code (defaulted severity)")
+      (assert_eq (message_of d2) "boom" "error_to_diag keeps message (defaulted severity)")
+      (assert_eq (span_of d2) null "error_to_diag keeps null span")))
+
+  ; ── string_to_diag ─────────────────────────────────────────────────────────
+  ; a finding "tag: loc: message" splits at the FIRST ": ": code before it,
+  ; message the remainder (so the location stays in the message text).
+  (bind ((f (string_to_diag "unused: foo.caap:3:5: variable x is never read")))
+    (do
+      (assert_eq (code_of f) "unused" "string_to_diag code is the leading tag")
+      (assert_eq (message_of f) "foo.caap:3:5: variable x is never read"
+        "string_to_diag message is the remainder after the first ': '")
+      (assert_eq (severity_of f) "error" "string_to_diag severity is error")
+      (assert_eq (span_of f) null "string_to_diag span is null")))
+
+  ; a finding with no ": " is all message, empty code.
+  (bind ((f2 (string_to_diag "bare finding")))
+    (do
+      (assert_eq (code_of f2) "" "string_to_diag empty code when no separator")
+      (assert_eq (message_of f2) "bare finding" "string_to_diag whole string is message")))
+
+  ; a leading ": " yields an empty code via the SLICE path (distinct from the
+  ; no-separator branch above), with the remainder as the message.
+  (bind ((f3 (string_to_diag ": just a message")))
+    (do
+      (assert_eq (code_of f3) "" "string_to_diag empty code on a leading separator")
+      (assert_eq (message_of f3) "just a message"
+        "string_to_diag message after a leading separator")))
+
+  ; the separator is ": " (colon-space), NOT a bare colon: "a:b" has no ": ",
+  ; so it stays all-message with an empty code.
+  (bind ((f4 (string_to_diag "a:b")))
+    (do
+      (assert_eq (code_of f4) "" "string_to_diag does not split on a bare colon")
+      (assert_eq (message_of f4) "a:b" "string_to_diag keeps a colon-only string as message")))
+
+  ; ── backend_map_to_diag ────────────────────────────────────────────────────
+  ; a full backend emitter map: code/severity carry over; node_name is appended.
+  (bind ((m (assoc (map_of)
+              "code" "stdlib.llvm.error"
+              "severity" "error"
+              "message" "bad operand"
+              "node_name" "%call"
+              "path" "<program>"))
+         (b (backend_map_to_diag m)))
+    (do
+      (assert_eq (code_of b) "stdlib.llvm.error" "backend_map_to_diag keeps code")
+      (assert_eq (severity_of b) "error" "backend_map_to_diag keeps severity")
+      (assert_eq (message_of b) "bad operand (%call)"
+        "backend_map_to_diag appends node_name to message")
+      (assert_eq (span_of b) null "backend_map_to_diag span is null")))
+
+  ; defaults when fields are absent; an empty node_name is NOT appended.
+  (bind ((b2 (backend_map_to_diag (assoc (map_of) "message" "plain" "node_name" ""))))
+    (do
+      (assert_eq (code_of b2) "stdlib.backend.unknown" "backend_map_to_diag default code")
+      (assert_eq (severity_of b2) "error" "backend_map_to_diag default severity")
+      (assert_eq (message_of b2) "plain" "backend_map_to_diag empty node_name not appended")))
+
+  (assert_eq (message_of (backend_map_to_diag (map_of))) ""
+    "backend_map_to_diag empty map -> empty message"))

@@ -1,0 +1,8 @@
+(surface stdlib.frontend.clike)
+
+; Fixture for test_analyze_weak_diag: a file WITH a surface header on its first
+; non-comment line. stdlib.reader's surface_of/surface_of_diag must report it
+; as "present" naming the kit. ONLY the header line is read (as text) by the
+; test; the body below is never lowered through the named kit — it is plain
+; kernel so the file still parses cleanly for any tooling that parses it.
+(int_add 40 2)

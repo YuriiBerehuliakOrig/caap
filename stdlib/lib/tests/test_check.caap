@@ -1,0 +1,145 @@
+; stdlib/lib/tests/test_check.caap — the load-time semantic checker
+; (boot/check.caap, published as `stdlib.check`).
+;
+; The checker is registered by the bootstrap, so this test looks it up from
+; the compiler registry (like test_graph reaches the loader). It builds
+; EXPANDED kernel nodes with the ast builders and feeds them to `check_node`,
+; asserting on the located findings it appends to a sink. Coverage: the two
+; explosions it turns into load-time diagnostics (unknown names, wrong arity)
+; and the scope rules that must NOT false-alarm (lambda params, flat/letrec
+; bind, match patterns, catch clauses, the ambient `compiler`).
+
+;; @area: semantics
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_true)
+(use stdlib.syntax.ast sym lit calln call lam)
+(use stdlib.lib.collections.sequence any?)
+
+(do
+  (bind (
+    (checker (ctfe_compiler_lookup_value compiler "stdlib.check"))
+    (check_node (get checker "check_node"))
+    ; findings — run the checker over `node` (empty base scope) and return the
+    ; sink of located diagnostic strings.
+    (findings
+      (lambda (node)
+        (bind ((sink (list_of)))
+          (do (check_node node (map_of) sink) sink))))
+    ; has — does any finding mention `needle`?
+    (has (lambda (fs needle) (any? fs (lambda (f) (string_contains f needle)))))
+    ; clean? — no findings at all.
+    (clean? (lambda (node) (eq (size (findings node)) 0)))
+  )
+    (do
+      ; ── unknown name: a bare free name not in scope/vocab is flagged ──
+      (assert_true
+        (has (findings (sym "lenght")) "unknown name `lenght`")
+        "free unknown name flagged")
+      ; a kernel-vocabulary name resolves and is clean
+      (assert_true (clean? (sym "int_add")) "vocabulary name resolves")
+      ; the ambient `compiler` handle is always in scope (not a vocab entry)
+      (assert_true (clean? (sym "compiler")) "ambient compiler resolves")
+
+      ; ── arity: a known builtin head with too few args is flagged ──
+      ; int_add is fixed arity 2
+      (assert_true
+        (has (findings (calln "int_add" (list_of (lit 1)))) "expects 2")
+        "under-arity builtin call flagged")
+      (assert_true
+        (clean? (calln "int_add" (list_of (lit 1) (lit 2))))
+        "correct-arity builtin call is clean")
+
+      ; ── scope: a lambda parameter is visible in the body, NOT a false alarm ──
+      (assert_true
+        (clean? (lam (list_of "x") (calln "int_add" (list_of (sym "x") (lit 1)))))
+        "lambda param visible in body")
+      ; but an undeclared name in the body IS flagged
+      (assert_true
+        (has (findings (lam (list_of "x")
+               (calln "int_add" (list_of (sym "y") (lit 1)))))
+             "unknown name `y`")
+        "undeclared name in lambda body flagged")
+
+      ; ── scope: a flat bind value may reference its own name (self-recursion) ──
+      ; (bind rec (lambda (n) (rec n)) (rec 0)) — `rec` resolves in its own body
+      (assert_true
+        (clean?
+          (call (sym "bind")
+            (list_of (sym "rec")
+                     (lam (list_of "n") (calln "rec" (list_of (sym "n"))))
+                     (calln "rec" (list_of (lit 0))))))
+        "flat-bound lambda may call itself")
+
+      ; ── scope: canonical (letrec) bind — string-literal pairs, then body ──
+      ; (bind "a" 1 "b" (int_add a 1) (int_add a b)) — both names pre-bound,
+      ; so "b"'s value may see "a" and the body may see both
+      (assert_true
+        (clean?
+          (calln "bind"
+            (list_of (lit "a") (lit 1)
+                     (lit "b") (calln "int_add" (list_of (sym "a") (lit 1)))
+                     (calln "int_add" (list_of (sym "a") (sym "b"))))))
+        "letrec bind pre-binds every pair name")
+
+      ; ── scope: match binds the clause variable and knows its type guards ──
+      ; (match v ((int? n) n)) — `n` is bound in the arm body
+      (assert_true
+        (clean?
+          (calln "match"
+            (list_of (sym "compiler")
+              (call (calln "int?" (list_of (sym "n"))) (list_of (sym "n"))))))
+        "match clause binds its pattern variable")
+      ; an unknown guard predicate is flagged
+      (assert_true
+        (has (findings
+               (calln "match"
+                 (list_of (sym "compiler")
+                   (call (calln "weird?" (list_of (sym "n"))) (list_of (sym "n"))))))
+             "unknown match guard `weird?`")
+        "unknown match guard flagged")
+
+      ; ── scope: try/catch binds the error variable in the handler ──
+      ; (try (size compiler) (catch e e)) — the handler body references `e`,
+      ; which the catch binder must make resolve (no "unknown name `e`")
+      (assert_true
+        (clean?
+          (calln "try"
+            (list_of (calln "size" (list_of (sym "compiler")))
+              (calln "catch" (list_of (sym "e") (sym "e"))))))
+        "catch clause binds its error variable")
+
+      ; ── quote: its argument is DATA, not code — never name-checked ──
+      (assert_true
+        (clean? (calln "quote" (list_of (sym "this_is_not_a_name"))))
+        "quote argument is data, not checked")
+
+      ; ── scope: flat-single-string bind is a top-level DEF, visible after ──
+      ; A 2-arg literal-string bind `(bind "scale__3" (lambda (x) …))` is a
+      ; top-level definition with NO body whose name the checker keeps in scope
+      ; for later sibling forms. Threaded through a `do`, a later `(scale__3 0)`
+      ; MUST resolve (no "unknown name `scale__3`"). (The `pe` pass now emits its
+      ; specialized variants as NAME-node binders instead, but this string-binder
+      ; shape is still accepted for any hand-written top-level def of this form.)
+      (assert_true
+        (clean?
+          (calln "do"
+            (list_of
+              (calln "bind"
+                (list_of (lit "scale__3")
+                         (lam (list_of "x") (sym "x"))))
+              (calln "scale__3" (list_of (lit 0))))))
+        "flat-single-string bind visible to later sibling forms")
+      ; and its captured arity is checked: (scale__3) with 0 args is wrong
+      (assert_true
+        (has
+          (findings
+            (calln "do"
+              (list_of
+                (calln "bind"
+                  (list_of (lit "scale__3")
+                           (lam (list_of "x") (sym "x"))))
+                (calln "scale__3" (list_of)))))
+          "expects 1")
+        "flat-single-string bind records the variant's arity")
+      true)))

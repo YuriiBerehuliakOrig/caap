@@ -1,0 +1,143 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  ur_semaphore — the counting-semaphore control block + the full create / get
+//  / put / ceiling_put / prioritize / delete service set (module
+//  stdlib.urun.ur_semaphore). The analogue of URun's ur_semaphore.h +
+//  ur_semaphore_*.c. `get` takes a URun WAIT OPTION (UR_NO_WAIT = 0,
+//  UR_WAIT_FOREVER = 0xFFFFFFFF, or a tick count); a timed-out get returns
+//  UR_NO_INSTANCE. `export` = the public interface; the list helpers and the
+//  suspend-cleanup callback are module-private.
+// ═══════════════════════════════════════════════════════════════════════════
+(surface stdlib.frontend.clike stdlib.urun.ur_semaphore)
+
+use stdlib.urun.ur_scheduler (UR_THREAD, ur_thread_current, _ur_thread_resume, _ur_thread_suspend_timed, _ur_list_prioritize_inplace, _ur_wake_all)
+use stdlib.urun.ur_port (ur_interrupt_save, ur_interrupt_restore, ur_pend_switch)
+use stdlib.urun.ur_status (UR_SUCCESS, UR_DELETED, UR_NO_INSTANCE, UR_CEILING_EXCEEDED, UR_NO_WAIT, UR_WAIT_FOREVER)
+use stdlib.urun.ur_list (List, ur_list_init, ur_list_empty, ur_list_head, ur_list_set_head, ur_list_push, ur_list_remove, ur_list_pop)
+
+// A counting semaphore: a count plus a generic intrusive list of blocked threads.
+// The waiter list is the STRUCT-container form — a `List<UR_THREAD,
+// ur_thread_suspend_next>` held inline. The element type AND the link field are
+// part of the TYPE (declared once, here), so every operation just takes its
+// address `&s->ur_semaphore_waiters` and DEDUCES both — no type, no field name at
+// the call. Layout-identical to the old raw head pointer (a single embedded pointer).
+UR_SEMAPHORE struct export = {
+  ur_semaphore_count u32,
+  ur_semaphore_waiters List<UR_THREAD, ur_thread_suspend_next>
+}
+
+ur_semaphore_create (s UR_SEMAPHORE*, initial u32) i32 export = {
+  s->ur_semaphore_count = initial
+  ur_list_init(&s->ur_semaphore_waiters)
+  0
+}
+
+// ── suspension-list helpers — PRIVATE ───────────────────────────────────────
+// Thin wrappers over the generic container — `ur_list_push`/`ur_list_remove` on
+// `&waiters`; the type+field ride in the List<…> type, monomorphized to concrete
+// push/remove.
+_sem_append (s UR_SEMAPHORE*, cur UR_THREAD*) i32 = {
+  ur_list_push(&s->ur_semaphore_waiters, cur)
+}
+_sem_unlink (s UR_SEMAPHORE*, t UR_THREAD*) i32 = {
+  ur_list_remove(&s->ur_semaphore_waiters, t)
+}
+
+// suspend-cleanup callback: the timer (or wait_abort) calls this with the
+// timing-out thread. Unlink it from THIS semaphore's list and record that get
+// found no instance. The object address rides in ur_thread_suspend_control.
+_ur_sem_cleanup (t UR_THREAD*) i32 = {
+  s UR_SEMAPHORE* = t->ur_thread_suspend_control as UR_SEMAPHORE*
+  _sem_unlink(s, t)
+  t->ur_thread_suspend_status = UR_NO_INSTANCE
+  0
+}
+
+// get: take a unit if available; else honour the wait option. UR_NO_WAIT (0)
+// returns UR_NO_INSTANCE at once; otherwise suspend with a cleanup so a timeout
+// (or wait-abort) unlinks us, then block. The return is the suspend status set
+// by put (0 = got it) or the cleanup (13 = timed out, 26 = aborted).
+ur_semaphore_get (s UR_SEMAPHORE*, wait u32) i32 export = {
+  prev u32 = ur_interrupt_save()
+  if s->ur_semaphore_count > 0 {
+    s->ur_semaphore_count = s->ur_semaphore_count - 1
+    ur_interrupt_restore(prev)
+    0
+  } else {
+    if wait == UR_NO_WAIT() {
+      ur_interrupt_restore(prev)
+      UR_NO_INSTANCE
+    } else {
+      cur UR_THREAD* = ur_thread_current()
+      _sem_append(s, cur)
+      _ur_thread_suspend_timed(cur,
+        fn_ptr(_ur_sem_cleanup) as u32,
+        s as u32, wait)
+      ur_pend_switch()
+      ur_interrupt_restore(prev)           // PendSV fires here: switch away until resumed
+      cur->ur_thread_suspend_status
+    }
+  }
+}
+
+// put: hand the unit DIRECTLY to the first waiter (no count change), recording
+// success on it, and resume it — and if it outranks the caller, the resume pends
+// a switch that fires when we unmask. With no waiter, just bump the count.
+ur_semaphore_put (s UR_SEMAPHORE*) i32 export = {
+  prev u32 = ur_interrupt_save()
+  if !ur_list_empty(&s->ur_semaphore_waiters) {
+    woken UR_THREAD* = ur_list_pop(&s->ur_semaphore_waiters)
+    woken->ur_thread_suspend_status = UR_SUCCESS
+    _ur_thread_resume(woken)
+  } else {
+    // SATURATE: a semaphore posted repeatedly with no waiter must not wrap its
+    // count past 0xFFFFFFFF back to 0 (which would silently drop every unit). A
+    // full counting semaphore stays full.
+    if s->ur_semaphore_count < 4294967295 {
+      s->ur_semaphore_count = s->ur_semaphore_count + 1
+    } else {
+      0
+    }
+  }
+  ur_interrupt_restore(prev)           // PendSV (pended by resume) fires here if higher prio
+  0
+}
+
+// ceiling_put: like put, but refuse to raise the count past `ceiling` when no
+// thread is waiting (returns UR_CEILING_EXCEEDED). A waiter still gets the unit.
+ur_semaphore_ceiling_put (s UR_SEMAPHORE*, ceiling u32) i32 export = {
+  prev u32 = ur_interrupt_save()
+  if !ur_list_empty(&s->ur_semaphore_waiters) {
+    woken UR_THREAD* = ur_list_pop(&s->ur_semaphore_waiters)
+    woken->ur_thread_suspend_status = UR_SUCCESS
+    _ur_thread_resume(woken)
+    ur_interrupt_restore(prev)
+    0
+  } else {
+    if s->ur_semaphore_count >= ceiling {
+      ur_interrupt_restore(prev)
+      UR_CEILING_EXCEEDED
+    } else {
+      s->ur_semaphore_count = s->ur_semaphore_count + 1
+      ur_interrupt_restore(prev)
+      0
+    }
+  }
+}
+
+// prioritize: reorder the suspension list so the highest-priority waiter is
+// next to be served by put.
+ur_semaphore_prioritize (s UR_SEMAPHORE*) i32 export = {
+  prev u32 = ur_interrupt_save()
+  _ur_list_prioritize_inplace(&s->ur_semaphore_waiters)
+  ur_interrupt_restore(prev)
+  0
+}
+
+// delete: wake every waiter with UR_DELETED and reset the object.
+ur_semaphore_delete (s UR_SEMAPHORE*) i32 export = {
+  prev u32 = ur_interrupt_save()
+  _ur_wake_all(&s->ur_semaphore_waiters, UR_DELETED)
+  s->ur_semaphore_count = 0
+  ur_interrupt_restore(prev)
+  0
+}

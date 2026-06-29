@@ -1,0 +1,93 @@
+; stdlib/lib/tests/test_registry_contract.caap — the compiler-registry key ABI (#13).
+;
+; Proves the formal ABI table loads and is internally consistent: every documented
+; key resolves through abi_entry to a well-formed row, the named constants are in
+; the table, and an unknown key is reported (null) rather than silently faked.
+; #32 hardens it: every row's `required` is a canonical tier and every `shape_kind`
+; is a canonical kind (the enums can't silently drift), and the LIVE registry value
+; for a few stable core keys actually MATCHES its documented shape (presence is no
+; longer enough).
+;; @area: boot
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.boot.registry_contract
+  registry_abi abi_keys abi_entry
+  required_tiers required_tier? shape_kinds shape_kind?
+  validate_shape! validate_registry_contract!
+  key_expand key_gate key_load key_types key_emit_llvm key_passes key_commands)
+
+(do
+  (bind (
+    (contains?
+      (lambda (lst x)
+        (bind ((found (ref false)))
+          (do (sequence_each lst (lambda (e) (if (eq e x) (set_ref found true) null)))
+              (deref found)))))
+  )
+    (do
+      ; the ABI documents the core + codegen + command keys
+      (assert_true (gt (size abi_keys) 12) "abi_keys documents the registry surface")
+      (assert_true (contains? abi_keys key_load) "stdlib.load is documented")
+      (assert_true (contains? abi_keys key_passes) "the pass registry key is documented")
+      (assert_true (contains? abi_keys key_emit_llvm) "the llvm emitter key is documented")
+      (assert_true (contains? abi_keys "stdlib.native.emit")
+        "the codegen convenience key is documented")
+
+      ; abi_entry resolves a documented key to a well-formed row
+      (bind ((e (abi_entry key_load)))
+        (do
+          (assert_eq (get e "key") key_load "abi_entry returns the matching row")
+          (assert_eq (get e "owner") "boot/loader.caap" "stdlib.load is owned by the loader")
+          (assert_eq (get e "required") "core" "stdlib.load is a core key")))
+      (assert_eq (get (abi_entry key_commands) "required") "core"
+        "the session command map is core")
+      (assert_eq (get (abi_entry key_emit_llvm) "required") "codegen"
+        "the llvm emitter is a codegen-tier key")
+
+      ; an undocumented key reports null (no silent fake)
+      (assert_eq (abi_entry "nope.not.a.key") null "abi_entry of an unknown key is null")
+
+      ; the canonical enums are exactly what the validators accept (#32)
+      (assert_true (required_tier? "core") "core is a canonical required tier")
+      (assert_true (required_tier? "command") "command is an OFFICIAL required tier")
+      (assert_true (not (required_tier? "made-up")) "an unknown required tier is rejected")
+      (assert_true (shape_kind? "map_of_functions") "map_of_functions is a canonical shape kind")
+      (assert_true (shape_kind? "single_callable") "single_callable is a canonical shape kind")
+      (assert_true (not (shape_kind? "made-up")) "an unknown shape kind is rejected")
+
+      ; every row is well-formed AND its enums are in the canonical sets, so the
+      ; `required`/`shape_kind` categories can't silently drift from the validators.
+      (sequence_each registry_abi
+        (lambda (row)
+          (do
+            (assert_true (not (eq (get row "key") null)) "row has a key")
+            (assert_true (not (eq (get row "owner") null)) "row has an owner")
+            (assert_true (not (eq (get row "required") null)) "row has a required tier")
+            (assert_true (required_tier? (get row "required"))
+              (string_concat_many "row \"" (get row "key")
+                "\" has a canonical required tier"))
+            (assert_true (shape_kind? (get row "shape_kind"))
+              (string_concat_many "row \"" (get row "key")
+                "\" has a canonical shape_kind"))
+            (assert_true (not (eq (get row "shape_note") null)) "row has a shape note")
+            ; map_of_functions rows must name at least one expected member
+            (when (eq (get row "shape_kind") "map_of_functions")
+              (assert_true (gt (size (get row "expected_members")) 0)
+                (string_concat_many "map_of_functions row \"" (get row "key")
+                  "\" names its expected members"))))))
+
+      ; ── LIVE shape check (#32): the registered value matches the documented
+      ; shape, not just presence. These STABLE core keys are registered by the
+      ; base bootstrap (the expander, gate, loader, and the eager type pass and
+      ; command surface are all loaded before any session runs). validate_shape!
+      ; raises on a mismatch, so reaching `null` is the pass.
+      ; (the pass registry — stdlib.semantics.passes.registry — and the codegen
+      ; keys — stdlib.backend.emit.* / stdlib.native.emit — are lazily registered
+      ; and ABSENT in the base bootstrap, so they are intentionally NOT checked.)
+      (assert_eq (validate_registry_contract!
+                   (list_of key_expand key_gate key_load key_types key_commands))
+                 null "the live core registry values match their documented shapes")
+      ; a single key form works too
+      (assert_eq (validate_shape! key_load) null
+        "stdlib.load's live map carries its expected members"))))

@@ -1,0 +1,179 @@
+; stdlib/boot/namespace.caap — the NAMESPACE responsibility (module stdlib.namespace).
+; MODULE IDENTITY: a RAW bootstrap script (run via ctfe_compiler_execute_bootstrap_file /
+; run_expanded BEFORE the `module` form is a bound name), so it carries NO `(module …)`
+; form — adding one would raise `unknown name: module`. Its registry identity is set
+; explicitly via ctfe_compiler_register_value. Allowlisted in stdlib/CONVENTIONS.md +
+; stdlib_module_identity_check (caap/tests/stdlib_governance_tests.rs).
+;
+; A namespace in CAAP is a first-class VALUE: a map of name -> binding. This module
+; is the reusable toolkit for them, extracted from the loader so the loader, the
+; re_export/prelude facades, and any user library can share one implementation:
+;   - the loader's directive/export-map machinery (form_head/ident/check_directive/
+;     export_map_spec/get_export) — reading `(import|use|re_export|export …)` shapes
+;     and synthesizing a module's export map; and
+;   - reusable namespace-VALUE operations (ns_of/ns_get/ns_has/ns_keys/ns_merge/
+;     ns_merge_keep/ns_conflicts/ns_subset/ns_nest/ns_qualify/ns_resolve) — build,
+;     compose, sub-namespace, and qualified-dotted-resolve a namespace map.
+; Pure: holds no loader state (a private `missing` sentinel makes absence detectable).
+(do
+  (bind (
+    ; unique sentinel for "key absent" detection (a value may legitimately be null)
+    (missing (map_of))
+
+    ; ── directive / export-map toolkit (used by the loader's unit assembly) ──────
+    ; form_head — head symbol of a form, for recognising directives.
+    (form_head
+      (lambda (spec)
+        (if (eq (syntax_kind spec) "call")
+          (bind ((callee (syntax_call_callee spec)))
+            (if (eq (syntax_kind callee) "name")
+              (syntax_name_identifier callee)
+              null))
+          null)))
+
+    ; ident — a directive argument's identifier text. Directives take NAMES, not
+    ; strings: interpreted off the AST, never evaluated. A string literal is an error.
+    (ident
+      (lambda (node)
+        (if (eq (syntax_kind node) "name")
+          (syntax_name_identifier node)
+          (runtime_error
+            "stdlib: module directives take a name, not a string literal"))))
+
+    ; ident_arg — directive identifier argument at `index`.
+    (ident_arg
+      (lambda (spec index)
+        (ident (get (syntax_call_args spec) index))))
+
+    ; arg_idents — directive identifier args from `from` onward
+    ; (e.g. (use mod a b) -> from=1 -> ["a" "b"]).
+    (arg_idents
+      (lambda (spec from)
+        (bind (
+          (args (syntax_call_args spec))
+          (out (list_of))
+        )
+          (do
+            (sequence_each (sequence_range from (size args))
+              (lambda (i) (append out (ident (get args i)))))
+            out))))
+
+    ; export_map_spec — synthesize (assoc (map_of) "n1" n1 …) reading names from scope.
+    (export_map_spec
+      (lambda (names)
+        (bind ((args (list_of (syntax_call (syntax_name "map_of") (list_of)))))
+          (do
+            (sequence_each names
+              (lambda (nm)
+                (do
+                  (append args (syntax_literal nm))
+                  (append args (syntax_name nm)))))
+            (syntax_call (syntax_name "assoc") args)))))
+
+    ; check_directive — validate a directive's shape BEFORE reading it, so a
+    ; malformed directive fails with a located, usage-carrying error.
+    ;   at / head / spec / min / max / usage  (max -1 = unbounded)
+    (check_directive
+      (lambda (at head spec min max usage)
+        (bind (
+          (args (syntax_call_args spec))
+          (n (size args))
+        )
+          (do
+            (if (or (lt n min) (and (not (eq max -1)) (lt max n)))
+              (runtime_error
+                (string_concat_many
+                  at ": malformed (" head " …): expected " usage
+                  ", got " (int_to_string n) " argument(s)")))
+            (for arg args
+              (if (not (eq (syntax_kind arg) "name"))
+                (runtime_error
+                  (string_concat_many
+                    at ": (" head " …) takes names, not literals; expected " usage))))
+            null))))
+
+    ; get_export — read a symbol from a dependency's exports, validating presence.
+    ;   exports / name / importer / mod / at  -> the value; raises if absent
+    (get_export
+      (lambda (exports name importer mod at)
+        (bind ((value (get exports name missing)))
+          (if (eq value missing)
+            (runtime_error
+              (string_concat_many
+                at ": module \"" importer "\" imports \"" name
+                "\" from \"" mod "\", which does not export it"))
+            value))))
+
+    ; ── reusable namespace-VALUE operations (a namespace = a map name->binding) ──
+    ; ns_of — build a namespace from parallel name + value lists.
+    (ns_of
+      (lambda (names values)
+        (bind ((out (map_of)))
+          (do
+            (sequence_each (sequence_range 0 (size names))
+              (lambda (i) (assoc out (get names i) (get values i))))
+            out))))
+    ; ns_get / ns_has / ns_keys — lookup, membership, names.
+    (ns_get (lambda (ns name) (get ns name)))
+    (ns_has (lambda (ns name) (contains ns name)))
+    (ns_keys (lambda (ns) (map_keys ns)))
+    ; ns_merge — last-wins union (b overrides a, like map_merge).
+    (ns_merge (lambda (a b) (map_merge a b)))
+    ; ns_merge_keep — first-wins union (a's binding wins on a clash; the prelude policy).
+    (ns_merge_keep
+      (lambda (a b)
+        (bind ((out (map_merge (map_of) a)))
+          (do
+            (for k (map_keys b)
+              (unless (contains out k) (assoc out k (get b k))))
+            out))))
+    ; ns_conflicts — the names bound by BOTH a and b (collision detection).
+    (ns_conflicts
+      (lambda (a b)
+        (bind ((out (list_of)))
+          (do
+            (for k (map_keys a) (when (contains b k) (append out k)))
+            out))))
+    ; ns_subset — a namespace holding only `names` that a actually binds.
+    (ns_subset
+      (lambda (ns names)
+        (bind ((out (map_of)))
+          (do
+            (for nm names (when (contains ns nm) (assoc out nm (get ns nm))))
+            out))))
+    ; ns_nest — wrap a namespace as a sub-namespace under `name` (enables p.name.x).
+    (ns_nest (lambda (name sub) (assoc (map_of) name sub)))
+    ; ns_qualify — a flat namespace whose keys are "prefix.<key>".
+    (ns_qualify
+      (lambda (prefix ns)
+        (bind ((out (map_of)))
+          (do
+            (for k (map_keys ns)
+              (assoc out (string_concat_many prefix "." k) (get ns k)))
+            out))))
+    ; ns_resolve — qualified DOTTED lookup: "a.b.c" walked through nested namespaces.
+    ; Returns the binding, or null if any segment is absent / not a namespace.
+    (ns_resolve
+      (lambda (ns dotted)
+        (bind (
+          (parts (string_split dotted "."))
+          (cur (ref ns))
+          (ok (ref true))
+        )
+          (do
+            (for seg parts
+              (when (deref ok)
+                (if (and (eq (value_type (deref cur)) "map") (contains (deref cur) seg))
+                  (set_ref cur (get (deref cur) seg))
+                  (set_ref ok false))))
+            (if (deref ok) (deref cur) null)))))
+  )
+    (ctfe_compiler_register_value compiler "stdlib.namespace"
+      (assoc (map_of)
+        "form_head" form_head "ident" ident "ident_arg" ident_arg
+        "arg_idents" arg_idents "export_map_spec" export_map_spec
+        "check_directive" check_directive "get_export" get_export
+        "ns_of" ns_of "ns_get" ns_get "ns_has" ns_has "ns_keys" ns_keys
+        "ns_merge" ns_merge "ns_merge_keep" ns_merge_keep "ns_conflicts" ns_conflicts
+        "ns_subset" ns_subset "ns_nest" ns_nest "ns_qualify" ns_qualify
+        "ns_resolve" ns_resolve))))

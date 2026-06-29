@@ -1,0 +1,41 @@
+; stdlib/lib/tests/test_opt_result_gaps.caap — the new option/result eliminators.
+
+;; @area: core
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.collections.option
+     some none some? none? option_unwrap
+     option_unwrap_or_else option_fold option_transpose)
+(use stdlib.lib.collections.result
+     ok err ok? err? error_code error_of
+     unwrap_or_else result_fold result_transpose)
+(do
+  ; option_unwrap_or_else — lazy default only runs on none
+  (assert_eq (option_unwrap_or_else (some 5) (lambda () 99)) 5 "uoe some -> value")
+  (assert_eq (option_unwrap_or_else (none) (lambda () 99)) 99 "uoe none -> thunk")
+  ; option_fold — eliminate to one value
+  (assert_eq (option_fold (some 5) 0 (lambda (v) (int_add v 1))) 6 "fold some")
+  (assert_eq (option_fold (none) 0 (lambda (v) (int_add v 1))) 0 "fold none -> default")
+  ; option_transpose — all-some -> some list; any-none -> none
+  (assert_true (value_eq (option_unwrap (option_transpose (list_of (some 1) (some 2) (some 3))))
+                         (list_of 1 2 3)) "transpose all-some -> some [1 2 3]")
+  (assert_true (none? (option_transpose (list_of (some 1) (none) (some 3))))
+               "transpose with a none -> none")
+  (assert_true (some? (option_transpose (list_of))) "transpose [] -> some []")
+
+  ; unwrap_or_else (result) — recovery sees the error
+  (assert_eq (unwrap_or_else (ok 5) (lambda (e) 99)) 5 "result uoe ok -> value")
+  (assert_eq (unwrap_or_else (err "E1" "bad") (lambda (e) (get e "code"))) "E1"
+             "result uoe err -> f(error) sees the code")
+  ; result_fold — eliminate both arms
+  (assert_eq (result_fold (ok 5) (lambda (v) (int_add v 1)) (lambda (e) 0)) 6 "fold ok")
+  (assert_eq (result_fold (err "E" "m") (lambda (v) v) (lambda (e) (get e "code"))) "E" "fold err")
+  ; result_transpose — all-ok -> ok list; first-err short-circuits
+  (assert_true (value_eq (unwrap_or_else (result_transpose (list_of (ok 1) (ok 2) (ok 3))) (lambda (e) null))
+                         (list_of 1 2 3)) "result transpose all-ok -> ok [1 2 3]")
+  (bind ((t (result_transpose (list_of (ok 1) (err "X" "oops") (ok 3)))))
+    (do
+      (assert_true (err? t) "result transpose with an err -> err")
+      (assert_eq (error_code t) "X" "transpose surfaces the first err")))
+  true)

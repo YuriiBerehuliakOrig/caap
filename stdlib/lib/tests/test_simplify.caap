@@ -1,0 +1,44 @@
+; stdlib/lib/tests/test_simplify.caap — dead-branch elimination + beta reduction.
+
+;; @area: passes
+;; @kind: regression
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.simplify simplify_node)
+(use stdlib.syntax.ast
+  sym lit calln call lam arg head_is? literal_of bind_pairs)
+
+(do
+  ; ── dead branch: (if true 1 2) -> 1, (if false 1 2) -> 2 ──
+  (assert_eq (literal_of (simplify_node (calln "if" (list_of (lit true) (lit 1) (lit 2))))) 1
+    "(if true 1 2) -> 1")
+  (assert_eq (literal_of (simplify_node (calln "if" (list_of (lit false) (lit 1) (lit 2))))) 2
+    "(if false 1 2) -> 2")
+
+  ; ── pruning happens inside a subexpression ──
+  (bind ((r (simplify_node
+              (calln "int_add"
+                (list_of (calln "if" (list_of (lit true) (lit 1) (lit 2))) (lit 3))))))
+    (assert_eq (literal_of (arg r 0)) 1 "branch pruned inside an argument"))
+
+  ; ── beta: ((lambda (x) (int_add x 1)) 5) -> (bind ("x" 5) (int_add x 1)) ──
+  (bind ((r (simplify_node
+              (call (lam (list_of "x") (calln "int_add" (list_of (sym "x") (lit 1))))
+                    (list_of (lit 5))))))
+    (do
+      (assert_true (head_is? r "bind") "immediately-applied lambda becomes a bind")
+      (assert_eq (get (get (get (bind_pairs r) "pairs") 0) "name") "x"
+        "the parameter is bound")
+      (assert_eq (literal_of (get (get (get (bind_pairs r) "pairs") 0) "value")) 5
+        "bound to the argument")))
+
+  ; ── capture-unsafe beta is left intact: arg mentions the param name ──
+  (bind ((r (simplify_node
+              (call (lam (list_of "y") (sym "y")) (list_of (sym "y"))))))
+    (assert_true (not (head_is? r "bind"))
+      "beta is skipped when an argument would be captured"))
+
+  ; ── arity mismatch is left intact ──
+  (bind ((r (simplify_node
+              (call (lam (list_of "x" "z") (sym "x")) (list_of (lit 1))))))
+    (assert_true (not (head_is? r "bind")) "arity mismatch is not beta-reduced")))

@@ -1,0 +1,248 @@
+; stdlib/boot/expander.caap — the expander ENGINE (mechanism only; no forms).
+; MODULE IDENTITY: a RAW bootstrap script (run via ctfe_compiler_execute_bootstrap_file /
+; run_expanded BEFORE the `module` form is a bound name), so it carries NO `(module …)`
+; form — adding one would raise `unknown name: module`. Its registry identity is set
+; explicitly via ctfe_compiler_register_value. Allowlisted in stdlib/CONVENTIONS.md +
+; stdlib_module_identity_check (caap/tests/stdlib_governance_tests.rs).
+;
+; A form is a compile-time function the expander runs: `(ctx node) -> node`.
+; Forms themselves live in `boot/forms.caap` (policy). This file is the seed —
+; the only file that must be written in bare kernel forms — so it is kept minimal.
+;
+; ctx (the compile-time toolbox handed to every form):
+;   eval    node   -> value     evaluate a sub-expression now (ctfe_eval_node)
+;   emit    diag   -> null       record a diagnostic {severity, message}
+;   gensym  prefix -> name       a fresh unique identifier (hygiene)
+;
+; Published as `stdlib.expand`:
+;   expand / expand_with_diagnostics   node -> …
+;   expand_with    node extras -> node   strict expand with ctx extras overlaid
+;   expand_collect node extras -> {node, diagnostics}   non-raising + extras
+;   define_form    name min max fn      register a form (arity enforced centrally)
+;   forms                               the registry map
+;   plus syntax builders for forms.caap:
+;     kname kcall body_spec call_items prepend append_last pair_spec kbind non_null_test
+(do
+  (bind (
+    ; ── form registry ──────────────────────────────────────────────────────────
+    ; Registry: name -> { min, max, fn }.  max = -1 means "no upper bound".
+    (forms (map_of))
+
+    ; ── syntax builders ────────────────────────────────────────────────────────
+    (kname (lambda (name) (syntax_name name)))           ; "x" -> the name node
+    (kcall (lambda (name args) (syntax_call (syntax_name name) args)))  ; (name args…)
+
+    (body_spec (lambda (nodes) (kcall "do" nodes)))      ; nodes -> (do nodes…)
+
+    (prepend                                             ; x, [a b] -> [x a b] (fresh)
+      (lambda (x items)
+        (bind ((out (list_of x)))
+          (do (sequence_each items (lambda (e) (append out e))) out))))
+    (append_last                                         ; [a b], x -> [a b x] (fresh)
+      (lambda (items x)
+        (bind ((out (list_of)))
+          (do (sequence_each items (lambda (e) (append out e))) (append out x) out))))
+
+    (call_items                                          ; (a b c) -> [a b c]
+      (lambda (spec) (prepend (syntax_call_callee spec) (syntax_call_args spec))))
+
+    (pair_spec                                           ; name, v -> (name v)
+      (lambda (name_spec value_spec)
+        (syntax_call name_spec (list_of value_spec))))
+
+    (kbind                                               ; [pair…], body -> (bind (pair…) body)
+      (lambda (pairs body)
+        (kcall "bind"
+          (list_of
+            (syntax_call (get pairs 0) (sequence_drop pairs 1))
+            body))))
+
+    (non_null_test                                       ; x -> (not (eq x null))
+      (lambda (x)
+        (kcall "not" (list_of (kcall "eq" (list_of x (syntax_literal null)))))))
+
+    ; ── the expansion pass ─────────────────────────────────────────────────────
+
+    ; walk_bind_pairs — expand a multi-bind pair list ((n v) …) touching ONLY
+    ; the value positions: the bound NAMES are bindings, not code, so a name
+    ; that happens to spell a registered form must not be expanded.
+    ;   self / ctx : the walk recursion + its toolbox
+    ;   pairs_node : a bind's first argument (left as-is for flat/canonical)
+    (walk_bind_pairs
+      (lambda (self ctx pairs_node)
+        (if (eq (syntax_kind pairs_node) "call")
+          (bind (
+            (walk_pair
+              (lambda (item)
+                (if (eq (syntax_kind item) "call")
+                  (syntax_call
+                    (syntax_call_callee item)
+                    (sequence_map (syntax_call_args item)
+                      (lambda (a) (self self ctx a))))
+                  item)))
+          )
+            (syntax_call
+              (walk_pair (syntax_call_callee pairs_node))
+              (sequence_map (syntax_call_args pairs_node) walk_pair)))
+          pairs_node)))
+
+    ; walk — recursively expand a node tree to fixpoint.
+    ;   self : this function (passed explicitly — the codebase's recursion idiom)
+    ;   ctx  : the run's compile-time toolbox, threaded into every form
+    ;   node : the node to expand
+    ;   ->   : the expanded node (all registered forms applied, sugar removed)
+    ; At a call headed by a registered form: enforce the form's declared arity
+    ; (on mismatch emit a diagnostic and substitute null), else run the form and
+    ; re-expand its result (forms reduce sugar heads to kernel heads, so the
+    ; fixpoint terminates). Other calls recurse into callee + args — EXCEPT
+    ; non-code positions: quoted data, lambda/macro parameter lists, and the
+    ; name side of bind pairs are never expanded. Leaves pass.
+    (walk
+      (lambda (self ctx node)
+        (if (eq (syntax_kind node) "call")
+          (bind (
+            (callee (syntax_call_callee node))
+            (head
+              (if (eq (syntax_kind callee) "name")
+                (syntax_name_identifier callee)
+                null))
+            (entry (if (eq head null) null (get forms head)))
+          )
+            (if (eq entry null)
+              (if (eq head "quote")
+                node
+                (if (and (if (eq head "lambda") true (eq head "macro"))
+                         (lt 0 (size (syntax_call_args node))))
+                  ; params (arg 0) are bindings — walk only the body
+                  (bind ((as (syntax_call_args node)))
+                    (syntax_call
+                      callee
+                      (prepend (get as 0)
+                        (sequence_map (sequence_drop as 1)
+                          (lambda (arg) (self self ctx arg))))))
+                  (if (and (eq head "bind")
+                           (lt 0 (size (syntax_call_args node))))
+                    (bind ((as (syntax_call_args node)))
+                      (syntax_call
+                        callee
+                        (prepend (walk_bind_pairs self ctx (get as 0))
+                          (sequence_map (sequence_drop as 1)
+                            (lambda (arg) (self self ctx arg))))))
+                    (syntax_call
+                      (self self ctx callee)
+                      (sequence_map (syntax_call_args node)
+                        (lambda (arg) (self self ctx arg)))))))
+              (bind (
+                (n   (size (syntax_call_args node)))
+                (lo  (get entry "min" 0))
+                (hi  (get entry "max" -1))
+              )
+                (if (or (lt n lo) (and (not (eq hi -1)) (lt hi n)))
+                  (do
+                    ((get ctx "emit")
+                      (assoc (map_of) "severity" "error" "message"
+                        (string_concat_many
+                          "stdlib form " head ": wrong arg count "
+                          (int_to_string n) " (expects " (int_to_string lo)
+                          (if (eq hi -1) "+" (string_concat_many ".." (int_to_string hi)))
+                          ")")))
+                    (syntax_literal null))
+                  (self self ctx ((get entry "fn") ctx node))))))
+          node)))
+
+    ; ── registration & entry points ────────────────────────────────────────────
+
+    ; define_form — register a form under a head symbol, with its arity.
+    ;   name : the head symbol the form responds to (string)
+    ;   min  : minimum argument count
+    ;   max  : maximum argument count, or -1 for unbounded
+    ;   fn   : the form function, (ctx node) -> node
+    ;   ->   : the updated registry (also mutated in place)
+    (define_form
+      (lambda (name min max fn)
+        (assoc forms name (assoc (map_of) "min" min "max" max "fn" fn))))
+
+    ; make_ctx — assemble a form ctx over a diagnostics sink. `extras` (from
+    ; the loader: "effect_of", an import-aware "eval") overlay the defaults,
+    ; giving forms module awareness without the engine knowing the policy.
+    ;   diags  : the sink "emit" appends to
+    ;   extras : a map of ctx overrides/additions, or null
+    ;   ->     : the ctx map
+    (make_ctx
+      (lambda (diags extras)
+        (bind (
+          (ctx
+            (assoc (map_of)
+              "eval"   (lambda (n) (ctfe_eval_node n))
+              "emit"   (lambda (d) (append diags d))
+              "gensym" (lambda (prefix) (gensym prefix))))
+        )
+          (if (eq extras null)
+            ctx
+            (do
+              (sequence_each (map_keys extras)
+                (lambda (k) (assoc ctx k (get extras k))))
+              ctx)))))
+
+    ; run_expansion — one pass: fresh sink, ctx (defaults + extras), walk.
+    ;   node / extras : the tree and the optional ctx overlay (null = none)
+    ;   ->            : {node: <expanded>, diagnostics: [{severity, message}…]}
+    (run_expansion
+      (lambda (node extras)
+        (bind ((diags (list_of)))
+          (assoc (map_of)
+            "node" (walk walk (make_ctx diags extras) node)
+            "diagnostics" diags))))
+
+    ; expand_with_diagnostics — expand, collecting diagnostics instead of raising.
+    (expand_with_diagnostics
+      (lambda (node) (run_expansion node null)))
+
+    ; expand_with — the strict loader entry with ctx extras: raises if any
+    ; error-severity diagnostic fired.
+    (expand_with
+      (lambda (node extras)
+        (bind (
+          (result (run_expansion node extras))
+          (diags (get result "diagnostics" (list_of)))
+        )
+          (do
+            (sequence_each diags
+              (lambda (d)
+                (if (eq (get d "severity" "error") "error")
+                  (runtime_error
+                    (string_concat_many
+                      "stdlib.expand: " (get d "message" "expansion error"))))))
+            (get result "node")))))
+
+    ; expand — strict, no extras (tests, boot files).
+    (expand
+      (lambda (node) (expand_with node null)))
+  )
+    (do
+      ; The public API: what consumers (loader, tests) use.
+      (ctfe_compiler_register_value
+        compiler
+        "stdlib.expand"
+        (assoc (map_of)
+          "expand" expand
+          "expand_with" expand_with
+          "expand_collect" run_expansion
+          "expand_with_diagnostics" expand_with_diagnostics
+          "define_form" define_form
+          "forms" forms))
+      ; Syntax builders: internal toolkit for form AUTHORS (boot/forms.caap).
+      ; Registered separately so the public surface stays just the four entries.
+      (ctfe_compiler_register_value
+        compiler
+        "stdlib.expand.builders"
+        (assoc (map_of)
+          "kname" kname
+          "kcall" kcall
+          "body_spec" body_spec
+          "call_items" call_items
+          "prepend" prepend
+          "append_last" append_last
+          "pair_spec" pair_spec
+          "kbind" kbind
+          "non_null_test" non_null_test)))))

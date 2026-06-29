@@ -1,0 +1,690 @@
+; stdlib/boot/forms.caap — the form set (POLICY) on top of the engine.
+; MODULE IDENTITY: a RAW bootstrap script (run via ctfe_compiler_execute_bootstrap_file /
+; run_expanded BEFORE the `module` form is a bound name), so it carries NO `(module …)`
+; form — adding one would raise `unknown name: module`. Its registry identity is set
+; explicitly via ctfe_compiler_register_value. Allowlisted in stdlib/CONVENTIONS.md +
+; stdlib_module_identity_check (caap/tests/stdlib_governance_tests.rs).
+;
+; Separated from boot/expander.caap (the bare seed/mechanism): these are ordinary
+; `(ctx node) -> node` transforms registered via `define_form name min max fn`.
+; Arity is declared per form and enforced centrally by the engine's walk, so the
+; forms below do no arg-count checking themselves.
+;
+; Each form reduces a SUGAR head to kernel heads; the engine re-expands the
+; result, so forms may emit other forms (e.g. `case` emits `cond`). Forms get a
+; ctx (eval / emit / gensym, plus the loader's effect_of + import-aware eval).
+;
+; The set (alphabetical within tiers):
+;   control   : cond, when, unless, case, if_let, when_let
+;   pipeline  : ->, ->>
+;   iteration : for
+;   binding   : with_map
+;   fold      : const                  (compile-time evaluation, purity-guarded)
+;   types     : defn, struct, alias, enum, union
+; The helpers above the `do` (type_text, typed_clause, const_guard, …) are the
+; shared machinery the type-declaring forms and `const` lean on.
+(do
+  (bind (
+    ; ── imported handles (engine + syntax builders) ────────────────────────────
+    (ex            (ctfe_compiler_lookup_value compiler "stdlib.expand"))
+    (b             (ctfe_compiler_lookup_value compiler "stdlib.expand.builders"))
+    (define_form   (get ex "define_form"))
+    (kname         (get b "kname"))
+    (kcall         (get b "kcall"))
+    (body_spec     (get b "body_spec"))
+    (call_items    (get b "call_items"))
+    (prepend       (get b "prepend"))
+    (append_last   (get b "append_last"))
+    (pair_spec     (get b "pair_spec"))
+    (kbind         (get b "kbind"))
+    (non_null_test (get b "non_null_test"))
+
+    ; ── type-syntax helpers (shared by the type-declaring forms) ───────────────
+    ; nm_or? — a node's identifier when it is a name, else "?" (the marker
+    ; placeholder a malformed declaration leaves so a single diagnostic, not a
+    ; cascade, is emitted). Used by every type-declaring form's name slots.
+    (nm_or?
+      (lambda (node)
+        (if (eq (syntax_kind node) "name") (syntax_name_identifier node) "?")))
+
+    ; type_text — a TYPE position as its canonical name string. A bare name
+    ; is itself; a call is a PARAMETERIZED type — `(list int)` spells
+    ; "list<int>", recursively (`(map string (list u8))` ->
+    ; "map<string,list<u8>>"). Pure syntax: the registry interprets the
+    ; spelling lazily (the type constructor is a compile-time function that
+    ; runs when the type pass first resolves the name). Null when malformed.
+    (type_text
+      (lambda (self node)
+        (if (eq (syntax_kind node) "name")
+          (syntax_name_identifier node)
+          (if (eq (syntax_kind node) "call")
+            (bind (
+              (head (self self (syntax_call_callee node)))
+              (parts (list_of))
+              (bad (map_of))
+            )
+              (do
+                (sequence_each (syntax_call_args node)
+                  (lambda (a)
+                    (bind ((t (self self a)))
+                      (if (eq t null)
+                        (assoc bad "v" true)
+                        (append parts t)))))
+                (if (or (eq head null)
+                        (or (not (eq (get bad "v") null))
+                            (eq (size parts) 0)))
+                  null
+                  (string_concat_many
+                    head "<" (sequence_join parts ",") ">"))))
+            null))))
+
+    ; typed_clause — parse a `(name type)` clause (a struct field, union
+    ; member, or defn parameter) into {name, type} strings; the type may be
+    ; parameterized (type_text). Null when the shape is wrong.
+    (typed_clause
+      (lambda (clause)
+        (bind (
+          (n (if (eq (syntax_kind clause) "call") (syntax_call_callee clause) null))
+          (t (if (eq (syntax_kind clause) "call")
+               (get (syntax_call_args clause) 0) null))
+        )
+          (if (and (not (eq n null))
+                   (and (eq (syntax_kind n) "name")
+                        (and (not (eq t null))
+                             (not (eq (type_text type_text t) null)))))
+            (assoc (map_of)
+              "name" (syntax_name_identifier n)
+              "type" (type_text type_text t))
+            null))))
+
+    ; ── if_let / when_let core ─────────────────────────────────────────────────
+    ; let_branch — the shared core of if_let / when_let: bind `x` to `expr`
+    ; once, then branch on its non-nullness. Expands to
+    ;   (bind ((x expr)) (if (not (eq x null)) then else_))
+    ;   binding : a `(x expr)` clause — `x` is the callee, `expr` its first arg
+    ;   then    : the body spec evaluated when `x` is non-null
+    ;   else_   : the body spec evaluated when `x` is null
+    ;   ->      : the bind/if node
+    (let_branch
+      (lambda (binding then else_)
+        (bind (
+          (x (syntax_call_callee binding))
+          (expr (get (syntax_call_args binding) 0))
+        )
+          (kbind (list_of (pair_spec x expr))
+            (kcall "if" (list_of (non_null_test x) then else_))))))
+
+    ; ── const purity machinery (the guard `const` leans on) ────────────────────
+    ; the kernel's callable vocabulary (name -> {pure, effects, …}), for the
+    ; const purity guard below
+    (vocab (ctfe_kernel_vocabulary))
+
+    ; every effect tag the kernel declares anywhere — so a defn effect slot
+    ; written as a call, e.g. (mutation), is recognized as a TAG LIST (and a
+    ; body form starting with an ordinary call is not mistaken for one)
+    (known_tags
+      (bind ((acc (map_of)))
+        (do
+          (sequence_each (map_keys vocab)
+            (lambda (k)
+              (sequence_each (get (get vocab k) "effects" (list_of))
+                (lambda (t) (assoc acc t true)))))
+          acc)))
+
+    ; const_guard — walk `node`'s tree recording (in `state`) why a fold would
+    ; be unsafe:
+    ;   "impure"  — a head with declared effects: a kernel builtin from the
+    ;               vocabulary, or (when the loader supplied effect_of) a
+    ;               function whose settled effect is impure; folding would
+    ;               RUN those effects at expansion time
+    ;   "unknown" — a head whose effect cannot be established; flagged only
+    ;               under effect_of (module loads) — bare contexts keep the
+    ;               legacy kernel-vocab-only guard
+    ; The first witness of each kind is kept.
+    ;   self      : itself (recursion idiom)
+    ;   effect_of : (name) -> "pure" | "impure" | null — or null when absent
+    ;   node      : the syntax tree to scan
+    ;   state     : the witness map (mutated)
+    (const_guard
+      (lambda (self effect_of node state)
+        (if (eq (syntax_kind node) "call")
+          (bind (
+            (callee (syntax_call_callee node))
+            (head
+              (if (eq (syntax_kind callee) "name")
+                (syntax_name_identifier callee)
+                null))
+          )
+            (do
+              (if (eq head null)
+                ; computed callee: unverifiable under strict mode
+                (if (and (not (eq effect_of null))
+                         (eq (get state "unknown") null))
+                  (assoc state "unknown" "<computed callee>")
+                  null)
+                (bind ((entry (get vocab head)))
+                  (if (not (eq entry null))
+                    (if (and (eq (get entry "pure" true) false)
+                             (eq (get state "impure") null))
+                      (assoc state "impure" head)
+                      null)
+                    (if (eq effect_of null)
+                      null   ; legacy: unknown user heads pass unanalyzed
+                      (bind ((eff (effect_of head)))
+                        (if (eq eff "pure")
+                          null
+                          (if (eq eff "impure")
+                            (if (eq (get state "impure") null)
+                              (assoc state "impure" head)
+                              null)
+                            (if (eq (get state "unknown") null)
+                              (assoc state "unknown" head)
+                              null))))))))
+              (sequence_each
+                (prepend callee (syntax_call_args node))
+                (lambda (child) (self self effect_of child state)))))
+          null)))
+  )
+    (do
+      ; ── const-folding form ──────────────────────────────────────────────────
+      ; ── const ── evaluate the argument at compile time, inline as a literal.
+      ; Guarded: a fold must not RUN side effects at expansion time. Impure
+      ; heads (kernel vocabulary, or settled-impure functions via the loader's
+      ; effect_of) are rejected; under effect_of, heads whose effect cannot be
+      ; PROVEN pure are rejected too. The loader also supplies an eval with
+      ; the module's imports bound, so a call to a use-imported pure fn folds.
+      (define_form "const" 1 1
+        (lambda (ctx node)
+          (bind (
+            (arg (get (syntax_call_args node) 0))
+            (state (map_of))
+            (emit (get ctx "emit"))
+          )
+            (do
+              (const_guard const_guard (get ctx "effect_of") arg state)
+              (if (not (eq (get state "impure") null))
+                (do
+                  (emit
+                    (assoc (map_of) "severity" "error" "message"
+                      (string_concat_many
+                        "const requires a pure expression (found impure `"
+                        (get state "impure") "`)")))
+                  (syntax_literal null))
+                (if (not (eq (get state "unknown") null))
+                  (do
+                    (emit
+                      (assoc (map_of) "severity" "error" "message"
+                        (string_concat_many
+                          "const requires a pure expression (cannot prove `"
+                          (get state "unknown") "` pure)")))
+                    (syntax_literal null))
+                  (syntax_literal ((get ctx "eval") arg))))))))
+
+      ; ── control forms (cond / when / unless; if_let/when_let/case below) ────
+      ; ── cond ── (cond (test body…) … (else body…)) -> right-folded nested `if`.
+      ; Beyond arity, validates clause shape and `else` position (emits diagnostics).
+      (define_form "cond" 0 -1
+        (lambda (ctx node)
+          (bind (
+            (clauses (syntax_call_args node))
+            (n (size clauses))
+            (emit (get ctx "emit"))
+          )
+            (do
+              (sequence_each (sequence_range 0 n)
+                (lambda (i)
+                  (bind ((clause (get clauses i)))
+                    (if (not (eq (syntax_kind clause) "call"))
+                      (emit (assoc (map_of) "severity" "error"
+                              "message" "cond clause must be a (test body…) form"))
+                      (bind ((callee (syntax_call_callee clause)))
+                        (if (and (eq (syntax_kind callee) "name")
+                                 (and (eq (syntax_name_identifier callee) "else")
+                                      (not (eq i (int_sub n 1)))))
+                          (emit (assoc (map_of) "severity" "error"
+                                  "message" "cond: else clause must be last"))
+                          null))))))
+              (sequence_fold_left (sequence_reverse clauses) (syntax_literal null)
+                (lambda (acc clause)
+                  (bind (
+                    (test (syntax_call_callee clause))
+                    (body (body_spec (syntax_call_args clause)))
+                    (is_else (and (eq (syntax_kind test) "name")
+                                  (eq (syntax_name_identifier test) "else")))
+                  )
+                    (if is_else body
+                      (kcall "if" (list_of test body acc))))))))))
+
+      ; ── when ── (when test body…) -> (if test (do body…) null).
+      ; The one-armed `if` for an effectful body run only when `test` holds.
+      (define_form "when" 1 -1
+        (lambda (_ctx node)
+          (bind ((args (syntax_call_args node)))
+            (kcall "if" (list_of
+              (get args 0)
+              (body_spec (sequence_drop args 1))
+              (syntax_literal null))))))
+
+      ; ── unless ── (unless test body…) -> (if test null (do body…)).
+      ; `when` with the arms swapped: the body runs only when `test` is false.
+      (define_form "unless" 1 -1
+        (lambda (_ctx node)
+          (bind ((args (syntax_call_args node)))
+            (kcall "if" (list_of
+              (get args 0)
+              (syntax_literal null)
+              (body_spec (sequence_drop args 1)))))))
+
+      ; ── threading / pipeline forms (-> / ->>) ───────────────────────────────
+      ; ── -> ── thread-first: (-> x (f a) (g b)) -> (g (f x a) b).
+      ; Each step folds the running accumulator in as its FIRST argument; a bare
+      ; name step `s` is treated as `(s)`, i.e. (s acc). Left-to-right reading
+      ; order, so a pipeline reads top-to-bottom as written.
+      (define_form "->" 1 -1
+        (lambda (_ctx node)
+          (bind ((args (syntax_call_args node)))
+            (sequence_fold_left (sequence_drop args 1) (get args 0)
+              (lambda (acc step)
+                (if (eq (syntax_kind step) "call")
+                  (syntax_call (syntax_call_callee step)
+                    (prepend acc (syntax_call_args step)))
+                  (syntax_call step (list_of acc))))))))
+
+      ; ── ->> ── thread-last: (->> x (f a) (g b)) -> (g b (f a x)).
+      ; The sibling of `->` that folds the accumulator in as the LAST argument —
+      ; the natural fit for sequence ops that take the collection last
+      ; (`(->> xs (sequence_map f) (sequence_filter p))`). Bare name -> (s acc).
+      (define_form "->>" 1 -1
+        (lambda (_ctx node)
+          (bind ((args (syntax_call_args node)))
+            (sequence_fold_left (sequence_drop args 1) (get args 0)
+              (lambda (acc step)
+                (if (eq (syntax_kind step) "call")
+                  (syntax_call (syntax_call_callee step)
+                    (append_last (syntax_call_args step) acc))
+                  (syntax_call step (list_of acc))))))))
+
+      ; ── iteration form (for) ────────────────────────────────────────────────
+      ; ── for ── (for x items body…) -> (sequence_each items (lambda (x) (do body…))).
+      ; Side-effecting iteration: `x` binds each element of `items` in turn while
+      ; the body runs for effect (the result is `sequence_each`'s — null). For a
+      ; VALUE out of a traversal, reach for sequence_map / sequence_fold_left.
+      (define_form "for" 2 -1
+        (lambda (_ctx node)
+          (bind (
+            (args (syntax_call_args node))
+            (var (get args 0))
+            (items (get args 1))
+            (body (body_spec (sequence_drop args 2)))
+          )
+            (kcall "sequence_each" (list_of
+              items
+              (kcall "lambda" (list_of (syntax_call var (list_of)) body)))))))
+
+      ; ── binding form (with_map) ─────────────────────────────────────────────
+      ; ── with_map ── (with_map m ((local key [default]) …) body…)
+      ; eval `m` once into a gensym temp, bind each local to (get <m> key default).
+      (define_form "with_map" 2 -1
+        (lambda (ctx node)
+          (bind (
+            (args (syntax_call_args node))
+            (map_expr (get args 0))
+            (binds_node (get args 1))
+            (body (body_spec (sequence_drop args 2)))
+            (g (kname ((get ctx "gensym") "with_map")))
+            (map_pair (pair_spec g map_expr))
+            (local_pairs
+              (sequence_map (call_items binds_node)
+                (lambda (clause)
+                  (bind (
+                    (local (syntax_call_callee clause))
+                    (ca (syntax_call_args clause))
+                    (key (get ca 0))
+                    (default (if (gt (size ca) 1) (get ca 1) (syntax_literal null)))
+                  )
+                    (pair_spec local (kcall "get" (list_of g key default)))))))
+          )
+            (kbind (prepend map_pair local_pairs) body))))
+
+      ; ── control forms, binding-branch (if_let / when_let) ───────────────────
+      ; ── if_let ── (if_let (x e) then else) — bind `x` to `e`, take `then`
+      ; when non-null else `else`, with `x` in scope for BOTH arms (the
+      ; option/lookup unwrap idiom). Exactly two arms (arity 3).
+      (define_form "if_let" 3 3
+        (lambda (_ctx node)
+          (bind ((args (syntax_call_args node)))
+            (let_branch (get args 0) (get args 1) (get args 2)))))
+
+      ; ── when_let ── (when_let (x e) body…) — `if_let` with no else arm: the
+      ; body (with `x` bound) runs only when `e` is non-null, otherwise null.
+      (define_form "when_let" 2 -1
+        (lambda (_ctx node)
+          (bind ((args (syntax_call_args node)))
+            (let_branch (get args 0)
+              (body_spec (sequence_drop args 1)) (syntax_literal null)))))
+
+      ; ── definition / type forms (alias / enum / union / struct / defn) ──────
+      ; ── alias ── (alias byte u8) — another spelling for a type, declared AT
+      ; its name. Expands to an inert "::alias" marker (in a (do … null) so it
+      ; sits where the type pass's do-walker looks for markers); the registry
+      ; resolves the target lazily, so an alias may precede its target.
+      (define_form "alias" 2 2
+        (lambda (ctx node)
+          (bind (
+            (args (syntax_call_args node))
+            (nm (get args 0))
+            (tg (get args 1))
+          )
+            (if (and (eq (syntax_kind nm) "name") (eq (syntax_kind tg) "name"))
+              (kcall "do" (list_of
+                (syntax_literal
+                  (list_of "::alias"
+                    (syntax_name_identifier nm)
+                    (syntax_name_identifier tg)))
+                (syntax_literal null)))
+              (do
+                ((get ctx "emit")
+                  (assoc (map_of) "severity" "error" "message"
+                    "alias expects (alias name target_type)"))
+                (syntax_literal null))))))
+
+      ; ── enum ── named integer constants under a type name:
+      ;   (enum Vector (timer 32) (keyboard 33) spurious)
+      ; A bare variant auto-numbers from the running counter; an explicit
+      ; (name value) sets it and the counter continues from value+1. Expands to
+      ;   (do <"::enum" marker> (bind timer 32) (bind keyboard 33) (bind spurious 34))
+      ; — the binds give the constants to eval (and the native consts table);
+      ; the marker registers `Vector` as an i32 type alias for the type pass.
+      ; Use the constants anywhere; declare the enum name as a param/result
+      ; type in LOADED modules (native signatures use the backing int directly).
+      (define_form "enum" 2 -1
+        (lambda (ctx node)
+          (bind (
+            (args (syntax_call_args node))
+            (ename (get args 0))
+            (emit (get ctx "emit"))
+            (marker (list_of "::enum"))
+            (binds (list_of))
+            (next (ref 0))
+            (ok (map_of))
+          )
+            (do
+              (assoc ok "valid" true)
+              (if (not (eq (syntax_kind ename) "name"))
+                (do
+                  (emit (assoc (map_of) "severity" "error" "message"
+                    "enum expects (enum Name variant…)"))
+                  (assoc ok "valid" false)))
+              (append marker (nm_or? ename))
+              (append marker "i32")
+              (sequence_each (sequence_drop args 1)
+                (lambda (clause)
+                  (bind (
+                    (vname (if (eq (syntax_kind clause) "name") clause
+                             (if (eq (syntax_kind clause) "call")
+                               (syntax_call_callee clause) null)))
+                    (vexpr (if (eq (syntax_kind clause) "call")
+                             (get (syntax_call_args clause) 0) null))
+                    (explicit_int (and (not (eq vexpr null))
+                                       (and (eq (syntax_kind vexpr) "literal")
+                                            (eq (value_type (syntax_literal_value vexpr)) "int"))))
+                    (val (if explicit_int (syntax_literal_value vexpr) (deref next)))
+                  )
+                    ; an explicit value that is NOT an integer literal: a certain
+                    ; error, never a silent fall-through to auto-number
+                    (if (and (not (eq vexpr null)) (not explicit_int))
+                      (do
+                        (emit (assoc (map_of) "severity" "error" "message"
+                          "enum value must be an integer literal"))
+                        (assoc ok "valid" false))
+                      (if (and (not (eq vname null)) (eq (syntax_kind vname) "name"))
+                        (do
+                          (append marker (syntax_name_identifier vname))
+                          (append marker val)
+                          (append binds (pair_spec (kname (syntax_name_identifier vname))
+                                                   (syntax_literal val)))
+                          (set_ref next (int_add val 1)))
+                        (do
+                          (emit (assoc (map_of) "severity" "error" "message"
+                            "enum variant must be `name` or `(name int)`"))
+                          (assoc ok "valid" false)))))))
+              (if (eq (get ok "valid" true) false)
+                (syntax_literal null)
+                (kcall "do"
+                  (prepend (syntax_literal marker)
+                    (sequence_map binds
+                      (lambda (pr) (kcall "bind" (call_items pr)))))))))))
+
+      ; ── union ── overlapping storage: all members live at offset 0, sized to
+      ; the largest (CPU register reinterpretation, descriptor variants):
+      ;   (union Reg (raw u32) (lo u16) (b0 u8))
+      ; NATIVE-ONLY (overlapping memory has no eval meaning). Expands to an
+      ; inert "::union" marker; the backend sizes the storage and gives
+      ; `(union_field u "raw")` a typed pointer at offset 0.
+      (define_form "union" 2 -1
+        (lambda (ctx node)
+          (bind (
+            (args (syntax_call_args node))
+            (uname (get args 0))
+            (emit (get ctx "emit"))
+            (marker (list_of "::union"))
+            (ok (map_of))
+          )
+            (do
+              (assoc ok "valid" true)
+              (if (not (eq (syntax_kind uname) "name"))
+                (do
+                  (emit (assoc (map_of) "severity" "error" "message"
+                    "union expects (union Name (member type)…)"))
+                  (assoc ok "valid" false)))
+              (append marker (nm_or? uname))
+              (sequence_each (sequence_drop args 1)
+                (lambda (clause)
+                  (bind ((m (typed_clause clause)))
+                    (if (not (eq m null))
+                      (do
+                        (append marker (get m "name"))
+                        (append marker (get m "type")))
+                      (do
+                        (emit (assoc (map_of) "severity" "error" "message"
+                          "union member must be (name type)"))
+                        (assoc ok "valid" false))))))
+              (if (eq (get ok "valid" true) false)
+                (syntax_literal null)
+                (kcall "do" (list_of (syntax_literal marker) (syntax_literal null))))))))
+
+      ; ── struct ── a struct type declared AT its name, with a typed constructor:
+      ;   (struct Point (x i32) (y i32))
+      ; expands to
+      ;   (do <"::struct" marker> (bind make_Point (lambda (x y) {…"__type" "Point"…})))
+      ; The marker registers the type (and the constructor signature) in the
+      ; type pass; the constructor is an ordinary checked function.
+      (define_form "struct" 2 -1
+        (lambda (ctx node)
+          (bind (
+            (args (syntax_call_args node))
+            (sname_node (get args 0))
+            (emit (get ctx "emit"))
+            (marker (list_of "::struct"))
+            (field_names (list_of))
+            (ok (map_of))
+          )
+            (do
+              (assoc ok "valid" true)
+              (if (not (eq (syntax_kind sname_node) "name"))
+                (do
+                  (emit (assoc (map_of) "severity" "error" "message"
+                    "struct expects (struct Name (field type)…)"))
+                  (assoc ok "valid" false)))
+              (append marker (nm_or? sname_node))
+              (sequence_each (sequence_drop args 1)
+                (lambda (clause)
+                  (bind ((f (typed_clause clause)))
+                    (if (not (eq f null))
+                      (do
+                        (append marker (get f "name"))
+                        (append marker (get f "type"))
+                        (append field_names (get f "name")))
+                      (do
+                        (emit (assoc (map_of) "severity" "error" "message"
+                          "struct field must be (name type)"))
+                        (assoc ok "valid" false))))))
+              (if (eq (get ok "valid" true) false)
+                (syntax_literal null)
+                (bind (
+                  (sname (syntax_name_identifier sname_node))
+                  (ctor_args (list_of (kcall "map_of" (list_of))
+                                      (syntax_literal "__type")
+                                      (syntax_literal sname)))
+                )
+                  (do
+                    (sequence_each field_names
+                      (lambda (fname)
+                        (do
+                          (append ctor_args (syntax_literal fname))
+                          (append ctor_args (kname fname)))))
+                    (kcall "do" (list_of
+                      (syntax_literal marker)
+                      (kcall "bind" (list_of
+                        (kname (string_concat_many "make_" sname))
+                        (kcall "lambda" (list_of
+                          (if (eq (size field_names) 0)
+                            (syntax_literal null)
+                            (syntax_call
+                              (kname (get field_names 0))
+                              (sequence_map (sequence_drop field_names 1)
+                                (lambda (f2) (kname f2)))))
+                          (kcall "assoc" ctor_args))))))))))))))
+
+      ; ── defn ── a function definition with the signature AT THE NAME:
+      ;   (defn add ((a u8) (b u8)) u8 body…)
+      ; expands to
+      ;   (do <sig-marker-literal> (bind add (lambda (a b) body…)))
+      ; The marker is an inert tuple literal ["::defn_sig" name result pn pt …]
+      ; that costs nothing at eval; the type pass reads it from the tree right
+      ; next to the binding — the signature never lives in a separate place.
+      (define_form "defn" 4 -1
+        (lambda (ctx node)
+          (bind (
+            (args (syntax_call_args node))
+            (fname (get args 0))
+            (params_node (get args 1))
+            (result_node (get args 2))
+            ; optional declared effect right after the result type:
+            ;   (defn f ((a u8)) u8 pure body…)            — pure | impure
+            ;   (defn f ((xs list)) list (mutation) body…) — a TAG LIST
+            ; A call counts as a tag list only when EVERY item is a known
+            ; kernel effect tag — an ordinary body call is never mistaken.
+            (eff_node (get args 3))
+            (declared_effect
+              (if (eq eff_node null)
+                null
+                (if (and (eq (syntax_kind eff_node) "name")
+                         (or (eq (syntax_name_identifier eff_node) "pure")
+                             (eq (syntax_name_identifier eff_node) "impure")))
+                  (syntax_name_identifier eff_node)
+                  (if (eq (syntax_kind eff_node) "call")
+                    (bind (
+                      (items (prepend (syntax_call_callee eff_node)
+                                      (syntax_call_args eff_node)))
+                      (all_tags (map_of))
+                    )
+                      (do
+                        (assoc all_tags "v" true)
+                        (sequence_each items
+                          (lambda (it)
+                            (if (and (eq (syntax_kind it) "name")
+                                     (eq (get known_tags
+                                            (syntax_name_identifier it) false)
+                                         true))
+                              null
+                              (assoc all_tags "v" false))))
+                        (if (eq (get all_tags "v" true) false)
+                          null
+                          (sequence_join
+                            (sequence_map items
+                              (lambda (it) (syntax_name_identifier it)))
+                            ","))))
+                    null))))
+            (body (body_spec (sequence_drop args
+                               (if (eq declared_effect null) 3 4))))
+            (emit (get ctx "emit"))
+            (param_clauses
+              (if (eq (syntax_kind params_node) "call")
+                (call_items params_node)
+                (list_of)))
+            (marker (list_of "::defn_sig"))
+            (lambda_params (list_of))
+            (ok (map_of))
+          )
+            (do
+              (assoc ok "valid" true)
+              (if (or (not (eq (syntax_kind fname) "name"))
+                      (eq (type_text type_text result_node) null))
+                (do
+                  (emit (assoc (map_of) "severity" "error" "message"
+                    "defn expects (defn name ((param type)…) result body…)"))
+                  (assoc ok "valid" false)))
+              (append marker (nm_or? fname))
+              (append marker
+                (bind ((tt (type_text type_text result_node)))
+                  (if (eq tt null) "?" tt)))
+              ; slot 3: the DECLARED effect ("?" = none -> inferred only)
+              (append marker (if (eq declared_effect null) "?" declared_effect))
+              (sequence_each param_clauses
+                (lambda (clause)
+                  (bind ((p (typed_clause clause)))
+                    (if (not (eq p null))
+                      (do
+                        (append marker (get p "name"))
+                        (append marker (get p "type"))
+                        (append lambda_params (get p "name")))
+                      (do
+                        (emit (assoc (map_of) "severity" "error" "message"
+                          "defn parameter must be (name type)"))
+                        (assoc ok "valid" false))))))
+              (if (eq (get ok "valid" true) false)
+                (syntax_literal null)
+                (kcall "do" (list_of
+                  (syntax_literal marker)
+                  (kcall "bind" (list_of
+                    fname
+                    (kcall "lambda" (list_of
+                      (if (eq (size lambda_params) 0)
+                        (syntax_literal null)
+                        (syntax_call
+                          (kname (get lambda_params 0))
+                          (sequence_map (sequence_drop lambda_params 1)
+                            (lambda (p) (kname p)))))
+                      body)))))))))))
+
+      ; ── control form, defined last (emits `cond`, so registered after it) ───
+      ; ── case ── value dispatch by equality:
+      ;   (case x (v1 body…) (v2 body…) … (else body…))
+      ; The scrutinee is evaluated ONCE into a gensym temp `<g>`, then each
+      ; non-else clause `(v body…)` becomes a cond clause `((eq <g> v) body…)`;
+      ; an `else` clause passes through (its placement is validated downstream
+      ; by `cond`). Expands to (bind ((<g> x)) (cond …)).
+      (define_form "case" 1 -1
+        (lambda (ctx node)
+          (bind (
+            (args (syntax_call_args node))
+            (scrutinee (get args 0))
+            (clauses (sequence_drop args 1))
+            (g (kname ((get ctx "gensym") "case")))
+            (cond_clauses
+              (sequence_map clauses
+                (lambda (clause)
+                  (bind (
+                    (head (syntax_call_callee clause))
+                    (cbody (syntax_call_args clause))
+                    (is_else (and (eq (syntax_kind head) "name")
+                                  (eq (syntax_name_identifier head) "else")))
+                  )
+                    (if is_else clause
+                      (syntax_call (kcall "eq" (list_of g head)) cbody))))))
+          )
+            (kbind (list_of (pair_spec g scrutinee))
+              (kcall "cond" cond_clauses)))))
+
+      null)))

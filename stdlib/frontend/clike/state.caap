@@ -1,0 +1,70 @@
+; stdlib/frontend/clike/state.caap - per-file state for stdlib.frontend.clike.
+;
+; The clike facade owns the parse/lower pipeline, but every map in this module is
+; scoped to one source file. reset_file_state! swaps the whole record so adding a
+; new per-file map cannot accidentally leak between lower_program calls.
+(module stdlib.frontend.clike.state)
+
+; the unified compile-session context (audit #1/#17) — the per-file clike state is
+; OWNED by the session (session_cell_owned!), so a single session_reset! re-initialises
+; it via the cell's init thunk (no separate reset hook needed). reset_file_state! still
+; swaps it per file; clike_context exposes it as a VALUE for explicit threading.
+(use stdlib.semantics.session session_cell_owned!)
+
+(bind new_clike_file_state
+  (lambda ()
+    (assoc (map_of)
+      "local_types" (map_of)
+      "local_imports" (map_of)
+      "value_types" (map_of)
+      "field_types" (map_of)
+      "fn_rets" (map_of)
+      "local_globals" (map_of)
+      "local_global_arrays" (map_of)
+      "local_consts" (map_of)
+      "local_volatile_consts" (map_of)
+      "local_enums" (map_of)
+      "local_enum_variants" (map_of))))
+
+; single-owner cell (clike is the only writer): claim it via session_cell_owned!
+; so an accidental name collision surfaces as an error (audit #31).
+(bind clike_file_state
+  (session_cell_owned! "frontend.clike" "frontend.clike.state" (lambda () (new_clike_file_state))))
+
+(bind local_types         (lambda () (get (deref clike_file_state) "local_types")))
+(bind local_imports       (lambda () (get (deref clike_file_state) "local_imports")))
+(bind value_types         (lambda () (get (deref clike_file_state) "value_types")))
+(bind field_types         (lambda () (get (deref clike_file_state) "field_types")))
+(bind fn_rets             (lambda () (get (deref clike_file_state) "fn_rets")))
+(bind local_globals       (lambda () (get (deref clike_file_state) "local_globals")))
+(bind local_global_arrays (lambda () (get (deref clike_file_state) "local_global_arrays")))
+(bind local_consts        (lambda () (get (deref clike_file_state) "local_consts")))
+(bind local_volatile_consts
+  (lambda () (get (deref clike_file_state) "local_volatile_consts")))
+(bind local_enums         (lambda () (get (deref clike_file_state) "local_enums")))
+(bind local_enum_variants (lambda () (get (deref clike_file_state) "local_enum_variants")))
+
+(bind reset_file_state!
+  (lambda ()
+    (set_ref clike_file_state (new_clike_file_state))))
+
+; clike_context (audit #17) — a SNAPSHOT of the per-file state as a plain VALUE
+; (deep-copied maps), so a caller can thread the clike context explicitly through
+; the lowering pipeline instead of reaching the module-level ref. Read-only: it
+; does not alias the live state (mutating the snapshot's maps would not affect
+; lowering). The full parameter-threading of this value through parse_expr/
+; lower_block is a deliberate follow-up (it touches every lowering call site).
+(bind clike_context
+  (lambda ()
+    (bind ((s (deref clike_file_state)) (out (map_of)))
+      (do
+        (for k (map_keys s)
+          (bind ((inner (get s k)) (copy (map_of)))
+            (do (for kk (map_keys inner) (assoc copy kk (get inner kk)))
+                (assoc out k copy))))
+        out))))
+
+(export reset_file_state! clike_context
+        local_types local_imports value_types field_types fn_rets
+        local_globals local_global_arrays local_consts local_volatile_consts
+        local_enums local_enum_variants)

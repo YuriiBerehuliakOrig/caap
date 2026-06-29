@@ -1,0 +1,8 @@
+; tests/bad_result.caap — a defn whose body type contradicts the
+; declared result type (body returns int, declaration says string).
+(module stdlib.fixtures.bad_result)
+
+(defn wrong ((x int)) string
+  (int_add x 1))
+
+(export wrong)

@@ -1,0 +1,78 @@
+; stdlib/semantics/passes/ur_suspend.caap — LOST-WAKEUP analysis pass (module
+; stdlib.semantics.passes.ur_suspend).
+;
+; The blocking discipline in urun is a PAIR: before a thread parks itself on an
+; object (_ur_thread_suspend_timed with a cleanup callback), it must first ENQUEUE
+; itself on that object's waiter list (ur_list_push). The wake side (put / send /
+; receive) pops the waiter list to find whom to resume; a thread that suspended
+; without enqueuing is invisible to every waker and is stranded forever — a
+; lost-wakeup deadlock. The five hand-maintained pairing sites (semaphore get,
+; queue send / front_send / receive, plus the cleanup-free sleep) keep this by
+; convention; one dropped enqueue line during a refactor reintroduces the deadlock.
+; This pass makes the pairing a STATIC, build-time invariant.
+;
+; It is self-contained and call-graph aware: the enqueue is often INDIRECT (the
+; semaphore pushes through _sem_append, not a literal ur_list_push in get's body),
+; so a function that directly calls _ur_thread_suspend_timed is cleared only if
+; IT OR A TRANSITIVE CALLEE reaches a ur_list_push. `ur_thread_sleep` is the one
+; legitimate cleanup-free suspend (a pure tick delay, on no object) and is exempt.
+(module stdlib.semantics.passes.ur_suspend)
+
+(use stdlib.syntax.ast call? name? name_of head_of walk)
+(use stdlib.semantics.passes.monomorph decode_defn)
+(use stdlib.semantics.passes.registry install_pass! note!)
+
+; reach! — mark `nm` and everything it transitively calls into `seen`.
+(bind reach!
+  (lambda (edges nm seen)
+    (when (eq (get seen nm) null)
+      (do
+        (assoc seen nm true)
+        (for c (get edges nm (list_of)) (reach! edges c seen))))))
+
+(bind run
+  (lambda (located sink)
+    (bind ((defs (map_of)) (vals (map_of)) (edges (map_of))
+           (suspends (map_of))      ; nm -> the suspend call node (for the finding loc)
+           (pushes (map_of)))       ; nm -> does it DIRECTLY call ur_list_push*?
+      (do
+        ; 1. index definitions
+        (for f located
+          (bind ((d (decode_defn (get f "node"))))
+            (when (not (eq d null))
+              (do (assoc defs (get d "name") (get f "node"))
+                  (assoc vals (get d "name") (get d "value"))))))
+        ; 2. per definition: call edges + does it suspend / does it push?
+        (for nm (map_keys defs)
+          (bind ((es (map_of)) (susp (ref null)) (push (ref false)))
+            (do
+              (walk (get vals nm)
+                (lambda (n)
+                  (do
+                    (when (and (name? n) (not (eq (get defs (name_of n)) null)))
+                      (assoc es (name_of n) true))
+                    (when (call? n)
+                      (do
+                        (when (eq (head_of n) "_ur_thread_suspend_timed") (set_ref susp n))
+                        (when (string_starts_with (head_of n) "ur_list_push") (set_ref push true)))))))
+              (assoc edges nm (map_keys es))
+              (when (not (eq (deref susp) null)) (assoc suspends nm (deref susp)))
+              (when (deref push) (assoc pushes nm true)))))
+        ; 3. every directly-suspending function (except the cleanup-free sleep) must
+        ;    reach a ur_list_push directly or through a callee.
+        (for nm (map_keys suspends)
+          (when (not (eq nm "ur_thread_sleep"))
+            (bind ((seen (map_of)) (found (ref false)))
+              (do
+                (reach! edges nm seen)
+                (for r (map_keys seen) (when (not (eq (get pushes r) null)) (set_ref found true)))
+                (when (not (deref found))
+                  (note! sink "ur-suspend" (get suspends nm)
+                    (string_concat_many "`" nm "` parks a thread (_ur_thread_suspend_timed) but "
+                      "enqueues it onto no waiter list (no reachable ur_list_push) — no waker "
+                      "could ever find it: a lost-wakeup deadlock")))))))))))
+
+(bind register!
+  (lambda () (install_pass! "ur-suspend" (lambda (located sink) (run located sink)))))
+
+(export run register!)

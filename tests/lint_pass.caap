@@ -1,0 +1,20 @@
+; lint_pass — a USER-DEFINED load-time pass: forbids int_div in any module
+; loaded after this one. Demonstrates the pass protocol: walk the located
+; forms, report findings at the offending sub-expression via loc_of.
+(module stdlib.fixtures.lint_pass)
+(use stdlib.semantics.passes.registry register_pass! loc_of)
+(use stdlib.syntax.ast walk head_is?)
+
+(bind registered
+  (register_pass! "no_int_div"
+    (lambda (located sink)
+      (for f located
+        (walk (get f "node" null)
+          (lambda (n)
+            (when (head_is? n "int_div")
+              (append sink
+                (string_concat_many
+                  (loc_of n (get f "loc" "<unknown>"))
+                  ": [no_int_div] integer division is forbidden here")))))))))
+
+(export registered)

@@ -1,0 +1,16 @@
+; pe_scale — a real source module exercising the `pe` polyvariant
+; specialization pass end-to-end. `scale`'s parameter 0 (factor) is declared
+; STATIC via the in-source (static_params …) form; `compute` calls it with two
+; distinct literal static args, so pe redirects each call to a specialized
+; variant (scale__1 = identity, scale__3 = multiply-by-3) and DCEs the original.
+; compute(10) = scale(1,10) + scale(3,10) = 10 + 30 = 40.
+;
+; Loaded only when the `pe` leg (stdlib/boot/pe.caap) is composed, which
+; registers the (static_params …) form and the load-time transform.
+(module stdlib.fixtures.pe_scale)
+(static_params scale 0)
+(defn scale ((factor int) (x int)) int
+  (if (eq factor 1) x (int_mul factor x)))
+(defn compute ((y int)) int
+  (int_add (scale 1 y) (scale 3 y)))
+(export compute)

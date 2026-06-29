@@ -1,0 +1,119 @@
+; stdlib/lib/tests/test_log.caap — leveled structured logging.
+
+;; @area: diag
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.diag.log
+     level_value level_name make_logger with_field with_min
+     log_debug log_info log_warn log_error
+     render_line render_jsonl make_memory_sink make_record
+     logf with_fields)
+(do
+  ; level ordering + name roundtrip
+  (assert_eq (level_value "trace") 0 "trace=0")
+  (assert_eq (level_value "error") 4 "error=4")
+  (assert_eq (level_value "bogus") 2 "unknown level -> info")
+  (assert_eq (level_name 3) "warn" "3 -> warn")
+
+  ; threshold filtering: a min=info logger drops debug, keeps info/warn/error
+  (bind ((mem (make_memory_sink render_line))
+         (lg  (make_logger "info" (get mem "sink"))))
+    (do
+      (log_debug lg "shh")          ; below threshold -> dropped
+      (log_info  lg "hello")
+      (log_warn  lg "careful")
+      (assert_eq (size ((get mem "lines"))) 2 "debug filtered, info+warn kept")
+      (assert_eq (get ((get mem "lines")) 0) "level=info msg=\"hello\"" "logfmt info line")
+      (assert_eq (get ((get mem "lines")) 1) "level=warn msg=\"careful\"" "logfmt warn line")))
+
+  ; with_field layers context immutably; parent logger keeps NO fields
+  (bind ((mem (make_memory_sink render_line))
+         (base (make_logger "trace" (get mem "sink")))
+         (req  (with_field (with_field base "user" "alice") "attempt" 3)))
+    (do
+      (log_error req "denied")
+      (log_info  base "no fields")  ; base must be unaffected by req's fields
+      (assert_eq (get ((get mem "lines")) 0)
+                 "level=error msg=\"denied\" user=\"alice\" attempt=3"
+                 "fields render in insertion order, json-valued")
+      (assert_eq (get ((get mem "lines")) 1) "level=info msg=\"no fields\""
+                 "parent logger carries no leaked fields")))
+
+  ; with_min raises the threshold
+  (bind ((mem (make_memory_sink render_line))
+         (lg  (with_min (make_logger "trace" (get mem "sink")) "warn")))
+    (do
+      (log_info lg "ignored")
+      (log_warn lg "kept")
+      (assert_eq (size ((get mem "lines"))) 1 "with_min warn drops info")))
+
+  ; jsonl renderer (one compact object) + a memory sink that stores jsonl
+  (assert_eq (render_jsonl (make_record 2 "hi" (list_of (list_of "k" 1))))
+             "{\"level\":\"info\",\"msg\":\"hi\",\"k\":1}"
+             "jsonl record")
+  (bind ((mem (make_memory_sink render_jsonl))
+         (lg  (make_logger "info" (get mem "sink"))))
+    (do
+      (log_info lg "msg")
+      (assert_eq (get ((get mem "lines")) 0) "{\"level\":\"info\",\"msg\":\"msg\"}"
+                 "jsonl sink, no fields")))
+
+  ; quoting: a message with a quote/newline is JSON-escaped, not raw
+  (assert_eq (render_line (make_record 2 "a\"b" (list_of)))
+             "level=info msg=\"a\\\"b\"" "message quote is escaped")
+
+  ; ── logf: format the message, then route through log_at at an ordinal ──────
+  (bind ((mem (make_memory_sink render_line))
+         (lg  (make_logger "info" (get mem "sink"))))
+    (do
+      ; positional + indexed substitution via lib/text/format's `format`
+      (logf lg 2 "user {0} did {1}" (list_of "alice" "login"))
+      (assert_eq (get ((get mem "lines")) 0)
+                 "level=info msg=\"user alice did login\""
+                 "logf renders the template into the message")
+      ; named substitution from a map
+      (logf lg 4 "code={code}" (assoc (map_of) "code" 42))
+      (assert_eq (get ((get mem "lines")) 1)
+                 "level=error msg=\"code=42\""
+                 "logf supports named args and the given ordinal level")))
+  ; logf respects the logger threshold (a below-min line is dropped)
+  (bind ((mem (make_memory_sink render_line))
+         (lg  (make_logger "warn" (get mem "sink"))))
+    (do
+      (logf lg 2 "ignored {0}" (list_of "x"))   ; ordinal 2 (info) < warn
+      (logf lg 3 "kept {0}"    (list_of "y"))
+      (assert_eq (size ((get mem "lines"))) 1 "logf drops a below-threshold line")
+      (assert_eq (get ((get mem "lines")) 0) "level=warn msg=\"kept y\""
+                 "logf keeps an at-threshold line")))
+
+  ; ── with_fields: add several context fields at once (immutable) ────────────
+  (bind ((mem  (make_memory_sink render_line))
+         (base (make_logger "trace" (get mem "sink")))
+         (ctx  (with_fields base (list_of (list_of "user" "bob")
+                                          (list_of "attempt" 2)))))
+    (do
+      (log_info ctx "go")
+      (log_info base "bare")   ; base must carry none of ctx's fields
+      (assert_eq (get ((get mem "lines")) 0)
+                 "level=info msg=\"go\" user=\"bob\" attempt=2"
+                 "with_fields adds every pair in order")
+      (assert_eq (get ((get mem "lines")) 1) "level=info msg=\"bare\""
+                 "with_fields leaves the parent logger unchanged")))
+  ; with_fields composes with a prior with_field (fields layer left-to-right)
+  (bind ((mem (make_memory_sink render_line))
+         (lg  (with_fields (with_field (make_logger "trace" (get mem "sink")) "a" 1)
+                (list_of (list_of "b" 2) (list_of "c" 3)))))
+    (do
+      (log_info lg "x")
+      (assert_eq (get ((get mem "lines")) 0)
+                 "level=info msg=\"x\" a=1 b=2 c=3"
+                 "with_fields appends after an existing field, in order")))
+  ; with_fields of an empty pair list is a no-op (no fields added)
+  (bind ((mem (make_memory_sink render_line))
+         (lg  (with_fields (make_logger "trace" (get mem "sink")) (list_of))))
+    (do
+      (log_info lg "x")
+      (assert_eq (get ((get mem "lines")) 0) "level=info msg=\"x\""
+                 "with_fields of no pairs adds no fields")))
+  true)

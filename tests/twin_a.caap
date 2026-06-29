@@ -1,0 +1,4 @@
+; tests/twin_a.caap — claims module name "twin" (duplicate test).
+(module stdlib.fixtures.twin)
+(bind v (lambda () 1))
+(export v)

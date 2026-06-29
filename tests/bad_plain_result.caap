@@ -1,0 +1,11 @@
+; tests/bad_plain_result.caap — a PLAIN bind
+; lambda (no defn) gets an INFERRED signature; its int result certainly
+; contradicts the caller's declared string result.
+(module stdlib.fixtures.bad_plain_result)
+
+(bind five (lambda () 5))
+
+(defn shout5 ((s string)) string
+  (five))
+
+(export shout5)

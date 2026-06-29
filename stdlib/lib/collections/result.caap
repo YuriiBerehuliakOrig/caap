@@ -1,0 +1,219 @@
+; stdlib/lib/collections/result.caap — Result: a value that is either ok or an error
+; (module stdlib.lib.collections.result).
+;
+;   (ok v)            -> { ok: true,  value: v }
+;   (err code msg)    -> { ok: false, error: { code, message } }
+;
+; Every operation is TOTAL: predicates treat non-Results as not-ok, accessors
+; fall back rather than throw — only `unwrap`/`unwrap_err` throw, by contract.
+; The companion absence type is stdlib.lib.collections.option; `to_option`
+; bridges to it (dropping the error).
+(module stdlib.lib.collections.result)
+
+(use stdlib.lib.collections.option some none some?)
+
+; ── constructors ────────────────────────────────────────────────────────────
+
+; ok — wrap a success value.
+;   value : the success payload
+;   ->    : an ok Result carrying it
+(bind ok
+  (lambda (value) (assoc (map_of) "ok" true "value" value)))
+
+; err — build a failure.
+;   code    : machine-readable error code (string)
+;   message : human-readable description
+;   ->      : an err Result carrying {code, message}
+(bind err
+  (lambda (code message)
+    (assoc (map_of)
+      "ok" false
+      "error" (assoc (map_of) "code" code "message" message))))
+
+; ── predicates ──────────────────────────────────────────────────────────────
+
+; ok? — is `r` a successful Result?
+;   r  : any value (non-Results are simply not ok)
+;   -> : bool
+(bind ok?
+  (lambda (r) (and (eq (value_type r) "map") (eq (get r "ok" false) true))))
+
+; err? — is `r` a failed Result? (the complement of ok?)
+;   r  : any value
+;   -> : bool
+(bind err?
+  (lambda (r) (not (ok? r))))
+
+; ── accessors (total) ───────────────────────────────────────────────────────
+
+; error_of — the error payload of a failed Result.
+;   r  : a Result
+;   -> : the {code, message} map, or null when `r` is ok
+(bind error_of
+  (lambda (r) (if (ok? r) null (get r "error"))))
+
+; error_code — the dotted code of a failed Result, or "" when ok / shapeless.
+;   r  : a Result
+;   -> : string
+(bind error_code
+  (lambda (r) (get (get r "error" (map_of)) "code" "")))
+
+; error_message — the human message of a failed Result, or "" when ok.
+;   r  : a Result
+;   -> : string
+(bind error_message
+  (lambda (r) (get (get r "error" (map_of)) "message" "")))
+
+; unwrap — the success value, or throw with the error's message.
+;   r  : a Result
+;   -> : the value when ok; throws "unwrap on err: <message>" when err
+(bind unwrap
+  (lambda (r)
+    (cond
+      ((ok? r) (get r "value"))
+      (else
+        (throw (string_concat_many
+          "unwrap on err: "
+          (get (get r "error" (map_of)) "message" "unknown error")))))))
+
+; unwrap_err — the error payload, or throw when `r` is unexpectedly ok.
+;   r  : a Result
+;   -> : the {code, message} map when err; throws "unwrap_err on ok" when ok
+(bind unwrap_err
+  (lambda (r)
+    (cond
+      ((err? r) (get r "error"))
+      (else (throw "unwrap_err on ok")))))
+
+; unwrap_or — the success value, or a fallback.
+;   r       : a Result
+;   default : returned when `r` is err
+;   ->      : the value when ok, else `default`
+(bind unwrap_or
+  (lambda (r default) (if (ok? r) (get r "value") default)))
+
+; ── transforms ──────────────────────────────────────────────────────────────
+
+; map_ok — transform the success value, pass errors through.
+;   r  : a Result
+;   f  : (value) -> new value
+;   -> : (ok (f value)) when ok, else `r` unchanged
+(bind map_ok
+  (lambda (r f) (if (ok? r) (ok (f (get r "value"))) r)))
+
+; map_or — transform the success value, or return a fallback for errors.
+;   r       : a Result
+;   default : returned when `r` is err
+;   f       : (value) -> new value, applied when ok
+;   ->      : (f value) when ok, else `default` (a plain value, not a Result)
+(bind map_or
+  (lambda (r default f) (if (ok? r) (f (get r "value")) default)))
+
+; and_then — chain a fallible step, pass errors through.
+;   r  : a Result
+;   f  : (value) -> Result
+;   -> : (f value) when ok, else `r` unchanged
+(bind and_then
+  (lambda (r f) (if (ok? r) (f (get r "value")) r)))
+
+; map_err — transform the error payload, pass successes through.
+;   r  : a Result
+;   f  : (error) -> new error (the {code, message} map)
+;   -> : `r` when ok, else (err …) carrying (f error)
+(bind map_err
+  (lambda (r f)
+    (if (ok? r)
+      r
+      (bind ((e (f (get r "error"))))
+        (assoc (map_of) "ok" false "error" e)))))
+
+; or_else — recover from an error with a Result-returning handler.
+;   r  : a Result
+;   f  : (error) -> Result
+;   -> : `r` when ok, else (f error)
+(bind or_else
+  (lambda (r f) (if (ok? r) r (f (get r "error")))))
+
+; result_or — the first Result if ok, else an alternative Result.
+;   r / alt : two Results
+;   ->      : r when ok, else alt (the eager sibling of or_else)
+(bind result_or
+  (lambda (r alt) (if (ok? r) r alt)))
+
+; ── bridges ─────────────────────────────────────────────────────────────────
+
+; to_option — view a Result as an Option, discarding the error.
+;   r  : a Result
+;   -> : (some value) when ok, else (none)
+(bind to_option
+  (lambda (r) (if (ok? r) (some (get r "value")) (none))))
+
+; from_option — lift an Option into a Result, labelling an absence. The mirror
+; of to_option: it adds the error a `none` lacks.
+;   opt   : an Option
+;   error : the {code, message} payload to use when `opt` is none
+;   ->    : (ok value) when some, else an err Result carrying `error`
+(bind from_option
+  (lambda (opt error)
+    (if (some? opt)
+      (ok (get opt "value"))
+      (assoc (map_of) "ok" false "error" error))))
+
+; ── eliminators ──────────────────────────────────────────────────────────────
+
+; unwrap_or_else — the ok value, or the result of `(f error)` (LAZY default that
+;   sees the error). The recovering sibling of unwrap_or.
+(bind unwrap_or_else
+  (lambda (r f) (if (ok? r) (get r "value") (f (error_of r)))))
+
+; result_fold — collapse a Result to a single value of any type.
+;   r / on_ok / on_err : (on_ok value) when ok, else (on_err error)
+(bind result_fold
+  (lambda (r on_ok on_err)
+    (if (ok? r) (on_ok (get r "value")) (on_err (error_of r)))))
+
+; result_transpose — a list of Results into a Result of the list: (ok [v…]) when
+;   EVERY element is ok, else the FIRST err (short-circuit semantics).
+(bind result_transpose
+  (lambda (results)
+    (bind ((out (ref (list_of))) (first_err (ref null)))
+      (do
+        (sequence_each results
+          (lambda (r)
+            (when (eq (deref first_err) null)
+              (if (ok? r) (append (deref out) (get r "value")) (set_ref first_err r)))))
+        (if (eq (deref first_err) null) (ok (deref out)) (deref first_err))))))
+
+; ── strict validators ────────────────────────────────────────────────────────
+
+; result? — is `r` a WELL-SHAPED Result (the strict structural predicate)?
+; Unlike ok?/err? (which treat any non-Result as not-ok), this is true ONLY for
+; a map whose "ok" key is a bool, AND — when ok=true — carries a "value", AND —
+; when ok=false — carries an "error" map with string "code" and "message".
+;   r  : any value
+;   -> : bool
+(bind result?
+  (lambda (r)
+    (and (eq (value_type r) "map")
+      (and (eq (value_type (get r "ok" null)) "bool")
+        (if (eq (get r "ok" false) true)
+          (contains r "value")
+          (bind ((e (get r "error" null)))
+            (and (eq (value_type e) "map")
+              (and (eq (value_type (get e "code" null)) "string")
+                (eq (value_type (get e "message" null)) "string")))))))))
+
+; require_result! — the identity on a valid Result, a throw otherwise (the
+; strict gate at a boundary). Uses kernel `throw` directly to stay free of a
+; diag dependency.
+;   r  : a value asserted to be a Result
+;   -> : `r` when (result? r); throws "require_result!: not a Result" otherwise
+(bind require_result!
+  (lambda (r)
+    (if (result? r) r (throw "require_result!: not a Result"))))
+
+(export ok err ok? err? error_of error_code error_message
+        result? require_result!
+        unwrap unwrap_err unwrap_or unwrap_or_else result_fold result_transpose
+        map_ok map_or and_then map_err or_else result_or
+        to_option from_option)

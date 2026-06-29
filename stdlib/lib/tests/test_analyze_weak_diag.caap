@@ -1,0 +1,148 @@
+; stdlib/lib/tests/test_analyze_weak_diag.caap — audit #14: the analyze/reader
+; tooling functions used to swallow failures into null/empty, so the LSP could
+; not tell "absent" from "analysis failed". This pins the additive tri-state /
+; weak-diagnostic surfaces that fix that, WITHOUT breaking the null-compat
+; callers (surface_of still returns the bare kit-or-null; resolve_imports still
+; returns a bare list, reached here through analyze_source_with_root).
+;
+; We need ABSOLUTE fixture paths but have no fs builtins in-language, so we
+; recover this test's own absolute path from the loader's `load_log` (the same
+; trick as test_project_clear / test_graph) and derive the sibling fixtures
+; from it with the pure `path` helpers.
+;
+; fs CAVEAT: the in-language corpus runner (eval_ok) runs the loader WITHOUT a
+; live compile-time `fs` grant — header reads are DENIED, so every file looks
+; unreadable (see caap/tests/common/mod.rs::eval_fs_unit, which exists precisely
+; because surface dispatch needs the grant). That is itself the audit-#14 point:
+; a denied/failed read must surface as the DISTINCT "unknown" verdict (carrying
+; a reason), never collapse into the silent "absent" it used to. So we probe fs
+; once and assert the right contract for whichever environment we run in:
+;   - fs available  -> the full present / absent / unknown split.
+;   - fs unavailable -> every read is "unknown" with a reason (NOT "absent"),
+;                       and the compat surface_of stays null (falsy) — exactly
+;                       the regression audit #14 guards against.
+
+;; @area: semantics
+;; @kind: regression
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.text.path dirname path_join normalize)
+(use stdlib.lib.collections.sequence find)
+
+(do
+  (bind (
+    (loadapi  (ctfe_compiler_lookup_value compiler "stdlib.load"))
+    (commands (ctfe_compiler_lookup_value compiler "caap.session.commands"))
+  )
+    (bind (
+      (surface_of      (get loadapi "surface_of"))
+      (surface_of_diag (get loadapi "surface_of_diag"))
+      (with_root       (get commands "analyze_source_with_root"))
+      (log ((get loadapi "load_log")))
+      ; this test's own load_log entry carries its canonical absolute path
+      (me  (find log
+             (lambda (e2) (string_ends_with (get e2 "path" "")
+                                            "test_analyze_weak_diag.caap"))))
+    )
+      (do
+        ; guard FIRST — every path below dereferences `me`
+        (assert_true (not (eq me null)) "found own load_log entry")
+        (assert_true (not (eq surface_of_diag null))
+          "stdlib.load exposes surface_of_diag (the tri-state sibling)")
+        (assert_true (not (eq with_root null))
+          "session commands expose analyze_source_with_root")
+        (bind (
+          (here    (dirname (get me "path")))
+          (own     (get me "path"))
+          (present (normalize (path_join here "wd_present_header.caap")))
+          (absent  (normalize (path_join here "wd_absent_header.caap")))
+          (missing (normalize (path_join here "wd_does_not_exist.caap")))
+          ; probe: read THIS file (it certainly exists). If even that is
+          ; "unknown", the session has no live fs read grant.
+          (fs_ok (eq (get (surface_of_diag own) "status") "absent"))
+        )
+        (bind (
+          ; the tri-state verdict is ALWAYS a tagged map with these three keys,
+          ; regardless of fs — pin that shape on the missing-file path, which is
+          ; "unknown" in either environment.
+          (du (surface_of_diag missing))
+        )
+          (do
+            ; ── invariant across environments: an unreadable file is UNKNOWN ──
+            ; (the core audit-#14 fix: failure is a DISTINCT verdict, not silent
+            ;  "absent"), it carries no kit, and it carries a reason string.
+            (assert_eq (get du "status") "unknown"
+              "an unreadable file is unknown, NOT absent (the audit-#14 fix)")
+            (assert_eq (get du "kit") null "unknown has no kit")
+            (assert_true (not (eq (get du "reason") null))
+              "unknown carries a reason (why the header is unreadable)")
+            ; compat: surface_of of an unreadable file is null (falsy), as before
+            (assert_eq (surface_of missing) null
+              "compat surface_of is null for an unreadable file (falsy, as before)")
+
+            (if fs_ok
+              ; ── fs AVAILABLE: the full present / absent split ───────────────
+              (do
+                (bind ((dp (surface_of_diag present)))
+                  (do
+                    (assert_eq (get dp "status") "present"
+                      "a surface-headed file is reported present")
+                    (assert_eq (get dp "kit") "stdlib.frontend.clike"
+                      "present verdict names the header's kit")
+                    (assert_eq (get dp "reason") null "present carries no reason")))
+                (bind ((da (surface_of_diag absent)))
+                  (do
+                    (assert_eq (get da "status") "absent"
+                      "a headerless file is reported absent")
+                    (assert_eq (get da "kit") null "absent has no kit")
+                    (assert_eq (get da "reason") null "absent carries no reason")))
+                ; compat surface_of: kit for present, null for absent
+                (assert_eq (surface_of present) "stdlib.frontend.clike"
+                  "compat surface_of returns the kit for a present header")
+                (assert_eq (surface_of absent) null
+                  "compat surface_of is null for a headerless file (falsy)")
+                ; analyze_source_with_root: imports + tooling_warnings channel.
+                ; THIS file's resolvable `use` directives yield cross-module
+                ; imports; tooling_warnings is ALWAYS present (the weak-diag
+                ; channel) so the LSP tells "no imports" from "resolve failed".
+                (bind ((res (with_root own here)))
+                  (do
+                    (assert_true (not (eq (get res "imports" null) null))
+                      "analyze_source_with_root carries an imports list")
+                    (assert_true (sequence_any (get res "imports" (list_of))
+                                   (lambda (i) (eq (get i "name") "assert_eq")))
+                      "imports resolves a real use-imported name (assert_eq)")
+                    (assert_true (sequence_any (get res "imports" (list_of))
+                                   (lambda (i)
+                                     (eq (get i "module") "stdlib.lib.test")))
+                      "imports records the source module of an imported name")
+                    (assert_true (not (eq (get res "tooling_warnings" null) null))
+                      "tooling_warnings is always present (the weak-diag channel)")
+                    (assert_eq (size (get res "tooling_warnings" (list_of))) 0
+                      "a clean analysis produces no weak diagnostics")
+                    (assert_true (not (eq (get res "definitions" null) null))
+                      "definitions still flow alongside the imports channel"))))
+              ; ── fs UNAVAILABLE: every read is "unknown" with a reason; the
+              ; compat accessor stays null. This is the degraded-but-CORRECT
+              ; behaviour — failures are visible, never silently "absent". ─────
+              (do
+                (assert_eq (get (surface_of_diag present) "status") "unknown"
+                  "no-fs: a present-header file reads as unknown (read denied)")
+                (assert_true (not (eq (get (surface_of_diag present) "reason") null))
+                  "no-fs: the unknown verdict still carries a reason")
+                (assert_eq (get (surface_of_diag absent) "status") "unknown"
+                  "no-fs: a headerless file reads as unknown (read denied)")
+                (assert_eq (surface_of present) null
+                  "no-fs: compat surface_of is null (falsy) for a denied read")
+                (assert_eq (surface_of absent) null
+                  "no-fs: compat surface_of is null (falsy) for a denied read")
+                ; analyze_source_with_root must still RETURN cleanly under no-fs,
+                ; with the tooling_warnings channel present (audit-#14 contract):
+                ; a recoverable miss is data, never a thrown failure.
+                (bind ((res (with_root own here)))
+                  (do
+                    (assert_true (not (eq (get res "tooling_warnings" null) null))
+                      "no-fs: tooling_warnings is still present (weak-diag channel)")
+                    (assert_true (not (eq (get res "imports" null) null))
+                      "no-fs: imports is still a list (empty), never null")))))
+            true)))))))

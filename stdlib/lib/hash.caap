@@ -1,0 +1,325 @@
+; stdlib/lib/hash.caap — non-cryptographic hashes + a facade over the kernel's
+; content hash (module stdlib.lib.hash).
+;
+; These are the everyday hashes a compiler reaches for: FNV-1a and djb2 for
+; cheap dictionary/bucket keys, CRC-32 for integrity checks (the same poly
+; 0xEDB88320 algorithm storage/binary.caap uses on byte buffers). All three are
+; 32-bit; the kernel int is i64 and the bitwise/arith builtins are CHECKED, so
+; every step is MASKED back to 32 bits with `(int_and … mask32)` to stay in
+; range and to wrap exactly like a real `u32`.
+;
+; SHA-256 / MD5 are deliberately absent — they need true u64 lanes beyond i64's
+; range, and the kernel already ships a strong content hash (`stable_hash`,
+; Blake2b). `content_hash`/`structural_hash` below are thin facades over it:
+; verified empirically, `stable_hash` accepts ANY value (string, list, map …)
+; and returns a stable hex string, and structurally-equal values (value_eq)
+; hash to the SAME string — so no `value_to_string` pre-render is needed.
+(module stdlib.lib.hash)
+
+(use stdlib.lib.collections.sequence each range)
+
+; mask32 — 0xFFFFFFFF, the 32-bit wrap-around mask.
+(bind mask32 4294967295)
+
+; m32 — confine `x` to 32 bits (the checked builtins never overflow because we
+; mask after every multiply/add/shift).
+(bind m32 (lambda (x) (int_and x mask32)))
+
+; bytes_of — a string's UTF-8 bytes as a list of ints 0..255; a value that is
+; already such a list passes through. fnv1a/crc32 accept either spelling so a
+; caller can hash a string directly or a byte list it already holds.
+(bind bytes_of
+  (lambda (v)
+    (if (eq (value_type v) "string")
+      (bytes_to_list (string->bytes v))
+      v)))
+
+; fnv1a — 32-bit FNV-1a over the UTF-8 bytes of `v` (a string or a byte list).
+;   v  : a string, or a list of byte ints (0..255)
+;   -> : the 32-bit FNV-1a hash (0 .. 4294967295)
+; offset basis 2166136261, prime 16777619; per byte: h = (h XOR b) * prime,
+; masked to 32 bits.
+(defn fnv1a ((v any)) int
+  (bind ((h (ref 2166136261)))
+    (do
+      (each (bytes_of v)
+        (lambda (b)
+          (set_ref h (m32 (int_mul (int_xor (deref h) b) 16777619)))))
+      (deref h))))
+
+; djb2 — Dan Bernstein's 32-bit string hash over the UTF-8 bytes of `s`.
+;   s  : a string (its bytes are the char codes for ASCII)
+;   -> : the 32-bit djb2 hash
+; seed 5381; per byte: h = ((h << 5) + h) + b, masked to 32 bits.
+(defn djb2 ((s string)) int
+  (bind ((h (ref 5381)))
+    (do
+      (each (bytes_to_list (string->bytes s))
+        (lambda (b)
+          (set_ref h (m32 (int_add (int_add (int_shl (deref h) 5) (deref h)) b)))))
+      (deref h))))
+
+; crc32 — CRC-32 (poly 0xEDB88320) over the UTF-8 bytes of `v`. The table-free
+; bit algorithm mirrored from storage/binary.caap (init/final XOR 0xFFFFFFFF,
+; reflected poly 0xEDB88320 = 3988292384), here masked to 32 bits at each step
+; so a byte list and a string of the same content agree with that module.
+;   v  : a string, or a list of byte ints (0..255)
+;   -> : the standard CRC-32 (0 .. 4294967295)
+(defn crc32 ((v any)) int
+  (bind ((crc (ref mask32)) (bytes (bytes_of v)))
+    (do
+      (each bytes
+        (lambda (b)
+          (do
+            (set_ref crc (m32 (int_xor (deref crc) b)))
+            (each (range 0 8)
+              (lambda (_k)
+                (if (eq (int_and (deref crc) 1) 1)
+                  (set_ref crc (m32 (int_xor (int_shr (deref crc) 1) 3988292384)))
+                  (set_ref crc (int_shr (deref crc) 1))))))))
+      (m32 (int_xor (deref crc) mask32)))))
+
+; ── 64-bit FNV-1a ───────────────────────────────────────────────────────────
+; The 32-bit hashes above are ample for in-memory bucket keys, but a wider
+; digest collides far less often across a large symbol table. FNV-1a-64 is the
+; same construction at 64 bits — offset basis 0xcbf29ce484222325, prime
+; 0x100000001b3 — and it is its own little numeric challenge here: the kernel
+; int is i64 with CHECKED arithmetic, so `h * prime` cannot be evaluated as a
+; plain int_mul (the true product reaches ~2^64 and would overflow/raise).
+; Instead the multiply is done MOD 2^64 with 16-bit-lane schoolbook
+; multiplication (each partial product a_i * b_j is < 2^32, well inside i64),
+; using only the bit-pattern builtins int_and/int_or/int_xor/int_shl/int_shr
+; (which operate on the raw i64 bits and never overflow). The result is the
+; true u64 FNV-1a value returned as its 64-bit TWO'S-COMPLEMENT bit pattern: a
+; value at or above 2^63 reads back as a NEGATIVE int (this is the faithful
+; "masked to 64 bits" spelling — no information is dropped). SHA-256/MD5 stay a
+; separate crypto module; this is a fast, non-cryptographic 64-bit digest.
+
+; mask16 — 0xFFFF, the 16-bit lane mask used by the mod-2^64 multiply.
+(bind mask16 65535)
+
+; lane64 — assemble a 64-bit bit pattern from its low/high 32-bit halves.
+;   lo / hi : the two 32-bit halves (each confined with int_and mask32)
+;   ->      : (lo | hi<<32), a 64-bit two's-complement int
+(bind lane64
+  (lambda (lo hi)
+    (int_or (int_and lo mask32) (int_shl (int_and hi mask32) 32))))
+
+; mul64 — (a * b) MOD 2^64, overflow-free. Both operands are split into four
+; 16-bit words; only the partial products whose combined weight is < 2^64 are
+; kept (the high half is discarded, as wraparound mod 2^64 requires). Carries
+; propagate up the 16-bit positions. Every int_mul here is at most
+; 0xFFFF*0xFFFF + carries ≈ 2^32, far below i64's ceiling, so nothing raises.
+;   a / b : 64-bit bit-pattern ints
+;   ->    : (a*b) mod 2^64, as a 64-bit bit pattern
+(bind mul64
+  (lambda (a b)
+    (bind (
+      (a0 (int_and a mask16)) (a1 (int_and (int_shr a 16) mask16))
+      (a2 (int_and (int_shr a 32) mask16)) (a3 (int_and (int_shr a 48) mask16))
+      (b0 (int_and b mask16)) (b1 (int_and (int_shr b 16) mask16))
+      (b2 (int_and (int_shr b 32) mask16)) (b3 (int_and (int_shr b 48) mask16))
+      ; column sums by output 16-bit position (products beyond bit 63 dropped)
+      (c0 (int_mul a0 b0))
+      (c1 (int_add (int_mul a0 b1) (int_mul a1 b0)))
+      (c2 (int_add (int_add (int_mul a0 b2) (int_mul a1 b1)) (int_mul a2 b0)))
+      (c3 (int_add (int_add (int_add (int_mul a0 b3) (int_mul a1 b2))
+             (int_mul a2 b1)) (int_mul a3 b0)))
+      ; fold carries up the columns
+      (r0 (int_and c0 mask16))
+      (s1 (int_add c1 (int_shr c0 16)))
+      (r1 (int_and s1 mask16))
+      (s2 (int_add c2 (int_shr s1 16)))
+      (r2 (int_and s2 mask16))
+      (s3 (int_add c3 (int_shr s2 16)))
+      (r3 (int_and s3 mask16))
+    )
+      (int_or
+        (int_or r0 (int_shl r1 16))
+        (int_or (int_shl r2 32) (int_shl r3 48))))))
+
+; fnv1a_64 — 64-bit FNV-1a over the UTF-8 bytes of `v` (a string or byte list).
+;   v  : a string, or a list of byte ints (0..255)
+;   -> : the 64-bit FNV-1a hash as a two's-complement int (negative when the
+;        true u64 value is >= 2^63)
+; offset basis 0xcbf29ce484222325, prime 0x100000001b3 (1099511628211); per
+; byte: h = (h XOR b) * prime mod 2^64.
+(defn fnv1a_64 ((v any)) int
+  (bind ((h (ref (lane64 2216829733 3421674724)))   ; 0xcbf29ce484222325
+         (prime 1099511628211))                      ; 0x100000001b3
+    (do
+      (each (bytes_of v)
+        (lambda (b)
+          (set_ref h (mul64 (int_xor (deref h) b) prime))))
+      (deref h))))
+
+; ── SipHash-2-4 (keyed, DoS-resistant 64-bit) ───────────────────────────────
+; The FNV/CRC/djb2 hashes above are fast but NOT keyed: an adversary who knows
+; the algorithm can craft inputs that all land in one bucket and grind a hash
+; table to O(n^2). SipHash-2-4 is the standard fix (it is what Rust, Python and
+; many languages key their hash maps with): a small keyed PRF over 64-bit lanes.
+; It uses only add/xor/rotate on u64 — NO multiply — so it sidesteps mul64, but
+; every step still has to stay inside i64's CHECKED arithmetic:
+;   • addition wraps mod 2^64 via `add64` (16/32-bit lane carry, never int_add on
+;     two big values — that would RAISE on overflow, e.g. 0x7fff..+0x7fff..);
+;   • rotate-left is `(x << b) | logical_shr(x, 64-b)`, and because the kernel's
+;     int_shr is ARITHMETIC (sign-extending), the right half is masked back to
+;     its low (64-b) bits with `low_bits` so a value with bit 63 set does not
+;     smear ones into the rotated result.
+; All lane values are 64-bit two's-complement bit patterns (>= 2^63 reads back
+; negative); the final digest is returned the same way (as fnv1a_64 does).
+
+; mask64 — 0xFFFFFFFFFFFFFFFF as an i64 is -1 (every bit set); AND-ing with it is
+; the identity on an i64, the "confine to 64 bits" no-op kept for documentation.
+(bind mask64 -1)
+
+; add64 — (a + b) MOD 2^64, overflow-free. Split each operand into low/high 32-bit
+; halves (masking the arithmetic int_shr back to 32 bits), add the halves with a
+; carry — each int_add here is at most ~2^33, far below i64's ceiling, so nothing
+; raises — then reassemble. The high half's top bit may land in bit 63, giving a
+; negative i64: that is the correct two's-complement bit pattern.
+;   a / b : 64-bit bit-pattern ints
+;   ->    : (a + b) mod 2^64
+(bind add64
+  (lambda (a b)
+    (bind (
+      (alo (int_and a mask32)) (ahi (int_and (int_shr a 32) mask32))
+      (blo (int_and b mask32)) (bhi (int_and (int_shr b 32) mask32))
+      (slo (int_add alo blo))
+      (rlo (int_and slo mask32))
+      (shi (int_add (int_add ahi bhi) (int_shr slo 32)))   ; + carry out of low
+      (rhi (int_and shi mask32))
+    )
+      (int_or rlo (int_shl rhi 32)))))
+
+; low_bits — keep only the low `n` bits of `x` (0 < n < 64). Builds the mask
+; (1<<n)-1 with int_shl (n is always in 1..63 at the call sites) and ANDs; used
+; to turn the kernel's arithmetic right shift into a LOGICAL one.
+;   x / n : the value and the number of low bits to retain
+;   ->    : x with bits at/above position n cleared
+(bind low_bits
+  (lambda (x n) (int_and x (int_sub (int_shl 1 n) 1))))
+
+; rotl64 — rotate the 64-bit value `x` left by `b` bits (0 < b < 64). The right
+; part uses a LOGICAL shift: int_shr is arithmetic, so its (64-b) result is masked
+; to its low (64-b) bits before being OR'd with the left part. The OR may set bit
+; 63 (a negative i64) — the faithful rotated bit pattern.
+;   x / b : the lane and a rotation amount in 1..63
+;   ->    : x rotated left by b, mod 2^64
+(bind rotl64
+  (lambda (x b)
+    (int_or (int_shl x b) (low_bits (int_shr x (int_sub 64 b)) b))))
+
+; sip_round — one SipHash compression round, mutating the four lane refs in place
+; (the canonical SIPROUND: four add/rotate/xor quartets). add64 keeps every sum
+; mod 2^64; the rotate constants 13/16/17/21/32 are SipHash's fixed schedule.
+(bind sip_round
+  (lambda (v0 v1 v2 v3)
+    (do
+      (set_ref v0 (add64 (deref v0) (deref v1)))
+      (set_ref v1 (rotl64 (deref v1) 13))
+      (set_ref v1 (int_xor (deref v1) (deref v0)))
+      (set_ref v0 (rotl64 (deref v0) 32))
+      (set_ref v2 (add64 (deref v2) (deref v3)))
+      (set_ref v3 (rotl64 (deref v3) 16))
+      (set_ref v3 (int_xor (deref v3) (deref v2)))
+      (set_ref v0 (add64 (deref v0) (deref v3)))
+      (set_ref v3 (rotl64 (deref v3) 21))
+      (set_ref v3 (int_xor (deref v3) (deref v0)))
+      (set_ref v2 (add64 (deref v2) (deref v1)))
+      (set_ref v1 (rotl64 (deref v1) 17))
+      (set_ref v1 (int_xor (deref v1) (deref v2)))
+      (set_ref v2 (rotl64 (deref v2) 32)))))
+
+; le64_word — assemble the little-endian u64 of the 8 bytes at `off` in `bytes`,
+; reading only the bytes that exist (a short final block stops at the list end).
+; Byte k contributes (byte << 8k); int_shl by up to 56 is in range, and each
+; partial OR stays a clean 64-bit bit pattern.
+;   bytes / off / count : the byte list, the block offset, how many bytes to read
+;   ->                  : the little-endian 64-bit word of that block
+(bind le64_word
+  (lambda (bytes off count)
+    (bind ((w (ref 0)))
+      (do
+        (each (range 0 count)
+          (lambda (k)
+            (set_ref w (int_or (deref w)
+              (int_shl (int_and (get bytes (int_add off k)) 255) (int_mul k 8))))))
+        (deref w)))))
+
+; siphash_key — the 64-bit lane for key word `lo`/`hi`. The two default key words
+; below are arbitrary fixed constants; pass your own via siphash_keyed for a
+; per-process secret (the point of a keyed hash is an attacker not knowing them).
+(bind sip_k0 (lane64 1684234849 1751606885))   ; 0x68676665_64636261  ("abcdefgh" LE)
+(bind sip_k1 (lane64 1818845809 1885957735))   ; 0x706f6e6d_6c6b6a69  ("ijklmnop" LE)
+
+; siphash_keyed — SipHash-2-4 of `v`'s bytes under the 64-bit key (k0, k1),
+; returned as the 64-bit two's-complement digest (negative when >= 2^63). 2
+; compression rounds per block, 4 finalization rounds — the standard "2-4".
+;   k0 / k1 : the two 64-bit key words (bit patterns)
+;   v       : a string, or a list of byte ints (0..255)
+;   ->      : the 64-bit SipHash digest as a two's-complement int
+(defn siphash_keyed ((k0 int) (k1 int) (v any)) int
+  (bind ((bytes (bytes_of v))
+         (n (size bytes))
+         ; init the four lanes from the key and SipHash's magic constants
+         (v0 (ref (int_xor k0 (lane64 1886610805 1936682341))))   ; "somepseu" -> 0x736f6d6570736575
+         (v1 (ref (int_xor k1 (lane64 1852075885 1685025377))))   ; 0x646f72616e646f6d
+         (v2 (ref (int_xor k0 (lane64 1852142177 1819895653))))   ; 0x6c7967656e657261
+         (v3 (ref (int_xor k1 (lane64 2037671283 1952801890))))   ; 0x7465646279746573
+         (full (int_div n 8))            ; whole 8-byte blocks
+         (tail_off (int_mul full 8)))    ; where the final partial block begins
+    (do
+      ; full blocks: v3 ^= m ; 2 rounds ; v0 ^= m
+      (each (range 0 full)
+        (lambda (blk)
+          (bind ((m (le64_word bytes (int_mul blk 8) 8)))
+            (do
+              (set_ref v3 (int_xor (deref v3) m))
+              (sip_round v0 v1 v2 v3)
+              (sip_round v0 v1 v2 v3)
+              (set_ref v0 (int_xor (deref v0) m))))))
+      ; final block: the remaining <8 bytes, with the length (mod 256) in the
+      ; top byte — SipHash's standard padding so length is mixed in.
+      (bind ((rem (int_sub n tail_off))
+             (b (int_or (le64_word bytes tail_off rem)
+                  (int_shl (int_and n 255) 56))))
+        (do
+          (set_ref v3 (int_xor (deref v3) b))
+          (sip_round v0 v1 v2 v3)
+          (sip_round v0 v1 v2 v3)
+          (set_ref v0 (int_xor (deref v0) b))))
+      ; finalization: v2 ^= 0xff ; 4 rounds ; return v0 ^ v1 ^ v2 ^ v3
+      (set_ref v2 (int_xor (deref v2) 255))
+      (sip_round v0 v1 v2 v3)
+      (sip_round v0 v1 v2 v3)
+      (sip_round v0 v1 v2 v3)
+      (sip_round v0 v1 v2 v3)
+      (int_xor (int_xor (deref v0) (deref v1))
+               (int_xor (deref v2) (deref v3))))))
+
+; siphash — SipHash-2-4 of `v` under the module's fixed default key. Deterministic
+; and keyed: ideal as a hash-table key function within one process. For real DoS
+; resistance against an adversary, seed a per-process key with siphash_keyed.
+;   v  : a string, or a list of byte ints (0..255)
+;   -> : the 64-bit SipHash digest as a two's-complement int
+(defn siphash ((v any)) int (siphash_keyed sip_k0 sip_k1 v))
+
+; content_hash — the kernel's stable content hash of `value` (Blake2b hex
+; string). Stable across runs and accepts ANY value; structurally-equal values
+; produce the same string. Use it to key caches on content rather than identity.
+;   value : any value
+;   -> : a hex-string digest
+(defn content_hash ((value any)) string
+  (stable_hash value))
+
+; structural_hash — an explicit alias for content_hash: the name documents the
+; contract that VALUE-equal inputs (value_eq) hash to the SAME string regardless
+; of how each was constructed (the kernel hash is structural, not by identity).
+;   value : any value
+;   -> : a hex-string digest, equal for value_eq-equal inputs
+(defn structural_hash ((value any)) string
+  (stable_hash value))
+
+(export fnv1a fnv1a_64 djb2 crc32 siphash siphash_keyed
+        content_hash structural_hash)

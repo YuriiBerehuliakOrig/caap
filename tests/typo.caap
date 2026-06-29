@@ -1,0 +1,5 @@
+; tests/typo.caap — references a misspelled name; the load-time
+; checker must reject it (instead of a deep eval-time "unknown name").
+(module stdlib.fixtures.typo)
+(bind total (lambda (xs) (sequence_fold_lett xs 0 (lambda (a x) (int_add a x)))))
+(export total)

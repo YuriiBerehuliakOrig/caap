@@ -1,0 +1,156 @@
+; stdlib/storage/binary/runtime.caap — the byte runtime + CRC the generated eval
+; code calls BY NAME (module stdlib.storage.binary.runtime).
+;
+; A buffer is a plain list of bytes (ints 0..255); encode builds one, decode
+; reads one. Little-endian by default; a `(endian big)` spec lowers scalar
+; reads/writes to the big-endian twins (be_bytes / read_be / read_be_signed).
+;
+; This is the lowest seam of stdlib.storage.binary: the int-size tables (the
+; on-disk widths every other submodule reads), the scalar byte readers/writers
+; in both byte orders, the fixed-slice helpers, and the range-form CRC-32. It
+; depends only on sequence — nothing else in storage/binary depends on it
+; cyclically. The facade re-exports the public helpers verbatim.
+(module stdlib.storage.binary.runtime)
+
+(use stdlib.lib.collections.sequence each range)
+
+; int_sizes — the on-disk width (bytes) of each scalar integer spelling. Both
+; unsigned (u8…u64) and two's-complement signed (i8…i64) are supported; an enum
+; base must be UNSIGNED (`uint_type?`), because a variant value is a bit pattern.
+(bind uint_sizes (assoc (map_of) "u8" 1 "u16" 2 "u32" 4 "u64" 8))
+(bind sint_sizes (assoc (map_of) "i8" 1 "i16" 2 "i32" 4 "i64" 8))
+(bind int_sizes  (assoc (map_of) "u8" 1 "u16" 2 "u32" 4 "u64" 8
+                                 "i8" 1 "i16" 2 "i32" 4 "i64" 8))
+(bind uint_type? (lambda (s) (not (eq (get uint_sizes s) null))))
+(bind sint_type? (lambda (s) (not (eq (get sint_sizes s) null))))
+(bind int_type?  (lambda (s) (not (eq (get int_sizes  s) null))))
+
+; pow256 — 256^i (the place value of byte i).
+(bind pow256
+  (lambda (i)
+    (bind ((p (ref 1)))
+      (do (each (range 0 i) (lambda (_k) (set_ref p (int_mul (deref p) 256)))) (deref p)))))
+
+; le_bytes — `value` as `n` little-endian bytes.
+(bind le_bytes
+  (lambda (value n)
+    (bind ((out (list_of)) (v (ref value)))
+      (do
+        (each (range 0 n)
+          (lambda (_i)
+            (do (append out (int_mod (deref v) 256))
+                (set_ref v (int_div (deref v) 256)))))
+        out))))
+
+; read_le — the `n`-byte little-endian int at `off` in buffer `bs`, assembled by
+; shift/or so the result is the exact i64 BIT PATTERN (it wraps like the native
+; backend, never overflows). For n<8 the pattern equals the unsigned value; for
+; n=8 a value with bit 63 set comes back as a NEGATIVE i64 — the kernel int is
+; i64, so a u64 ≥ 2^63 cannot be held positive on the eval backend (the native
+; backend stores a true u64). See storage/README.md "Boundaries".
+(bind read_le
+  (lambda (bs off n)
+    (bind ((v (ref 0)))
+      (do
+        (each (range 0 n)
+          (lambda (i)
+            (set_ref v (int_or (deref v)
+              (int_shl (get bs (int_add off i) 0) (int_mul i 8))))))
+        (deref v)))))
+
+; read_le_signed — read `n` bytes as a two's-complement signed integer. For n<8
+; the unsigned read fits i64, so sign-extend by subtracting 256^n when the high
+; bit is set; for n=8 the i64 bit pattern from read_le IS already the signed value
+; (and 256^8 = 2^64 would overflow i64, so it is not formed). Encode needs no
+; signed twin: int_mod/int_div are Euclidean, so (le_bytes -1 1) already yields
+; the byte 255, which read_le_signed turns back into -1.
+(bind read_le_signed
+  (lambda (bs off n)
+    (if (ge n 8)
+      (read_le bs off n)
+      (bind ((u (read_le bs off n)) (limit (pow256 n)))
+        (if (ge u (int_div limit 2)) (int_sub u limit) u)))))
+
+; ── big-endian twins ─────────────────────────────────────────────────────────
+; A `(endian big)` storage spec lowers its scalar reads/writes to these instead
+; of the LE helpers above. Same on-disk values, reversed byte order: be_bytes
+; emits the most-significant byte first, read_be assembles it from off..off+n in
+; the same MSB-first order. The bit-pattern/sign-extension contracts match the LE
+; twins exactly (read_be n=8 returns the i64 bit pattern; read_be_signed sign-
+; extends an n<8 read). bytes[N] fields and the CRC are byte streams, so they are
+; endian-agnostic and keep the LE-named slice/crc helpers on either spec.
+; be_bytes — `value` as `n` big-endian bytes (MSB first).
+(bind be_bytes
+  (lambda (value n)
+    (bind ((out (list_of)))
+      (do
+        (each (range 0 n)
+          (lambda (i)
+            ; byte i (from the front) is the (n-1-i)-th place value
+            (append out (int_mod (int_div value (pow256 (int_sub (int_sub n 1) i))) 256))))
+        out))))
+
+; read_be — the `n`-byte big-endian int at `off` (MSB first), as the exact i64
+; bit pattern (same wraparound contract as read_le for n=8).
+(bind read_be
+  (lambda (bs off n)
+    (bind ((v (ref 0)))
+      (do
+        (each (range 0 n)
+          (lambda (i)
+            (set_ref v (int_or
+              (int_shl (deref v) 8)
+              (get bs (int_add off i) 0)))))
+        (deref v)))))
+
+; read_be_signed — `n` big-endian bytes as a two's-complement signed integer.
+(bind read_be_signed
+  (lambda (bs off n)
+    (if (ge n 8)
+      (read_be bs off n)
+      (bind ((u (read_be bs off n)) (limit (pow256 n)))
+        (if (ge u (int_div limit 2)) (int_sub u limit) u)))))
+
+; pad_bytes — a fixed-width `n`-byte field from a byte list (truncate / zero-pad).
+(bind pad_bytes
+  (lambda (lst n)
+    (bind ((out (list_of)))
+      (do (each (range 0 n) (lambda (i) (append out (get lst i 0)))) out))))
+
+; slice_bytes — `n` bytes of `bs` from `off`.
+(bind slice_bytes
+  (lambda (bs off n)
+    (bind ((out (list_of)))
+      (do (each (range 0 n) (lambda (i) (append out (get bs (int_add off i) 0)))) out))))
+
+; emit! — append every byte of `lst` to buffer `acc`; returns acc.
+(bind emit!
+  (lambda (acc lst) (do (each lst (lambda (b) (append acc b))) acc)))
+
+; crc32 — CRC-32 (poly 0xEDB88320) over bytes [start,end) of `bs`. This RANGE
+; form is load-bearing: the encoder checksums an explicit sub-region (everything
+; before the trailing crc field), so it stays here rather than calling
+; stdlib.lib.hash.crc32, which hashes a WHOLE value and would change the covered
+; bytes. Use hash.crc32 only when the checksum is over an entire buffer.
+(bind crc32
+  (lambda (bs start end)
+    (bind ((crc (ref 4294967295)))
+      (do
+        (each (range start end)
+          (lambda (i)
+            (do
+              (set_ref crc (int_xor (deref crc) (get bs i 0)))
+              (each (range 0 8)
+                (lambda (_b)
+                  (if (eq (int_mod (deref crc) 2) 1)
+                    (set_ref crc (int_xor (int_div (deref crc) 2) 3988292384))
+                    (set_ref crc (int_div (deref crc) 2))))))))
+        (int_xor (deref crc) 4294967295)))))
+
+; the SIZE/predicate tables and `pow256` are also used by parse + validate; the
+; byte helpers (le_bytes…crc32) are the public byte runtime the generated eval
+; code (and importers) call by name. The facade re-exports the public subset.
+(export int_sizes int_type? uint_type? sint_type?
+        pow256 le_bytes read_le read_le_signed
+        be_bytes read_be read_be_signed
+        pad_bytes slice_bytes emit! crc32)

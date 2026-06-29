@@ -1,0 +1,32 @@
+; stdlib/lib/test_types.caap — in-language tests for the type registry.
+
+;; @area: types
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq)
+(use stdlib.semantics.types.registry
+  define_struct! field resolve known_type? field_type
+  sized_int? int_family? bounds literal_fits? assignable?)
+
+(do
+  (assert_eq (known_type? "u8") true "u8 is registered")
+  (assert_eq (known_type? "nope") false "unknown type")
+  (assert_eq (sized_int? "u16") true "sized_int? u16")
+  (assert_eq (sized_int? "int") false "int is dynamic, not sized")
+  (assert_eq (int_family? "int") true "int_family int")
+  (assert_eq (int_family? "i32") true "int_family i32")
+  (assert_eq (get (bounds "u8") "max" 0) 255 "u8 max")
+  (assert_eq (get (bounds "i8") "min" 0) -128 "i8 min")
+  (assert_eq (literal_fits? 255 "u8") true "255 fits u8")
+  (assert_eq (literal_fits? 256 "u8") false "256 does not fit u8")
+  (assert_eq (literal_fits? -1 "u8") false "-1 does not fit u8")
+  (assert_eq (assignable? "u8" "int") true "dynamic int into u8 (no width at runtime)")
+  (assert_eq (assignable? "int" "u8") true "u8 into int")
+  (assert_eq (assignable? "u8" "string") false "string into u8")
+  (assert_eq (assignable? "any" "string") true "any accepts all")
+  (assert_eq
+    (do
+      (define_struct! "TPoint" (list_of (field "x" "i32") (field "y" "i32")))
+      (field_type "TPoint" "y"))
+    "i32" "struct field type")
+  true)

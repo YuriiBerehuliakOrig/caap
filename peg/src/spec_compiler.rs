@@ -1,30 +1,44 @@
+//! [`SpecCompiler`] — compile a JSON list-format grammar spec
+//! (`["grammar", name, root, [rules…]]`) into a [`Grammar`].
+
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::behaviors::{
-    BehaviorEntry, DiagnosticBehavior, GrammarScalar, PredicateBehavior, TraceBehavior,
-    TransformBehavior,
-};
-use crate::expr::{CompiledRegex, PegExpr, RuleTextParser};
+use crate::expr::PegExpr;
 use crate::grammar::{Grammar, GrammarRule};
+
+use super::spec_compiler_exprs::{expr_to_peg_expr, expr_to_source};
+use super::spec_compiler_helpers::{
+    expect_arr, expect_bool, expect_non_empty_str, expect_str, require_non_empty_str, string_array,
+    string_values, type_name,
+};
 
 // ── Error ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// Why compiling a JSON grammar spec failed.
 pub enum SpecCompileError {
     #[error("invalid spec format: {0}")]
+    /// The spec was not in the expected list format.
     InvalidFormat(String),
     #[error("unknown expr tag: {0}")]
+    /// An expression used an unrecognised tag.
     UnknownTag(String),
     #[error("missing required field: {0}")]
+    /// A required field was absent.
     MissingField(String),
     #[error("type error: expected {expected}, got {actual} in {ctx}")]
+    /// A value had the wrong type.
     TypeError {
+        /// The expected type name.
         expected: &'static str,
+        /// The actual type name.
         actual: String,
+        /// Where the mismatch occurred.
         ctx: String,
     },
     #[error("duplicate rule: {0}")]
+    /// Two rules shared a name.
     DuplicateRule(String),
 }
 
@@ -51,6 +65,7 @@ pub struct SpecCompiler {
 }
 
 impl SpecCompiler {
+    /// A compiler with default options.
     pub fn new() -> Self {
         Self::default()
     }
@@ -81,7 +96,7 @@ impl SpecCompiler {
         }
 
         // Build the Grammar
-        let mut grammar = Grammar::new("").with_start_rule(root_rule.to_string());
+        let mut grammar = Grammar::trusted_new("").with_start_rule(root_rule.to_string());
         // Clear the auto-parsed empty rules
         grammar.rules.clear();
         grammar.text.clear();
@@ -96,9 +111,9 @@ impl SpecCompiler {
             if !grammar.text.is_empty() {
                 grammar.text.push('\n');
             }
-            grammar
-                .text
-                .push_str(&format!("{} <- {}", rule.name, rule.source));
+            grammar.text.push_str(&rule.name);
+            grammar.text.push_str(" <- ");
+            grammar.text.push_str(&rule.source);
         }
 
         // Store options as __grammar__ metadata
@@ -106,23 +121,13 @@ impl SpecCompiler {
         if !ctx.hard_keywords.is_empty() {
             gmeta.insert(
                 "hard_keywords".to_string(),
-                Value::Array(
-                    ctx.hard_keywords
-                        .iter()
-                        .map(|s| Value::String(s.clone()))
-                        .collect(),
-                ),
+                string_array(&ctx.hard_keywords),
             );
         }
         if !ctx.soft_keywords.is_empty() {
             gmeta.insert(
                 "soft_keywords".to_string(),
-                Value::Array(
-                    ctx.soft_keywords
-                        .iter()
-                        .map(|s| Value::String(s.clone()))
-                        .collect(),
-                ),
+                string_array(&ctx.soft_keywords),
             );
         }
         if !ctx.strict_actions {
@@ -134,12 +139,7 @@ impl SpecCompiler {
         if !ctx.line_comments.is_empty() {
             gmeta.insert(
                 "line_comments".to_string(),
-                Value::Array(
-                    ctx.line_comments
-                        .iter()
-                        .map(|s| Value::String(s.clone()))
-                        .collect(),
-                ),
+                string_array(&ctx.line_comments),
             );
         }
         if ctx.indentation {
@@ -182,29 +182,29 @@ impl SpecCompiler {
 
 // ── Internal state ─────────────────────────────────────────────────────────
 
-struct CompileState {
-    rules: Vec<CompiledRuleSpec>, // ordered insertion
-    seen_names: std::collections::HashSet<String>,
-    rule_metadata: HashMap<String, HashMap<String, Value>>,
-    hard_keywords: Vec<String>,
-    soft_keywords: Vec<String>,
-    strict_actions: bool,
-    whitespace: Option<String>,
-    line_comments: Vec<String>,
+pub(super) struct CompileState {
+    pub(super) rules: Vec<CompiledRuleSpec>, // ordered insertion
+    pub(super) seen_names: std::collections::HashSet<String>,
+    pub(super) rule_metadata: HashMap<String, HashMap<String, Value>>,
+    pub(super) hard_keywords: Vec<String>,
+    pub(super) soft_keywords: Vec<String>,
+    pub(super) strict_actions: bool,
+    pub(super) whitespace: Option<String>,
+    pub(super) line_comments: Vec<String>,
     /// Whether indentation-sensitive mode is enabled.
-    indentation: bool,
+    pub(super) indentation: bool,
     /// Extra grammar-level metadata keys.
-    grammar_metadata: HashMap<String, Value>,
+    pub(super) grammar_metadata: HashMap<String, Value>,
     /// Imports: alias → grammar name (stored in __grammar__ imports metadata).
-    imports: HashMap<String, String>,
+    pub(super) imports: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug)]
-struct CompiledRuleSpec {
-    name: String,
-    source: String,
-    params: Vec<String>,
-    expr: PegExpr,
+pub(super) struct CompiledRuleSpec {
+    pub(super) name: String,
+    pub(super) source: String,
+    pub(super) params: Vec<String>,
+    pub(super) expr: PegExpr,
 }
 
 impl Default for CompileState {
@@ -215,7 +215,7 @@ impl Default for CompileState {
             rule_metadata: HashMap::new(),
             hard_keywords: Vec::new(),
             soft_keywords: Vec::new(),
-            strict_actions: true, // Python default
+            strict_actions: true,
             whitespace: None,
             line_comments: Vec::new(),
             indentation: false,
@@ -228,98 +228,118 @@ impl Default for CompileState {
 // ── Top-level option handlers ──────────────────────────────────────────────
 
 fn apply_top_level_option(ctx: &mut CompileState, entry: &Value) -> Result<(), SpecCompileError> {
-    let arr = match entry.as_array() {
-        Some(a) if !a.is_empty() => a,
-        _ => return Ok(()), // skip non-list / empty entries
-    };
+    let arr = expect_arr(entry, "grammar top-level option")?;
+    if arr.is_empty() {
+        return Err(SpecCompileError::InvalidFormat(
+            "grammar top-level option must not be empty".to_string(),
+        ));
+    }
 
-    let tag = match arr[0].as_str() {
-        Some(t) => t,
-        None => return Ok(()),
-    };
+    let tag = expect_str(&arr[0], "grammar top-level option tag")?;
 
     match tag {
-        "hard_keywords" | "hard-keywords" => {
-            ctx.hard_keywords = arr[1..]
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect();
+        "hard_keywords" => {
+            ctx.hard_keywords = string_values(&arr[1..], "hard_keywords")?;
         }
-        "soft_keywords" | "soft-keywords" => {
-            ctx.soft_keywords = arr[1..]
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect();
+        "soft_keywords" => {
+            ctx.soft_keywords = string_values(&arr[1..], "soft_keywords")?;
         }
-        "strict_actions" | "strict-actions" => {
+        "strict_actions" => {
+            if arr.len() > 2 {
+                return Err(SpecCompileError::InvalidFormat(
+                    "strict_actions option expects at most one boolean argument".to_string(),
+                ));
+            }
             ctx.strict_actions = if arr.len() < 2 {
                 true
             } else {
-                parse_bool(&arr[1], "strict_actions")?
+                expect_bool(&arr[1], "strict_actions")?
             };
         }
         "trivia" => {
             for item in arr.iter().skip(1) {
                 let sub = expect_arr(item, "trivia entry")?;
                 if sub.is_empty() {
-                    continue;
+                    return Err(SpecCompileError::InvalidFormat(
+                        "trivia entry must not be empty".to_string(),
+                    ));
                 }
-                match sub[0].as_str() {
-                    Some("whitespace") => {
-                        ctx.whitespace = Some(
-                            sub[1..]
-                                .iter()
-                                .filter_map(|v| v.as_str())
-                                .collect::<String>(),
-                        );
+                match expect_str(&sub[0], "trivia entry tag")? {
+                    "whitespace" => {
+                        ctx.whitespace =
+                            Some(string_values(&sub[1..], "trivia whitespace")?.concat());
                     }
-                    Some("line_comments") => {
-                        ctx.line_comments = sub[1..]
-                            .iter()
-                            .filter_map(|v| v.as_str().map(str::to_string))
-                            .collect();
+                    "line_comments" => {
+                        ctx.line_comments = string_values(&sub[1..], "trivia line_comments")?;
                     }
-                    _ => {} // block_comments etc. — tolerate
+                    other => {
+                        return Err(SpecCompileError::InvalidFormat(format!(
+                            "unsupported trivia entry '{other}'"
+                        )));
+                    }
                 }
             }
         }
         "indentation" => {
+            if arr.len() > 2 {
+                return Err(SpecCompileError::InvalidFormat(
+                    "indentation option expects at most one boolean argument".to_string(),
+                ));
+            }
             ctx.indentation = if arr.len() < 2 {
                 true
             } else {
-                parse_bool(&arr[1], "indentation")?
+                expect_bool(&arr[1], "indentation")?
             };
         }
-        "metadata" | "grammar_metadata" | "grammar-metadata"
-            // ["metadata", key, value] — sets a grammar-level metadata key
-            if arr.len() >= 3 => {
-                if let Some(key) = arr[1].as_str() {
-                    ctx.grammar_metadata.insert(key.to_string(), arr[2].clone());
-                }
+        "grammar_metadata"
+            // ["grammar_metadata", key, value] sets a grammar-level metadata key.
+            if arr.len() == 3 => {
+                let key = expect_str(&arr[1], "grammar metadata key")?;
+                ctx.grammar_metadata.insert(key.to_string(), arr[2].clone());
             }
         "imports"
-            // ["imports", {"alias": "GrammarName", ...}] or ["imports", alias, name]
             if arr.len() >= 2 => {
-                match &arr[1] {
-                    Value::Object(map) => {
-                        for (alias, name) in map {
-                            if let Some(n) = name.as_str() {
-                                ctx.imports.insert(alias.clone(), n.to_string());
-                            }
-                        }
-                    }
-                    Value::String(alias) if arr.len() >= 3 => {
-                        if let Some(name) = arr[2].as_str() {
-                            ctx.imports.insert(alias.clone(), name.to_string());
-                        }
-                    }
-                    _ => {}
+                if arr.len() != 2 {
+                    return Err(SpecCompileError::InvalidFormat(
+                        "imports option expects exactly one object argument".to_string(),
+                    ));
+                }
+                let Some(map) = arr[1].as_object() else {
+                    return Err(SpecCompileError::TypeError {
+                        expected: "object",
+                        actual: type_name(&arr[1]).to_string(),
+                        ctx: "imports payload".to_string(),
+                    });
+                };
+                for (alias, name) in map {
+                    let alias = require_non_empty_str(alias, "imports alias")?;
+                    let n = expect_non_empty_str(name, "imports map value")?;
+                    ctx.imports.insert(alias.to_string(), n.to_string());
                 }
             }
-        // Tolerate known but not yet implemented options
-        "semantic_hooks" | "semantic-hooks" | "recovery" | "recover_sync" | "recover-sync"
-        | "rule_memo" | "rule-memo" => {}
-        _ => {} // silently skip unknown top-level entries
+        "grammar_metadata" => {
+            return if arr.len() < 3 {
+                Err(SpecCompileError::MissingField(
+                    "grammar metadata key/value".to_string(),
+                ))
+            } else {
+                Err(SpecCompileError::InvalidFormat(
+                    "metadata option expects exactly key and value".to_string(),
+                ))
+            };
+        }
+        "imports" => {
+            return Err(SpecCompileError::MissingField("imports payload".to_string()));
+        }
+        "semantic_hooks" | "recovery" | "recover_sync" | "rule_memo" => {
+            return Err(SpecCompileError::InvalidFormat(format!(
+                "unsupported grammar top-level option '{tag}'"
+            )));
+        }
+        other => {
+            return Err(SpecCompileError::UnknownTag(other.to_string()));
+        }
     }
     Ok(())
 }
@@ -388,7 +408,7 @@ fn parse_rule_name(header: &Value) -> Result<String, SpecCompileError> {
     }
     Err(SpecCompileError::TypeError {
         expected: "string or rule header",
-        actual: type_name(header).to_string(),
+        actual: super::spec_compiler_helpers::type_name(header).to_string(),
         ctx: "rule name".to_string(),
     })
 }
@@ -398,25 +418,24 @@ fn apply_rule_meta(
     rule_name: &str,
     meta: &Value,
 ) -> Result<(), SpecCompileError> {
-    // String shorthand: "memo", "no_memo"
-    if let Some(s) = meta.as_str() {
-        let lower = s.trim().to_lowercase();
-        if lower == "memo" || lower == ":memo" {
-            ctx.rule_metadata
-                .entry(rule_name.to_string())
-                .or_default()
-                .insert("memo".to_string(), Value::Bool(true));
-        }
-        return Ok(());
-    }
-
     let arr = match meta.as_array() {
         Some(a) if !a.is_empty() => a,
-        _ => return Ok(()),
+        Some(_) => {
+            return Err(SpecCompileError::InvalidFormat(
+                "rule metadata entry must not be empty".to_string(),
+            ));
+        }
+        _ => {
+            return Err(SpecCompileError::TypeError {
+                expected: "metadata list",
+                actual: super::spec_compiler_helpers::type_name(meta).to_string(),
+                ctx: "rule metadata".to_string(),
+            });
+        }
     };
 
     match arr[0].as_str() {
-        Some("metadata") if arr.len() >= 3 => {
+        Some("metadata") if arr.len() == 3 => {
             let key = expect_str(&arr[1], "metadata key")?;
             ctx.rule_metadata
                 .entry(rule_name.to_string())
@@ -434,880 +453,41 @@ fn apply_rule_meta(
                 );
         }
         Some("memo") => {
+            if arr.len() > 2 {
+                return Err(SpecCompileError::InvalidFormat(
+                    "rule memo metadata expects at most one value".to_string(),
+                ));
+            }
             let enabled = if arr.len() < 2 {
                 true
             } else {
-                parse_bool(&arr[1], "memo")?
+                expect_bool(&arr[1], "memo")?
             };
             ctx.rule_metadata
                 .entry(rule_name.to_string())
                 .or_default()
                 .insert("memo".to_string(), Value::Bool(enabled));
         }
-        _ => {}
-    }
-    Ok(())
-}
-
-// ── Expression → source text ───────────────────────────────────────────────
-
-/// Convert a spec expression to its PEG grammar source text.
-///
-/// Accepts both **list form** (`["lit", "hello"]`) and **mapping form**
-/// (`{"type": "literal", "text": "hello"}`).  Mirrors the union of
-/// `peg/compile/list_forms.py` and `peg/compile/mapping.py`.
-pub fn expr_to_source(expr: &Value) -> Result<String, SpecCompileError> {
-    // Mapping-style spec: { "type": "...", ... }
-    if let Some(obj) = expr.as_object() {
-        return mapping_expr_to_source(obj);
-    }
-    let arr = expect_arr(expr, "expr")?;
-    if arr.is_empty() {
-        return Err(SpecCompileError::MissingField("expr tag".to_string()));
-    }
-
-    let tag = expect_str(&arr[0], "expr tag")?;
-
-    match tag {
-        // ── Terminals ──────────────────────────────────────────────────
-        "lit" | "literal" => {
-            let text = expect_str_at(arr, 1, "lit text")?;
-            let escaped = text.replace('\\', "\\\\").replace('\'', "\\'");
-            Ok(format!("'{escaped}'"))
+        Some("metadata") => {
+            return Err(SpecCompileError::InvalidFormat(
+                "rule metadata entry expects exactly key and value".to_string(),
+            ));
         }
-        "regex" => {
-            let pattern = expect_str_at(arr, 1, "regex pattern")?;
-            Ok(format!("/{pattern}/"))
+        Some("type") => {
+            return Err(SpecCompileError::InvalidFormat(
+                "rule type metadata expects exactly one value".to_string(),
+            ));
         }
-        "token" => {
-            let pattern = expect_str_at(arr, 1, "token pattern")?;
-            Ok(format!("token({pattern})"))
-        }
-        "tok" | "token_ref" => {
-            let kind = expect_str_at(arr, 1, "tok kind")?;
-            if arr.len() > 2 {
-                let text = expect_str_at(arr, 2, "tok text")?;
-                let escaped = text.replace('\'', "\\'");
-                Ok(format!("tok({kind},'{escaped}')"))
-            } else {
-                Ok(format!("tok({kind})"))
-            }
-        }
-        "soft_kw" | "soft_keyword" => {
-            let text = expect_str_at(arr, 1, "soft_kw text")?;
-            let escaped = text.replace('\'', "\\'");
-            Ok(format!("'{escaped}'"))
-        }
-        "param" => {
-            let name = expect_str_at(arr, 1, "param name")?;
-            Ok(format!("${name}"))
-        }
-        "newline" => Ok("newline".to_string()),
-        "indent" => Ok("indent".to_string()),
-        "dedent" => Ok("dedent".to_string()),
-
-        // ── Composite ──────────────────────────────────────────────────
-        "seq" => {
-            let items = expect_arr_at(arr, 1, "seq items")?;
-            let parts: Vec<_> = items.iter().map(expr_to_source).collect::<Result<_, _>>()?;
-            Ok(match parts.len() {
-                0 => String::new(),
-                1 => parts.into_iter().next().unwrap(),
-                _ => format!("({})", parts.join(" ")),
-            })
-        }
-        "choice" => {
-            let items = expect_arr_at(arr, 1, "choice items")?;
-            let parts: Vec<_> = items.iter().map(expr_to_source).collect::<Result<_, _>>()?;
-            Ok(match parts.len() {
-                0 => String::new(),
-                1 => parts.into_iter().next().unwrap(),
-                _ => format!("({})", parts.join(" / ")),
-            })
-        }
-
-        // ── Quantifiers ────────────────────────────────────────────────
-        "star" | "*" | "many" => {
-            let inner = expr_to_source(expect_val_at(arr, 1, "star expr")?)?;
-            Ok(format!("{inner}*"))
-        }
-        "plus" | "+" | "one_or_more" => {
-            let inner = expr_to_source(expect_val_at(arr, 1, "plus expr")?)?;
-            Ok(format!("{inner}+"))
-        }
-        "opt" | "?" | "optional" => {
-            let inner = expr_to_source(expect_val_at(arr, 1, "opt expr")?)?;
-            Ok(format!("{inner}?"))
-        }
-
-        // ── References ─────────────────────────────────────────────────
-        "ref" => {
-            let name = expect_str_at(arr, 1, "ref name")?;
-            Ok(name.to_string())
-        }
-        "imported_ref" | "import" => {
-            let grammar = expect_str_at(arr, 1, "imported_ref grammar")?;
-            let rule = expect_str_at(arr, 2, "imported_ref rule")?;
-            Ok(format!("{grammar}::{rule}"))
-        }
-        "grammar_scope" | "scope" => {
-            let grammar = expect_str_at(arr, 1, "grammar_scope grammar")?;
-            let inner = expr_to_source(expect_val_at(arr, 2, "grammar_scope expr")?)?;
-            Ok(format!("scope('{grammar}', {inner})"))
-        }
-
-        // ── Predicates ─────────────────────────────────────────────────
-        "and" => {
-            let inner = expr_to_source(expect_val_at(arr, 1, "and expr")?)?;
-            Ok(format!("&{inner}"))
-        }
-        "not" => {
-            let inner = expr_to_source(expect_val_at(arr, 1, "not expr")?)?;
-            Ok(format!("!{inner}"))
-        }
-
-        // ── Named capture / binding ────────────────────────────────────
-        "named" | "=" | "bind" => {
-            let name = expect_str_at(arr, 1, "named label")?;
-            let inner = expr_to_source(expect_val_at(arr, 2, "named expr")?)?;
-            Ok(format!("{name}:{inner}"))
-        }
-
-        // ── Cut ────────────────────────────────────────────────────────
-        "cut" | "~" => Ok("~".to_string()),
-
-        // ── Eager ──────────────────────────────────────────────────────
-        "eager" | "&&" => {
-            let inner = expr_to_source(expect_val_at(arr, 1, "eager expr")?)?;
-            Ok(format!("&&{inner}"))
-        }
-
-        // ── Tight / no_trivia ──────────────────────────────────────────
-        "tight" | "no_trivia" => {
-            let inner = expr_to_source(expect_val_at(arr, 1, "tight expr")?)?;
-            Ok(format!("no_trivia({inner})"))
-        }
-
-        // ── Separator ──────────────────────────────────────────────────
-        "sep_plus" | "gather" => {
-            let sep = expr_to_source(expect_val_at(arr, 1, "sep_plus sep")?)?;
-            let elem = expr_to_source(expect_val_at(arr, 2, "sep_plus element")?)?;
-            Ok(format!("({elem} ({sep} {elem})*)"))
-        }
-
-        // ── Island / raw_block ─────────────────────────────────────────
-        "island" => {
-            let start = expect_str_at(arr, 1, "island start")?;
-            let end = expect_str_at(arr, 2, "island end")?;
-            Ok(format!("island('{start}', '{end}')"))
-        }
-        "raw_block" => {
-            let start = expect_str_at(arr, 1, "raw_block start")?;
-            let end = expect_str_at(arr, 2, "raw_block end")?;
-            Ok(format!("raw_block('{start}', '{end}')"))
-        }
-
-        // ── Behavior ───────────────────────────────────────────────────
-        "behavior" => {
-            // ["behavior", [entries...], inner_expr]
-            let inner = expr_to_source(expect_val_at(arr, 2, "behavior expr")?)?;
-            // Behaviors are informational — emit the inner expression unchanged
-            Ok(inner)
-        }
-
-        // ── Precedence hint (ignored, just compile inner) ──────────────
-        "prec" => {
-            // ["prec", ..., expr] — last element is the actual expression
-            let last = arr
-                .last()
-                .ok_or_else(|| SpecCompileError::MissingField("prec inner expr".to_string()))?;
-            expr_to_source(last)
-        }
-
-        other => Err(SpecCompileError::UnknownTag(other.to_string())),
-    }
-}
-
-fn expr_to_peg_expr(expr: &Value) -> Result<PegExpr, SpecCompileError> {
-    if let Some(obj) = expr.as_object() {
-        return mapping_expr_to_peg_expr(obj);
-    }
-
-    if let Some(arr) = expr.as_array() {
-        return list_expr_to_peg_expr(arr);
-    }
-
-    let source = expr_to_source(expr)?;
-    RuleTextParser::parse(&source)
-        .map_err(|err| SpecCompileError::InvalidFormat(err.message.into()))
-}
-
-fn list_expr_to_peg_expr(arr: &[Value]) -> Result<PegExpr, SpecCompileError> {
-    let tag = expect_str_at(arr, 0, "expr tag")?;
-    match tag {
-        "lit" | "literal" => Ok(PegExpr::Literal(
-            expect_str_at(arr, 1, "lit text")?.to_string(),
-        )),
-        "regex" => {
-            let pattern = expect_str_at(arr, 1, "regex pattern")?;
-            Ok(PegExpr::Regex(
-                CompiledRegex::new(pattern, 0, pattern.len())
-                    .map_err(|err| SpecCompileError::InvalidFormat(err.message.into()))?,
-            ))
-        }
-        "tok" | "token_ref" => {
-            let kind = Some(expect_str_at(arr, 1, "tok kind")?.to_string());
-            let text = if arr.len() > 2 {
-                Some(expect_str_at(arr, 2, "tok text")?.to_string())
-            } else {
-                None
-            };
-            Ok(PegExpr::TokenRef { kind, text })
-        }
-        "soft_kw" | "soft_keyword" => Ok(PegExpr::SoftKeyword(
-            expect_str_at(arr, 1, "soft keyword text")?.to_string(),
-        )),
-        "param" => Ok(PegExpr::Parameter {
-            name: expect_str_at(arr, 1, "param name")?.to_string(),
-        }),
-        "newline" => Ok(PegExpr::Newline),
-        "indent" => Ok(PegExpr::Indent),
-        "dedent" => Ok(PegExpr::Dedent),
-        "seq" => Ok(PegExpr::Sequence(
-            expect_arr_at(arr, 1, "seq items")?
-                .iter()
-                .map(expr_to_peg_expr)
-                .collect::<Result<Vec<_>, _>>()?,
-        )),
-        "choice" => Ok(PegExpr::Choice(
-            expect_arr_at(arr, 1, "choice items")?
-                .iter()
-                .map(expr_to_peg_expr)
-                .collect::<Result<Vec<_>, _>>()?,
-        )),
-        "star" | "*" | "many" => Ok(PegExpr::ZeroOrMore(Box::new(expr_to_peg_expr(
-            expect_val_at(arr, 1, "star expr")?,
-        )?))),
-        "plus" | "+" | "one_or_more" => Ok(PegExpr::OneOrMore(Box::new(expr_to_peg_expr(
-            expect_val_at(arr, 1, "plus expr")?,
-        )?))),
-        "opt" | "?" | "optional" => Ok(PegExpr::Optional(Box::new(expr_to_peg_expr(
-            expect_val_at(arr, 1, "opt expr")?,
-        )?))),
-        "ref" => Ok(PegExpr::Ref(expect_str_at(arr, 1, "ref name")?.to_string())),
-        "imported_ref" | "import" => Ok(PegExpr::ImportedRef {
-            grammar_name: expect_str_at(arr, 1, "imported_ref grammar")?.to_string(),
-            rule_name: expect_str_at(arr, 2, "imported_ref rule")?.to_string(),
-        }),
-        "grammar_scope" | "scope" => Ok(PegExpr::GrammarScope {
-            grammar_name: expect_str_at(arr, 1, "grammar_scope grammar")?.to_string(),
-            expr: Box::new(expr_to_peg_expr(expect_val_at(
-                arr,
-                2,
-                "grammar_scope expr",
-            )?)?),
-        }),
-        "and" => Ok(PegExpr::And(Box::new(expr_to_peg_expr(expect_val_at(
-            arr, 1, "and expr",
-        )?)?))),
-        "not" => Ok(PegExpr::Not(Box::new(expr_to_peg_expr(expect_val_at(
-            arr, 1, "not expr",
-        )?)?))),
-        "named" | "=" | "bind" => Ok(PegExpr::Named {
-            name: expect_str_at(arr, 1, "named label")?.to_string(),
-            expr: Box::new(expr_to_peg_expr(expect_val_at(arr, 2, "named expr")?)?),
-        }),
-        "cut" | "~" => Ok(PegExpr::Cut),
-        "eager" | "&&" => Ok(PegExpr::Eager(Box::new(expr_to_peg_expr(expect_val_at(
-            arr,
-            1,
-            "eager expr",
-        )?)?))),
-        "tight" | "no_trivia" => Ok(PegExpr::NoTrivia(Box::new(expr_to_peg_expr(
-            expect_val_at(arr, 1, "tight expr")?,
-        )?))),
-        "sep_plus" | "gather" => Ok(PegExpr::SepOneOrMore {
-            separator: Box::new(expr_to_peg_expr(expect_val_at(arr, 1, "sep_plus sep")?)?),
-            element: Box::new(expr_to_peg_expr(expect_val_at(
-                arr,
-                2,
-                "sep_plus element",
-            )?)?),
-        }),
-        "island" => Ok(PegExpr::Island {
-            start: expect_str_at(arr, 1, "island start")?.to_string(),
-            end: expect_str_at(arr, 2, "island end")?.to_string(),
-            include_delims: false,
-        }),
-        "raw_block" => Ok(PegExpr::RawBlock {
-            start: expect_str_at(arr, 1, "raw_block start")?.to_string(),
-            end: expect_str_at(arr, 2, "raw_block end")?.to_string(),
-            delim_kind: "generic".to_string(),
-        }),
-        "behavior" => {
-            let entries = expect_arr_at(arr, 1, "behavior entries")?
-                .iter()
-                .map(behavior_entry_from_value)
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(PegExpr::Behavior {
-                entries,
-                expr: Box::new(expr_to_peg_expr(expect_val_at(arr, 2, "behavior expr")?)?),
-            })
-        }
-        "prec" => {
-            let last = arr
-                .last()
-                .ok_or_else(|| SpecCompileError::MissingField("prec inner expr".to_string()))?;
-            expr_to_peg_expr(last)
-        }
-        _ => {
-            let source = expr_to_source(&Value::Array(arr.to_vec()))?;
-            RuleTextParser::parse(&source)
-                .map_err(|err| SpecCompileError::InvalidFormat(err.message.into()))
-        }
-    }
-}
-
-fn behavior_entry_from_value(value: &Value) -> Result<BehaviorEntry, SpecCompileError> {
-    if let Some(arr) = value.as_array() {
-        let tag = expect_str_at(arr, 0, "behavior entry tag")?;
-        return match tag {
-            "diagnostic" => Ok(BehaviorEntry::Diagnostic(DiagnosticBehavior::new(
-                expect_str_at(arr, 1, "behavior diagnostic label")?,
-            ))),
-            "transform" => Ok(BehaviorEntry::Transform(
-                TransformBehavior::new(expect_str_at(arr, 1, "behavior transform name")?)
-                    .with_args(grammar_scalars_from_slice(&arr[2..])?),
-            )),
-            "predicate" => Ok(BehaviorEntry::Predicate(
-                PredicateBehavior::new(expect_str_at(arr, 1, "behavior predicate name")?)
-                    .with_args(grammar_scalars_from_slice(&arr[2..])?),
-            )),
-            "trace" => {
-                let kind = expect_str_at(arr, 1, "behavior trace kind")?;
-                let label = expect_str_at(arr, 2, "behavior trace label")?;
-                match kind {
-                    "capture" => Ok(BehaviorEntry::Trace(TraceBehavior::capture(label))),
-                    "action" => Ok(BehaviorEntry::Trace(TraceBehavior::action(label))),
-                    _ => Err(SpecCompileError::InvalidFormat(format!(
-                        "unknown trace behavior kind: {kind}"
-                    ))),
-                }
-            }
-            other => Err(SpecCompileError::UnknownTag(other.to_string())),
-        };
-    }
-
-    let obj = value
-        .as_object()
-        .ok_or_else(|| SpecCompileError::TypeError {
-            expected: "array or object",
-            actual: type_name(value).to_string(),
-            ctx: "behavior entry".to_string(),
-        })?;
-    let kind = obj
-        .get("kind")
-        .or_else(|| obj.get("type"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| SpecCompileError::MissingField("behavior kind".to_string()))?;
-    match kind {
-        "diagnostic" => Ok(BehaviorEntry::Diagnostic(DiagnosticBehavior::new(
-            obj.get("label").and_then(|v| v.as_str()).ok_or_else(|| {
-                SpecCompileError::MissingField("behavior diagnostic label".to_string())
-            })?,
-        ))),
-        "transform" => Ok(BehaviorEntry::Transform(
-            TransformBehavior::new(obj.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
-                SpecCompileError::MissingField("behavior transform name".to_string())
-            })?)
-            .with_args(grammar_scalars_from_value(obj.get("args"))?),
-        )),
-        "predicate" => Ok(BehaviorEntry::Predicate(
-            PredicateBehavior::new(obj.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
-                SpecCompileError::MissingField("behavior predicate name".to_string())
-            })?)
-            .with_args(grammar_scalars_from_value(obj.get("args"))?),
-        )),
-        "trace" => {
-            let trace_kind = obj
-                .get("trace_kind")
-                .or_else(|| obj.get("traceKind"))
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| SpecCompileError::MissingField("behavior trace kind".to_string()))?;
-            let label = obj.get("label").and_then(|v| v.as_str()).ok_or_else(|| {
-                SpecCompileError::MissingField("behavior trace label".to_string())
-            })?;
-            match trace_kind {
-                "capture" => Ok(BehaviorEntry::Trace(TraceBehavior::capture(label))),
-                "action" => Ok(BehaviorEntry::Trace(TraceBehavior::action(label))),
-                _ => Err(SpecCompileError::InvalidFormat(format!(
-                    "unknown trace behavior kind: {trace_kind}"
-                ))),
-            }
-        }
-        other => Err(SpecCompileError::UnknownTag(other.to_string())),
-    }
-}
-
-fn grammar_scalars_from_value(
-    value: Option<&Value>,
-) -> Result<Vec<GrammarScalar>, SpecCompileError> {
-    match value {
-        None => Ok(Vec::new()),
-        Some(Value::Array(items)) => grammar_scalars_from_slice(items),
-        Some(other) => Err(SpecCompileError::TypeError {
-            expected: "array",
-            actual: type_name(other).to_string(),
-            ctx: "behavior args".to_string(),
-        }),
-    }
-}
-
-fn grammar_scalars_from_slice(items: &[Value]) -> Result<Vec<GrammarScalar>, SpecCompileError> {
-    items.iter().map(grammar_scalar_from_value).collect()
-}
-
-fn grammar_scalar_from_value(value: &Value) -> Result<GrammarScalar, SpecCompileError> {
-    Ok(match value {
-        Value::Null => GrammarScalar::Null,
-        Value::Bool(v) => GrammarScalar::Bool(*v),
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                GrammarScalar::Int(i)
-            } else if let Some(f) = n.as_f64() {
-                GrammarScalar::Float(f)
-            } else {
-                return Err(SpecCompileError::TypeError {
-                    expected: "finite number",
-                    actual: "number".to_string(),
-                    ctx: "behavior arg".to_string(),
-                });
-            }
-        }
-        Value::String(s) => GrammarScalar::Str(s.clone()),
-        other => {
+        Some(other) => return Err(SpecCompileError::UnknownTag(other.to_string())),
+        None => {
             return Err(SpecCompileError::TypeError {
-                expected: "scalar",
-                actual: type_name(other).to_string(),
-                ctx: "behavior arg".to_string(),
+                expected: "metadata tag string",
+                actual: super::spec_compiler_helpers::type_name(&arr[0]).to_string(),
+                ctx: "rule metadata tag".to_string(),
             });
         }
-    })
-}
-
-fn mapping_expr_to_peg_expr(
-    obj: &serde_json::Map<String, Value>,
-) -> Result<PegExpr, SpecCompileError> {
-    let kind = obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| SpecCompileError::MissingField("type".to_string()))?;
-    let child = |key: &str| -> Result<PegExpr, SpecCompileError> {
-        expr_to_peg_expr(
-            obj.get(key)
-                .ok_or_else(|| SpecCompileError::MissingField(key.to_string()))?,
-        )
-    };
-    let children = |key: &str| -> Result<Vec<PegExpr>, SpecCompileError> {
-        let arr = obj
-            .get(key)
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| SpecCompileError::MissingField(key.to_string()))?;
-        arr.iter().map(expr_to_peg_expr).collect()
-    };
-
-    match kind {
-        "literal" | "lit" => Ok(PegExpr::Literal(
-            obj.get("text")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| SpecCompileError::MissingField("text".to_string()))?
-                .to_string(),
-        )),
-        "regex" => {
-            let pattern = obj
-                .get("pattern")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| SpecCompileError::MissingField("pattern".to_string()))?;
-            Ok(PegExpr::Regex(
-                CompiledRegex::new(pattern, 0, pattern.len())
-                    .map_err(|err| SpecCompileError::InvalidFormat(err.message.into()))?,
-            ))
-        }
-        "token_ref" | "tok" => {
-            let kind = obj.get("kind").and_then(|v| v.as_str()).map(str::to_string);
-            let text = obj.get("text").and_then(|v| v.as_str()).map(str::to_string);
-            Ok(PegExpr::TokenRef { kind, text })
-        }
-        "soft_keyword" | "soft_kw" => Ok(PegExpr::SoftKeyword(
-            obj.get("text")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| SpecCompileError::MissingField("text".to_string()))?
-                .to_string(),
-        )),
-        "param" => Ok(PegExpr::Parameter {
-            name: obj
-                .get("name")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| SpecCompileError::MissingField("name".to_string()))?
-                .to_string(),
-        }),
-        "newline" => Ok(PegExpr::Newline),
-        "indent" => Ok(PegExpr::Indent),
-        "dedent" => Ok(PegExpr::Dedent),
-        "cut" | "~" => Ok(PegExpr::Cut),
-        "seq" | "sequence" => children("parts")
-            .or_else(|_| children("items"))
-            .or_else(|_| children("exprs"))
-            .map(PegExpr::Sequence),
-        "choice" => children("options")
-            .or_else(|_| children("alts"))
-            .or_else(|_| children("items"))
-            .map(PegExpr::Choice),
-        "star" | "many" | "zero_or_more" => Ok(PegExpr::ZeroOrMore(Box::new(
-            child("expr").or_else(|_| child("body"))?,
-        ))),
-        "plus" | "one_or_more" => Ok(PegExpr::OneOrMore(Box::new(
-            child("expr").or_else(|_| child("body"))?,
-        ))),
-        "opt" | "optional" => Ok(PegExpr::Optional(Box::new(
-            child("expr").or_else(|_| child("body"))?,
-        ))),
-        "and" => Ok(PegExpr::And(Box::new(child("expr")?))),
-        "not" => Ok(PegExpr::Not(Box::new(child("expr")?))),
-        "eager" | "and_eager" => Ok(PegExpr::Eager(Box::new(child("expr")?))),
-        "named" | "bind" => Ok(PegExpr::Named {
-            name: obj
-                .get("name")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| SpecCompileError::MissingField("name".to_string()))?
-                .to_string(),
-            expr: Box::new(child("expr")?),
-        }),
-        "ref" => Ok(PegExpr::Ref(
-            obj.get("name")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| SpecCompileError::MissingField("name".to_string()))?
-                .to_string(),
-        )),
-        "imported_ref" | "import" => Ok(PegExpr::ImportedRef {
-            grammar_name: obj
-                .get("grammar_name")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| SpecCompileError::MissingField("grammar_name".to_string()))?
-                .to_string(),
-            rule_name: obj
-                .get("rule_name")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| SpecCompileError::MissingField("rule_name".to_string()))?
-                .to_string(),
-        }),
-        "grammar_scope" | "scope" => Ok(PegExpr::GrammarScope {
-            grammar_name: obj
-                .get("grammar_name")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| SpecCompileError::MissingField("grammar_name".to_string()))?
-                .to_string(),
-            expr: Box::new(child("expr")?),
-        }),
-        "no_trivia" | "tight" => Ok(PegExpr::NoTrivia(Box::new(child("expr")?))),
-        "sep_plus" | "sep_one_or_more" | "gather" => Ok(PegExpr::SepOneOrMore {
-            separator: Box::new(child("sep").or_else(|_| child("separator"))?),
-            element: Box::new(child("expr").or_else(|_| child("body"))?),
-        }),
-        "island" => Ok(PegExpr::Island {
-            start: obj
-                .get("start")
-                .and_then(|v| v.as_str())
-                .unwrap_or("{")
-                .to_string(),
-            end: obj
-                .get("end")
-                .and_then(|v| v.as_str())
-                .unwrap_or("}")
-                .to_string(),
-            include_delims: obj
-                .get("include_delims")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-        }),
-        "raw_block" => Ok(PegExpr::RawBlock {
-            start: obj
-                .get("start")
-                .and_then(|v| v.as_str())
-                .unwrap_or("{")
-                .to_string(),
-            end: obj
-                .get("end")
-                .and_then(|v| v.as_str())
-                .unwrap_or("}")
-                .to_string(),
-            delim_kind: obj
-                .get("delim_kind")
-                .and_then(|v| v.as_str())
-                .unwrap_or("generic")
-                .to_string(),
-        }),
-        "behavior" => {
-            let inner = obj
-                .get("expr")
-                .or_else(|| obj.get("body"))
-                .ok_or_else(|| SpecCompileError::MissingField("behavior expr".to_string()))?;
-            let entries = obj
-                .get("behaviors")
-                .or_else(|| obj.get("entries"))
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| SpecCompileError::MissingField("behavior entries".to_string()))?
-                .iter()
-                .map(behavior_entry_from_value)
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(PegExpr::Behavior {
-                entries,
-                expr: Box::new(expr_to_peg_expr(inner)?),
-            })
-        }
-        _ => {
-            let source = mapping_expr_to_source(obj)?;
-            RuleTextParser::parse(&source)
-                .map_err(|err| SpecCompileError::InvalidFormat(err.message.into()))
-        }
     }
-}
-
-// ── Mapping-style expression compiler ────────────────────────────────────
-
-/// Handle `{"type": "...", ...}` mapping-style spec expressions.
-///
-/// Mirrors `peg/compile/mapping.py::build_mapping_node()`.
-fn mapping_expr_to_source(
-    obj: &serde_json::Map<String, Value>,
-) -> Result<String, SpecCompileError> {
-    let kind = obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| SpecCompileError::MissingField("type".to_string()))?;
-
-    // Helper to get required child expr and compile it.
-    let child_src = |key: &str| -> Result<String, SpecCompileError> {
-        let v = obj
-            .get(key)
-            .ok_or_else(|| SpecCompileError::MissingField(key.to_string()))?;
-        expr_to_source(v)
-    };
-    let parts_src = |key: &str| -> Result<Vec<String>, SpecCompileError> {
-        let arr = obj
-            .get(key)
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| SpecCompileError::MissingField(key.to_string()))?;
-        arr.iter().map(expr_to_source).collect()
-    };
-
-    match kind {
-        "literal" | "lit" => {
-            let text = obj
-                .get("text")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| SpecCompileError::MissingField("text".to_string()))?;
-            let escaped = text.replace('\\', "\\\\").replace('\'', "\\'");
-            Ok(format!("'{escaped}'"))
-        }
-        "regex" => {
-            let pattern = obj
-                .get("pattern")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| SpecCompileError::MissingField("pattern".to_string()))?;
-            Ok(format!("/{pattern}/"))
-        }
-        "token" => {
-            let pattern = obj
-                .get("pattern")
-                .or_else(|| obj.get("text"))
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| SpecCompileError::MissingField("pattern".to_string()))?;
-            Ok(format!("token({pattern})"))
-        }
-        "token_ref" | "tok" => {
-            let kind_val = obj.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-            let text_val = obj.get("text").and_then(|v| v.as_str());
-            if let Some(t) = text_val {
-                let escaped = t.replace('\'', "\\'");
-                Ok(format!("tok({kind_val},'{escaped}')"))
-            } else {
-                Ok(format!("tok({kind_val})"))
-            }
-        }
-        "soft_keyword" | "soft_kw" => {
-            let text = obj
-                .get("text")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| SpecCompileError::MissingField("text".to_string()))?;
-            let escaped = text.replace('\'', "\\'");
-            Ok(format!("'{escaped}'"))
-        }
-        "param" => {
-            let name = obj
-                .get("name")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| SpecCompileError::MissingField("name".to_string()))?;
-            Ok(format!("${name}"))
-        }
-        "newline" => Ok("newline".to_string()),
-        "indent" => Ok("indent".to_string()),
-        "dedent" => Ok("dedent".to_string()),
-        "cut" | "~" => Ok("~".to_string()),
-        "seq" | "sequence" => {
-            let children = parts_src("parts")
-                .or_else(|_| parts_src("items"))
-                .or_else(|_| parts_src("exprs"))?;
-            Ok(children.join(" "))
-        }
-        "choice" => {
-            let children = parts_src("options")
-                .or_else(|_| parts_src("alts"))
-                .or_else(|_| parts_src("items"))?;
-            Ok(children.join(" / "))
-        }
-        "star" | "many" | "zero_or_more" => Ok(format!(
-            "({})*",
-            child_src("expr").or_else(|_| child_src("body"))?
-        )),
-        "plus" | "one_or_more" => Ok(format!(
-            "({})+",
-            child_src("expr").or_else(|_| child_src("body"))?
-        )),
-        "opt" | "optional" => Ok(format!(
-            "({})?",
-            child_src("expr").or_else(|_| child_src("body"))?
-        )),
-        "and" => Ok(format!("&({})", child_src("expr")?)),
-        "not" => Ok(format!("!({})", child_src("expr")?)),
-        "eager" | "and_eager" => Ok(format!("!!({})", child_src("expr")?)),
-        "named" | "bind" => {
-            let name = obj
-                .get("name")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| SpecCompileError::MissingField("name".to_string()))?;
-            Ok(format!("{name}:({})", child_src("expr")?))
-        }
-        "ref" => {
-            let name = obj
-                .get("name")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| SpecCompileError::MissingField("name".to_string()))?;
-            Ok(name.to_string())
-        }
-        "imported_ref" | "import" => {
-            let grammar = obj
-                .get("grammar_name")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| SpecCompileError::MissingField("grammar_name".to_string()))?;
-            let rule = obj
-                .get("rule_name")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| SpecCompileError::MissingField("rule_name".to_string()))?;
-            Ok(format!("{grammar}::{rule}"))
-        }
-        "grammar_scope" | "scope" => {
-            let grammar = obj
-                .get("grammar_name")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| SpecCompileError::MissingField("grammar_name".to_string()))?;
-            Ok(format!("scope('{grammar}', {})", child_src("expr")?))
-        }
-        "no_trivia" | "tight" => Ok(format!("tight({})", child_src("expr")?)),
-        "island" => {
-            let start = obj.get("start").and_then(|v| v.as_str()).unwrap_or("{");
-            let end = obj.get("end").and_then(|v| v.as_str()).unwrap_or("}");
-            Ok(format!("island('{start}', '{end}')"))
-        }
-        "sep_plus" | "sep_one_or_more" | "gather" => {
-            let sep = child_src("sep").or_else(|_| child_src("separator"))?;
-            let body = child_src("expr").or_else(|_| child_src("body"))?;
-            Ok(format!("({body}) ++ ({sep})"))
-        }
-        "raw_block" => {
-            let start = obj.get("start").and_then(|v| v.as_str()).unwrap_or("{");
-            let end = obj.get("end").and_then(|v| v.as_str()).unwrap_or("}");
-            Ok(format!("raw_block('{start}', '{end}')"))
-        }
-        other => Err(SpecCompileError::UnknownTag(other.to_string())),
-    }
-}
-
-// ── Small helpers ──────────────────────────────────────────────────────────
-
-fn expect_arr<'v>(v: &'v Value, ctx: &str) -> Result<&'v Vec<Value>, SpecCompileError> {
-    v.as_array().ok_or_else(|| SpecCompileError::TypeError {
-        expected: "array",
-        actual: type_name(v).to_string(),
-        ctx: ctx.to_string(),
-    })
-}
-
-fn expect_str<'v>(v: &'v Value, ctx: &str) -> Result<&'v str, SpecCompileError> {
-    v.as_str().ok_or_else(|| SpecCompileError::TypeError {
-        expected: "string",
-        actual: type_name(v).to_string(),
-        ctx: ctx.to_string(),
-    })
-}
-
-fn expect_str_at<'v>(arr: &'v [Value], idx: usize, ctx: &str) -> Result<&'v str, SpecCompileError> {
-    let v = arr
-        .get(idx)
-        .ok_or_else(|| SpecCompileError::MissingField(ctx.to_string()))?;
-    expect_str(v, ctx)
-}
-
-fn expect_arr_at<'v>(
-    arr: &'v [Value],
-    idx: usize,
-    ctx: &str,
-) -> Result<&'v Vec<Value>, SpecCompileError> {
-    let v = arr
-        .get(idx)
-        .ok_or_else(|| SpecCompileError::MissingField(ctx.to_string()))?;
-    expect_arr(v, ctx)
-}
-
-fn expect_val_at<'v>(
-    arr: &'v [Value],
-    idx: usize,
-    ctx: &str,
-) -> Result<&'v Value, SpecCompileError> {
-    arr.get(idx)
-        .ok_or_else(|| SpecCompileError::MissingField(ctx.to_string()))
-}
-
-fn parse_bool(v: &Value, ctx: &str) -> Result<bool, SpecCompileError> {
-    if let Some(b) = v.as_bool() {
-        return Ok(b);
-    }
-    if let Some(n) = v.as_i64() {
-        return Ok(n != 0);
-    }
-    if let Some(s) = v.as_str() {
-        match s.trim().to_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => return Ok(true),
-            "false" | "0" | "no" | "off" => return Ok(false),
-            _ => {}
-        }
-    }
-    Err(SpecCompileError::TypeError {
-        expected: "bool",
-        actual: type_name(v).to_string(),
-        ctx: ctx.to_string(),
-    })
-}
-
-fn type_name(v: &Value) -> &'static str {
-    match v {
-        Value::Null => "null",
-        Value::Bool(_) => "bool",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
+    Ok(())
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -1315,6 +495,8 @@ fn type_name(v: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expr::PegExpr;
+    use crate::spec_compiler_exprs::expr_to_source;
     use serde_json::json;
 
     fn compile(spec: Value) -> Grammar {
@@ -1435,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn compile_python_authoring_aliases() {
+    fn compile_authoring_operator_aliases() {
         let g = compile(json!([
             "grammar",
             "aliases",
@@ -1480,25 +662,6 @@ mod tests {
         ]));
         assert_eq!(g.rule_count(), 2);
         assert_eq!(g.get_rule("root").unwrap().source, "('x' rest)");
-    }
-
-    #[test]
-    fn compile_behavior_preserves_trace_for_ast_capture() {
-        let g = compile(json!([
-            "grammar",
-            "g",
-            "start",
-            [[
-                "rule",
-                "start",
-                ["behavior", [["trace", "capture", "atom"]], ["lit", "x"]]
-            ]]
-        ]));
-        let node = crate::ast::parse_ast(&g, "x", None).expect("ast parse should succeed");
-        assert_eq!(node.captures.len(), 1);
-        assert_eq!(node.captures[0].label, "atom");
-        assert_eq!(node.captures[0].node.span.start, 0);
-        assert_eq!(node.captures[0].node.span.end, 1);
     }
 
     #[test]
@@ -1568,6 +731,202 @@ mod tests {
     }
 
     #[test]
+    fn compile_unknown_top_level_option_errors() {
+        let err = compile_err(json!([
+            "grammar",
+            "g",
+            "root",
+            [["rule", "root", ["lit", "x"]]],
+            ["unknown_option", true]
+        ]));
+        assert!(matches!(err, SpecCompileError::UnknownTag(tag) if tag == "unknown_option"));
+    }
+
+    #[test]
+    fn compile_top_level_options_reject_alias_tags() {
+        for option in [
+            json!(["hard-keywords", "if"]),
+            json!(["soft-keywords", "match"]),
+            json!(["strict-actions", false]),
+            json!(["metadata", "custom_key", 42]),
+            json!(["grammar-metadata", "custom_key", 42]),
+            json!(["semantic-hooks"]),
+            json!(["recover-sync"]),
+            json!(["rule-memo"]),
+        ] {
+            let err = compile_err(json!([
+                "grammar",
+                "g",
+                "root",
+                [["rule", "root", ["lit", "x"]]],
+                option
+            ]));
+            assert!(
+                matches!(err, SpecCompileError::UnknownTag(_)),
+                "expected UnknownTag for alias option, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_malformed_top_level_option_errors() {
+        let err = compile_err(json!([
+            "grammar",
+            "g",
+            "root",
+            [["rule", "root", ["lit", "x"]]],
+            "not-an-option-list"
+        ]));
+        assert!(matches!(err, SpecCompileError::TypeError { .. }));
+    }
+
+    #[test]
+    fn compile_top_level_option_rejects_non_string_keyword() {
+        let err = compile_err(json!([
+            "grammar",
+            "g",
+            "root",
+            [["rule", "root", ["lit", "x"]]],
+            ["hard_keywords", "if", 123]
+        ]));
+        assert!(matches!(err, SpecCompileError::TypeError { .. }));
+    }
+
+    #[test]
+    fn compile_top_level_options_reject_extra_arguments() {
+        for option in [
+            json!(["grammar_metadata", "key", "value", "extra"]),
+            json!(["imports", "dep", "Grammar", "extra"]),
+            json!(["imports", {"dep": "Grammar"}, "extra"]),
+            json!(["strict_actions", true, false]),
+            json!(["indentation", true, false]),
+        ] {
+            let err = compile_err(json!([
+                "grammar",
+                "g",
+                "root",
+                [["rule", "root", ["lit", "x"]]],
+                option
+            ]));
+            assert!(
+                matches!(err, SpecCompileError::InvalidFormat(_)),
+                "expected InvalidFormat, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_boolean_options_reject_coerced_values() {
+        for option in [
+            json!(["strict_actions", "false"]),
+            json!(["strict_actions", 0]),
+            json!(["indentation", "on"]),
+            json!(["indentation", 1]),
+        ] {
+            let err = compile_err(json!([
+                "grammar",
+                "g",
+                "root",
+                [["rule", "root", ["lit", "x"]]],
+                option
+            ]));
+            assert!(
+                matches!(
+                    err,
+                    SpecCompileError::TypeError {
+                        expected: "bool",
+                        ..
+                    }
+                ),
+                "expected bool TypeError, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_imports_accepts_object_mapping_only() {
+        let g = compile(json!([
+            "grammar",
+            "g",
+            "root",
+            [["rule", "root", ["lit", "x"]]],
+            ["imports", {"dep": "Grammar"}]
+        ]));
+        let gmeta = g.metadata.get("__grammar__").expect("grammar meta");
+        assert_eq!(
+            gmeta
+                .get("imports")
+                .and_then(|v| v.as_object())
+                .and_then(|imports| imports.get("dep"))
+                .and_then(|v| v.as_str()),
+            Some("Grammar")
+        );
+    }
+
+    #[test]
+    fn compile_imports_rejects_positional_tuple_shape() {
+        let err = compile_err(json!([
+            "grammar",
+            "g",
+            "root",
+            [["rule", "root", ["lit", "x"]]],
+            ["imports", "dep", "Grammar"]
+        ]));
+        assert!(matches!(err, SpecCompileError::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn compile_imports_rejects_non_object_payload() {
+        let err = compile_err(json!([
+            "grammar",
+            "g",
+            "root",
+            [["rule", "root", ["lit", "x"]]],
+            ["imports", "dep"]
+        ]));
+        assert!(matches!(
+            err,
+            SpecCompileError::TypeError {
+                expected: "object",
+                ctx,
+                ..
+            } if ctx == "imports payload"
+        ));
+    }
+
+    #[test]
+    fn compile_imports_rejects_empty_alias_or_target() {
+        for option in [
+            json!(["imports", {"": "Grammar"}]),
+            json!(["imports", {"dep": ""}]),
+        ] {
+            let err = compile_err(json!([
+                "grammar",
+                "g",
+                "root",
+                [["rule", "root", ["lit", "x"]]],
+                option
+            ]));
+            assert!(
+                matches!(err, SpecCompileError::InvalidFormat(_)),
+                "expected InvalidFormat, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_trivia_rejects_unknown_entry() {
+        let err = compile_err(json!([
+            "grammar",
+            "g",
+            "root",
+            [["rule", "root", ["lit", "x"]]],
+            ["trivia", ["block_comments", "/*", "*/"]]
+        ]));
+        assert!(matches!(err, SpecCompileError::InvalidFormat(_)));
+    }
+
+    #[test]
     fn compile_duplicate_rule_errors() {
         let err = compile_err(json!([
             "grammar",
@@ -1607,11 +966,97 @@ mod tests {
             "grammar",
             "g",
             "root",
-            [["rule", "root", ["lit", "x"], "memo"]]
+            [["rule", "root", ["lit", "x"], ["memo"]]]
         ]));
         let meta = g.metadata.get("root");
         if let Some(m) = meta {
             assert_eq!(m.get("memo").and_then(|v| v.as_bool()), Some(true));
+        }
+    }
+
+    #[test]
+    fn compile_rule_with_memo_disabled() {
+        let g = compile(json!([
+            "grammar",
+            "g",
+            "root",
+            [["rule", "root", ["lit", "x"], ["memo", false]]]
+        ]));
+        let meta = g.metadata.get("root").expect("rule meta");
+        assert_eq!(meta.get("memo").and_then(|v| v.as_bool()), Some(false));
+    }
+
+    #[test]
+    fn compile_rule_memo_rejects_coerced_values() {
+        for metadata in [json!(["memo", "false"]), json!(["memo", 0])] {
+            let err = compile_err(json!([
+                "grammar",
+                "g",
+                "root",
+                [["rule", "root", ["lit", "x"], metadata]]
+            ]));
+            assert!(
+                matches!(
+                    err,
+                    SpecCompileError::TypeError {
+                        expected: "bool",
+                        ..
+                    }
+                ),
+                "expected bool TypeError, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_rule_metadata_rejects_string_shorthands() {
+        for metadata in ["memo", "no_memo", "no-memo", ":memo", ":no_memo"] {
+            let err = compile_err(json!([
+                "grammar",
+                "g",
+                "root",
+                [["rule", "root", ["lit", "x"], metadata]]
+            ]));
+            assert!(matches!(
+                err,
+                SpecCompileError::TypeError {
+                    expected: "metadata list",
+                    ctx,
+                    ..
+                } if ctx == "rule metadata"
+            ));
+        }
+    }
+
+    #[test]
+    fn compile_rule_metadata_rejects_malformed_entries() {
+        for metadata in [
+            json!("unknown_meta"),
+            json!([]),
+            json!({ "metadata": true }),
+            json!(["metadata", "key"]),
+            json!(["metadata", "key", "value", "extra"]),
+            json!(["type"]),
+            json!(["type", "Expr", "extra"]),
+            json!(["memo", true, false]),
+            json!([123, "value"]),
+            json!(["unknown", "value"]),
+        ] {
+            let err = compile_err(json!([
+                "grammar",
+                "g",
+                "root",
+                [["rule", "root", ["lit", "x"], metadata]]
+            ]));
+            assert!(
+                matches!(
+                    err,
+                    SpecCompileError::InvalidFormat(_)
+                        | SpecCompileError::TypeError { .. }
+                        | SpecCompileError::UnknownTag(_)
+                ),
+                "expected metadata contract error, got {err:?}"
+            );
         }
     }
 
@@ -1656,6 +1101,143 @@ mod tests {
         assert_eq!(src, "tok(NAME)");
         let src2 = expr_to_source(&json!(["tok", "NAME", "hello"])).unwrap();
         assert_eq!(src2, "tok(NAME,'hello')");
+    }
+
+    #[test]
+    fn mapping_tok_expr_preserves_text_only_and_any_token_refs() {
+        use crate::spec_compiler_exprs::expr_to_peg_expr;
+        let src = expr_to_source(&json!({"type": "tok", "text": "hello"})).unwrap();
+        assert_eq!(src, "tok('hello')");
+        let expr = expr_to_peg_expr(&json!({"type": "tok", "text": "hello"})).unwrap();
+        assert_eq!(
+            expr,
+            PegExpr::TokenRef {
+                kind: None,
+                text: Some("hello".to_string())
+            }
+        );
+
+        let src = expr_to_source(&json!({"type": "tok"})).unwrap();
+        assert_eq!(src, "tok()");
+        let expr = expr_to_peg_expr(&json!({"type": "tok"})).unwrap();
+        assert_eq!(
+            expr,
+            PegExpr::TokenRef {
+                kind: None,
+                text: None
+            }
+        );
+    }
+
+    #[test]
+    fn expected_compiles_to_pegexpr_expected_in_both_spec_forms() {
+        use crate::spec_compiler_exprs::expr_to_peg_expr;
+        // Array form: ["expected", message, inner]. The source repr keeps the
+        // inner expression (like `behavior`/`prec`); the PegExpr carries the
+        // diagnostic message.
+        let arr = json!(["expected", "'}' to close", ["lit", "}"]]);
+        assert_eq!(expr_to_source(&arr).unwrap(), "'}'");
+        assert_eq!(
+            expr_to_peg_expr(&arr).unwrap(),
+            PegExpr::Expected {
+                message: "'}' to close".to_string(),
+                expr: Box::new(PegExpr::Literal("}".to_string())),
+            }
+        );
+        // Object form: {"type":"expected","message":..,"expr":..}.
+        let obj = json!({"type": "expected", "message": "x", "expr": {"type": "lit", "text": "y"}});
+        assert_eq!(
+            expr_to_peg_expr(&obj).unwrap(),
+            PegExpr::Expected {
+                message: "x".to_string(),
+                expr: Box::new(PegExpr::Literal("y".to_string())),
+            }
+        );
+        // A whole grammar using `expected` compiles.
+        let g = compile(json!([
+            "grammar",
+            "g",
+            "forms",
+            [["rule", "start", ["expected", "msg", ["lit", "a"]]]]
+        ]));
+        assert!(g.get_rule("start").is_some());
+    }
+
+    #[test]
+    fn call_compiles_to_pegexpr_call_in_both_spec_forms() {
+        use crate::spec_compiler_exprs::expr_to_peg_expr;
+        // Array form: ["call", rule, args…]
+        let arr = json!(["call", "wrapped", ["lit", "a"], ["param", "x"]]);
+        assert_eq!(expr_to_source(&arr).unwrap(), "wrapped('a', $x)");
+        assert_eq!(
+            expr_to_peg_expr(&arr).unwrap(),
+            PegExpr::Call {
+                rule: "wrapped".to_string(),
+                args: vec![
+                    PegExpr::Literal("a".to_string()),
+                    PegExpr::Parameter {
+                        name: "x".to_string()
+                    },
+                ],
+            }
+        );
+        // Object form.
+        let obj = json!({"type": "call", "rule": "r", "args": [{"type": "param", "name": "p"}]});
+        assert_eq!(
+            expr_to_peg_expr(&obj).unwrap(),
+            PegExpr::Call {
+                rule: "r".to_string(),
+                args: vec![PegExpr::Parameter {
+                    name: "p".to_string()
+                }],
+            }
+        );
+        // A grammar with a parametric rule (header carries the param) compiles,
+        // and `call`/`param` survive into the rule body.
+        let g = compile(json!([
+            "grammar",
+            "g",
+            "forms",
+            [
+                [
+                    "rule",
+                    ["wrapped", "x", "->"],
+                    ["seq", [["lit", "("], ["param", "x"], ["lit", ")"]]]
+                ],
+                ["rule", "start", ["call", "wrapped", ["regex", "[a-z]+"]]]
+            ]
+        ]));
+        assert!(
+            matches!(g.get_rule("start").unwrap().expr(), PegExpr::Call { rule, .. } if rule == "wrapped")
+        );
+    }
+
+    #[test]
+    fn tok_expr_rejects_malformed_kind_and_text_fields() {
+        use crate::spec_compiler_exprs::expr_to_peg_expr;
+        let err = expr_to_source(&json!(["tok", ""])).unwrap_err();
+        assert!(
+            matches!(&err, SpecCompileError::InvalidFormat(message) if message.contains("tok kind")),
+            "expected invalid tok kind, got {err:?}"
+        );
+
+        let err = expr_to_peg_expr(&json!(["tok", "NAME", ""])).unwrap_err();
+        assert!(
+            matches!(&err, SpecCompileError::InvalidFormat(message) if message.contains("tok text")),
+            "expected invalid tok text, got {err:?}"
+        );
+
+        let err = expr_to_source(&json!({"type": "tok", "kind": 1})).unwrap_err();
+        assert!(
+            matches!(&err, SpecCompileError::TypeError { ctx, .. } if ctx == "tok kind"),
+            "expected tok kind type error, got {err:?}"
+        );
+
+        let err = expr_to_peg_expr(&json!({"type": "tok", "text": ""})).unwrap_err();
+        assert!(
+            matches!(&err, SpecCompileError::InvalidFormat(message) if message.contains("tok text")),
+            "expected invalid tok text, got {err:?}"
+        );
     }
 
     #[test]
@@ -1767,5 +1349,148 @@ mod tests {
             expr_to_source(&json!({"type": "tight", "expr": {"type": "literal", "text": "x"}}))
                 .unwrap();
         assert_eq!(src, "tight('x')");
+    }
+
+    #[test]
+    fn mapping_island_requires_explicit_delimiters() {
+        use crate::spec_compiler_exprs::expr_to_peg_expr;
+        let err = expr_to_source(&json!({"type": "island"})).unwrap_err();
+        assert!(matches!(err, SpecCompileError::MissingField(field) if field == "island start"));
+        let err = expr_to_peg_expr(&json!({"type": "island", "start": "<"})).unwrap_err();
+        assert!(matches!(err, SpecCompileError::MissingField(field) if field == "island end"));
+    }
+
+    #[test]
+    fn mapping_island_options_are_strict() {
+        use crate::spec_compiler_exprs::expr_to_peg_expr;
+        let src = expr_to_source(&json!({
+            "type": "island",
+            "start": "<",
+            "end": ">",
+            "include_delims": true
+        }))
+        .unwrap();
+        assert_eq!(src, "island(\"<\", \">\", true)");
+
+        let expr = expr_to_peg_expr(&json!(["island", "<", ">", true])).unwrap();
+        assert!(matches!(
+            expr,
+            PegExpr::Island {
+                include_delims: true,
+                ..
+            }
+        ));
+
+        let err = expr_to_source(&json!({
+            "type": "island",
+            "start": "<",
+            "end": ">",
+            "include_delims": "yes"
+        }))
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SpecCompileError::TypeError {
+                expected: "bool",
+                ctx,
+                ..
+            } if ctx == "island include_delims"
+        ));
+
+        let err = expr_to_peg_expr(&json!(["island", "<", ">", 1])).unwrap_err();
+        assert!(matches!(
+            err,
+            SpecCompileError::TypeError {
+                expected: "bool",
+                ctx,
+                ..
+            } if ctx == "island include_delims"
+        ));
+    }
+
+    #[test]
+    fn mapping_raw_block_requires_explicit_delimiters() {
+        use crate::spec_compiler_exprs::expr_to_peg_expr;
+        let err = expr_to_source(&json!({"type": "raw_block"})).unwrap_err();
+        assert!(matches!(err, SpecCompileError::MissingField(field) if field == "raw_block start"));
+        let err = expr_to_peg_expr(&json!({"type": "raw_block", "start": "{"})).unwrap_err();
+        assert!(matches!(err, SpecCompileError::MissingField(field) if field == "raw_block end"));
+    }
+
+    #[test]
+    fn mapping_raw_block_options_are_strict() {
+        use crate::spec_compiler_exprs::expr_to_peg_expr;
+        let src = expr_to_source(&json!({
+            "type": "raw_block",
+            "start": "{",
+            "end": "}",
+            "delim_kind": "brace"
+        }))
+        .unwrap();
+        assert_eq!(src, "raw_block(\"{\", \"}\", \"brace\")");
+
+        let expr = expr_to_peg_expr(&json!(["raw_block", "{", "}"])).unwrap();
+        assert!(matches!(
+            expr,
+            PegExpr::RawBlock {
+                ref delim_kind,
+                ..
+            } if delim_kind == "block"
+        ));
+
+        let expr = expr_to_peg_expr(&json!(["raw_block", "{", "}", "brace"])).unwrap();
+        assert!(matches!(
+            expr,
+            PegExpr::RawBlock {
+                ref delim_kind,
+                ..
+            } if delim_kind == "brace"
+        ));
+
+        let err = expr_to_source(&json!({
+            "type": "raw_block",
+            "start": "{",
+            "end": "}",
+            "delim_kind": false
+        }))
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SpecCompileError::TypeError {
+                expected: "string",
+                ctx,
+                ..
+            } if ctx == "raw_block delim_kind"
+        ));
+
+        let err = expr_to_peg_expr(&json!(["raw_block", "{", "}", false])).unwrap_err();
+        assert!(matches!(
+            err,
+            SpecCompileError::TypeError {
+                expected: "string",
+                ctx,
+                ..
+            } if ctx == "raw_block delim_kind"
+        ));
+    }
+
+    #[test]
+    fn mapping_expr_rejects_legacy_object_alias_fields() {
+        let err =
+            expr_to_source(&json!({"type": "seq", "items": [{"type": "literal", "text": "x"}]}))
+                .unwrap_err();
+        assert!(matches!(err, SpecCompileError::MissingField(field) if field == "parts"));
+
+        let err = expr_to_source(&json!({"type": "star", "body": {"type": "ref", "name": "x"}}))
+            .unwrap_err();
+        assert!(matches!(err, SpecCompileError::MissingField(field) if field == "expr"));
+
+        let err = expr_to_source(&json!({
+            "type": "sep_plus",
+            "separator": {"type": "literal", "text": ","},
+            "body": {"type": "ref", "name": "item"}
+        }))
+        .unwrap_err();
+        assert!(matches!(err, SpecCompileError::MissingField(field) if field == "sep"));
     }
 }

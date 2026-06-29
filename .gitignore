@@ -1,8 +1,14 @@
 .DS_Store
 *:Zone.Identifier
-.agents/
 .codex/
 .caap_build/
 target/
 */target/
 *.log
+
+# Personal local agent-permission file (keep CLAUDE.md, .claude/skills, .agents tracked)
+.claude/settings.local.json
+
+# Python bytecode caches (scripts/, .agents/, anywhere)
+__pycache__/
+*.pyc

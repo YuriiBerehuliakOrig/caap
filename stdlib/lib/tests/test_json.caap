@@ -1,0 +1,167 @@
+; stdlib/lib/tests/test_json.caap — in-language tests for lib/text/json.
+
+;; @area: text
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.text.json json_parse json_stringify json_pretty)
+(use stdlib.lib.diag.error error? error_code)
+(use stdlib.lib.core.equal deep_eq)
+
+(do
+  ; scalars
+  (assert_eq (get (json_parse "42") "value" 0) 42 "int")
+  (assert_eq (get (json_parse "-7") "value" 0) -7 "negative int")
+  (assert_eq (get (json_parse "2.5") "value" 0.0) 2.5 "float")
+  (assert_eq (get (json_parse "true") "value" false) true "true")
+  (assert_eq (get (json_parse "null") "value" 1) null "null")
+  (assert_eq (get (json_parse "\"hi\\nthere\"") "value" "") "hi\nthere" "string escapes")
+
+  ; structures
+  (assert_true
+    (deep_eq (get (json_parse "[1, 2, [3]]") "value")
+             (list_of 1 2 (list_of 3)))
+    "nested arrays")
+  (assert_true
+    (deep_eq (get (json_parse "{\"a\": 1, \"b\": {\"c\": [true]}}") "value")
+             (assoc (map_of) "a" 1 "b" (assoc (map_of) "c" (list_of true))))
+    "nested objects")
+  (assert_true
+    (deep_eq (get (json_parse "  { } ") "value") (map_of))
+    "empty object, whitespace tolerated")
+
+  ; failures are located DATA
+  (assert_eq (get (json_parse "[1, 2") "ok" true) false "unterminated array")
+  (assert_true
+    (string_contains (get (json_parse "{\"a\" 1}") "error" "") "expected `:`")
+    "missing colon message")
+  (assert_true
+    (string_contains (get (json_parse "1 2") "error" "") "trailing content")
+    "trailing content rejected")
+  (assert_true
+    (string_contains (get (json_parse "\n\n  nope") "error" "") "json: 3:3:")
+    "errors carry line:col")
+
+  ; stringify round-trips through parse
+  (bind ((v (assoc (map_of) "name" "x\"y" "ns" (list_of 1 2.5 false null))))
+    (assert_true
+      (deep_eq (get (json_parse (json_stringify v)) "value") v)
+      "stringify -> parse round-trip"))
+  (assert_eq (json_stringify (list_of)) "[]" "empty array compact")
+  (assert_eq
+    (json_pretty (assoc (map_of) "a" (list_of 1)))
+    "{\n  \"a\": [\n    1\n  ]\n}" "pretty layout")
+
+  ; \uXXXX escapes — decoded to the real UTF-8 character
+  (assert_eq (get (json_parse "\"\\u0041\"") "value" "") "A" "\\u BMP ascii")
+  ; U+00E9 (e-acute) is one character, two UTF-8 bytes (0xC3 0xA9)
+  (bind ((eacute (bytes->string (bytes_from_list (list_of 195 169)))))
+    (do
+      (assert_eq (get (json_parse "\"\\u00e9\"") "value" "") eacute "\\u 2-byte")
+      (assert_eq (size (get (json_parse "\"\\u00E9\"") "value" "")) 1
+        "\\u 2-byte is one char (case-insensitive hex)")))
+  ; U+263A (smiling face) is one character, three UTF-8 bytes
+  (bind ((smiley (bytes->string (bytes_from_list (list_of 226 152 186)))))
+    (assert_eq (get (json_parse "\"\\u263A\"") "value" "") smiley "\\u 3-byte"))
+  ; U+1F600 (grinning face) — a surrogate pair \uD83D\uDE00, four UTF-8 bytes
+  (bind ((grin (bytes->string (bytes_from_list (list_of 240 159 152 128)))))
+    (do
+      (assert_eq (get (json_parse "\"\\uD83D\\uDE00\"") "value" "") grin
+        "\\u surrogate pair")
+      (assert_eq (size (get (json_parse "\"\\uD83D\\uDE00\"") "value" "")) 1
+        "surrogate pair is one char")))
+  ; mixed text around an escape survives intact
+  (assert_eq (get (json_parse "\"a\\u0042c\"") "value" "") "aBc" "\\u amid text")
+
+  ; bad \u forms are located DATA, not a crash
+  (assert_eq (get (json_parse "\"\\u12\"") "ok" true) false "short \\u rejected")
+  (assert_true
+    (string_contains (get (json_parse "\"\\uZZZZ\"") "error" "") "u escape")
+    "non-hex \\u message")
+  (assert_eq (get (json_parse "\"\\uDE00\"") "ok" true) false "lone low surrogate rejected")
+  (assert_true
+    (string_contains (get (json_parse "\"\\uD83Dx\"") "error" "") "surrogate")
+    "high surrogate without a pair is an error")
+
+  ; \b / \f decode without loss and round-trip back through stringify
+  (bind ((bsp (bytes->string (bytes_from_list (list_of 8))))
+         (ffd (bytes->string (bytes_from_list (list_of 12)))))
+    (do
+      (assert_eq (get (json_parse "\"a\\bc\"") "value" "")
+        (string_concat_many "a" bsp "c") "\\b decodes to backspace")
+      (assert_eq (get (json_parse "\"a\\fc\"") "value" "")
+        (string_concat_many "a" ffd "c") "\\f decodes to form feed")
+      ; the control chars must come BACK as \b / \f on stringify (valid JSON)
+      (assert_eq (json_stringify (string_concat_many "x" bsp "y")) "\"x\\by\""
+        "backspace re-encodes as \\b")
+      (assert_eq (json_stringify (string_concat_many "x" ffd "y")) "\"x\\fy\""
+        "form feed re-encodes as \\f")
+      ; a NUL (U+0000) and other C0 controls re-encode as \u00XX
+      (assert_eq (json_stringify (bytes->string (bytes_from_list (list_of 0)))) "\"\\u0000\""
+        "NUL re-encodes as \\u0000")
+      (assert_eq (json_stringify (bytes->string (bytes_from_list (list_of 31)))) "\"\\u001f\""
+        "unit separator re-encodes as \\u001f")
+      ; full text round-trip: parse the encoding back to the same value
+      (assert_eq (get (json_parse (json_stringify (string_concat_many "p" bsp ffd "q"))) "value" "")
+        (string_concat_many "p" bsp ffd "q") "control round-trip parse->stringify->parse")))
+
+  ; raw control characters inside a string are rejected (must be escaped). In
+  ; CAAP source "\n" is a real U+000A byte, so this feeds JSON  "x<0x0A>y" — a
+  ; string literal carrying an unescaped newline, which the JSON spec forbids.
+  (assert_eq (get (json_parse "\"x\ny\"") "ok" true) false
+    "raw newline in string rejected")
+  (assert_true
+    (string_contains (get (json_parse "\"x\ny\"") "error" "") "control character")
+    "raw control char message")
+  ; a real NUL byte (U+0000) in a string is likewise rejected
+  (bind ((nul (bytes->string (bytes_from_list (list_of 0)))))
+    (assert_eq
+      (get (json_parse (string_concat_many "\"a" nul "b\"")) "ok" true) false
+      "raw NUL in string rejected"))
+  ; the escaped forms of the same controls still parse (regression guard)
+  (assert_eq (get (json_parse "\"x\\ny\"") "value" "")
+    (string_concat_many "x" "\n" "y") "escaped \\n still accepted")
+  (assert_eq (get (json_parse "\"a\\u0000b\"") "value" "")
+    (string_concat_many "a" (bytes->string (bytes_from_list (list_of 0))) "b")
+    "\\u0000 escape still accepted")
+
+  ; malformed numbers are now located parse errors, not lenient delegate parses
+  (assert_eq (get (json_parse "1.2.3") "ok" true) false "1.2.3 rejected")
+  (assert_eq (get (json_parse "01") "ok" true) false "leading-zero int rejected")
+  (assert_eq (get (json_parse "1e") "ok" true) false "exponent with no digits rejected")
+  (assert_eq (get (json_parse "-") "ok" true) false "lone minus rejected")
+  (assert_eq (get (json_parse "1.") "ok" true) false "trailing dot rejected")
+  (assert_true
+    (string_contains (get (json_parse "1.2.3") "error" "") "bad number")
+    "malformed number message")
+  ; valid numbers in every shape still parse to the same values as before
+  (assert_eq (get (json_parse "0") "value" 1) 0 "zero")
+  (assert_eq (get (json_parse "-0") "value" 1) 0 "negative zero")
+  (assert_eq (get (json_parse "10") "value" 0) 10 "multi-digit int")
+  (assert_eq (get (json_parse "-12.5") "value" 0.0) -12.5 "negative decimal")
+  (assert_eq (get (json_parse "1e3") "value" 0.0) 1000.0 "exponent")
+  (assert_eq (get (json_parse "1E+2") "value" 0.0) 100.0 "signed uppercase exponent")
+  (assert_eq (get (json_parse "2.5e-1") "value" 0.0) 0.25 "decimal with negative exponent")
+  ; an exponent that overflows f64 is Infinity, which is not valid JSON
+  (assert_eq (get (json_parse "1e400") "ok" true) false "over-magnitude float rejected")
+  (assert_true
+    (string_contains (get (json_parse "1e400") "error" "") "bad number")
+    "over-magnitude float message")
+  ; an integer past i64 range is still a valid JSON number: parsed as a (lossy)
+  ; float, mirroring how its float-shaped equivalent already parses
+  (assert_eq (get (json_parse "10000000000000000000000") "value" 0.0)
+    1e22 "huge integer falls back to float")
+
+  ; non-JSON values raise the protocol error
+  (bind ((e (try (json_stringify (lambda (x) x)) (catch e2 e2))))
+    (do
+      (assert_true (error? e) "encode failure is a protocol error")
+      (assert_eq (error_code e) "stdlib.json.encode" "encode error code")))
+
+  ; longer strings exercise the list-accumulate-then-join esc / parse_string
+  ; paths (the previous per-char concat was O(n^2)); the round-trip must be
+  ; byte-identical, escapes included
+  (bind ((long (string_concat_many (string_repeat "a\"b\\c\n" 50) "tail")))
+    (assert_eq (get (json_parse (json_stringify long)) "value" "") long
+      "long string with escapes round-trips through stringify/parse"))
+  true)

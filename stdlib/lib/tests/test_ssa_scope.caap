@@ -1,0 +1,79 @@
+; stdlib/lib/tests/test_ssa_scope.caap — REGRESSION gate for to_ssa's round-trip self-
+; validation (stdlib.semantics.ssa). The raw transform threads a single version cell in
+; EVAL order but emits versions with LEXICAL scope; the two diverge when a version-
+; introducing write (a `set_ref`, or a divergent `if`) sits in a bind-pair VALUE
+; position — the new version is bound only inside that value, yet a later read in the
+; bind BODY names it, so it leaks scope (pre-fix: `eval_ir(from_ssa(to_ssa body))` threw
+; `unknown name r__N`). The public `to_ssa` now validates its own output and BAILS to
+; identity on any leak, so the cardinal contract
+;     eval_ir(from_ssa(to_ssa body)) == eval_ir(body)
+; holds for EVERY body. This file pins the two leak shapes: each must (a) round-trip
+; eval-equivalent and (b) bail to identity (no SSA form produced — the witness the guard
+; fired). The sound siblings (write as a `do` STATEMENT) must still be SSA'd.
+
+;; @area: passes
+;; @kind: regression
+;; @slow: false
+(use stdlib.lib.test assert_true)
+(use stdlib.semantics.ssa to_ssa from_ssa supported? is_ssa_form? ssa_node)
+(use stdlib.syntax.ast sym lit calln eval_ir)
+(use stdlib.syntax.ir node_eq)
+(do
+  (bind (
+    (setr  (lambda (r v) (calln "set_ref" (list_of (sym r) v))))
+    (drf   (lambda (r)   (calln "deref" (list_of (sym r)))))
+    (mkref (lambda (v)   (calln "ref" (list_of v))))
+    (refbind (lambda (r v body) (calln "bind" (list_of (lit r) (mkref v) body))))
+    ; round-trip eval-equivalence — THE correctness gate.
+    (rt_eq?
+      (lambda (b) (value_eq (eval_ir b) (eval_ir (from_ssa (to_ssa b))))))
+    ; bailed? — to_ssa produced identity (the node is the input verbatim, no φ).
+    (bailed?
+      (lambda (b) (node_eq (ssa_node (to_ssa b)) b)))
+  )
+    (do
+      ; ── LEAK 1: a divergent `if` as a bind-pair VALUE ──
+      ;   (bind "r" (ref 0) (bind ((q (if true (set_ref r 7) (set_ref r 9)))) (deref r)))
+      ; pre-fix round-tripped to a free `r__3`; must now bail + round-trip (= 7).
+      (bind ((b (refbind "r" (lit 0)
+                  (calln "bind" (list_of (lit "q")
+                    (calln "if" (list_of (lit true) (setr "r" (lit 7)) (setr "r" (lit 9))))
+                    (drf "r"))))))
+        (do
+          (assert_true (eq (eval_ir b) 7) "if-in-bindval: original evals 7")
+          (assert_true (rt_eq? b) "if-in-bindval: round-trips eval-equivalent (was a miscompile)")
+          (assert_true (bailed? b) "if-in-bindval: to_ssa bails to identity (well-scoped guard fired)")))
+
+      ; ── LEAK 2: a bare `set_ref` as a bind-pair VALUE ──
+      ;   (bind "r" (ref 0) (bind ((q (set_ref r 5))) (deref r)))
+      ; pre-fix round-tripped to a free `r__1`; must now bail + round-trip (= 5).
+      (bind ((b (refbind "r" (lit 0)
+                  (calln "bind" (list_of (lit "q") (setr "r" (lit 5)) (drf "r"))))))
+        (do
+          (assert_true (eq (eval_ir b) 5) "set-in-bindval: original evals 5")
+          (assert_true (rt_eq? b) "set-in-bindval: round-trips eval-equivalent (was a miscompile)")
+          (assert_true (bailed? b) "set-in-bindval: to_ssa bails to identity (well-scoped guard fired)")))
+
+      ; ── SOUND control: the SAME writes as `do` STATEMENTS must still be SSA'd ──
+      ;   (bind "r" (ref 0) (do (set_ref r 5) (deref r)))  -> SSA form, evals 5.
+      (bind ((b (refbind "r" (lit 0)
+                  (calln "do" (list_of (setr "r" (lit 5)) (drf "r"))))))
+        (do
+          (assert_true (rt_eq? b) "set-as-statement: round-trips eval-equivalent")
+          ; no merge here, so no φ (is_ssa_form? keys on φ); assert it did NOT bail —
+          ; the transform ran and versioned the ref (output differs from the input).
+          (assert_true (not (bailed? b))
+            "set-as-statement: transform ran, did NOT over-bail to identity")))
+
+      ; ── SOUND control: a divergent if as a `do` STATEMENT is SSA'd (φ created) ──
+      ;   (bind "r" (ref 0) (do (if true (set_ref r 7) (set_ref r 9)) (deref r))) -> 7
+      (bind ((b (refbind "r" (lit 0)
+                  (calln "do" (list_of
+                    (calln "if" (list_of (lit true) (setr "r" (lit 7)) (setr "r" (lit 9))))
+                    (drf "r"))))))
+        (do
+          (assert_true (eq (eval_ir b) 7) "if-as-statement: original evals 7")
+          (assert_true (rt_eq? b) "if-as-statement: round-trips eval-equivalent")
+          (assert_true (is_ssa_form? (ssa_node (to_ssa b)))
+            "if-as-statement: still produces an SSA form (φ created, guard did NOT over-bail)")))
+      true)))

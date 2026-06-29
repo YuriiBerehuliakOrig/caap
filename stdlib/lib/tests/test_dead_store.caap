@@ -1,0 +1,832 @@
+; stdlib/lib/tests/test_dead_store.caap — dead-STORE elimination, the second real
+; consumer of the dataflow liveness engine. Every case asserts BEHAVIOR
+; PRESERVATION: eval_ir the body before AND after the rewrite, assert_eq the two
+; results, THEN assert the structural change (a store removed / kept). A wrong
+; deletion is a miscompile, so the negative cases (used value, effectful value)
+; matter as much as the positive one.
+
+;; @area: passes
+;; @kind: regression
+;; @slow: true
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.dead_store dead_store_node pure_value?)
+(use stdlib.syntax.ast sym lit calln call eval_ir walk head_is? call?)
+(use stdlib.syntax.ir node_eq)
+(use stdlib.lib.collections.sequence any?)
+
+(do
+  (bind (
+    ; (set_ref r v) — a write to the ref bound to name r.
+    (setr (lambda (r v) (calln "set_ref" (list_of (sym r) v))))
+    ; (deref r)
+    (drf (lambda (r) (calln "deref" (list_of (sym r)))))
+    ; (ref v)
+    (mkref (lambda (v) (calln "ref" (list_of v))))
+    ; count_set_ref — how many (set_ref …) statements appear anywhere in `node`.
+    (count_set_ref
+      (lambda (node)
+        (bind ((c (ref 0)))
+          (do
+            (walk node (lambda (n) (when (head_is? n "set_ref")
+                                     (set_ref c (int_add (deref c) 1)))))
+            (deref c)))))
+    ; eval a body to its value (the observable result).
+    (run_body (lambda (b) (eval_ir b)))
+    ; has_node? — does `target` appear anywhere in `node` (structural node_eq)?
+    (has_node?
+      (lambda (node target)
+        (bind ((found (ref false)))
+          (do
+            (walk node (lambda (n) (when (node_eq n target) (set_ref found true))))
+            (deref found)))))
+  )
+    (do
+      ; ════════════════════════════════════════════════════════════════════
+      ; 0. pure_value? unit — the soundness guard's classifier
+      ; ════════════════════════════════════════════════════════════════════
+      (assert_true (pure_value? (lit 2)) "a literal is pure_total")
+      ; `eq` is one of the FEW total heads (structural compare — returns false on a
+      ; type mismatch rather than throwing), so a store of it is droppable.
+      (assert_true (pure_value? (calln "eq" (list_of (lit 1) (lit 2))))
+        "eq of literals is pure_total (total: structural, never throws)")
+      (assert_true (pure_value? (calln "list_of" (list_of (lit 1) (lit "x"))))
+        "list_of is pure_total (a total variadic constructor)")
+      ; Arithmetic is now EXCLUDED: CAAP i64 arithmetic THROWS on overflow, so
+      ; int_add/int_mul/int_neg are PARTIAL — a store of an overflowing value must
+      ; NOT be silently dropped (it would erase the throw).
+      (assert_true (not (pure_value? (calln "int_add" (list_of (lit 1) (lit 2)))))
+        "int_add is NOT pure_total (i64 overflow throws) — partial head excluded")
+      (assert_true (not (pure_value? (calln "int_mul" (list_of (lit 1) (lit 2)))))
+        "int_mul is NOT pure_total (i64 overflow throws) — partial head excluded")
+      (assert_true (not (pure_value? (calln "int_neg" (list_of (lit 1)))))
+        "int_neg is NOT pure_total (i64::MIN overflow throws) — partial head excluded")
+      ; Bitwise / comparison / string heads THROW on a TYPE MISMATCH (CAAP is
+      ; dynamically typed), so they are PARTIAL too and excluded from the whitelist.
+      (assert_true (not (pure_value? (calln "int_and" (list_of (lit 1) (lit 2)))))
+        "int_and is NOT pure_total (throws on a non-int arg) — partial head excluded")
+      (assert_true (not (pure_value? (calln "lt" (list_of (lit 1) (lit 2)))))
+        "lt is NOT pure_total (throws on a type mismatch) — partial head excluded")
+      (assert_true (not (pure_value? (calln "string_slice" (list_of (lit 1) (lit 2)))))
+        "string_slice is NOT pure_total (throws on a non-string / bad range) — excluded")
+      (assert_true (not (pure_value? (calln "map_of" (list_of (lit "k")))))
+        "map_of is NOT pure_total (throws on odd/unpaired arity) — partial head excluded")
+      ; `not` is ARITY-partial: (not) and (not a b) throw, so it is NOT whitelisted.
+      (assert_true (not (pure_value? (call (sym "not") (list_of))))
+        "not is NOT pure_total (throws on arity 0) — arity-partial head excluded")
+      ; a bare NAME is NOT pure_total: reading an UNBOUND name throws, and the pass
+      ; cannot prove a name is in scope, so a store of a bare name is kept.
+      (assert_true (not (pure_value? (sym "ghost")))
+        "a bare name is NOT pure_total (an unbound read throws) — kept conservatively")
+      (assert_true (not (pure_value? (calln "set_ref" (list_of (sym "x") (lit 1)))))
+        "a set_ref value is NOT pure_total (it has an effect)")
+      (assert_true (not (pure_value? (calln "int_div" (list_of (lit 1) (lit 0)))))
+        "int_div is NOT pure_total (it may throw) — partial head excluded")
+      ; a buried effect makes the whole value non-pure_total even under a TOTAL head.
+      (assert_true (not (pure_value?
+                          (calln "eq"
+                            (list_of (lit 1)
+                              (calln "set_ref" (list_of (sym "y") (lit 2)))))))
+        "a buried effect makes the whole value non-pure_total")
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 1. POSITIVE — store-then-overwrite-without-read: the first store is dead
+      ;    (bind "r" (ref 0) (do (set_ref r 1) (set_ref r 2) (deref r)))
+      ;    r=1 is never read before r:=2 ⇒ the first store is dead; result = 2.
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (body (calln "bind"
+                (list_of (lit "r") (mkref (lit 0))
+                  (calln "do"
+                    (list_of (setr "r" (lit 1)) (setr "r" (lit 2)) (drf "r"))))))
+        (before (run_body body))
+        (rw (dead_store_node body))
+        (after (run_body rw))
+      )
+        (do
+          (assert_eq before 2 "original body evaluates to 2")
+          (assert_eq after before "behaviour preserved: rewrite still evaluates to 2")
+          ; exactly one of the two stores survived (the dead first store removed)
+          (assert_eq (count_set_ref rw) 1
+            "the dead first store was removed (one set_ref remains)")))
+
+      ; A chain of three stores, only the last read: the first TWO are dead.
+      ;   (do (set_ref r 1) (set_ref r 2) (set_ref r 3) (deref r)) ⇒ 3
+      (bind (
+        (body (calln "bind"
+                (list_of (lit "r") (mkref (lit 0))
+                  (calln "do"
+                    (list_of (setr "r" (lit 1)) (setr "r" (lit 2))
+                             (setr "r" (lit 3)) (drf "r"))))))
+        (before (run_body body))
+        (rw (dead_store_node body))
+        (after (run_body rw))
+      )
+        (do
+          (assert_eq before 3 "chain body evaluates to 3")
+          (assert_eq after before "behaviour preserved on the chain (still 3)")
+          (assert_eq (count_set_ref rw) 1
+            "both leading dead stores removed (only the live r:=3 remains)")))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 2. NEGATIVE (USED) — the first store is READ before the overwrite, so it
+      ;    is LIVE and must NOT be removed. We observe the read by accumulating
+      ;    the first value into a log ref (an observable read, no host I/O).
+      ;    (bind "log" (ref 0) (bind "r" (ref 0)
+      ;       (do (set_ref r 1)
+      ;           (set_ref log (deref r))   ; READS r=1
+      ;           (set_ref r 2)
+      ;           (deref log))))            ; ⇒ 1 (proves the first store mattered)
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (s_r1 (setr "r" (lit 1)))
+        (body (calln "bind"
+                (list_of (lit "log") (mkref (lit 0))
+                  (calln "bind"
+                    (list_of (lit "r") (mkref (lit 0))
+                      (calln "do"
+                        (list_of
+                          s_r1
+                          (calln "set_ref" (list_of (sym "log") (drf "r")))
+                          (setr "r" (lit 2))
+                          (drf "log"))))))))
+        (before (run_body body))
+        (rw (dead_store_node body))
+        (after (run_body rw))
+      )
+        (do
+          (assert_eq before 1 "the read of r=1 is observable (log = 1)")
+          (assert_eq after before
+            "behaviour preserved: the read still sees 1 (first store kept)")
+          ; the store whose value IS read (r:=1) MUST survive. (r:=2 is genuinely
+          ; dead here — nothing reads it — so the pass is free to drop it; what we
+          ; assert is that a READ value is never dropped.)
+          (assert_true (has_node? rw s_r1)
+            "the store whose value is read (r:=1) is kept")))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 3. NEGATIVE (EFFECTFUL VALUE) — r is dead (overwritten before any read),
+      ;    BUT the dead store's VALUE has an OBSERVABLE EFFECT (it writes a log
+      ;    ref). Deleting the store would drop that effect ⇒ it must be KEPT.
+      ;    (bind "log" (ref 0) (bind "r" (ref 0)
+      ;       (do
+      ;         (set_ref r (do (set_ref log 9) 7))  ; r:=7 dead, but log:=9 effect!
+      ;         (set_ref r 8)                        ; overwrites r before any read
+      ;         (deref log))))                       ; ⇒ 9 (the effect is observable)
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (effv (calln "do"
+                (list_of (calln "set_ref" (list_of (sym "log") (lit 9))) (lit 7))))
+        (s_eff (calln "set_ref" (list_of (sym "r") effv)))
+        (body (calln "bind"
+                (list_of (lit "log") (mkref (lit 0))
+                  (calln "bind"
+                    (list_of (lit "r") (mkref (lit 0))
+                      (calln "do"
+                        (list_of
+                          s_eff
+                          (setr "r" (lit 8))
+                          (drf "log"))))))))
+        (before (run_body body))
+        (rw (dead_store_node body))
+        (after (run_body rw))
+      )
+        (do
+          (assert_eq before 9 "the effectful value's write is observable (log = 9)")
+          (assert_eq after before
+            "behaviour preserved: the effect survives (still 9 — store KEPT)")
+          ; r is DEAD here (overwritten by r:=8 before any read), yet the first
+          ; store's VALUE writes log — deleting it would drop that write. So the
+          ; effectful store MUST survive even though its destination is dead.
+          ; (The pure r:=8 IS genuinely dead and may be dropped — irrelevant here.)
+          (assert_true (has_node? rw s_eff)
+            "a dead store whose value has an effect is kept (effect preserved)")))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 4. NEGATIVE (DEAD-OUT BUT READ ACROSS CONTROL) — block-granular safety:
+      ;    a store whose ref is read on the OTHER arm of an `if` after the store
+      ;    is live-out of its block, so it is conservatively KEPT.
+      ;    (bind "log" (ref 0) (bind "r" (ref 0)
+      ;       (do (set_ref r 5)
+      ;           (if (gt 1 0)
+      ;               (set_ref log (deref r))   ; reads r=5
+      ;               (set_ref r 6))
+      ;           (deref log))))                ; ⇒ 5
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (s_r5 (setr "r" (lit 5)))
+        (body (calln "bind"
+                (list_of (lit "log") (mkref (lit 0))
+                  (calln "bind"
+                    (list_of (lit "r") (mkref (lit 0))
+                      (calln "do"
+                        (list_of
+                          s_r5
+                          (calln "if"
+                            (list_of (calln "gt" (list_of (lit 1) (lit 0)))
+                              (calln "set_ref" (list_of (sym "log") (drf "r")))
+                              (setr "r" (lit 6))))
+                          (drf "log"))))))))
+        (before (run_body body))
+        (rw (dead_store_node body))
+        (after (run_body rw))
+      )
+        (do
+          (assert_eq before 5 "the cross-arm read sees r=5")
+          (assert_eq after before
+            "behaviour preserved across control (still 5 — store kept)")
+          ; r:=5 is read on the then-arm, so it is live-out of its block and MUST
+          ; survive — the block-granular live_out guard keeps it even though no
+          ; later statement IN ITS OWN block reads r. (The dead else-arm r:=6 may
+          ; be dropped; what we assert is that the cross-arm-read store stays.)
+          (assert_true (has_node? rw s_r5)
+            "a store read on another if-arm is live-out, so conservatively kept"))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 5. NEGATIVE (REF ALIASING) — name-based liveness is alias-blind. A second
+      ;    name `s` bound to the SAME cell reads the store through a name the
+      ;    liveness never connects to `r`. The store MUST be kept (else 7 -> 0).
+      ;    (bind "r" (ref 0) "s" r (do (set_ref r 7) (deref s)))  ⇒ 7
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (s_set (setr "r" (lit 7)))
+        (body (calln "bind"
+                (list_of (lit "r") (mkref (lit 0)) (lit "s") (sym "r")
+                  (calln "do"
+                    (list_of s_set (drf "s"))))))
+        (before (run_body body))
+        (rw (dead_store_node body))
+        (after (run_body rw))
+      )
+        (do
+          (assert_eq before 7 "the aliased read sees the stored 7")
+          (assert_eq after before
+            "behaviour preserved: aliased read still sees 7 (store kept)")
+          (assert_true (has_node? rw s_set)
+            "a store to an ALIASED ref is kept (liveness is alias-blind)")))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 6. NEGATIVE (CLOSURE CAPTURE) — a lambda captures `r` and reads it AFTER
+      ;    the store, through a deferred call. The name-based scan sees only the
+      ;    call name, not r, so without the lambda guard the store would be wrongly
+      ;    killed. Must be kept (else 1 -> 0).
+      ;    (bind "r" (ref 0) "f" (lambda () (deref r)) (do (set_ref r 1) (f)))  ⇒ 1
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (s_set (setr "r" (lit 1)))
+        (body (calln "bind"
+                (list_of (lit "r") (mkref (lit 0))
+                         (lit "f") (call (sym "lambda")
+                                     (list_of (lit (list_of)) (drf "r")))
+                  (calln "do"
+                    (list_of s_set (calln "f" (list_of)))))))
+        (before (run_body body))
+        (rw (dead_store_node body))
+        (after (run_body rw))
+      )
+        (do
+          (assert_eq before 1 "the captured read sees the stored 1")
+          (assert_eq after before
+            "behaviour preserved: the captured deref still sees 1 (store kept)")
+          (assert_true (has_node? rw s_set)
+            "a store to a ref read inside a lambda is kept (capture defers the read)")))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 7. NEGATIVE (RESULT VALUE) — a `set_ref` returns its written value, so the
+      ;    LAST statement of a body is the result. Even when its ref is otherwise
+      ;    dead, removing it would change the result. Must be kept (else 4 -> null).
+      ;    (bind "r" (ref 0) (set_ref r 4))  ⇒ 4   (set_ref returns 4)
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (s_set (setr "r" (lit 4)))
+        (body (calln "bind" (list_of (lit "r") (mkref (lit 0)) s_set)))
+        (before (run_body body))
+        (rw (dead_store_node body))
+        (after (run_body rw))
+      )
+        (do
+          (assert_eq before 4 "set_ref returns its written value (4)")
+          (assert_eq after before
+            "behaviour preserved: the trailing store is the result (kept, still 4)")
+          (assert_true (has_node? rw s_set)
+            "the final statement of a body is never removed (it is the result)")))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 8. POSITIVE (SIMPLE, NON-FINAL) — confirm the guards do not block a genuine
+      ;    dead store: r is simple, the dead store is non-final and overwritten.
+      ;    (bind "r" (ref 0) (do (set_ref r 1) (set_ref r 2) (deref r)))  ⇒ 2
+      ;    (already covered above, but re-assert removal survives all new guards.)
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (body (calln "bind"
+                (list_of (lit "r") (mkref (lit 0))
+                  (calln "do"
+                    (list_of (setr "r" (lit 1)) (setr "r" (lit 2)) (drf "r"))))))
+        (before (run_body body))
+        (rw (dead_store_node body))
+        (after (run_body rw))
+      )
+        (do
+          (assert_eq after before "simple dead store: behaviour preserved (2)")
+          (assert_eq (count_set_ref rw) 1
+            "a simple, non-final, overwritten dead store is still removed")))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 9. REGRESSION — ADVERSARIALLY-FOUND MISCOMPILES (each binary-reproduced).
+      ;    Every case asserts BEHAVIOUR PRESERVATION: eval(before) == eval(after).
+      ;    A wrong deletion here is a miscompile, so these are the soundness floor.
+      ; ════════════════════════════════════════════════════════════════════
+
+      ; ── A. VALUE-FLOW ALIASING (a fresh name `r` bound to an expression that
+      ;    RETURNS an existing cell). `r` appears only as a (set_ref r 7) dest, so
+      ;    the SYNTACTIC simple-ref walk calls it "simple" — but its cell is the
+      ;    SAME one read through the original handle. The fresh-allocation guard
+      ;    (every binding of r must be a literal `(ref …)`) keeps these stores.
+
+      ; A1 — alias via (deref outer) returning the inner cell.
+      ;   (bind "outer" (ref (ref 0)) (bind "r" (deref outer)
+      ;      (do (set_ref r 7) (deref (deref outer)))))  ⇒ 7
+      (bind (
+        (body (calln "bind"
+                (list_of (lit "outer") (mkref (mkref (lit 0)))
+                  (calln "bind"
+                    (list_of (lit "r") (drf "outer")
+                      (calln "do"
+                        (list_of (setr "r" (lit 7))
+                          (calln "deref" (list_of (drf "outer"))))))))))
+        (before (run_body body))
+        (rw (dead_store_node body))
+        (after (run_body rw))
+      )
+        (do
+          (assert_eq before 7 "A1: original aliased-via-deref body evaluates to 7")
+          (assert_eq after before
+            "A1: behaviour preserved — value-flow alias via deref (still 7, store kept)")))
+
+      ; A2 — alias via a function returning the ref it was passed.
+      ;   (bind "id" (lambda (x) x) (bind "c" (ref 0) (bind "r" (id c)
+      ;      (do (set_ref r 7) (deref c)))))  ⇒ 7
+      (bind (
+        (body (calln "bind"
+                (list_of (lit "id")
+                         (call (sym "lambda")
+                           (list_of (lit (list_of "x")) (sym "x")))
+                  (calln "bind"
+                    (list_of (lit "c") (mkref (lit 0))
+                      (calln "bind"
+                        (list_of (lit "r") (calln "id" (list_of (sym "c")))
+                          (calln "do"
+                            (list_of (setr "r" (lit 7)) (drf "c"))))))))))
+        (before (run_body body))
+        (rw (dead_store_node body))
+        (after (run_body rw))
+      )
+        (do
+          (assert_eq before 7 "A2: original aliased-via-call-return body evaluates to 7")
+          (assert_eq after before
+            "A2: behaviour preserved — value-flow alias via call return (still 7, store kept)")))
+
+      ; A3 — alias via a ref stored into a map then read back.
+      ;   (bind "c" (ref 0) (bind "m" (map_of "k" c) (bind "r" (get m "k")
+      ;      (do (set_ref r 7) (deref (get m "k"))))))  ⇒ 7
+      (bind (
+        (getmk (calln "get" (list_of (sym "m") (lit "k"))))
+        (body (calln "bind"
+                (list_of (lit "c") (mkref (lit 0))
+                  (calln "bind"
+                    (list_of (lit "m")
+                             (calln "map_of" (list_of (lit "k") (sym "c")))
+                      (calln "bind"
+                        (list_of (lit "r") getmk
+                          (calln "do"
+                            (list_of (setr "r" (lit 7))
+                              (calln "deref" (list_of getmk)))))))))))
+        (before (run_body body))
+        (rw (dead_store_node body))
+        (after (run_body rw))
+      )
+        (do
+          (assert_eq before 7 "A3: original aliased-via-map body evaluates to 7")
+          (assert_eq after before
+            "A3: behaviour preserved — value-flow alias via map lookup (still 7, store kept)")))
+
+      ; A4 — alias via a thunk that captures the ref and returns it.
+      ;   (bind "c" (ref 0) (bind "getcell" (lambda () c) (bind "r" (getcell)
+      ;      (do (set_ref r 7) (deref (getcell))))))  ⇒ 7
+      (bind (
+        (body (calln "bind"
+                (list_of (lit "c") (mkref (lit 0))
+                  (calln "bind"
+                    (list_of (lit "getcell")
+                             (call (sym "lambda")
+                               (list_of (lit (list_of)) (sym "c")))
+                      (calln "bind"
+                        (list_of (lit "r") (calln "getcell" (list_of))
+                          (calln "do"
+                            (list_of (setr "r" (lit 7))
+                              (calln "deref"
+                                (list_of (calln "getcell" (list_of)))))))))))))
+        (before (run_body body))
+        (rw (dead_store_node body))
+        (after (run_body rw))
+      )
+        (do
+          (assert_eq before 7 "A4: original aliased-via-thunk body evaluates to 7")
+          (assert_eq after before
+            "A4: behaviour preserved — value-flow alias via thunk return (still 7, store kept)")))
+
+      ; ── B. TRY/CATCH — a store inside the protected body read by the catch
+      ;    handler. The liveness CFG does not model exception edges, so the store
+      ;    looks dead; the try/catch bail keeps every store when a body has try.
+      ; B1 (bind "r" (ref 0) (do (try (do (set_ref r 7) (throw 1)) (catch e (deref r)))))  ⇒ 7
+      (bind (
+        (body (calln "bind"
+                (list_of (lit "r") (mkref (lit 0))
+                  (calln "do"
+                    (list_of
+                      (calln "try"
+                        (list_of
+                          (calln "do"
+                            (list_of (setr "r" (lit 7))
+                              (calln "throw" (list_of (lit 1)))))
+                          (call (sym "catch")
+                            (list_of (sym "e") (drf "r"))))))))))
+        (before (run_body body))
+        (rw (dead_store_node body))
+        (after (run_body rw))
+      )
+        (do
+          (assert_eq before 7 "B1: catch handler reads the in-try store (7)")
+          (assert_eq after before
+            "B1: behaviour preserved — try/catch bail keeps the in-try store (still 7)")
+          (assert_eq (count_set_ref rw) 1
+            "B1: no store removed from a body containing try/catch")))
+
+      ; ── C. OVERFLOW-THROWING VALUE — the dead store's value OVERFLOWS i64 and
+      ;    THROWS. Removing it would ERASE the throw (THROW -> 2). The tightened
+      ;    total_pure_heads (int_add/int_sub/int_mul/int_neg are PARTIAL) keeps it.
+      ;    Both before and after must THROW; we observe that via an outer try/catch
+      ;    that yields the sentinel "THREW".
+      (bind (
+        ; eval_guard b — eval body b, returning its value or "THREW" if it throws.
+        (eval_guard
+          (lambda (b)
+            (eval_ir
+              (calln "try"
+                (list_of b (call (sym "catch") (list_of (sym "e") (lit "THREW"))))))))
+        (maxint 9223372036854775807)
+        (minint -9223372036854775808)
+        ; build (bind "r" (ref 0) (do (set_ref r OVERFLOW) (set_ref r 2) (deref r)))
+        (mk_overflow_body
+          (lambda (ovf)
+            (calln "bind"
+              (list_of (lit "r") (mkref (lit 0))
+                (calln "do"
+                  (list_of (setr "r" ovf) (setr "r" (lit 2)) (drf "r")))))))
+      )
+        (do
+          ; C1 — int_add overflow.
+          (bind (
+            (ovf (calln "int_add" (list_of (lit maxint) (lit 1))))
+            (body (mk_overflow_body ovf))
+            (before (eval_guard body))
+            (rw (dead_store_node body))
+            (after (eval_guard rw))
+          )
+            (do
+              (assert_eq before "THREW" "C1: int_add overflow throws (before)")
+              (assert_eq after before
+                "C1: behaviour preserved — overflowing add still throws (store kept)")))
+          ; C2 — int_mul overflow.
+          (bind (
+            (ovf (calln "int_mul" (list_of (lit maxint) (lit maxint))))
+            (body (mk_overflow_body ovf))
+            (before (eval_guard body))
+            (rw (dead_store_node body))
+            (after (eval_guard rw))
+          )
+            (do
+              (assert_eq before "THREW" "C2: int_mul overflow throws (before)")
+              (assert_eq after before
+                "C2: behaviour preserved — overflowing mul still throws (store kept)")))
+          ; C3 — int_neg of i64::MIN overflow.
+          (bind (
+            (ovf (calln "int_neg" (list_of (lit minint))))
+            (body (mk_overflow_body ovf))
+            (before (eval_guard body))
+            (rw (dead_store_node body))
+            (after (eval_guard rw))
+          )
+            (do
+              (assert_eq before "THREW" "C3: int_neg of MIN overflow throws (before)")
+              (assert_eq after before
+                "C3: behaviour preserved — overflowing neg still throws (store kept)")))
+          ; C4 — TYPE-MISMATCH throw (not just overflow). (string_slice 5 0) throws
+          ; on a non-string arg; the dead store's value must NOT erase that throw.
+          ; This is the broader partial-head class: bitwise/comparison/string heads
+          ; throw on a type mismatch, so they are excluded from total_pure_heads.
+          (bind (
+            (ovf (calln "string_slice" (list_of (lit 5) (lit 0))))
+            (body (mk_overflow_body ovf))
+            (before (eval_guard body))
+            (rw (dead_store_node body))
+            (after (eval_guard rw))
+          )
+            (do
+              (assert_eq before "THREW" "C4: string_slice type-mismatch throws (before)")
+              (assert_eq after before
+                "C4: behaviour preserved — string_slice throw not erased (store kept)")))
+          ; C5 — odd-arity throw. (map_of "k") throws (unpaired key); a store of it
+          ; must be kept so the throw survives — map_of is partial, not whitelisted.
+          (bind (
+            (ovf (calln "map_of" (list_of (lit "k"))))
+            (body (mk_overflow_body ovf))
+            (before (eval_guard body))
+            (rw (dead_store_node body))
+            (after (eval_guard rw))
+          )
+            (do
+              (assert_eq before "THREW" "C5: map_of odd-arity throws (before)")
+              (assert_eq after before
+                "C5: behaviour preserved — map_of throw not erased (store kept)")))
+          ; C6 — UNBOUND-NAME throw. A store of a bare unbound name `ghost` throws
+          ; (`unknown name`); removing it would turn the throw into a value (2).
+          ; A bare name is non-pure_total, so the store is kept.
+          (bind (
+            (body (mk_overflow_body (sym "ghost")))
+            (before (eval_guard body))
+            (rw (dead_store_node body))
+            (after (eval_guard rw))
+          )
+            (do
+              (assert_eq before "THREW" "C6: unbound-name store throws (before)")
+              (assert_eq after before
+                "C6: behaviour preserved — unbound-name throw not erased (store kept)")))
+          ; C7 — ARITY throw. (not) at arity 0 throws; `not` is arity-partial and not
+          ; whitelisted, so the store is kept and the throw survives.
+          (bind (
+            (body (mk_overflow_body (call (sym "not") (list_of))))
+            (before (eval_guard body))
+            (rw (dead_store_node body))
+            (after (eval_guard rw))
+          )
+            (do
+              (assert_eq before "THREW" "C7: (not) arity-0 throws (before)")
+              (assert_eq after before
+                "C7: behaviour preserved — (not) arity throw not erased (store kept)")))))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 10. REGRESSION — LEXICAL-SHADOWING MISCOMPILES (each binary-reproduced).
+      ;    The hardest counterexamples the prior NAME-granular alias/liveness
+      ;    analysis kept leaking: a store to an OUTER ref `r` whose name is later
+      ;    SHADOWED by an inner `(bind "r" (ref …) …)` (a DISTINCT cell) in the
+      ;    SAME straight-line block, with the outer cell read AFTER the shadow.
+      ;    Both bindings are literal `(ref …)` (so r passed the FRESH guard) and r
+      ;    sits only in set_ref/deref slots (so r passed the SIMPLE guard), yet the
+      ;    inner shadow's `(bind "r")` def-marker fooled the in-block scan / live_out
+      ;    into judging the LIVE outer store dead — removing it changed 7→0 / 1→0 /
+      ;    42→0. The pass is now PROVABLY SOUND by restriction: the only body shape
+      ;    it acts on is a FLAT straight-line `(do …)` with NO control flow and NO
+      ;    nested scope, so a `bind` anywhere in the block makes the WHOLE block bail.
+      ;    Every shadowing shape below therefore keeps ALL its stores. Each case
+      ;    asserts BEHAVIOUR PRESERVATION (eval before == eval after) AND that no
+      ;    store was removed (count unchanged) — the soundness floor.
+      (bind (
+        ; shadow_check ir want nstore msg — eval before, rewrite, eval after; assert
+        ; behaviour preserved AND every store kept (a removed store here = miscompile).
+        (shadow_check
+          (lambda (ir want nstore msg)
+            (bind ((before (run_body ir)) (rw (dead_store_node ir)) (after (run_body rw)))
+              (do
+                (assert_eq before want msg)
+                (assert_eq after before msg)
+                (assert_eq (count_set_ref rw) nstore msg)))))
+      )
+        (do
+          ; 10A — SHADOW WITH INNER WRITE. Outer r:=7 to cell_A; inner shadow
+          ;   (bind "r" (ref 100) (set_ref r 8)) operates wholly on cell_B; the final
+          ;   (deref r) reads cell_A=7. The inner (bind "r") def-marker is NOT an
+          ;   overwrite of the outer cell — but the `bind` makes the block non-straight
+          ;   -line, so we bail and keep both stores.
+          ;   (bind "r" (ref 0) (do (set_ref r 7) (bind "r" (ref 100) (set_ref r 8)) (deref r)))  ⇒ 7
+          (shadow_check
+            (calln "bind"
+              (list_of (lit "r") (mkref (lit 0))
+                (calln "do"
+                  (list_of (setr "r" (lit 7))
+                    (calln "bind"
+                      (list_of (lit "r") (mkref (lit 100)) (setr "r" (lit 8))))
+                    (drf "r")))))
+            7 2 "10A: shadow with inner write — outer store kept (was 7→0)")
+
+          ; 10B — BROADER SHADOW, NO INNER WRITE. The inner shadow merely rebinds the
+          ;   name and derefs the inner cell (returns 100); it never writes r. The
+          ;   outer r:=7 was STILL wrongly removed before (the shadow bind made live_out
+          ;   exclude r). The straight-line restriction bails on the inner `bind`.
+          ;   (bind "r" (ref 0) (do (set_ref r 7) (bind "r" (ref 100) (deref r)) (deref r)))  ⇒ 7
+          (shadow_check
+            (calln "bind"
+              (list_of (lit "r") (mkref (lit 0))
+                (calln "do"
+                  (list_of (setr "r" (lit 7))
+                    (calln "bind"
+                      (list_of (lit "r") (mkref (lit 100)) (drf "r")))
+                    (drf "r")))))
+            7 1 "10B: shadow without inner write — outer store kept (was 7→0)")
+
+          ; 10C — SHADOW DEF-MARKER LIVENESS. Inner (bind "r" (ref 0) (deref r)) reads
+          ;   cell_B=0; the trailing (deref r) reads outer cell_A=1, so the outer store
+          ;   is LIVE. The in-block scan mis-read the shadow's stmt_def as an overwrite.
+          ;   (bind "r" (ref 0) (do (set_ref r 1) (bind "r" (ref 0) (deref r)) (deref r)))  ⇒ 1
+          (shadow_check
+            (calln "bind"
+              (list_of (lit "r") (mkref (lit 0))
+                (calln "do"
+                  (list_of (setr "r" (lit 1))
+                    (calln "bind"
+                      (list_of (lit "r") (mkref (lit 0)) (drf "r")))
+                    (drf "r")))))
+            1 1 "10C: shadow def-marker — outer store kept (was 1→0)")
+
+          ; 10D — INDEPENDENT REPRODUCTION (different inner values, robust across
+          ;   shapes). Outer r:=42 to cell_A; inner shadow operates on cell_B; trailing
+          ;   (deref r) reads cell_A=42.
+          ;   (bind "r" (ref 0) (do (set_ref r 42) (bind "r" (ref 7) (set_ref r 8)) (deref r)))  ⇒ 42
+          (shadow_check
+            (calln "bind"
+              (list_of (lit "r") (mkref (lit 0))
+                (calln "do"
+                  (list_of (setr "r" (lit 42))
+                    (calln "bind"
+                      (list_of (lit "r") (mkref (lit 7)) (setr "r" (lit 8))))
+                    (drf "r")))))
+            42 2 "10D: shadow distinct values — outer store kept (was 42→0)")))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 11. REGRESSION — COMPLEX-arg0 ALIASING / READ-IN-DEST (binary-reproduced).
+      ;    `simple_refs`/`walk_simple` once inspected the arg0 of a `deref`/`set_ref`
+      ;    ONLY when it was a BARE NAME (the safe-slot fast path). A COMPLEX arg0 —
+      ;    `(deref (cap r))`, `(set_ref (cap r) …)`, or `(set_ref (do … (deref r) …)
+      ;    555)` — was NOT walked, so a ref name `r` nested inside it was never
+      ;    TAINTED: r stayed "simple", a later straight-line write to r looked like a
+      ;    clean kill, and the LIVE store to r was wrongly dropped (1→0 / 42→0 / 3→0).
+      ;    walk_simple now recurses into a COMPLEX arg0 in ESCAPING mode, tainting
+      ;    EVERY ref name reachable through it (only a BARE NAME is a safe slot), so
+      ;    every store below is kept. Each case asserts BEHAVIOUR PRESERVATION
+      ;    (eval before == eval after) — a removed store here is a miscompile.
+      (bind (
+        ; alias_check ir want msg — eval before, rewrite, eval after; assert the
+        ; rewrite is behaviour-preserving (the store survives the complex arg0).
+        (alias_check
+          (lambda (ir want msg)
+            (bind ((before (run_body ir)) (rw (dead_store_node ir)) (after (run_body rw)))
+              (do
+                (assert_eq before want msg)
+                (assert_eq after before msg)))))
+        ; (cap r) — a lambda that STASHES its arg into an outer holder, then returns
+        ; it. Reaching r through (cap r) aliases cell-r into `holder`.
+        (cap_into
+          (lambda (target)
+            (call (sym "lambda")
+              (list_of (lit (list_of "x"))
+                (calln "do"
+                  (list_of (calln "set_ref" (list_of (sym target) (sym "x")))
+                           (sym "x")))))))
+      )
+        (do
+          ; 11A — ALIAS VIA (deref (cap r)). arg0 of the deref is the COMPLEX
+          ;   `(cap r)`, which stashes cell-r into `holder`; a later read through the
+          ;   alias `holder` sees r=1. r was untainted (complex arg0 skipped), so the
+          ;   live r:=1 was dropped (1→0). Now r is tainted -> store kept.
+          ;   (bind "cap" (lambda (x) (do (set_ref holder x) x)) "holder" (ref 0)
+          ;     "log" (ref 0) "r" (ref 0)
+          ;     (do (deref (cap r)) (set_ref r 1)
+          ;         (set_ref log (deref (deref holder))) (set_ref r 2) (deref log)))  ⇒ 1
+          (alias_check
+            (calln "bind"
+              (list_of (lit "cap") (cap_into "holder")
+                       (lit "holder") (mkref (lit 0))
+                       (lit "log") (mkref (lit 0))
+                       (lit "r") (mkref (lit 0))
+                (calln "do"
+                  (list_of
+                    (calln "deref" (list_of (calln "cap" (list_of (sym "r")))))
+                    (setr "r" (lit 1))
+                    (calln "set_ref"
+                      (list_of (sym "log")
+                        (calln "deref" (list_of (calln "deref" (list_of (sym "holder")))))))
+                    (setr "r" (lit 2))
+                    (drf "log")))))
+            1 "11A: alias via (deref (cap r)) — complex arg0 taints r, store kept (was 1→0)")
+
+          ; 11B — ALIAS VIA a COMPLEX set_ref DEST `(set_ref (cap r) 0)`. arg0 (the
+          ;   write dest) is `(cap r)`, which stashes cell-r into `holder`; the alias
+          ;   read sees r=1. Now r is tainted -> the live r:=1 is kept (was 1→0).
+          (alias_check
+            (calln "bind"
+              (list_of (lit "cap") (cap_into "holder")
+                       (lit "holder") (mkref (lit 0))
+                       (lit "log") (mkref (lit 0))
+                       (lit "r") (mkref (lit 0))
+                (calln "do"
+                  (list_of
+                    (calln "set_ref" (list_of (calln "cap" (list_of (sym "r"))) (lit 0)))
+                    (setr "r" (lit 1))
+                    (calln "set_ref"
+                      (list_of (sym "log")
+                        (calln "deref" (list_of (calln "deref" (list_of (sym "holder")))))))
+                    (setr "r" (lit 2))
+                    (drf "log")))))
+            1 "11B: alias via (set_ref (cap r) 0) dest — complex arg0 taints r, kept (was 1→0)")
+
+          ; 11C — ALIAS VIA a ref stashed into a LIST. (cap r) puts (list_of r) into
+          ;   `bag`; the alias read pulls cell-r back out of the list and sees r=1.
+          (alias_check
+            (calln "bind"
+              (list_of (lit "cap")
+                       (call (sym "lambda")
+                         (list_of (lit (list_of "x"))
+                           (calln "do"
+                             (list_of
+                               (calln "set_ref"
+                                 (list_of (sym "bag") (calln "list_of" (list_of (sym "x")))))
+                               (sym "x")))))
+                       (lit "bag") (mkref (lit 0))
+                       (lit "log") (mkref (lit 0))
+                       (lit "r") (mkref (lit 0))
+                (calln "do"
+                  (list_of
+                    (calln "deref" (list_of (calln "cap" (list_of (sym "r")))))
+                    (setr "r" (lit 1))
+                    (calln "set_ref"
+                      (list_of (sym "log")
+                        (calln "deref"
+                          (list_of (calln "get"
+                            (list_of (calln "deref" (list_of (sym "bag"))) (lit 0)))))))
+                    (setr "r" (lit 2))
+                    (drf "log")))))
+            1 "11C: alias via a ref stashed in a list — complex arg0 taints r, kept (was 1→0)")
+
+          ; 11D — READ-IN-COMPLEX-DEST. The middle statement's set_ref DEST is the
+          ;   COMPLEX `(do (set_ref obs (deref r)) dummy)`, which READS r=1 into `obs`
+          ;   before writing through `dummy`. The straight-line read-detection skips a
+          ;   set_ref's dest, so the read was missed and the live r:=1 dropped (1→0).
+          ;   walk_simple now taints r through the complex dest -> r is not a candidate.
+          ;   (bind "obs" (ref 0) (bind "dummy" (ref 0) (bind "r" (ref 0)
+          ;     (do (set_ref r 1)
+          ;         (set_ref (do (set_ref obs (deref r)) dummy) 555)
+          ;         (set_ref r 2) (deref obs)))))  ⇒ 1
+          (alias_check
+            (calln "bind" (list_of (lit "obs") (mkref (lit 0))
+              (calln "bind" (list_of (lit "dummy") (mkref (lit 0))
+                (calln "bind" (list_of (lit "r") (mkref (lit 0))
+                  (calln "do"
+                    (list_of
+                      (setr "r" (lit 1))
+                      (calln "set_ref"
+                        (list_of
+                          (calln "do"
+                            (list_of (calln "set_ref" (list_of (sym "obs") (drf "r")))
+                                     (sym "dummy")))
+                          (lit 555)))
+                      (setr "r" (lit 2))
+                      (drf "obs")))))))))
+            1 "11D: read of r in a complex set_ref dest — taints r, store kept (was 1→0)")
+
+          ; 11E — same complex-dest read with distinct values (42/999/7), independent
+          ;   reproduction. obs captures r=42 through the complex dest.
+          (alias_check
+            (calln "bind" (list_of (lit "obs") (mkref (lit 0))
+              (calln "bind" (list_of (lit "dummy") (mkref (lit 0))
+                (calln "bind" (list_of (lit "r") (mkref (lit 0))
+                  (calln "do"
+                    (list_of
+                      (setr "r" (lit 42))
+                      (calln "set_ref"
+                        (list_of
+                          (calln "do"
+                            (list_of (calln "set_ref" (list_of (sym "obs") (drf "r")))
+                                     (sym "dummy")))
+                          (lit 999)))
+                      (setr "r" (lit 7))
+                      (drf "obs")))))))))
+            42 "11E: complex-dest read, distinct values — store kept (was 42→0)")
+
+          ; 11F — complex-dest read with an extra earlier write to `dummy`. The read of
+          ;   r=3 still hides in the complex dest; r must stay live across it.
+          (alias_check
+            (calln "bind" (list_of (lit "obs") (mkref (lit 0))
+              (calln "bind" (list_of (lit "dummy") (mkref (lit 0))
+                (calln "bind" (list_of (lit "r") (mkref (lit 0))
+                  (calln "do"
+                    (list_of
+                      (setr "r" (lit 3))
+                      (calln "set_ref" (list_of (sym "dummy") (lit 100)))
+                      (calln "set_ref"
+                        (list_of
+                          (calln "do"
+                            (list_of (calln "set_ref" (list_of (sym "obs") (drf "r")))
+                                     (sym "dummy")))
+                          (lit 555)))
+                      (setr "r" (lit 9))
+                      (drf "obs")))))))))
+            3 "11F: complex-dest read with prior dummy write — store kept (was 3→0)")))))))

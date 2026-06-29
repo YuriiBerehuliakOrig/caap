@@ -1,0 +1,179 @@
+; stdlib/lib/tests/test_sccs.caap — Tarjan strongly-connected components over the
+; module call graph (stdlib.semantics.passes.sccs): self-loops, 2-cycles, an
+; acyclic chain (all singletons), an SCC-with-tail, and `analyze_module` on a
+; located list of mutually recursive defs.
+;
+; The "callgraph.scc" facts this test's pass run would publish are keyed by name
+; in the shared session store, so the analyze_module/pass scenario uses an
+; `scc_` name prefix and clears those facts on the way out (cf. test_inline).
+
+;; @area: passes
+;; @kind: regression
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.sccs sccs sorted_component analyze_module check_module)
+(use stdlib.semantics.passes.registry fact! fact_of)
+(use stdlib.syntax.ast sym lit calln lam)
+(use stdlib.lib.collections.sequence any?)
+(use stdlib.lib.core.equal deep_eq)
+
+(do
+  (bind (
+    ; a top-level definition form: (bind "name" value)
+    (def (lambda (nm v) (calln "bind" (list_of (lit nm) v))))
+    ; wrap forms as the loader's located list
+    (located (lambda (forms)
+               (bind ((out (list_of)))
+                 (do (for f forms (append out (assoc (map_of) "node" f "loc" "m")))
+                     out))))
+    (in? (lambda (lst x) (any? lst (lambda (e) (eq e x)))))
+    ; build an edge map from a list of {name -> callee-list} pairs
+    (edges_of (lambda (pairs)
+                (bind ((m (map_of)))
+                  (do (for p pairs (assoc m (get p 0) (get p 1))) m))))
+    ; the component of `comps` that contains `nm`, sorted; or null
+    (comp_with (lambda (comps nm)
+                 (bind ((hit (ref null)))
+                   (do
+                     (for c comps (when (in? c nm) (set_ref hit (sorted_component c))))
+                     (deref hit)))))
+    ; the index of the component of `comps` containing `nm`, or -1
+    (idx_of (lambda (comps nm)
+              (bind ((i (ref 0)) (found (ref -1)))
+                (do
+                  (for c comps
+                    (do
+                      (when (in? c nm) (set_ref found (deref i)))
+                      (set_ref i (int_add (deref i) 1))))
+                  (deref found)))))
+  )
+    (do
+      ; ── self-loop {a:[a]} -> one component {a} ──
+      (bind ((comps (sccs (edges_of (list_of (list_of "a" (list_of "a")))))))
+        (do
+          (assert_eq (size comps) 1 "self-loop is one component")
+          (assert_true (deep_eq (comp_with comps "a") (list_of "a"))
+            "self-loop component is exactly {a}")))
+
+      ; ── 2-cycle {a:[b], b:[a]} -> ONE component {a, b} ──
+      (bind ((comps (sccs (edges_of (list_of
+                     (list_of "a" (list_of "b"))
+                     (list_of "b" (list_of "a")))))))
+        (do
+          (assert_eq (size comps) 1 "a 2-cycle is a single SCC")
+          (assert_true (deep_eq (comp_with comps "a") (list_of "a" "b"))
+            "the 2-cycle component holds both a and b")
+          (assert_eq (idx_of comps "a") (idx_of comps "b")
+            "mutually recursive a and b share one scc id")))
+
+      ; ── acyclic chain {a:[b], b:[c]} (c undefined-as-key but present via b's
+      ;    edge only as a leaf) -> here a,b,c are all distinct singletons; give c
+      ;    its own key so it is a node too ──
+      (bind ((comps (sccs (edges_of (list_of
+                     (list_of "a" (list_of "b"))
+                     (list_of "b" (list_of "c"))
+                     (list_of "c" (list_of)))))))
+        (do
+          (assert_eq (size comps) 3 "an acyclic chain is three singletons")
+          (assert_true (deep_eq (comp_with comps "a") (list_of "a")) "a is alone")
+          (assert_true (deep_eq (comp_with comps "b") (list_of "b")) "b is alone")
+          (assert_true (deep_eq (comp_with comps "c") (list_of "c")) "c is alone")
+          (assert_true (not (eq (idx_of comps "a") (idx_of comps "b")))
+            "chain nodes do not share a scc id")
+          ; reverse-topological order: the callee `c` is emitted before its
+          ; caller `b`, which is emitted before `a`
+          (assert_true (lt (idx_of comps "c") (idx_of comps "b"))
+            "callee c precedes caller b (reverse topological)")
+          (assert_true (lt (idx_of comps "b") (idx_of comps "a"))
+            "caller b precedes a (reverse topological)")))
+
+      ; ── one SCC {a,b} with a tail: a<->b, and b -> t (t a leaf) ──
+      (bind ((comps (sccs (edges_of (list_of
+                     (list_of "a" (list_of "b"))
+                     (list_of "b" (list_of "a" "t"))
+                     (list_of "t" (list_of)))))))
+        (do
+          (assert_eq (size comps) 2 "the SCC plus its tail are two components")
+          (assert_true (deep_eq (comp_with comps "a") (list_of "a" "b"))
+            "a and b are the mutually recursive group")
+          (assert_true (deep_eq (comp_with comps "t") (list_of "t"))
+            "t is its own singleton component")
+          (assert_eq (idx_of comps "a") (idx_of comps "b")
+            "a and b share a scc id")
+          (assert_true (not (eq (idx_of comps "a") (idx_of comps "t")))
+            "the tail t has a different scc id")
+          ; the tail (a callee of the group) is emitted before the group
+          (assert_true (lt (idx_of comps "t") (idx_of comps "a"))
+            "the tail t precedes the SCC (reverse topological)")))
+
+      ; ── external callees are dropped: {a:[a, ext]} where `ext` is not a key ──
+      (bind ((comps (sccs (edges_of (list_of (list_of "a" (list_of "a" "ext")))))))
+        (do
+          (assert_eq (size comps) 1 "external callee adds no node")
+          (assert_true (deep_eq (comp_with comps "a") (list_of "a"))
+            "the external callee `ext` is not part of any component")))
+
+      ; ── analyze_module on a located list of mutually recursive defs ──
+      ;    (bind "scc_a" (lambda () (scc_b)))  /  (bind "scc_b" (lambda () (scc_a)))
+      (bind ((r (analyze_module (located (list_of
+                  (def "scc_a" (lam (list_of) (calln "scc_b" (list_of))))
+                  (def "scc_b" (lam (list_of) (calln "scc_a" (list_of))))
+                  (calln "export" (list_of (sym "scc_a"))))))))
+        (do
+          (assert_eq (get (get r "scc_of") "scc_a")
+                     (get (get r "scc_of") "scc_b")
+            "analyze_module groups mutually recursive scc_a/scc_b in one scc")
+          (assert_true
+            (deep_eq (comp_with (get r "components") "scc_a") (list_of "scc_a" "scc_b"))
+            "the recovered component is exactly {scc_a, scc_b}")))
+
+      ; ── a leaf def is its own singleton component ──
+      (bind ((r (analyze_module (located (list_of
+                  (def "scc_leaf" (lam (list_of) (lit 7)))
+                  (calln "export" (list_of (sym "scc_leaf"))))))))
+        (assert_true
+          (deep_eq (comp_with (get r "components") "scc_leaf") (list_of "scc_leaf"))
+          "a non-recursive leaf is a singleton SCC"))
+
+      ; ── the PASS entry (check_module): publishes one "callgraph.scc" fact per
+      ;    name and a finding per mutually-recursive group. Run it on a module of
+      ;    a 2-cycle scc_x<->scc_y plus a leaf scc_z; read the facts back with
+      ;    fact_of and inspect the sink. (Names carry the scc_ prefix so the facts
+      ;    don't collide with another test's, and are cleared at the end.) ──
+      (bind (
+        (sink (list_of))
+        (mod  (located (list_of
+                (def "scc_x" (lam (list_of) (calln "scc_y" (list_of))))
+                (def "scc_y" (lam (list_of) (calln "scc_x" (list_of))))
+                (def "scc_z" (lam (list_of) (lit 7)))
+                (calln "export" (list_of (sym "scc_x") (sym "scc_z"))))))
+        ; does any sink finding mention `nm` (membership of a group message)?
+        (finding_mentions? (lambda (nm)
+                             (any? sink (lambda (s) (string_contains s nm)))))
+      )
+        (do
+          (check_module mod sink)
+          ; facts: every defined name got an scc id; the 2-cycle shares one
+          (assert_true (not (eq (fact_of "callgraph.scc" "scc_x" null) null))
+            "check_module publishes an scc id for scc_x")
+          (assert_eq (fact_of "callgraph.scc" "scc_x" null)
+                     (fact_of "callgraph.scc" "scc_y" null)
+            "the 2-cycle scc_x/scc_y share a published scc id")
+          (assert_true (not (eq (fact_of "callgraph.scc" "scc_x" null)
+                                (fact_of "callgraph.scc" "scc_z" null)))
+            "the leaf scc_z has a different published scc id")
+          ; findings: exactly the mutually-recursive group, not the leaf
+          (assert_eq (size sink) 1
+            "check_module emits exactly one group finding (the 2-cycle)")
+          (assert_true (and (finding_mentions? "scc_x") (finding_mentions? "scc_y"))
+            "the group finding names both mutually recursive members")
+          (assert_true (not (finding_mentions? "scc_z"))
+            "the singleton leaf scc_z is not reported as a group")))
+
+      ; ── hygiene: clear the "callgraph.scc" facts the pass run above published
+      ;    (keyed by our scc_-prefixed names), so a later pass run in the same
+      ;    session starts clean (cf. test_inline) ──
+      (do
+        (for nm (list_of "scc_a" "scc_b" "scc_leaf" "scc_x" "scc_y" "scc_z")
+          (fact! "callgraph.scc" nm null))
+        (assert_true true "facts cleared")))))

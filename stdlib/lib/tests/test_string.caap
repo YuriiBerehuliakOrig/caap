@@ -1,0 +1,94 @@
+; stdlib/lib/tests/test_string.caap — in-language tests for lib/text/string.
+
+;; @area: text
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq)
+(use stdlib.lib.text.string
+  split trim upcase downcase replace repeat lines slice find
+  contains? starts_with? ends_with? concat to_string
+  length empty? char_at chars pad_left pad_right parse_int parse_float
+  rfind strip_prefix strip_suffix splitn split_whitespace replace_first
+  replace_n replace_last)
+(use stdlib.lib.collections.option some? none? option_unwrap_or)
+
+(do
+  (assert_eq (size (split "a,b,c" ",")) 3 "split count")
+  (assert_eq (get (split "a,b,c" ",") 1) "b" "split part")
+  (assert_eq (trim "  hi  ") "hi" "trim")
+  (assert_eq (upcase "hi") "HI" "upcase")
+  (assert_eq (downcase "HI") "hi" "downcase")
+  (assert_eq (replace "a-b-c" "-" "+") "a+b+c" "replace all")
+  (assert_eq (repeat "ab" 3) "ababab" "repeat")
+  (assert_eq (size (lines "x\ny")) 2 "lines")
+  (assert_eq (slice "hello" 1 3) "el" "slice")
+  (assert_eq (find "hello" "ll") 2 "find hit")
+  (assert_eq (find "hello" "zz") null "find miss -> null")
+  (assert_eq (contains? "hello" "ell") true "contains?")
+  (assert_eq (starts_with? "hello" "he") true "starts_with?")
+  (assert_eq (ends_with? "hello" "lo") true "ends_with?")
+  (assert_eq (concat "a" "b" "c") "abc" "concat")
+  (assert_eq (to_string 42) "42" "to_string int")
+  (assert_eq (length "hello") 5 "length")
+  (assert_eq (empty? "") true "empty?")
+  (assert_eq (char_at "abc" 1) "b" "char_at hit")
+  (assert_eq (char_at "abc" 9) null "char_at out of range")
+  (assert_eq (option_unwrap_or (parse_int "42") 0) 42 "parse_int ok")
+  (assert_eq (option_unwrap_or (parse_int " -7 ") 0) -7 "parse_int negative + spaces")
+  (assert_eq (none? (parse_int "nope")) true "parse_int bad -> none")
+  (assert_eq (none? (parse_int "1.5")) true "parse_int float -> none")
+  (assert_eq (none? (parse_int "")) true "parse_int empty -> none")
+  (assert_eq (option_unwrap_or (parse_float " 2.5 ") 0.0) 2.5 "parse_float ok")
+  (assert_eq (none? (parse_float "nope")) true "parse_float bad -> none")
+  ; enrichment
+  (assert_eq (size (chars "abc")) 3 "chars count")
+  (assert_eq (get (chars "abc") 1) "b" "chars element")
+  (assert_eq (pad_left "7" 3 "0") "007" "pad_left")
+  (assert_eq (pad_right "7" 3 " ") "7  " "pad_right")
+  (assert_eq (pad_left "long" 2 "0") "long" "pad no-op when wide")
+  ; rfind — last occurrence, null on miss
+  (assert_eq (rfind "abcabc" "bc") 4 "rfind last occurrence")
+  (assert_eq (rfind "aaa" "a") 2 "rfind overlapping")
+  (assert_eq (rfind "abc" "z") null "rfind miss -> null")
+  (assert_eq (rfind "" "x") null "rfind in empty -> null")
+  ; strip_prefix / strip_suffix — no-op when not present
+  (assert_eq (strip_prefix "foobar" "foo") "bar" "strip_prefix hit")
+  (assert_eq (strip_prefix "foobar" "xyz") "foobar" "strip_prefix miss")
+  (assert_eq (strip_suffix "foobar" "bar") "foo" "strip_suffix hit")
+  (assert_eq (strip_suffix "foobar" "xyz") "foobar" "strip_suffix miss")
+  ; splitn — at most n parts; the last keeps the remainder whole
+  (assert_eq (size (splitn "a,b,c,d" "," 2)) 2 "splitn count")
+  (assert_eq (get (splitn "a,b,c,d" "," 2) 0) "a" "splitn first part")
+  (assert_eq (get (splitn "a,b,c,d" "," 2) 1) "b,c,d" "splitn remainder")
+  (assert_eq (size (splitn "a,b" "," 5)) 2 "splitn fewer than n")
+  (assert_eq (get (splitn "a,b,c" "," 1) 0) "a,b,c" "splitn n=1 whole string")
+  (assert_eq (size (splitn "abc" "" 3)) 1 "splitn empty sep -> whole string")
+  (assert_eq (get (splitn "abc" "" 3) 0) "abc" "splitn empty sep single part")
+  (assert_eq (size (splitn "abc" "," 0)) 0 "splitn n=0 empty list")
+  ; split_whitespace — runs collapse, empty tokens dropped
+  (assert_eq (size (split_whitespace "  a  b   c ")) 3 "split_whitespace count")
+  (assert_eq (get (split_whitespace " a\tb\nc ") 1) "b" "split_whitespace mixed ws")
+  (assert_eq (size (split_whitespace "   ")) 0 "split_whitespace all whitespace")
+  (assert_eq (size (split_whitespace "")) 0 "split_whitespace empty")
+  ; replace_first — only the first match
+  (assert_eq (replace_first "a-b-c" "-" "+") "a+b-c" "replace_first first only")
+  (assert_eq (replace_first "abc" "z" "+") "abc" "replace_first miss")
+  ; replace_n — at most the first `count` matches, left-to-right
+  (assert_eq (replace_n "a-b-c-d" "-" "+" 2) "a+b+c-d" "replace_n two of three")
+  (assert_eq (replace_n "a-b-c" "-" "+" 5) "a+b+c" "replace_n count exceeds matches")
+  (assert_eq (replace_n "a-b-c" "-" "+" 1) "a+b-c" "replace_n one == replace_first")
+  (assert_eq (replace_n "a-b-c" "-" "+" 0) "a-b-c" "replace_n count 0 no-op")
+  (assert_eq (replace_n "a-b-c" "-" "+" -3) "a-b-c" "replace_n negative count no-op")
+  (assert_eq (replace_n "abc" "z" "+" 3) "abc" "replace_n miss")
+  (assert_eq (replace_n "abc" "" "+" 3) "abc" "replace_n empty needle no-op")
+  ; replacement is NOT re-scanned (non-overlapping, like the kernel replacer)
+  (assert_eq (replace_n "aaa" "a" "aa" 2) "aaaaa" "replace_n no re-match of insert")
+  (assert_eq (replace_n "xx" "x" "" 9) "" "replace_n delete all")
+  ; replace_last — only the final match (mirror of replace_first)
+  (assert_eq (replace_last "a-b-c" "-" "+") "a-b+c" "replace_last last only")
+  (assert_eq (replace_last "a-b-c-d" "-" "+") "a-b-c+d" "replace_last of three")
+  (assert_eq (replace_last "abc" "z" "+") "abc" "replace_last miss")
+  (assert_eq (replace_last "only" "only" "X") "X" "replace_last single match whole")
+  (assert_eq (replace_last "abc" "" "+") "abc" "replace_last empty needle no-op")
+  (assert_eq (replace_last "aaa" "a" "Z") "aaZ" "replace_last overlapping last")
+  true)

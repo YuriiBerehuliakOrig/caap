@@ -1,0 +1,18 @@
+; user_typefn — a USER-DEFINED type constructor: `pair` is a compile-time
+; function over descriptors producing a struct-shaped descriptor, so
+; (pair int string) in any LATER module's signature instantiates lazily and
+; rides every struct rule (field types, get checking, assignability).
+(module stdlib.fixtures.user_typefn)
+(use stdlib.semantics.types.registry define_type_fn! field)
+
+(bind registered
+  (define_type_fn! "pair"
+    (lambda (args)
+      (if (eq (size args) 2)
+        (assoc (map_of) "kind" "struct"
+          "fields" (list_of
+            (field "a" (get (get args 0 null) "name" null))
+            (field "b" (get (get args 1 null) "name" null))))
+        null))))
+
+(export registered)

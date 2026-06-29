@@ -1,0 +1,3 @@
+; ur-suspend probe: parks a thread but never enqueues it on a waiter list.
+(defn _ur_thread_suspend_timed ((t i32) (c u32) (o u32) (w u32)) i32 0)
+(defn _probe_lostwake ((t i32)) i32 (_ur_thread_suspend_timed t 1 2 3))

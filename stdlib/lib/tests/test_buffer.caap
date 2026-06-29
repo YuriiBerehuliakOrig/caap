@@ -1,0 +1,89 @@
+; stdlib/lib/tests/test_buffer.caap — in-language tests for lib/text/buffer.
+
+;; @area: text
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.text.buffer
+     buf_new push push_str push_char buf_len buf_is_empty? buf_clear to_string
+     newline push_line indent
+     byte_buf_new push_byte push_bytes to_byte_list to_bytes)
+
+(do
+  ; ── string buffer: push several pieces, join once ──
+  (bind ((b (buf_new)))
+    (do
+      (push b "hello")
+      (push_str b ", ")
+      (push b "world")
+      (push_char b "!")
+      (assert_eq (buf_len b) 4 "buf_len counts pushed fragments")
+      (assert_eq (to_string b) "hello, world!" "to_string == concatenation")))
+
+  ; ── push returns the buffer (writer-style chaining) ──
+  (assert_eq (to_string (push (push (buf_new) "a") "b")) "ab" "push chains")
+
+  ; ── empty buffer joins to "" ──
+  (assert_eq (to_string (buf_new)) "" "empty buffer is empty string")
+
+  ; ── buf_is_empty? / buf_clear ──
+  (assert_eq (buf_is_empty? (buf_new)) true "fresh buffer is empty")
+  (bind ((c (buf_new)))
+    (do
+      (push c "x")
+      (assert_eq (buf_is_empty? c) false "buffer with a fragment is not empty")
+      ; buf_clear resets in place and returns the SAME buffer
+      (assert_eq (buf_is_empty? (buf_clear c)) true "buf_clear empties the buffer")
+      (assert_eq (to_string c) "" "cleared buffer joins to empty")
+      ; the cell identity is preserved: a fresh push after clear works
+      (push c "y")
+      (assert_eq (to_string c) "y" "buffer is reusable after clear")))
+
+  ; ── push_line: fragment then a newline ──
+  (bind ((l (buf_new)))
+    (do
+      (push_line l "a")
+      (push_line l "b")
+      (assert_eq (to_string l) "a\nb\n" "push_line appends s then a newline")))
+  ; push_line chains (returns the buffer)
+  (assert_eq (to_string (push_line (buf_new) "x")) "x\n" "push_line returns the buffer")
+
+  ; ── indent / newline pretty-printer helpers ──
+  (bind ((p (buf_new)))
+    (do
+      (indent p 2)
+      (push p "x")
+      (newline p)
+      (indent p 1)
+      (push p "y")
+      (assert_eq (to_string p) "    x\n  y" "indent/newline build lines")))
+
+  ; ── indent n<=0 appends nothing ──
+  (assert_eq (to_string (indent (buf_new) 0)) "" "indent 0 is no-op")
+
+  ; ── byte buffer: round-trip through to_byte_list / to_bytes ──
+  ; (lists are `eq` by identity, so compare via value_to_string / value_eq.)
+  (bind ((bb (byte_buf_new)))
+    (do
+      (push_byte bb 72)
+      (push_byte bb 105)
+      (push_bytes bb (list_of 33 0 255))
+      (assert_eq (size (to_byte_list bb)) 5 "to_byte_list has every pushed byte")
+      (assert_true (value_eq (to_byte_list bb) (list_of 72 105 33 0 255))
+        "to_byte_list round-trips")
+      (assert_true (value_eq (bytes_to_list (to_bytes bb)) (list_of 72 105 33 0 255))
+        "to_bytes -> bytes_to_list round-trips")
+      (assert_eq (bytes->string (to_bytes (push_bytes (byte_buf_new) (list_of 72 105 33))))
+        "Hi!" "byte buffer decodes to text")))
+
+  ; ── push_byte rejects out-of-range / non-int ──
+  (assert_true
+    (try (do (push_byte (byte_buf_new) 256) false)
+         (catch e true))
+    "push_byte rejects 256")
+  (assert_true
+    (try (do (push_byte (byte_buf_new) -1) false)
+         (catch e true))
+    "push_byte rejects -1")
+
+  true)

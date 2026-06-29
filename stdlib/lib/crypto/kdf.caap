@@ -1,0 +1,167 @@
+; stdlib/lib/crypto/kdf.caap — password / key derivation functions in pure CAAP
+; (module stdlib.lib.crypto.kdf).
+;
+; PBKDF2 (RFC 2898) and HKDF (RFC 5869), both instantiated over HMAC-SHA-256
+; from stdlib.lib.crypto.digest. Everything here is PURE and DETERMINISTIC: the
+; same inputs always yield the same key, with no clock, randomness, or I/O.
+;
+; The whole construction is byte-list plumbing around the existing `hmac`:
+;   hmac : (hashfn key msg) -> a lowercase HEX string.
+; KDFs need the MAC as RAW BYTES to XOR/concatenate, so every hmac result is
+; routed through hex_decode + bytes_to_list back into a list of ints 0..255.
+; XOR is per-byte via the kernel `int_xor` (values already in 0..255, so no
+; masking is needed — the inputs cannot overflow 32 bits).
+;
+; Inputs (password / salt / ikm / info) accept either a string (its UTF-8 bytes
+; are used) or an explicit byte list. Outputs are lowercase hex strings.
+;
+; Known-answer RFC vectors in tests/test_kdf.caap pin the block counter,
+; XOR-fold, and big-endian byte order; any off-by-one there changes the hex.
+(module stdlib.lib.crypto.kdf)
+
+(use stdlib.lib.crypto.digest sha256 hmac)
+(use stdlib.lib.text.encoding hex_decode hex_encode)
+(use stdlib.lib.collections.sequence each range concat take)
+(use stdlib.lib.diag.error raise!)
+
+; ── byte plumbing ─────────────────────────────────────────────────────────────
+; bytes_of — a string's UTF-8 bytes as a list of ints 0..255; a byte list passes
+; through unchanged. Lets every public KDF accept either spelling.
+(bind bytes_of
+  (lambda (v)
+    (if (eq (value_type v) "string")
+      (bytes_to_list (string->bytes v))
+      v)))
+
+; hmac_bytes — HMAC-SHA-256(key, msg) as a RAW byte list (0..255 ints). `hmac`
+; hands back a hex string; decode it to bytes and explode to an int list so the
+; result can be XOR-folded and concatenated.
+(bind hmac_bytes
+  (lambda (key msg)
+    (bytes_to_list (hex_decode (hmac sha256 key msg)))))
+
+; to_hex — a list of bytes (0..255 ints) -> lowercase hex string. Sealed into a
+; kernel bytes value first, then hex-encoded.
+(bind to_hex (lambda (byte_list) (hex_encode (bytes_from_list byte_list))))
+
+; xor_bytes — element-wise XOR of two equal-length byte lists -> a new list.
+(bind xor_bytes
+  (lambda (a b)
+    (bind ((out (list_of)))
+      (do
+        (each (range 0 (size a))
+          (lambda (i) (append out (int_xor (get a i) (get b i)))))
+        out))))
+
+; int_32_be — a non-negative int as 4 big-endian bytes (PBKDF2's block index).
+(bind int_32_be
+  (lambda (n)
+    (list_of
+      (int_and (int_shr n 24) 255)
+      (int_and (int_shr n 16) 255)
+      (int_and (int_shr n 8) 255)
+      (int_and n 255))))
+
+; ── PBKDF2 ────────────────────────────────────────────────────────────────────
+; pbkdf2_f — one derived block F(P, S, c, i) (RFC 2898 §5.2):
+;   U1 = HMAC(P, S || INT_32_BE(i)),  Uj = HMAC(P, Uj-1),
+;   F  = U1 XOR U2 XOR … XOR Uc.
+; `pw`/`salt` are byte lists; `i` is the 1-based block index; returns a 32-byte
+; (one HMAC-SHA-256 digest) list.
+(bind pbkdf2_f
+  (lambda (pw salt c i)
+    (bind ((u (ref (hmac_bytes pw (concat salt (int_32_be i)))))
+           (acc (ref (deref u)))
+           (j (ref 1)))
+      (do
+        (while (lt (deref j) c)
+          (do
+            (set_ref u (hmac_bytes pw (deref u)))
+            (set_ref acc (xor_bytes (deref acc) (deref u)))
+            (set_ref j (int_add (deref j) 1))))
+        (deref acc)))))
+
+; pbkdf2_sha256 — PBKDF2 with HMAC-SHA-256 as the PRF (RFC 2898). Concatenates
+; ceil(dklen/32) derived blocks and truncates to `dklen` bytes.
+;   password / salt : string or byte list
+;   iterations      : iteration count c (>= 1; ENFORCED — raises otherwise)
+;   dklen           : derived-key length in bytes (>= 0; ENFORCED — raises otherwise)
+;   ->              : the derived key as a lowercase hex string (2*dklen chars)
+(defn pbkdf2_sha256 ((password any) (salt any) (iterations int) (dklen int)) string
+    (cond
+      ((lt iterations 1)
+        (raise! "stdlib.crypto.kdf.invalid_iterations"
+          "pbkdf2_sha256: iterations must be >= 1"
+          (assoc (map_of) "got" iterations)))
+      ((lt dklen 0)
+        (raise! "stdlib.crypto.kdf.invalid_dklen"
+          "pbkdf2_sha256: dklen must be >= 0"
+          (assoc (map_of) "got" dklen)))
+      (else
+        (bind ((pw (bytes_of password))
+               (st (bytes_of salt))
+               (hlen 32)
+               (nblocks (int_div (int_add dklen (int_sub hlen 1)) hlen))
+               (out (list_of))
+               (i (ref 1)))
+          (do
+            (while (le (deref i) nblocks)
+              (do
+                (each (pbkdf2_f pw st iterations (deref i))
+                  (lambda (b) (append out b)))
+                (set_ref i (int_add (deref i) 1))))
+            (to_hex (take out dklen)))))))
+
+; ── HKDF (RFC 5869) ───────────────────────────────────────────────────────────
+; hkdf_extract — extract step: PRK = HMAC-SHA-256(salt, IKM). A zero-length salt
+; is RFC-compliant input; the caller may pass the empty string or an empty list.
+;   salt / ikm : string or byte list
+;   ->         : the pseudorandom key PRK as a lowercase hex string
+(defn hkdf_extract ((salt any) (ikm any)) string
+    (to_hex (hmac_bytes (bytes_of salt) (bytes_of ikm))))
+
+; hkdf_expand — expand step (RFC 5869 §2.3): with PRK and optional `info`,
+;   T(0) = "",  T(n) = HMAC(PRK, T(n-1) || info || byte(n)),  n = 1..ceil(L/32),
+;   OKM  = first L bytes of T(1) || T(2) || …
+;   prk    : the PRK as a hex string (from hkdf_extract)
+;   info   : string or byte list (context/application info; may be empty)
+;   length : output length L in bytes (0 <= L <= 255*32 = 8160; ENFORCED — raises otherwise)
+;   ->     : the output keying material OKM as a lowercase hex string
+(defn hkdf_expand ((prk any) (info any) (length int)) string
+    (cond
+      ((lt length 0)
+        (raise! "stdlib.crypto.kdf.invalid_hkdf_length"
+          "hkdf_expand: length must be >= 0"
+          (assoc (map_of) "got" length)))
+      ((gt length 8160)
+        (raise! "stdlib.crypto.kdf.hkdf_length_exceeds_max"
+          "hkdf_expand: length must be <= 8160 (255*32)"
+          (assoc (map_of) "got" length)))
+      (else
+        (bind ((prk_bytes (bytes_to_list (hex_decode prk)))
+               (info_bytes (bytes_of info))
+               (hlen 32)
+               (nblocks (int_div (int_add length (int_sub hlen 1)) hlen))
+               (out (list_of))
+               (prev (ref (list_of)))
+               (n (ref 1)))
+          (do
+            (while (le (deref n) nblocks)
+              (do
+                (set_ref prev
+                  (hmac_bytes prk_bytes
+                    (concat (concat (deref prev) info_bytes) (list_of (deref n)))))
+                (each (deref prev) (lambda (b) (append out b)))
+                (set_ref n (int_add (deref n) 1))))
+            (to_hex (take out length)))))))
+
+; hkdf_sha256 — full HKDF (extract-then-expand) in one call (RFC 5869 §2).
+;   ikm    : input keying material — string or byte list
+;   salt   : optional salt — string or byte list (may be empty)
+;   info   : optional context info — string or byte list (may be empty)
+;   length : output length in bytes
+;   ->     : the OKM as a lowercase hex string
+(defn hkdf_sha256 ((ikm any) (salt any) (info any) (length int)) string
+    (hkdf_expand (hkdf_extract salt ikm) info length))
+
+(export pbkdf2_sha256 hkdf_sha256 hkdf_extract hkdf_expand)

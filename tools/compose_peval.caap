@@ -1,0 +1,6 @@
+; compose_peval.caap — bootstrap + opt-in load-time partial evaluation (peval).
+; Temporary profiling harness (C7 perf unit). Mirrors compose_native.caap's
+; relative-path pattern (resolved against this file's directory; ../ reaches repo root).
+(do
+  (ctfe_compiler_execute_bootstrap_file compiler "../stdlib/bootstrap.caap")
+  (ctfe_compiler_execute_bootstrap_file compiler "../stdlib/boot/peval.caap"))

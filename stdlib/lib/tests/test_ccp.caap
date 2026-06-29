@@ -1,0 +1,372 @@
+; stdlib/lib/tests/test_ccp.caap — sparse conditional constant propagation, with
+; an explicit BEHAVIOR-PRESERVATION proof on every case: eval the IR before and
+; after ccp and assert the values agree (the transform may only change SHAPE, not
+; MEANING), plus structural assertions that the intended rewrite actually fired
+; (positives) or was correctly withheld (negatives).
+
+;; @area: passes
+;; @kind: regression
+;; @slow: true
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.ccp ccp_node const_value const_bool)
+(use stdlib.syntax.ir node_eq)
+(use stdlib.syntax.ast
+  sym lit calln call if3 eval_ir eval_with literal? literal_of call? head_is?
+  args_of arg name? name_of bind_pairs)
+
+; ── helpers (defined before the test body that uses them) ─────────────────────
+; mentions_name? — does any NAME leaf in the tree carry identifier `nm`?
+(bind mentions_name?
+  (lambda (node nm)
+    (cond
+      ((name? node) (eq (name_of node) nm))
+      ((call? node)
+        (or (mentions_name? (syntax_call_callee node) nm)
+            (bind ((hit (ref false)))
+              (do
+                (for a (args_of node)
+                  (when (mentions_name? a nm) (set_ref hit true)))
+                (deref hit)))))
+      (else false))))
+
+; find_deref_of? — is there a `(deref <name nm>)` call anywhere in the tree (i.e.
+; the ref read was preserved, not replaced by a literal)?
+(bind find_deref_of?
+  (lambda (node nm)
+    (cond
+      ((not (call? node)) false)
+      ((and (head_is? node "deref")
+            (name? (arg node 0))
+            (eq (name_of (arg node 0)) nm))
+        true)
+      (else
+        (bind ((hit (ref false)))
+          (do
+            (when (find_deref_of? (syntax_call_callee node) nm) (set_ref hit true))
+            (for a (args_of node)
+              (when (find_deref_of? a nm) (set_ref hit true)))
+            (deref hit)))))))
+
+; has_head? — does any call in the tree have head `h`? (used to assert an `if`
+; was pruned: no `if` call should remain.) Visits BOTH the callee and the args —
+; an `if` can live under a callee position (e.g. an immediately-applied lambda
+; body), so a recursion that descended only `args_of` would miss it.
+(bind has_head?
+  (lambda (node h)
+    (cond
+      ((not (call? node)) false)
+      ((head_is? node h) true)
+      (else
+        (bind ((hit (ref false)))
+          (do
+            (when (has_head? (syntax_call_callee node) h) (set_ref hit true))
+            (for a (args_of node)
+              (when (has_head? a h) (set_ref hit true)))
+            (deref hit)))))))
+
+; find_body_const — the literal VALUE of the single body form of a canonical
+; bind (its last body element), when that body is a bare literal; else null.
+(bind find_body_const
+  (lambda (node)
+    (bind ((bp (bind_pairs node)))
+      (if (eq bp null)
+        (if (literal? node) (literal_of node) null)
+        (bind ((body (get bp "body")))
+          (if (and (gt (size body) 0) (literal? (get body (int_sub (size body) 1))))
+            (literal_of (get body (int_sub (size body) 1)))
+            null))))))
+
+(do
+  ; ── 1. propagate x=5 into a condition, prune the now-const `if` ──────────────
+  ; (bind "x" 5 (if (lt x 10) 100 200)) :  x is const 5, (lt 5 10) is const true,
+  ; so the if prunes to its THEN arm, the literal 100.
+  (bind (
+    (in1 (calln "bind"
+           (list_of (lit "x") (lit 5)
+             (if3 (calln "lt" (list_of (sym "x") (lit 10)))
+                  (lit 100) (lit 200)))))
+    (out1 (ccp_node in1))
+  )
+    (do
+      ; behavior preserved: same value before and after
+      (assert_eq (eval_ir in1) (eval_ir out1) "case1: eval preserved")
+      (assert_eq (eval_ir in1) 100 "case1: program yields 100")
+      ; the if was PRUNED: no `if` call survives anywhere in the rewritten tree
+      ; (CCP replaces it with its live THEN arm; the now-dead `x` bind is DCE's
+      ; job, not CCP's — what matters here is the branch decision was eliminated).
+      (assert_true (not (has_head? out1 "if")) "case1: the if was pruned away")
+      ; and x was propagated INTO the (removed) condition: no use of x remains in
+      ; the body — the only x left is the binding's own literal value, not a use.
+      (assert_eq (find_body_const out1) 100 "case1: pruned to the live arm 100")))
+
+  ; ── 2. propagate x=5 into an arithmetic use (and fold to 6) ──────────────────
+  ; (bind "x" 5 (int_add x 1)) : x propagates to 5; the value of the form is 6.
+  (bind (
+    (in2 (calln "bind"
+           (list_of (lit "x") (lit 5)
+             (calln "int_add" (list_of (sym "x") (lit 1))))))
+    (out2 (ccp_node in2))
+  )
+    (do
+      (assert_eq (eval_ir in2) (eval_ir out2) "case2: eval preserved")
+      (assert_eq (eval_ir in2) 6 "case2: program yields 6")
+      ; x was propagated: no bare name "x" survives anywhere in the rewritten tree
+      (assert_true (not (mentions_name? out2 "x")) "case2: x fully propagated away")))
+
+  ; ── 3. NEGATIVE: a ref read is NOT a propagatable constant ───────────────────
+  ; (bind "r" (ref 0) (do (set_ref r 9) (deref r))) : r is a MUTABLE cell, mutated
+  ; by set_ref, so it is BOTTOM — `(deref r)` must NOT be replaced by (lit 0) or
+  ; (lit 9). The value is 9 before and after; the deref structure is unchanged.
+  (bind (
+    (in3 (calln "bind"
+           (list_of (lit "r") (calln "ref" (list_of (lit 0)))
+             (calln "do" (list_of
+               (calln "set_ref" (list_of (sym "r") (lit 9)))
+               (calln "deref" (list_of (sym "r"))))))))
+    (out3 (ccp_node in3))
+  )
+    (do
+      (assert_eq (eval_ir in3) (eval_ir out3) "case3: eval preserved")
+      (assert_eq (eval_ir in3) 9 "case3: program yields 9")
+      ; the deref of the (poisoned) ref was left exactly intact, nothing propagated
+      (assert_true (find_deref_of? out3 "r")
+        "case3: (deref r) survives, NOT replaced by a literal")
+      ; the STRONGEST negative proof: the whole tree is byte-for-byte (structurally)
+      ; unchanged — r is poisoned (a set_ref target) so it was never a constant, no
+      ; `(lit 0)`/`(lit 9)` ever sneaked in anywhere.
+      (assert_true (node_eq out3 in3)
+        "case3: the ref/deref tree is structurally unchanged (nothing propagated)")))
+
+  ; ── 4. NEGATIVE: a name that DIFFERS on two if branches is NOT constant after ─
+  ; the merge. (bind "y" (if c 1 2) (int_add y 0)) with c a FREE name : y depends
+  ; on a runtime cond, so post-bind it is NOT a single constant — `(int_add y 0)`
+  ; must keep the name y, it MUST NOT be folded to a literal. The free `c` also
+  ; means the inner `if` can't be pruned. (We test the body DIRECTLY — no lambda
+  ; wrapper — so the merge logic is genuinely exercised; a wrapper would let ccp
+  ; ignore the whole node and the assertions would pass vacuously.) Behavior
+  ; preservation is checked for BOTH values of c via eval_with.
+  (bind (
+    (in4 (calln "bind"
+           (list_of (lit "y")
+             (if3 (sym "c") (lit 1) (lit 2))
+             (calln "int_add" (list_of (sym "y") (lit 0))))))
+    (out4 (ccp_node in4))
+  )
+    (do
+      ; behavior preserved for c=true (-> 1) AND c=false (-> 2)
+      (assert_eq (eval_with in4 (assoc (map_of) "c" true))
+                 (eval_with out4 (assoc (map_of) "c" true))
+        "case4: eval preserved (c=true)")
+      (assert_eq (eval_with in4 (assoc (map_of) "c" false))
+                 (eval_with out4 (assoc (map_of) "c" false))
+        "case4: eval preserved (c=false)")
+      (assert_eq (eval_with out4 (assoc (map_of) "c" true)) 1 "case4: c=true -> 1")
+      (assert_eq (eval_with out4 (assoc (map_of) "c" false)) 2 "case4: c=false -> 2")
+      ; y was NOT propagated to a constant: a bare name "y" still appears (the
+      ; merge of arms 1 and 2 is not a single constant) — the use survives.
+      (assert_true (mentions_name? out4 "y")
+        "case4: y NOT treated as constant after the if-merge")
+      ; the if was NOT pruned (c is free / unknown): an `if` head still remains.
+      (assert_true (has_head? out4 "if")
+        "case4: the if (free condition) was NOT pruned")))
+
+  ; ── 6. NEGATIVE (shadowing): a lambda PARAMETER shadows an outer constant ─────
+  ; (bind "x" 5 ((lambda (x) (int_add x 1)) 10)) with the param in the kernel's
+  ; CALL-of-names shape `(x)` (what the frontend actually emits). The body `x` is
+  ; the PARAMETER (10 at the call), NOT the outer 5 — it must NOT be replaced by 5.
+  ; Correct value 11; a buggy propagation would give 6.
+  (bind (
+    (params_call (call (sym "x") (list_of)))            ; call-of-names shape `(x)`
+    (in6 (calln "bind"
+           (list_of (lit "x") (lit 5)
+             (call (call (sym "lambda")
+                         (list_of params_call
+                                  (calln "int_add" (list_of (sym "x") (lit 1)))))
+                   (list_of (lit 10))))))
+    (out6 (ccp_node in6))
+  )
+    (do
+      (assert_eq (eval_ir in6) (eval_ir out6) "case6: eval preserved")
+      (assert_eq (eval_ir in6) 11 "case6: program yields 11 (param x = 10, +1)")
+      (assert_eq (eval_ir out6) 11 "case6: STILL 11 after ccp (param not clobbered)")))
+
+  ; ── 7. NEGATIVE (quote): a constant name inside `(quote …)` is DATA, not code ──
+  ; (bind "x" 5 (quote x)) : the quoted `x` is a symbol datum; ccp must NOT rewrite
+  ; it to `(quote 5)` (that would change the value from the symbol x to the int 5).
+  (bind (
+    (in7 (calln "bind" (list_of (lit "x") (lit 5) (calln "quote" (list_of (sym "x"))))))
+    (out7 (ccp_node in7))
+  )
+    (do
+      ; the quoted datum is untouched: the inner x is still a NAME, not a literal.
+      (assert_true (node_eq out7 in7) "case7: (quote x) is left intact (not (quote 5))")
+      (assert_true (mentions_name? out7 "x") "case7: the quoted symbol x survives")))
+
+  ; ── 8. NEGATIVE (lexical mutation): a name written by set!/assign_lexical is ───
+  ; BOTTOM. (bind "x" 5 (do (assign_lexical x 9) x)) : x is rebound to 9 before the
+  ; read, so the trailing x is NOT const-5 — it must NOT be replaced by (lit 5).
+  ; (set! lowers to assign_lexical; we use the lowered head directly so the test is
+  ; independent of the surface form and structurally checkable.)
+  (bind (
+    (in8 (calln "bind"
+           (list_of (lit "x") (lit 5)
+             (calln "do" (list_of
+               (calln "assign_lexical" (list_of (sym "x") (lit 9)))
+               (sym "x"))))))
+    (out8 (ccp_node in8))
+  )
+    (do
+      ; the read of the mutated x survives as a NAME (a poisoned name is never const)
+      (assert_true (node_eq out8 in8)
+        "case8: a lexically-mutated x is BOTTOM — tree unchanged, x not propagated")
+      (assert_true (mentions_name? out8 "x") "case8: the trailing x survives as a name")))
+
+  ; ── 9. REGRESSION (flat name-bind leak, straight-line): a FLAT name-bind
+  ; `(bind <name-node> v body…)` REBINDS x into the CURRENT scope (kernel
+  ; Environment::define, not a child scope), so it LEAKS past the surrounding
+  ; `do`. (bind "x" 5 (do (bind x 9 0) (int_add x 0))) reads 9, not 5: the inner
+  ; flat (bind x 9 0) overwrites x. CCP must NOT propagate the stale outer 5 —
+  ; x is poisoned whole-form as a flat-bind target, so the trailing x survives.
+  ; (Adversarially binary-reproduced as a miscompile: was 9 -> 5.)
+  (bind (
+    (in9 (calln "bind"
+           (list_of (lit "x") (lit 5)
+             (calln "do" (list_of
+               (calln "bind" (list_of (sym "x") (lit 9) (lit 0)))
+               (calln "int_add" (list_of (sym "x") (lit 0))))))))
+    (out9 (ccp_node in9))
+  )
+    (do
+      (assert_eq (eval_ir in9) (eval_ir out9) "case9: eval preserved")
+      (assert_eq (eval_ir in9) 9 "case9: program yields 9 (flat rebind wins)")
+      (assert_eq (eval_ir out9) 9 "case9: STILL 9 after ccp (stale 5 not propagated)")
+      (assert_true (mentions_name? out9 "x")
+        "case9: the flat-rebound x is BOTTOM — its use survives as a name")))
+
+  ; ── 10. REGRESSION (cross-branch flat-bind merge): each if-arm flat-rebinds x,
+  ; so after the join x is 7 (c=true) or 9 (c=false), NOT the outer 5. A flat
+  ; bind inside an arm leaks past the if-join (current-env define), so CCP must
+  ; NOT carry the stale outer x=5 across the control-flow boundary.
+  ; (bind "x" 5 (do (if c (bind x 7 0) (bind x 9 0)) (int_add x 0))) with c free.
+  ; (Adversarially binary-reproduced: was 7 (c=true) -> 5.)
+  (bind (
+    (in10 (calln "bind"
+            (list_of (lit "x") (lit 5)
+              (calln "do" (list_of
+                (if3 (sym "c")
+                     (calln "bind" (list_of (sym "x") (lit 7) (lit 0)))
+                     (calln "bind" (list_of (sym "x") (lit 9) (lit 0))))
+                (calln "int_add" (list_of (sym "x") (lit 0))))))))
+    (out10 (ccp_node in10))
+  )
+    (do
+      (assert_eq (eval_with in10 (assoc (map_of) "c" true))
+                 (eval_with out10 (assoc (map_of) "c" true))
+        "case10: eval preserved (c=true)")
+      (assert_eq (eval_with in10 (assoc (map_of) "c" false))
+                 (eval_with out10 (assoc (map_of) "c" false))
+        "case10: eval preserved (c=false)")
+      (assert_eq (eval_with out10 (assoc (map_of) "c" true)) 7 "case10: c=true -> 7")
+      (assert_eq (eval_with out10 (assoc (map_of) "c" false)) 9 "case10: c=false -> 9")
+      (assert_true (mentions_name? out10 "x")
+        "case10: x NOT propagated across the cross-branch flat-rebind merge")))
+
+  ; ── 11. REGRESSION (runtime flat-rebind drives branch pruning): the WORST
+  ; variant — a flat rebind makes x a RUNTIME value (c), and the stale outer 5
+  ; must NOT be propagated into a BRANCH CONDITION. (bind "x" 5 (do (bind x c 0)
+  ; (if (eq x 5) 111 222))) with c free: for c=7 the real value is 222, but a
+  ; buggy CCP folds (eq 5 5)=true and prunes to the THEN arm (111). The fix:
+  ; x is poisoned (flat-bind target) so it is never propagated into (eq x 5),
+  ; the if is left intact, and the runtime condition decides at eval.
+  ; (Adversarially binary-reproduced: was 222 (c=7) -> 111.)
+  (bind (
+    (in11 (calln "bind"
+            (list_of (lit "x") (lit 5)
+              (calln "do" (list_of
+                (calln "bind" (list_of (sym "x") (sym "c") (lit 0)))
+                (if3 (calln "eq" (list_of (sym "x") (lit 5))) (lit 111) (lit 222)))))))
+    (out11 (ccp_node in11))
+  )
+    (do
+      (assert_eq (eval_with in11 (assoc (map_of) "c" 7))
+                 (eval_with out11 (assoc (map_of) "c" 7))
+        "case11: eval preserved (c=7)")
+      (assert_eq (eval_with in11 (assoc (map_of) "c" 5))
+                 (eval_with out11 (assoc (map_of) "c" 5))
+        "case11: eval preserved (c=5)")
+      (assert_eq (eval_with out11 (assoc (map_of) "c" 7)) 222 "case11: c=7 -> 222 (else arm)")
+      (assert_eq (eval_with out11 (assoc (map_of) "c" 5)) 111 "case11: c=5 -> 111 (then arm)")
+      (assert_true (has_head? out11 "if")
+        "case11: the if was NOT pruned (x rebound to a runtime value, condition stays live)")
+      (assert_true (mentions_name? out11 "x")
+        "case11: stale 5 NOT propagated into the branch condition")))
+
+  ; ── 12. REGRESSION (same-name string-bind shadow, value reads the outer x): an
+  ; INNER canonical bind `(bind "x" v …)` SHADOWS an outer same-name x, and its
+  ; value v READS x. The kernel evaluates the inner bind as LETREC — every pair
+  ; name is pre-defined to Null in the new child scope BEFORE any pair value runs —
+  ; so the inner value sees x=Null, NOT the outer constant.
+  ; (bind "x" 5 (bind "x" (eq x null) (if x 111 222))): inner x = (eq Null null) =
+  ; true -> the if takes the THEN arm -> 111. A naive CCP walks the inner value
+  ; under the OUTER env still carrying x=5, folds (eq 5 null) = false, makes inner
+  ; x the constant false, and prunes the if to its ELSE arm -> 222 (WRONG). The fix:
+  ; x is bound TWICE (multiply-bound) so it is poisoned whole-form and never folded;
+  ; the runtime letrec value decides at eval. (Binary-reproduced: was 111 -> 222.)
+  (bind (
+    (in12 (calln "bind"
+            (list_of (lit "x") (lit 5)
+              (calln "bind"
+                (list_of (lit "x")
+                  (calln "eq" (list_of (sym "x") (lit null)))
+                  (if3 (sym "x") (lit 111) (lit 222)))))))
+    (out12 (ccp_node in12))
+  )
+    (do
+      (assert_eq (eval_ir in12) (eval_ir out12) "case12: eval preserved")
+      (assert_eq (eval_ir in12) 111 "case12: program yields 111 (inner x = (eq Null null))")
+      (assert_eq (eval_ir out12) 111 "case12: STILL 111 after ccp (shadow not mis-folded)")
+      ; the multiply-bound x is poisoned: it was never substituted into the inner
+      ; value nor used to prune the if — a bare name x survives in the rewrite.
+      (assert_true (mentions_name? out12 "x")
+        "case12: the shadowed x is BOTTOM — its uses survive as names")))
+
+  ; ── 13. REGRESSION (same-name string-bind shadow, independent shape): the inner
+  ; bind's value is itself an `if` reading the shadowed x. Same letrec root cause.
+  ; (bind "x" 10 (bind "x" (if (eq x null) 1 99) x)): inner x = (if (eq Null null)
+  ; 1 99) = 1, body x -> 1. A naive CCP substitutes outer x=10 -> (if (eq 10 null)
+  ; 1 99) -> 99, makes inner x = 99, body -> 99 (WRONG). The fix poisons x (bound
+  ; twice), so neither the inner value nor the body is folded; the value is 1.
+  ; (Binary-reproduced: was 1 -> 99.)
+  (bind (
+    (in13 (calln "bind"
+            (list_of (lit "x") (lit 10)
+              (calln "bind"
+                (list_of (lit "x")
+                  (if3 (calln "eq" (list_of (sym "x") (lit null))) (lit 1) (lit 99))
+                  (sym "x"))))))
+    (out13 (ccp_node in13))
+  )
+    (do
+      (assert_eq (eval_ir in13) (eval_ir out13) "case13: eval preserved")
+      (assert_eq (eval_ir in13) 1 "case13: program yields 1 (inner x = (if (eq Null null) 1 99))")
+      (assert_eq (eval_ir out13) 1 "case13: STILL 1 after ccp (shadow not mis-folded)")
+      (assert_true (mentions_name? out13 "x")
+        "case13: the shadowed x is BOTTOM — its uses survive as names")))
+
+  ; ── 5. direct lattice checks: const_value / const_bool ──────────────────────
+  ; a literal-only pure expression under an env with x=5 folds; an unknown name
+  ; does not; a ref read does not.
+  (bind ((env (assoc (map_of) "x" 5)))
+    (do
+      (assert_eq (const_value (calln "int_add" (list_of (sym "x") (lit 1))) env) 6
+        "const_value: (int_add x 1) with x=5 -> 6")
+      (assert_eq (const_value (calln "int_add" (list_of (sym "z") (lit 1))) env) null
+        "const_value: unknown z -> null (not constant)")
+      (assert_eq (const_value (calln "deref" (list_of (sym "x"))) env) null
+        "const_value: (deref x) -> null (a ref read is never constant)")
+      (assert_eq (const_bool (calln "lt" (list_of (sym "x") (lit 10))) env) true
+        "const_bool: (lt x 10) with x=5 -> true")
+      (assert_eq (const_bool (calln "lt" (list_of (sym "x") (lit 3))) env) false
+        "const_bool: (lt x 3) with x=5 -> false")
+      (assert_eq (const_bool (calln "int_add" (list_of (sym "x") (lit 1))) env) null
+        "const_bool: a non-bool constant -> null"))))

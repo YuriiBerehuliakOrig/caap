@@ -1,0 +1,106 @@
+; stdlib/frontend/clike/meta.caap - generic metadata scanning for clike.
+;
+; Metadata is intentionally parsed wider than the set of known attributes. The
+; declaration/local/field/param lowerers decide later whether each word is known
+; and legal for the classified shape.
+(module stdlib.frontend.clike.meta)
+
+(use stdlib.frontend.clike.tokens tval tsym? tloc)
+
+(bind meta_bag
+  (lambda ()
+    (assoc (map_of) "__tokens" (map_of) "__order" (list_of))))
+
+(bind meta_add!
+  (lambda (bag tok)
+    (do
+      (assoc bag (tval tok) true)
+      (assoc (get bag "__tokens") (tval tok) tok)
+      (append (get bag "__order") (tval tok))
+      bag)))
+
+(bind meta_token
+  (lambda (bag name fallback)
+    (get (get bag "__tokens" (map_of)) name fallback)))
+
+(bind meta_internal?
+  (lambda (name)
+    (or (eq name "i") (or (eq name "__tokens") (eq name "__order")))))
+
+(bind token_line
+  (lambda (tok)
+    (get (get tok "span" (map_of)) "start_line" null)))
+
+(bind same_line?
+  (lambda (anchor tok)
+    (bind ((a (token_line anchor)) (b (token_line tok)))
+      (or (eq a null) (or (eq b null) (eq a b))))))
+
+(bind scan_meta_until
+  (lambda (toks pos stop? emit!)
+    (bind ((p (ref pos)) (bag (meta_bag)))
+      (do
+        (while (bind ((tk (get toks (deref p))))
+                 (and (tsym? tk null) (not (stop? tk))))
+          (do
+            (when (not (eq emit! null)) (emit! (get toks (deref p))))
+            (meta_add! bag (get toks (deref p)))
+            (set_ref p (int_add (deref p) 1))))
+        (assoc bag "i" (deref p))))))
+
+(bind scan_meta_range
+  (lambda (toks pos end emit!)
+    (bind ((p (ref pos)) (bag (meta_bag)))
+      (do
+        (while (lt (deref p) end)
+          (bind ((tk (get toks (deref p))))
+            (do
+              (when (tsym? tk null)
+                (do
+                  (when (not (eq emit! null)) (emit! tk))
+                  (meta_add! bag tk)))
+              (set_ref p (int_add (deref p) 1)))))
+        (assoc bag "i" end)))))
+
+(bind scan_meta_until_line
+  (lambda (toks pos anchor stop? emit!)
+    (bind ((p (ref pos)) (bag (meta_bag)))
+      (do
+        (while (bind ((tk (get toks (deref p))))
+                 (and (tsym? tk null)
+                      (and (same_line? anchor tk) (not (stop? tk)))))
+          (do
+            (when (not (eq emit! null)) (emit! (get toks (deref p))))
+            (meta_add! bag (get toks (deref p)))
+            (set_ref p (int_add (deref p) 1))))
+        (assoc bag "i" (deref p))))))
+
+(bind scan_meta_while
+  (lambda (toks pos keep? emit!)
+    (bind ((p (ref pos)) (bag (meta_bag)))
+      (do
+        (while (bind ((tk (get toks (deref p))))
+                 (and (tsym? tk null) (keep? tk)))
+          (do
+            (when (not (eq emit! null)) (emit! (get toks (deref p))))
+            (meta_add! bag (get toks (deref p)))
+            (set_ref p (int_add (deref p) 1))))
+        (assoc bag "i" (deref p))))))
+
+(bind scan_meta_to_end
+  (lambda (toks pos emit!)
+    (scan_meta_until toks pos (lambda (tk) false) emit!)))
+
+(bind meta_merge!
+  (lambda (into from)
+    (do
+      (for name (get from "__order" (list_of))
+        (do
+          (assoc into name true)
+          (assoc (get into "__tokens") name (meta_token from name null))
+          (append (get into "__order") name)))
+      into)))
+
+(export meta_bag meta_add! meta_token meta_internal?
+        scan_meta_until scan_meta_until_line scan_meta_while scan_meta_to_end
+        scan_meta_range meta_merge! same_line?)

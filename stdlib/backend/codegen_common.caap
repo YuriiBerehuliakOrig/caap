@@ -1,0 +1,181 @@
+; stdlib/backend/codegen_common.caap — target-NEUTRAL codegen helpers shared by
+; the two tier-4 backends (backend/emit/llvm, the LLVM-IR emitter, and backend/emit/wasm, the
+; WAT emitter). Both consume backend/prep's prep_units output and lower the SAME
+; deliberately-small native subset; the only thing that differs is the target
+; text. The pieces here are exactly the parts that are NOT target text — pure
+; classification and width logic — so the two emitters share one source of
+; truth and cannot drift on, e.g., what counts as unsigned or which heads are
+; comparisons.
+;
+; Nothing here renders LLVM IR or WAT: every value is either a predicate, a
+; name, or a small table keyed by the kernel's CTFE head. Each backend keeps
+; its own renderers (they differ by target: `sdiv` vs `div_s`, `{ ptr, i64 }`
+; vs an i32 header) and only the shared *decisions* live here. This is codegen
+; POLICY (a kits-tier sibling), not a kernel concern.
+;
+; kits -> kits is a sideways tier edge (rank 5 -> rank 5), the same edge
+; backend/emit/llvm and backend/emit/wasm already take onto backend/prep — so importing this
+; module is within the tier tower.
+(module stdlib.backend.codegen_common)
+
+(use stdlib.semantics.types.registry pointer? ptr_elem)
+
+; ── signedness ──────────────────────────────────────────────────────────────
+; unsigned? — does a CAAP type NAME denote an unsigned integer? The `u`-prefix
+; convention (u8/u16/u32/u64) is the whole rule; it drives the signed vs
+; unsigned instruction choice for div/mod/shr/cmp and the widening op (zext vs
+; sext / extend_i32_u vs _s). NULL-safe: an absent type (a bare literal with no
+; recorded CAAP type) is treated as signed, the conservative default both
+; backends already rely on for the dynamic kernel int.
+;   ct : a CAAP type name (e.g. "u32") or null
+;   -> : bool
+(bind unsigned?
+  (lambda (ct) (and (not (eq ct null)) (string_starts_with ct "u"))))
+
+; ── integer-width unification ───────────────────────────────────────────────
+; unify_int — the shared integer width of two operand type tags, where a tag is
+; a backend's own width spelling ("i32"/"i64" for LLVM, "i32"/"i64" for wasm —
+; both happen to use the LLVM-ish names) or null for a bare int literal that has
+; not yet committed to a width. A literal adopts the other side; two literals
+; default to the 32-bit width; two CONCRETE but different widths are a certain
+; diagnostic (silently widening a u64 mask to i32 would corrupt it). The
+; `label` prefixes the error so each backend keeps its own diagnostic voice
+; ("native codegen:" / "wasm codegen:"); `i32` is passed explicitly because the
+; backends spell their 32-bit tag the same but this stays representation-free.
+;   a / b   : the two operand width tags (a width string, or null for a literal)
+;   i32     : the backend's 32-bit width tag (the two-literal default)
+;   label   : the diagnostic prefix on a width mismatch
+;   -> : the unified width tag, or throws on a concrete mismatch
+(bind unify_int
+  (lambda (a b i32 label)
+    (cond
+      ((eq a null) (if (eq b null) i32 b))
+      ((eq b null) a)
+      ((eq a b) a)
+      (else (throw (string_concat_many
+        label ": mixed integer widths " a " vs " b))))))
+
+; ── operator classification (head -> base op name) ──────────────────────────
+; The kernel's two-operand integer heads map to a base op NAME that is
+; identical across targets — LLVM and wasm both spell the add/sub/mul/bitwise
+; family `add`/`sub`/`mul`/`and`/`or`/`xor`/`shl`. (A left shift is one
+; instruction for both signs, so it is signedness-AGNOSTIC and lives here.)
+; Each backend prefixes the operand width itself (`add i32` vs `i32.add`).
+(bind binops
+  (assoc (map_of)
+    "int_add" "add" "int_sub" "sub" "int_mul" "mul"
+    "int_and" "and" "int_or" "or" "int_xor" "xor" "int_shl" "shl"))
+
+; signedness-DEPENDENT integer heads: the base op-name DIFFERS by target
+; (LLVM `sdiv`/`udiv`, wasm `div_s`/`div_u`), so the tables stay in each
+; backend; what is shared is the SET of heads and the index convention — slot 0
+; is the signed op, slot 1 the unsigned op. sbinop_index picks the slot from
+; the operands' signedness so neither backend re-derives the rule.
+(bind sbinop_heads
+  (assoc (map_of) "int_div" true "int_mod" true "int_shr" true))
+
+; sbinop_index — 1 (unsigned op) when EITHER operand's CAAP type is unsigned,
+; else 0 (signed op). The dynamic kernel int and arithmetic results are signed,
+; so a u* operand is what tips a div/mod/shr to the unsigned instruction.
+;   act / bct : the two operands' CAAP type names (or null)
+;   -> : 0 (signed slot) | 1 (unsigned slot)
+(bind sbinop_index
+  (lambda (act bct)
+    (if (or (unsigned? act) (unsigned? bct)) 1 0)))
+
+; ── comparison classification ───────────────────────────────────────────────
+; cmp_heads — the six comparison heads. Membership is shared; the per-target
+; predicate spelling (LLVM `slt`/`olt`, wasm `lt_s`/`lt`) is NOT, so each
+; backend keeps its own predicate table and only asks "is this a comparison?"
+; here. eq/ne are signedness-agnostic; lt/gt/le/ge pick a signed/unsigned (or,
+; for floats, ordered) predicate at the use site.
+(bind cmp_heads
+  (assoc (map_of)
+    "lt" true "gt" true "le" true "ge" true "eq" true "ne" true))
+
+; cmp? — is `head` one of the comparison heads?
+(bind cmp? (lambda (head) (eq (get cmp_heads head false) true)))
+
+; float_cmp_eq_ne? — does a comparison head need NO signedness (eq/ne)? Both
+; backends treat eq/ne the same for ints (no _s/_u) and for floats (oeq/one,
+; eq/ne); only lt/gt/le/ge branch on signedness/ordering.
+(bind eq_ne? (lambda (head) (or (eq head "eq") (eq head "ne"))))
+
+; ── floating-point classification ───────────────────────────────────────────
+; fbinop_heads — the four float arithmetic heads. As with the integer family
+; the base op-name differs (LLVM `fadd`, wasm `add` on an f-typed operand), so
+; the spelling tables stay per-backend; the head SET is shared.
+(bind fbinop_heads
+  (assoc (map_of)
+    "float_add" true "float_sub" true "float_mul" true "float_div" true))
+
+; ── byte → hex escape (shared string-constant lowering) ─────────────────────
+; byte_hex — one byte (0..255) as its two hex digits, high nibble first, using
+; the supplied 16-char alphabet. The two emitters both write a byte as `\HH` in
+; their string-constant escapes (LLVM `c"…"`, wasm `(data …)`) and differed only
+; in case — LLVM uppercase, wasm lowercase — so the digit-pair logic lived twice.
+; The caller passes its own alphabet ("0123456789ABCDEF" / "…abcdef") and prepends
+; the `\`, keeping each target's exact spelling byte-identical.
+;   b      : the byte value (int 0..255)
+;   digits : a 16-char hex alphabet (caller chooses upper/lower case)
+;   -> : the two hex digits as a string (no leading `\`)
+(bind byte_hex
+  (lambda (b digits)
+    (string_concat_many
+      (string_slice digits (int_div b 16) (int_add (int_div b 16) 1))
+      (string_slice digits (int_mod b 16) (int_add (int_mod b 16) 1)))))
+
+; ── pointer-to-struct naming ────────────────────────────────────────────────
+; ptr_struct_name — the struct NAME a `ptr_<Struct>` type refers to, when
+; `<Struct>` is a program struct, else null. The registry only knows
+; ptr_<scalar> (pointer?/ptr_elem); a pointer to a PROGRAM struct is spelled
+; `ptr_<Name>` and resolved against the prep `structs` table. Both backends
+; share this exact test (a struct value and a pointer to it coincide in
+; representation), differing only in what they build from the name.
+;   t       : a type name
+;   structs : the prep `structs` table (name -> field list)
+;   -> : the struct name (a string) or null
+(bind ptr_struct_name
+  (lambda (t structs)
+    (if (and (not (eq t null))
+             (string_starts_with t "ptr_")
+             (not (eq (get structs (string_slice t 4)) null)))
+      (string_slice t 4)
+      null)))
+
+; struct_name_of — the struct NAME a type refers to: a struct name itself, a
+; `ptr_<Struct>`, else null. Used where either a struct value or a pointer to
+; it is acceptable (field access flows through both).
+;   t       : a type name (or null)
+;   structs : the prep `structs` table
+;   -> : the struct name or null
+(bind struct_name_of
+  (lambda (t structs)
+    (cond
+      ((eq t null) null)
+      ((not (eq (get structs t) null)) t)
+      (else (ptr_struct_name t structs)))))
+
+; pointee_of — normalise any pointer type NAME to the type it points AT: a
+; `ptr_<Struct>` -> the struct name, a registry scalar pointer -> its element,
+; anything else (already a bare element name) -> itself. The backends use this
+; to rebuild a fully-typed pointer value after a load/return whose slot records
+; the pointee either as a pointer-type name or directly as the element.
+;   ct      : a CAAP type name (or null)
+;   structs : the prep `structs` table
+;   -> : the pointee type name (or null)
+(bind pointee_of
+  (lambda (ct structs)
+    (cond
+      ((eq ct null) null)
+      ((not (eq (ptr_struct_name ct structs) null)) (ptr_struct_name ct structs))
+      ((pointer? ct) (ptr_elem ct))
+      (else ct))))
+
+(export
+  unsigned? unify_int
+  binops sbinop_heads sbinop_index
+  cmp_heads cmp? eq_ne?
+  fbinop_heads
+  byte_hex
+  ptr_struct_name struct_name_of pointee_of)

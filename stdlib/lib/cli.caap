@@ -1,0 +1,421 @@
+; stdlib/lib/cli.caap — declarative argv parsing + subcommand dispatch.
+; (module stdlib.lib.cli).
+;
+; A CLI is described by a list of option SPECs (plain maps); `parse` turns a
+; list-of-strings argv into a Result: ok({values, positionals}) or err(message).
+; Everything here is PURE — argv, env, and command tables arrive as parameters,
+; never read from the ambient process (that would couple lib (rank 2) to
+; sys (rank 3), a tier violation; a caller in a higher tier passes
+; `(stdlib.sys.process.args)` in).
+;
+; An option SPEC is a map:
+;   "name"     : long name, used as the values key and matched as `--name`
+;   "short"    : a 1-char string for `-x`, or null
+;   "kind"     : "flag" (no value, becomes true) | "string" | "int" | "float"
+;                | "bool" (a valued switch: --flag=true/false) | "list"
+;                (repeatable; each occurrence appends one element)
+;   "default"  : value when the option is absent (flags default false; a list
+;                defaults to its "default" when that is a list, else [])
+;   "required" : bool — a missing required option is an err
+;   "help"     : one-line description for `usage`
+(module stdlib.lib.cli)
+
+(use stdlib.lib.collections.result ok err ok? err? error_code unwrap)
+
+; ── spec helpers ────────────────────────────────────────────────────────────
+
+; spec — build an option SPEC map. A convenience constructor so call sites stay
+; declarative; every field has a total default.
+;   name / short / kind / default / required / help
+;   -> : a SPEC map
+(bind spec
+  (lambda (name short kind default required help)
+    (assoc (map_of)
+      "name" name "short" short "kind" kind
+      "default" default "required" required "help" help)))
+
+; flag? — does this SPEC take no value (a boolean switch)?
+(bind flag?
+  (lambda (sp) (eq (get sp "kind" "string") "flag")))
+
+; ── lookup over the spec list ───────────────────────────────────────────────
+
+; spec_by — the first SPEC whose `field` equals `want`, or null. `want` of null
+; never matches (so a SPEC with a null short isn't found by a null query).
+(bind spec_by
+  (lambda (specs field want)
+    (if (eq want null)
+      null
+      (bind ((found (ref null)))
+        (do
+          (for sp specs
+            (when (and (eq (deref found) null) (eq (get sp field null) want))
+              (set_ref found sp)))
+          (deref found))))))
+
+(bind spec_for_long  (lambda (specs name) (spec_by specs "name" name)))
+(bind spec_for_short (lambda (specs ch)   (spec_by specs "short" ch)))
+
+; ── value coercion ──────────────────────────────────────────────────────────
+
+; parse_bool — the "bool" kind's accepted spellings, as a Result. true/1/yes/on
+; (case-insensitive) -> true, false/0/no/off -> false; anything else is a
+; cli.bad_bool err naming the option. So `--debug=true` and `--debug=off` both
+; parse; `--debug=maybe` is rejected rather than silently truthy.
+(bind parse_bool
+  (lambda (sp raw)
+    (bind ((v (string_downcase raw)))
+      (cond
+        ((or (eq v "true") (eq v "1") (eq v "yes") (eq v "on"))  (ok true))
+        ((or (eq v "false") (eq v "0") (eq v "no") (eq v "off")) (ok false))
+        (else (err "cli.bad_bool"
+          (string_concat_many "option --" (get sp "name")
+            " expects a boolean (true/false), got: " raw)))))))
+
+; coerce — turn a raw string into the SPEC's typed value, as a Result.
+;   sp  : the SPEC (its "kind" drives the conversion)
+;   raw : the string from argv
+;   ->  : ok(value) or err(message). "int"/"float" with a non-number is err;
+;         "bool" with an unrecognised word is err; "list" yields the raw ELEMENT
+;         string (accumulation across occurrences is handled by `parse`); any
+;         other kind ("string") passes the raw string through.
+(bind coerce
+  (lambda (sp raw)
+    (bind ((kind (get sp "kind" "string")))
+      (cond
+        ((eq kind "int")
+          (try (ok (string_to_int raw))
+            (catch e (err "cli.bad_int"
+              (string_concat_many "option --" (get sp "name")
+                " expects an integer, got: " raw)))))
+        ((eq kind "float")
+          (try (ok (string_to_float raw))
+            (catch e (err "cli.bad_float"
+              (string_concat_many "option --" (get sp "name")
+                " expects a number, got: " raw)))))
+        ((eq kind "bool") (parse_bool sp raw))
+        (else (ok raw))))))
+
+; list? — does this SPEC accumulate REPEATABLY (each occurrence appends an
+; element to one list value)?
+(bind list? (lambda (sp) (eq (get sp "kind" "string") "list")))
+
+; ── argv classification ─────────────────────────────────────────────────────
+
+(bind is_long?  (lambda (a) (string_starts_with a "--")))
+; a short token is "-x"… but bare "-" is a positional (a common stdin marker),
+; and "--" alone is the terminator (handled before this is asked).
+(bind is_short?
+  (lambda (a) (and (string_starts_with a "-") (not (string_starts_with a "--"))
+                   (gt (size a) 1))))
+
+; split_eq — for "--name=value", the [name value] pair; for "--name", [name null].
+;   a  : a token already known to start with "--"
+;   -> : a 2-element list [long-name-without-dashes, value-or-null]
+(bind split_eq
+  (lambda (a)
+    (bind ((eq_at (string_find a "=")))
+      (if (eq eq_at null)
+        (list_of (string_slice a 2 (size a)) null)
+        (list_of (string_slice a 2 eq_at)
+                 (string_slice a (int_add eq_at 1) (size a)))))))
+
+; ── the parse loop ──────────────────────────────────────────────────────────
+;
+; A single forward scan over argv driven by an index ref. Three accumulators:
+;   values      : map name -> parsed value (seeded with defaults at the end)
+;   positionals : the leftover non-option arguments, in order
+;   fail        : the first err Result seen (short-circuits the rest)
+; After `--`, every remaining token is a positional regardless of its dashes.
+
+; parse — the public entry. specs is a list of SPECs; argv a list of strings.
+;   -> : ok({"values" map, "positionals" list}) or err(message)
+(bind parse
+  (lambda (specs argv)
+    (bind (
+      (values (map_of))
+      (positionals (list_of))
+      (fail (ref null))
+      (i (ref 0))
+      (seen_dd (ref false))
+      (n (size argv))
+    )
+      (do
+        ; record! — store a parsed value or capture the first failure. A "list"
+        ; SPEC is REPEATABLE: each occurrence APPENDS its element to the option's
+        ; list (seeded to an empty list on first sight), so `--tag a --tag b`
+        ; yields ["a" "b"]. Every other kind overwrites (last occurrence wins).
+        (bind ((record!
+          (lambda (sp r)
+            (if (ok? r)
+              (bind ((nm (get sp "name")))
+                (if (list? sp)
+                  (do
+                    (unless (contains values nm) (assoc values nm (list_of)))
+                    (append (get values nm) (get r "value")))
+                  (assoc values nm (get r "value"))))
+              (when (eq (deref fail) null) (set_ref fail r))))))
+          (while (and (eq (deref fail) null) (lt (deref i) n))
+            (bind ((a (get argv (deref i))))
+              (cond
+                ; once past `--`, everything is positional
+                ((deref seen_dd)
+                  (do (append positionals a) (set_ref i (int_add (deref i) 1))))
+                ; the `--` terminator itself
+                ((eq a "--")
+                  (do (set_ref seen_dd true) (set_ref i (int_add (deref i) 1))))
+                ; --long  or  --long=value
+                ((is_long? a)
+                  (bind (
+                    (parts (split_eq a))
+                    (name (get parts 0))
+                    (inline (get parts 1))
+                    (sp (spec_for_long specs name))
+                  )
+                    (cond
+                      ((eq sp null)
+                        (set_ref fail (err "cli.unknown"
+                          (string_concat_many "unknown option: --" name))))
+                      ((flag? sp)
+                        (do (assoc values name true)
+                            (set_ref i (int_add (deref i) 1))))
+                      ((not (eq inline null))
+                        (do (record! sp (coerce sp inline))
+                            (set_ref i (int_add (deref i) 1))))
+                      ((lt (int_add (deref i) 1) n)
+                        (do (record! sp (coerce sp (get argv (int_add (deref i) 1))))
+                            (set_ref i (int_add (deref i) 2))))
+                      (else
+                        (set_ref fail (err "cli.missing_value"
+                          (string_concat_many "option --" name " requires a value")))))))
+                ; -x  or grouped -abc  (flags) ; -x value for a valued short
+                ((is_short? a)
+                  (bind (
+                    ; the characters after the leading '-'
+                    (body (string_slice a 1 (size a)))
+                    (j (ref 0))
+                    (m (size body))
+                    (consumed_next (ref false))
+                  )
+                    (do
+                      (while (and (eq (deref fail) null) (lt (deref j) m))
+                        (bind (
+                          (ch (string_slice body (deref j) (int_add (deref j) 1)))
+                          (sp (spec_for_short specs ch))
+                        )
+                          (cond
+                            ((eq sp null)
+                              (set_ref fail (err "cli.unknown"
+                                (string_concat_many "unknown option: -" ch))))
+                            ((flag? sp)
+                              (do (assoc values (get sp "name") true)
+                                  (set_ref j (int_add (deref j) 1))))
+                            ; a valued short: the rest of this token is its value
+                            ; ("-cVALUE"), else the next argv token.
+                            ((lt (int_add (deref j) 1) m)
+                              (do (record! sp (coerce sp
+                                    (string_slice body (int_add (deref j) 1) m)))
+                                  (set_ref j m)))
+                            ((lt (int_add (deref i) 1) n)
+                              (do (record! sp (coerce sp (get argv (int_add (deref i) 1))))
+                                  (set_ref consumed_next true)
+                                  (set_ref j m)))
+                            (else
+                              (set_ref fail (err "cli.missing_value"
+                                (string_concat_many "option -" ch " requires a value")))))))
+                      (set_ref i (int_add (deref i)
+                                   (if (deref consumed_next) 2 1))))))
+                ; a bare positional
+                (else
+                  (do (append positionals a)
+                      (set_ref i (int_add (deref i) 1)))))))
+
+          ; ── finalize: apply defaults + check required ──────────────────────
+          (when (eq (deref fail) null)
+            (for sp specs
+              (bind ((nm (get sp "name")))
+                (unless (contains values nm)
+                  (cond
+                    ((flag? sp)
+                      (assoc values nm (get sp "default" false)))
+                    ; a never-given repeatable list defaults to its "default"
+                    ; (when that is itself a list) or the empty list — UNLESS it
+                    ; is required (handled below). A null/absent default is [].
+                    ; The default list is COPIED, never aliased, so a caller that
+                    ; mutates the returned list (or reuses these specs across
+                    ; parses) cannot poison the spec's default in place.
+                    ((and (list? sp) (not (eq (get sp "required" false) true)))
+                      (bind ((dflt (get sp "default")) (fresh (list_of)))
+                        (do
+                          (when (eq (value_type dflt) "list")
+                            (for x dflt (append fresh x)))
+                          (assoc values nm fresh))))
+                    ((eq (get sp "required" false) true)
+                      (when (eq (deref fail) null)
+                        (set_ref fail (err "cli.missing_required"
+                          (string_concat_many "missing required option: --" nm)))))
+                    ((contains sp "default")
+                      (assoc values nm (get sp "default"))))))))
+
+          (if (eq (deref fail) null)
+            (ok (assoc (map_of) "values" values "positionals" positionals))
+            (deref fail)))))))
+
+; ── subcommand routing ──────────────────────────────────────────────────────
+
+; route — pick a subcommand by the FIRST argv token.
+;   commands : map name -> handler (the handler value is returned, not called)
+;   argv     : the full argv
+;   -> : ok({"command" name, "handler" h, "rest" remaining-argv}) or err
+;        (empty argv or an unknown command name are both err)
+(bind route
+  (lambda (commands argv)
+    (cond
+      ((eq (size argv) 0)
+        (err "cli.no_command" "no subcommand given"))
+      ((not (contains commands (get argv 0)))
+        (err "cli.unknown_command"
+          (string_concat_many "unknown subcommand: " (get argv 0))))
+      (else
+        (bind ((name (get argv 0)) (rest (list_of)) (i (ref 1)))
+          (do
+            (while (lt (deref i) (size argv))
+              (do (append rest (get argv (deref i)))
+                  (set_ref i (int_add (deref i) 1))))
+            (ok (assoc (map_of)
+                  "command" name
+                  "handler" (get commands name)
+                  "rest" rest))))))))
+
+; route_nested — a 2-LEVEL route (`prog GROUP SUB …`), the shape git/cargo/kubectl
+; use ("cargo build …", "git remote add …"). `groups` is a map GROUP -> (map SUB
+; -> handler); the first argv token picks the group, the second the subcommand,
+; and everything after is the remaining argv. Built by routing TWICE with the
+; one-level `route`: first into the group's sub-table, then into a leaf handler —
+; so this stays a thin, reuse-of-`route` composition rather than a second loop.
+;   groups : map GROUP -> (map SUB -> handler)
+;   argv   : the full argv
+;   -> : ok({"command" group, "subcommand" sub, "handler" h, "rest" remaining})
+;        or err. The errors distinguish the two levels: a missing/unknown GROUP
+;        reuses `route`'s cli.no_command / cli.unknown_command; a present group
+;        with a missing SUB is cli.no_subcommand, an unknown one cli.unknown_subcommand
+;        (each names what was expected), so a caller can react to the exact level.
+(bind route_nested
+  (lambda (groups argv)
+    (bind ((top (route groups argv)))
+      (if (err? top)
+        top
+        (bind ((chosen (unwrap top))
+               (group  (get chosen "command"))
+               (subs   (get chosen "handler"))   ; the group's SUB -> handler map
+               (rest   (get chosen "rest"))
+               (sub    (route subs rest)))
+          (if (err? sub)
+            ; remap the inner route's generic codes to subcommand-level ones that
+            ; name the group, so the message is actionable ("… in group build").
+            (cond
+              ((eq (error_code sub) "cli.no_command")
+                (err "cli.no_subcommand"
+                  (string_concat_many "no subcommand given for group: " group)))
+              ((eq (error_code sub) "cli.unknown_command")
+                (err "cli.unknown_subcommand"
+                  (string_concat_many "unknown subcommand '" (get rest 0)
+                    "' in group: " group)))
+              (else sub))
+            (bind ((leaf (unwrap sub)))
+              (ok (assoc (map_of)
+                    "command"    group
+                    "subcommand" (get leaf "command")
+                    "handler"    (get leaf "handler")
+                    "rest"       (get leaf "rest"))))))))))
+
+; ── usage / help text ───────────────────────────────────────────────────────
+
+; option_line — one help line for a single SPEC.
+;   sp -> "  -x, --name <kind>  (required)|[default]  help"
+(bind option_line
+  (lambda (sp)
+    (bind (
+      (sh (if (eq (get sp "short" null) null) "    "
+            (string_concat_many "  -" (get sp "short") ",")))
+      (kind (get sp "kind" "string"))
+      (arg (if (eq kind "flag") "" (string_concat_many " <" kind ">")))
+      (req (cond
+             ((eq (get sp "required" false) true) "  (required)")
+             ((contains sp "default")
+               (string_concat_many "  [default: " (value_to_string (get sp "default")) "]"))
+             (else "")))
+      (help (if (eq (get sp "help" "") "") ""
+              (string_concat_many "  " (get sp "help"))))
+    )
+      (string_concat_many sh " --" (get sp "name") arg req help))))
+
+; usage — a help block: a "Usage:" header followed by one line per SPEC.
+;   specs / prog : the SPECs and the program name shown in the header
+;   -> : a string with embedded newlines
+(bind usage
+  (lambda (specs prog)
+    (bind ((out (ref (string_concat_many "Usage: " prog " [options]"))))
+      (do
+        (for sp specs
+          (set_ref out (string_concat_many (deref out) "\n" (option_line sp))))
+        (deref out)))))
+
+; ── env fallback ────────────────────────────────────────────────────────────
+
+; env_key — the env var a SPEC reads its fallback from: upper-cased name with
+; dashes turned to underscores (e.g. "log-level" -> "LOG_LEVEL").
+(bind env_key
+  (lambda (name)
+    (string_upcase (string_replace name "-" "_"))))
+
+; env_default_value — coerce an env STRING into the typed value a SPEC's
+; "default" should hold for `sp`'s kind. This mirrors `coerce`/`parse_bool` but
+; yields a bare value (not a Result), because it lands in the "default" field
+; that `parse` consumes WITHOUT re-coercing: a "bool" env "false" must become the
+; bool false (not the truthy string "false"), an "int"/"float" its number, a
+; "list" a one-element list. An unparseable number falls back to the raw string
+; (the historical int behaviour); a bool that does not match keeps the raw
+; string too.
+;   sp / raw : the SPEC and its env string
+;   ->       : the typed default value
+(bind env_default_value
+  (lambda (sp raw)
+    (bind ((kind (get sp "kind" "string")))
+      (cond
+        ((eq kind "int")   (try (string_to_int raw)   (catch e raw)))
+        ((eq kind "float") (try (string_to_float raw) (catch e raw)))
+        ((eq kind "bool")
+          (bind ((r (parse_bool sp raw)))
+            (if (ok? r) (get r "value") raw)))
+        ((eq kind "list")  (list_of raw))
+        (else raw)))))
+
+; with_env_default — a fresh SPEC list whose "default" is filled from `env_map`
+; wherever the matching env key is present (an explicit default is overridden;
+; this is a pure transform — pass the environment in, e.g. from sys.env). The
+; env string is COERCED to the SPEC's kind (int/float/bool/list), so an env
+; default reads back as the same typed value an inline argument would.
+;   specs / env_map : the SPECs and a map of NAME -> string
+;   -> : a fresh list of SPECs (inputs untouched)
+(bind with_env_default
+  (lambda (specs env_map)
+    (bind ((out (list_of)))
+      (do
+        (for sp specs
+          (bind ((key (env_key (get sp "name"))))
+            (if (contains env_map key)
+              (append out
+                (bind ((raw (get env_map key)))
+                  (assoc (map_of)
+                    "name" (get sp "name") "short" (get sp "short" null)
+                    "kind" (get sp "kind" "string")
+                    "default" (env_default_value sp raw)
+                    "required" false
+                    "help" (get sp "help" ""))))
+              (append out sp))))
+        out))))
+
+(export spec flag? list? parse route route_nested usage option_line
+        with_env_default env_key coerce parse_bool
+        spec_for_long spec_for_short)

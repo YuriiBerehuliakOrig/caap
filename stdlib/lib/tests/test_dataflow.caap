@@ -1,0 +1,207 @@
+; stdlib/lib/tests/test_dataflow.caap — the CFG + monotone-dataflow framework:
+; a control-flow graph built from 3-node IR (control from the callee policy),
+; a generic worklist fixpoint, and backward LIVENESS over it. Driven over
+; hand-built AST like test_alias / test_escape.
+
+;; @area: passes
+;; @kind: regression
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.dataflow
+  build_cfg cfg_blocks cfg_block cfg_succ cfg_pred cfg_entry cfg_exit
+  solve solve_forward solve_backward
+  liveness live_in live_out)
+(use stdlib.syntax.ast sym lit calln call)
+(use stdlib.lib.collections.set set_has? set_size set_items)
+(use stdlib.lib.collections.sequence any?)
+
+(do
+  (bind (
+    ; (set_ref r v) — a write to r
+    (setr (lambda (r v) (calln "set_ref" (list_of (sym r) v))))
+    ; a use of a name (e.g. as a call arg): (use x) is just a call mentioning x
+    (use1 (lambda (x) (calln "use" (list_of (sym x)))))
+    ; live_in of the ENTRY block of a liveness result
+    (live_entry (lambda (res) (live_in res (cfg_entry (get res "cfg")))))
+  )
+    (do
+      ; ════════════════════════════════════════════════════════════════════
+      ; 1. CFG SHAPE — control comes from the callee, not the node shape
+      ; ════════════════════════════════════════════════════════════════════
+
+      ; straight-line (do a b c): ENTRY reaches EXIT; ENTRY has a path to EXIT
+      (bind ((cfg (build_cfg
+                    (calln "do" (list_of (use1 "a") (use1 "b") (use1 "c"))))))
+        (do
+          (assert_true (any? (cfg_succ cfg (cfg_entry cfg))
+                         (lambda (s) (eq s (cfg_exit cfg))))
+            "straight-line: ENTRY flows to EXIT")
+          ; the three statements all land in the ENTRY block (one basic block)
+          (assert_eq (size (get (cfg_block cfg (cfg_entry cfg)) "stmts")) 3
+            "straight-line: all three statements in one block")))
+
+      ; (if t then else): ENTRY forks to TWO successors that both rejoin
+      (bind ((cfg (build_cfg
+                    (calln "if" (list_of (sym "t") (use1 "a") (use1 "b"))))))
+        (do
+          (assert_eq (size (cfg_succ cfg (cfg_entry cfg))) 2
+            "if: the branch block has two successors")
+          ; the two arms reconverge: some block has >= 2 predecessors (the join)
+          (assert_true
+            (any? (cfg_blocks cfg)
+              (lambda (b) (ge (size (cfg_pred cfg (get b "id"))) 2)))
+            "if: the two arms rejoin at a merge block")))
+
+      ; (while t body): a loop has a back-edge — some block's successor list
+      ; includes a block with a LOWER id (a cycle in the graph)
+      (bind ((cfg (build_cfg
+                    (calln "while" (list_of (sym "t") (setr "i" (sym "i")))))))
+        (assert_true
+          (any? (cfg_blocks cfg)
+            (lambda (b) (any? (cfg_succ cfg (get b "id"))
+                          (lambda (s) (le s (get b "id"))))))
+          "while: a back-edge (successor id <= block id) exists"))
+
+      ; (throw e): the throwing block edges to EXIT (non-local exit)
+      (bind ((cfg (build_cfg
+                    (calln "do"
+                      (list_of (use1 "a")
+                               (calln "throw" (list_of (lit "boom"))))))))
+        (assert_true
+          (any? (cfg_blocks cfg)
+            (lambda (b) (any? (cfg_succ cfg (get b "id"))
+                          (lambda (s) (eq s (cfg_exit cfg))))))
+          "throw: a block edges to EXIT"))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 2. LIVENESS (backward) — a var used after a point is live; a dead store
+      ;    is not live-out
+      ; ════════════════════════════════════════════════════════════════════
+
+      ; A var USED later is live at entry.
+      ;   (do (use x))  — x is read, never defined ⇒ x live on entry
+      (bind ((res (liveness (calln "do" (list_of (use1 "x"))))))
+        (assert_true (set_has? (live_entry res) "x")
+          "a name that is read is live on entry"))
+
+      ; A var WRITTEN then USED: the value flows, the use makes the source live.
+      ;   (do (set_ref y x) (use y))
+      ;   x is read in the write (live at entry); y is defined then read.
+      (bind ((res (liveness
+                    (calln "do"
+                      (list_of (setr "y" (sym "x")) (use1 "y"))))))
+        (do
+          (assert_true (set_has? (live_entry res) "x")
+            "the source of a later-used store is live on entry")
+          ; y is NOT live on entry — it is defined before any use of it
+          (assert_true (not (set_has? (live_entry res) "y"))
+            "a name defined before its first use is not live on entry")))
+
+      ; A DEAD STORE is not live-out: a value written but never read again is
+      ; not live where it is killed.
+      ;   (do (set_ref d 1) (use a))  — d is written, never read ⇒ d not live
+      ;   anywhere, in particular not on entry.
+      (bind ((res (liveness
+                    (calln "do"
+                      (list_of (setr "d" (lit 1)) (use1 "a"))))))
+        (do
+          (assert_true (not (set_has? (live_entry res) "d"))
+            "a dead store (written, never read) is not live")
+          (assert_true (set_has? (live_entry res) "a")
+            "an unrelated later use stays live")))
+
+      ; Across an `if`: a name used on BOTH arms is live before the branch.
+      ;   (if t (use z) (use z))  — z live at entry regardless of the branch.
+      (bind ((res (liveness
+                    (calln "if" (list_of (sym "t") (use1 "z") (use1 "z"))))))
+        (assert_true (set_has? (live_entry res) "z")
+          "a name used on both arms of an if is live before the branch"))
+
+      ; A name used on only ONE arm is still live before the branch (some path
+      ; uses it) — and `t` (the test) is live too.
+      ;   (if t (use p) (use q))
+      (bind ((res (liveness
+                    (calln "if" (list_of (sym "t") (use1 "p") (use1 "q"))))))
+        (do
+          (assert_true (set_has? (live_entry res) "p")
+            "a name used on one arm is live before the branch (p)")
+          (assert_true (set_has? (live_entry res) "q")
+            "a name used on the other arm is live before the branch (q)")
+          (assert_true (set_has? (live_entry res) "t")
+            "the branch test is live before the branch")))
+
+      ; LIVENESS OVER A LOOP — a backward analysis with a back-edge MUST reach a
+      ; fixpoint (regression: an order-sensitive fact comparator would spin
+      ; forever here). The loop reads `n` (the bound) on each iteration, so `n`
+      ; is live at entry; `i` is DEFINED before the loop, so it is NOT live at
+      ; entry, but IS live around the back-edge.
+      ;   (do (set_ref i 0) (while (lt i n) (set_ref i (int_add i 1))) (use i))
+      (bind ((res (liveness
+                    (calln "do"
+                      (list_of
+                        (setr "i" (lit 0))
+                        (calln "while"
+                          (list_of (calln "lt" (list_of (sym "i") (sym "n")))
+                            (setr "i" (calln "int_add"
+                                        (list_of (sym "i") (lit 1))))))
+                        (use1 "i"))))))
+        (do
+          (assert_true (set_has? (live_entry res) "n")
+            "loop liveness terminates; the loop bound `n` is live on entry")
+          (assert_true (not (set_has? (live_entry res) "i"))
+            "`i` is defined before the loop, so it is not live on entry")))
+
+      ; MULTI-STATEMENT MATCH ARM — every body form of an arm `(pat b1 b2)` is
+      ; laid out (regression: dropping all but the first body would hide b2's
+      ; uses). Here arm 2 reads `m` only in its SECOND form.
+      ;   (match s (0 (use a)) (1 (use k) (use m)))  — m must be live somewhere.
+      (bind ((res (liveness
+                    (calln "match"
+                      (list_of (sym "s")
+                        (call (lit 0) (list_of (use1 "a")))
+                        (call (lit 1) (list_of (use1 "k") (use1 "m"))))))))
+        (do
+          (assert_true (set_has? (live_entry res) "m")
+            "a name used in the SECOND form of a match arm is live (not dropped)")
+          (assert_true (set_has? (live_entry res) "a")
+            "a name used in another arm's body is live too")))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 3. GENERIC FIXPOINT — a custom lattice converges
+      ; ════════════════════════════════════════════════════════════════════
+
+      ; "reaching depth": a FORWARD analysis whose fact is the max block depth
+      ; reached. bottom = 0; join = max; transfer = in + 1. Over a CFG it must
+      ; converge to a fixpoint (a loop does NOT diverge — join caps it).
+      (bind (
+        (cfg (build_cfg
+               (calln "do"
+                 (list_of (use1 "a")
+                          (calln "if"
+                            (list_of (sym "t") (use1 "b") (use1 "c")))
+                          (use1 "d")))))
+        (lattice (assoc (map_of)
+          "bottom" 0
+          "join" (lambda (x y) (if (gt x y) x y))
+          "transfer" (lambda (blk in_) (int_add in_ 1))))
+        (sol (solve_forward cfg lattice))
+      )
+        (do
+          ; the fixpoint exists: out of EXIT is a finite number
+          (assert_true (gt (get (get sol "out") (int_to_string (cfg_exit cfg))) 0)
+            "the generic forward fixpoint converges to a positive depth")
+          ; the in of ENTRY (no predecessors) stays bottom = 0
+          (assert_eq (get (get sol "in") (int_to_string (cfg_entry cfg))) 0
+            "ENTRY has no predecessors: its in-fact is bottom (0)")))
+
+      ; backward generic fixpoint also converges (a reverse "depth from exit")
+      (bind (
+        (cfg (build_cfg (calln "do" (list_of (use1 "a") (use1 "b")))))
+        (lattice (assoc (map_of)
+          "bottom" 0
+          "join" (lambda (x y) (if (gt x y) x y))
+          "transfer" (lambda (blk out_) (int_add out_ 1))))
+        (sol (solve_backward cfg lattice))
+      )
+        (assert_true (gt (get (get sol "in") (int_to_string (cfg_entry cfg))) 0)
+          "the generic backward fixpoint converges")))))

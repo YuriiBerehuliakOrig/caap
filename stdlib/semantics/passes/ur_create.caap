@@ -1,0 +1,79 @@
+; stdlib/semantics/passes/ur_create.caap — DOUBLE-CREATE analysis pass (module
+; stdlib.semantics.passes.ur_create).
+;
+; A urun control block (UR_THREAD / UR_TIMER / UR_SEMAPHORE / UR_QUEUE) is a
+; STATIC object the application owns; `ur_*_create` INITIALISES it (links, counts,
+; lists). Calling create a SECOND time on a still-live block — without an
+; intervening `ur_*_delete` — re-initialises an object that may be on the ready
+; list, holding waiters, or mid-wait, silently corrupting that in-flight state.
+; Today nothing catches it. This pass makes a re-create a STATIC, build-time error.
+;
+; Same SOUNDNESS-over-precision shape as the ur_intrusive pass: keep it PER
+; FUNCTION and key on the RENDERED text of the create's first argument (the control
+; block). Per-function is required for rendered identity to be sound — `&t` in two
+; unrelated functions denotes different objects yet renders identically, so a
+; whole-program key would false-positive; within ONE function `&t` is the same `t`.
+; A block created >= 2x in a function with NO delete of that same block is reported.
+; (LIMITATION, documented: a create in function A and a re-create in function B on a
+; shared global block is out of scope — that needs whole-program flow the rendered
+; key cannot model soundly.)
+(module stdlib.semantics.passes.ur_create)
+
+(use stdlib.syntax.ast call? head_of args_of walk)
+(use stdlib.syntax.render render)
+(use stdlib.semantics.passes.monomorph decode_defn)
+(use stdlib.semantics.passes.registry install_pass! note!)
+
+; ends_with? — string suffix test (the create/delete services are NOT generic, so
+; their heads keep their plain `ur_<obj>_create` / `ur_<obj>_delete` spelling — no
+; monomorphization mangling to strip).
+(bind ends_with?
+  (lambda (s suf)
+    (bind ((n (size s)) (k (size suf)))
+      (and (ge n k) (eq (string_slice s (int_sub n k) n) suf)))))
+
+(bind is_create
+  (lambda (h)
+    (and (not (eq h null))
+         (and (string_starts_with h "ur_") (ends_with? h "_create")))))
+
+(bind is_delete
+  (lambda (h)
+    (and (not (eq h null))
+         (and (string_starts_with h "ur_") (ends_with? h "_delete")))))
+
+(bind run
+  (lambda (located sink)
+    (for f located
+      (bind ((d (decode_defn (get f "node")))
+             (val (if (eq d null) null (get d "value"))))
+        (when (and (not (eq val null)) (call? val))
+          ; per function: count creates per rendered block, and the blocks deleted
+          ; (a delete legitimately frees a block for re-creation).
+          (bind ((creates (map_of)) (create_node (map_of)) (deleted (map_of)))
+            (do
+              (walk val
+                (lambda (n)
+                  (when (call? n)
+                    (bind ((h (head_of n)) (as (args_of n)))
+                      (cond
+                        ((and (is_create h) (ge (size as) 1))
+                          (bind ((key (render (get as 0))))
+                            (do (assoc creates key (int_add (get creates key 0) 1))
+                                (assoc create_node key n))))
+                        ((and (is_delete h) (ge (size as) 1))
+                          (assoc deleted (render (get as 0)) true))
+                        (else null))))))
+              ; flag any block created >= 2x with no delete of that block.
+              (for key (map_keys creates)
+                (when (ge (get creates key 0) 2)
+                  (when (eq (get deleted key) null)
+                    (note! sink "ur-create" (get create_node key)
+                      (string_concat_many "`" (get d "name") "` calls a *_create on `" key
+                        "` more than once with no intervening *_delete — re-initialising a "
+                        "live control block corrupts its in-flight state"))))))))))))
+
+(bind register!
+  (lambda () (install_pass! "ur-create" (lambda (located sink) (run located sink)))))
+
+(export run register!)

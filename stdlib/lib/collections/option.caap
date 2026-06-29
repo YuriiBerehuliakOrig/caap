@@ -1,0 +1,211 @@
+; stdlib/lib/collections/option.caap — Option: a value that may be absent
+; (module stdlib.lib.collections.option).
+;
+;   (some v) -> { some: true, value: v }   (none) -> { some: false }
+;
+; Every operation is TOTAL: predicates treat non-Options as none, accessors
+; fall back rather than throw — only `option_unwrap` throws, by contract.
+; The companion fallible type is stdlib.lib.collections.result (which bridges
+; back via its `to_option`); `option_to_result` is the labelled lift forward.
+; This module stays dependency-free, so result may `use` it without a cycle.
+(module stdlib.lib.collections.option)
+
+; ── constructors ────────────────────────────────────────────────────────────
+
+; some — wrap a present value.
+;   value : the payload
+;   ->    : a present Option carrying it
+(bind some
+  (lambda (value) (assoc (map_of) "some" true "value" value)))
+
+; none — the absent Option.
+;   -> : an Option with no value
+(bind none
+  (lambda () (assoc (map_of) "some" false)))
+
+; option_of — lift a nullable value into an Option.
+;   v  : any value, possibly null
+;   -> : (none) when v is null, else (some v)
+(bind option_of
+  (lambda (v) (if (eq (value_type v) "null") (none) (some v))))
+
+; ── predicates ──────────────────────────────────────────────────────────────
+
+; some? — does `o` hold a value?
+;   o  : any value (non-Options are simply not some)
+;   -> : bool
+(bind some?
+  (lambda (o) (and (eq (value_type o) "map") (eq (get o "some" false) true))))
+
+; none? — is `o` absent? (the complement of some?)
+;   o  : any value
+;   -> : bool
+(bind none?
+  (lambda (o) (not (some? o))))
+
+; ── accessors (total) ───────────────────────────────────────────────────────
+
+; option_unwrap — the value, or throw (the strict accessor).
+;   o  : an Option
+;   -> : the value when some; throws "option_unwrap on none" when none
+(bind option_unwrap
+  (lambda (o)
+    (if (some? o) (get o "value") (throw "option_unwrap on none"))))
+
+; option_unwrap_or — the value, or a fallback.
+;   o       : an Option
+;   default : returned when `o` is none
+;   ->      : the value when some, else `default`
+(bind option_unwrap_or
+  (lambda (o default) (if (some? o) (get o "value") default)))
+
+; ── transforms ──────────────────────────────────────────────────────────────
+
+; option_map — transform the value if present.
+;   o  : an Option
+;   f  : (value) -> new value
+;   -> : (some (f value)) when some, else (none)
+(bind option_map
+  (lambda (o f) (if (some? o) (some (f (get o "value"))) (none))))
+
+; option_map_or — transform the value if present, else a fallback.
+;   o       : an Option
+;   default : returned when `o` is none
+;   f       : (value) -> new value, applied when some
+;   ->      : (f value) when some, else `default` (a plain value, not an Option)
+(bind option_map_or
+  (lambda (o default f) (if (some? o) (f (get o "value")) default)))
+
+; option_filter — keep the value only when it satisfies `pred`.
+;   o    : an Option
+;   pred : (value) -> bool
+;   ->   : `o` when some and (pred value), else (none)
+(bind option_filter
+  (lambda (o pred)
+    (if (and (some? o) (pred (get o "value"))) o (none))))
+
+; option_and_then — chain an Option-returning step (monadic bind / flat_map).
+;   o  : an Option
+;   f  : (value) -> Option
+;   -> : (f value) when some, else (none)
+(bind option_and_then
+  (lambda (o f) (if (some? o) (f (get o "value")) (none))))
+
+; option_or — the first Option if present, else the alternative.
+;   o / alt : two Options
+;   ->      : o when some, else alt
+(bind option_or
+  (lambda (o alt) (if (some? o) o alt)))
+
+; option_or_else — the first Option if present, else a thunk's Option.
+;   o : an Option
+;   f : () -> Option, called only when `o` is none (the lazy alternative)
+;   -> : o when some, else (f)
+(bind option_or_else
+  (lambda (o f) (if (some? o) o (f))))
+
+; option_map2 — combine two Options with a binary `f` (an applicative lift).
+;   f / a / b : the combiner (av bv) -> value and the two Options
+;   ->        : (some (f av bv)) when BOTH are some, else (none)
+(bind option_map2
+  (lambda (f a b)
+    (if (and (some? a) (some? b))
+      (some (f (get a "value") (get b "value")))
+      (none))))
+
+; option_zip — pair the values of two Options into a 2-element list.
+;   a / b : two Options
+;   ->    : (some [av bv]) when both are some, else (none)
+(bind option_zip
+  (lambda (a b)
+    (option_map2 (lambda (av bv) (list_of av bv)) a b)))
+
+; option_flatten — collapse one nesting level (monadic join): (some (some v))
+; -> (some v) and (some (none)) -> (none). An outer none stays none; a some
+; whose value is NOT itself an Option is treated as already flat and passed
+; through as (some value).
+;   o  : an Option whose value may itself be an Option
+;   -> : the inner Option when `o` holds one, else `o` flattened
+(bind option_flatten
+  (lambda (o)
+    (if (some? o)
+      (bind ((inner (get o "value")))
+        ; an Option is a map carrying a boolean "some" key; if `inner` is one,
+        ; it already IS the flattened result (some or none) — return it as-is.
+        (if (and (eq (value_type inner) "map") (eq (value_type (get inner "some" null)) "bool"))
+          inner
+          (some inner)))
+      (none))))
+
+; ── bridges ─────────────────────────────────────────────────────────────────
+
+; option_to_result — label an absence with an error code/message.
+;   o / code / message : an Option and the error to use when it is none
+;   ->                 : (ok value) when some, else an err Result {code, message}
+; Builds the Result shape inline so option stays free of a result dependency
+; (which would cycle, since result `use`s option).
+(bind option_to_result
+  (lambda (o code message)
+    (if (some? o)
+      (assoc (map_of) "ok" true "value" (get o "value"))
+      (assoc (map_of)
+        "ok" false
+        "error" (assoc (map_of) "code" code "message" message)))))
+
+; ── eliminators ──────────────────────────────────────────────────────────────
+
+; option_unwrap_or_else — the value, or the result of calling `f` (LAZY default).
+;   o : an Option ; f : (() -> default) a zero-arg thunk, run only when none
+(bind option_unwrap_or_else
+  (lambda (o f) (if (some? o) (get o "value") (f))))
+
+; option_fold — collapse an Option to a single value of any type.
+;   o / default / f : returns (f value) when some, else `default`
+(bind option_fold
+  (lambda (o default f) (if (some? o) (f (get o "value")) default)))
+
+; option_transpose — a list of Options into an Option of the list: (some [v…])
+;   when EVERY element is some, else (none) as soon as one is absent.
+(bind option_transpose
+  (lambda (opts)
+    (bind ((out (ref (list_of))) (bad (ref false)))
+      (do
+        (sequence_each opts
+          (lambda (o)
+            (if (some? o)
+              (when (not (deref bad)) (append (deref out) (get o "value")))
+              (set_ref bad true))))
+        (if (deref bad) (none) (some (deref out)))))))
+
+; ── strict validators ────────────────────────────────────────────────────────
+
+; option? — is `o` a WELL-SHAPED Option (the strict structural predicate)?
+; Unlike some?/none? (which treat any non-Option as none), this is true ONLY
+; for a map whose "some" key is a bool, and — when some=true — that also carries
+; a "value" key. A non-map, a map lacking a bool "some", or a some without
+; "value" is NOT an Option.
+;   o  : any value
+;   -> : bool
+(bind option?
+  (lambda (o)
+    (and (eq (value_type o) "map")
+      (and (eq (value_type (get o "some" null)) "bool")
+        (if (eq (get o "some" false) true)
+          (contains o "value")
+          true)))))
+
+; require_option! — the identity on a valid Option, a throw otherwise (the
+; strict gate at a boundary). Uses kernel `throw` directly to stay free of a
+; diag dependency.
+;   o  : a value asserted to be an Option
+;   -> : `o` when (option? o); throws "require_option!: not an Option" otherwise
+(bind require_option!
+  (lambda (o)
+    (if (option? o) o (throw "require_option!: not an Option"))))
+
+(export some none option_of some? none?
+        option? require_option!
+        option_unwrap option_unwrap_or option_unwrap_or_else option_fold
+        option_map option_map_or option_filter option_and_then
+        option_or option_or_else option_map2 option_zip option_flatten
+        option_transpose option_to_result)

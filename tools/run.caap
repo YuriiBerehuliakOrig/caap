@@ -1,0 +1,42 @@
+;; Run a stdlib program through the loader — the stdlib counterpart to the
+;; bare-kernel `caap PROGRAM` hello.
+;;
+;;   caap stdlib/bootstrap.caap tools/run.caap FILE
+;;
+;; Why a driver tool? The flagless CLI runs `caap BOOTSTRAP PROGRAM [ARG…]`:
+;; after BOOTSTRAP executes it looks up `cli.main`, and `stdlib/bootstrap.caap`
+;; registers none — so PROGRAM is evaluated as a BARE bootstrap script. A bare
+;; script does not understand `(use stdlib.… …)` (a *loader* directive), so a
+;; stdlib program can't be PROGRAM directly. This tool IS that bare PROGRAM: it
+;; reads FILE from `cli.args` and hands it to the stdlib loader, which expands
+;; the file, resolves its `(use …)` directives, and returns the value of its
+;; final top-level form (an int becomes the process exit code).
+;;
+;; This is the shape of tools/ast_json.caap (a bare bootstrap script reading its
+;; target from `cli.args`); the only difference is the verb — load the file
+;; instead of dumping its AST.
+;;
+;; Path note: the loader resolves a RELATIVE path against the including unit's
+;; location, which here is this tool (`tools/`) — so a bare `prog.caap` would
+;; be looked for under `tools/prog.caap`. To make a bare relative FILE behave
+;; like the user's CWD (the repo root the CLI runs from), we resolve it to an
+;; absolute path via the `path`/`os` sys services before handing it to the
+;; loader. An already-absolute path is passed through untouched.
+(bind (
+  (args (ctfe_compiler_lookup_value compiler "cli.args"))
+  ; the bootstrapped session-command map; `run_source` is the loader's
+  ; file-runner (it calls ((get loader_api "load") path) — see stdlib/boot/run.caap)
+  (commands (ctfe_compiler_lookup_value compiler "caap.session.commands"))
+  (path_join   (host_service_export "path" "join" "compile_time"))
+  (is_absolute (host_service_export "path" "is_absolute" "compile_time"))
+  (getcwd      (host_service_export "os" "getcwd" "compile_time"))
+)
+  (do
+    (if (eq (size args) 0)
+      (runtime_error "usage: caap stdlib/bootstrap.caap tools/run.caap FILE"))
+    (bind (
+      (raw (get args 0 null))
+      ; resolve CWD-relative -> absolute so the loader doesn't anchor on tools/
+      (path (if (is_absolute raw) raw (path_join (getcwd) raw)))
+    )
+      ((get commands "run_source") path))))

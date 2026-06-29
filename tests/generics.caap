@@ -1,0 +1,9 @@
+; generics — typed containers as COMPILE-TIME TYPE FUNCTIONS: (list int) in a
+; signature spells list<int>; the registry instantiates the constructor on
+; first resolve; element types flow through get/append and call sites.
+(module stdlib.fixtures.generics)
+(defn total ((xs (list int))) int
+  (int_add (get xs 0 0) (get xs 1 0)))
+(bind nums (list_of 1 2))
+(bind ok (total nums))
+(export total ok)

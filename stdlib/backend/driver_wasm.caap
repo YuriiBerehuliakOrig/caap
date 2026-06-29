@@ -1,0 +1,217 @@
+; stdlib/backend/driver_wasm.caap — WebAssembly build on stdlib's OWN backend
+; (module stdlib.backend.driver_wasm). Zero stdlib-v1.
+;
+;   build_wasm   program_or_units out   a stdlib program (file path OR built
+;                                        trees) -> a .wasm binary
+;   run_wasm     wasm_path [args]        execute a .wasm via wasmtime
+;
+; The wasm sibling of driver.caap: where that driver lowers through emit/llvm and
+; drives clang (.ll -> .o -> link), this one lowers through emit/wasm (which
+; already produces COMPLETE WAT) and drives wat2wasm (.wat -> .wasm). The
+; toolchain plumbing mirrors driver.caap exactly — host services resolve LAZILY
+; at compile_time grant level, tools are discovered by probing PATH, and EVERY
+; failure (missing tool, emit diagnostics, wat2wasm error) is returned as DATA
+; ({ok:false, error|diagnostics}); nothing is left half-written and nothing
+; throws across the API boundary.
+;
+; Tool discovery: wat2wasm (from the WABT toolkit) and wasmtime (the runtime) are
+; probed via `which`; when absent the entry returns a clean
+; {ok:false, error:"wat2wasm not found"} rather than throwing — a session on a
+; host without WABT degrades to a diagnostic, never a crash.
+(module stdlib.backend.driver_wasm)
+
+(use stdlib.syntax.render render_program)
+(import stdlib.backend.emit.wasm wasm)
+
+; svc — resolve ONE host service op (fs/os/process), LAZILY and at compile_time
+; grant level. This is the only door to the host here, so a session that never
+; builds neither resolves nor needs the grant. Mirrors driver.caap's `svc`.
+;   service : the service name ("fs" | "os" | "process")
+;   name    : the op within it ("write_text", "run", …)
+;   ->      : the callable op
+(bind svc
+  (lambda (service name)
+    (host_service_export service name "compile_time")))
+
+; ── wat2wasm / wasmtime toolchain plumbing (native-only, no v1) ──────────────
+
+; find_tool — the absolute path of a host tool on PATH, or null. Probes via
+; `which <tool>`; a non-zero exit (or empty stdout) means absent -> null, so the
+; caller can surface a clean "<tool> not found" diagnostic instead of letting a
+; later spawn throw. The returned line must look like an ABSOLUTE path (start
+; with "/") — some `which` variants print a "no <tool> in …" message to stdout
+; AND exit 0, and that message must NOT be mistaken for an executable (it would
+; spawn-fail with a confusing error instead of the clean "not found" datum). Pure
+; DATA: no throw on a missing tool.
+;   tool : the executable name ("wat2wasm" | "wasmtime")
+;   ->   : the trimmed absolute-path string, or null
+(bind find_tool
+  (lambda (tool)
+    (try
+      (bind (
+        (proc_run (svc "process" "run"))
+        (r (proc_run (assoc (map_of)
+             "argv" (list_of "which" tool)
+             "capture_stdout" true "capture_stderr" true)))
+      )
+        (if (get r "success" false)
+          (bind ((out (string_trim (get r "stdout" ""))))
+            (if (and (not (eq out "")) (string_starts_with out "/")) out null))
+          null))
+      ; `which` itself absent (or the process service denied) -> treat as "not
+      ; found" rather than propagating; the build entry reports it as data.
+      (catch e null))))
+
+; tool_missing — the standard {ok:false} "not found" datum for a tool.
+(bind tool_missing
+  (lambda (tool)
+    (assoc (map_of) "ok" false
+      "error" (string_concat_many tool " not found"))))
+
+; ── WAT emit (the own backend) ───────────────────────────────────────────────
+
+; emit_wat! — lower a loaded unit to WAT TEXT through the own backend
+; (emit/wasm emit_program). Diagnostics (front-end or codegen) short-circuit the
+; build: nothing is written, the caller surfaces them. Mirrors driver.caap's
+; emit! (the wasm emitter returns the SAME {text, diagnostics, source_map} shape).
+;   unit : the loaded (sugared) root unit
+;   ->   : {ok:true, wat} | {ok:false, diagnostics}
+(bind emit_wat!
+  (lambda (unit)
+    (bind ((res ((get wasm "emit_program") unit)))
+      (if (gt (size (get res "diagnostics" (list_of))) 0)
+        (assoc (map_of) "ok" false "diagnostics" (get res "diagnostics"))
+        (assoc (map_of) "ok" true "wat" (get res "text" ""))))))
+
+; wat_to_wasm! — WAT TEXT -> a .wasm binary at `out`: write a .wat temp, invoke
+; `wat2wasm <tmp> -o <out>`, clean up the temp. The wasm analogue of
+; driver.caap's link_ir! (but ONE tool step — wat2wasm both assembles and emits
+; the binary). Returns {ok:true, path} | {ok:false, error}. The temp .wat is
+; always removed, even on failure.
+;   wat : the WAT module text
+;   out : the output .wasm path
+(bind wat_to_wasm!
+  (lambda (wat out)
+    (bind (
+      (wat2wasm (find_tool "wat2wasm"))
+    )
+      (if (eq wat2wasm null)
+        (tool_missing "wat2wasm")
+        (bind (
+          (write_text (svc "fs" "write_text"))
+          (remove_file (svc "fs" "remove_file"))
+          (proc_run (svc "process" "run"))
+          (wat_path (string_concat_many out ".wat"))
+          (clean! (lambda () (try (remove_file wat_path) (catch e null))))
+        )
+          (try
+            (do
+              (write_text wat_path wat)
+              (bind ((asm (proc_run (assoc (map_of)
+                            "argv" (list_of wat2wasm wat_path "-o" out)
+                            "capture_stdout" true "capture_stderr" true))))
+                (do
+                  (clean!)
+                  (if (get asm "success" false)
+                    (assoc (map_of) "ok" true "path" out)
+                    (assoc (map_of) "ok" false
+                      "error" (string_concat_many "wat2wasm: "
+                                (get asm "stderr" "")))))))
+            (catch err
+              (do
+                (clean!)
+                (assoc (map_of) "ok" false
+                  "error" (if (eq (value_type err) "map")
+                            (get err "message" (value_to_string err))
+                            (value_to_string err)))))))))))
+
+; ── build entries ────────────────────────────────────────────────────────────
+
+; build_wasm — a stdlib program -> a .wasm binary at `out`, end-to-end (emit WAT
+; -> wat2wasm). `program_or_units` is EITHER a source file path (string) OR a list
+; of built top-level specs (lib/ast/ir/surface trees); the latter is rendered to a
+; temp .caap source first (the same DATA-as-program entry driver.caap's compile_ir
+; offers). The ONE end-to-end wasm entry. Any thrown load/emit error is caught and
+; returned as DATA (never propagates).
+;   program_or_units : a directive-free stdlib program path, OR a list of specs
+;   out              : the output .wasm path
+;   ->               : {ok:true, path} | {ok:false, error|diagnostics}
+(bind build_wasm
+  (lambda (program_or_units out)
+    (bind (
+      (write_text (svc "fs" "write_text"))
+      (remove_file (svc "fs" "remove_file"))
+      (is_path (eq (value_type program_or_units) "string"))
+      (tmp (if is_path null (string_concat_many out ".gen.caap")))
+      ; the .caap source to load: the given path, or the rendered temp.
+      (clean_tmp! (lambda ()
+        (when (not (eq tmp null)) (try (remove_file tmp) (catch e null)))))
+    )
+      (try
+        (do
+          (when (not is_path) (write_text tmp (render_program program_or_units)))
+          (bind (
+            (src (if is_path program_or_units tmp))
+            (e (emit_wat! (ctfe_compiler_load_surface_file_template compiler src)))
+          )
+            (do
+              (clean_tmp!)
+              (if (not (get e "ok" false))
+                e
+                (wat_to_wasm! (get e "wat" "") out)))))
+        (catch err
+          (do
+            (clean_tmp!)
+            (assoc (map_of) "ok" false
+              "error" (if (eq (value_type err) "map")
+                        (get err "message" (value_to_string err))
+                        (value_to_string err)))))))))
+
+; run_wasm — execute a .wasm binary via `wasmtime`. wasmtime is an OPTIONAL part
+; of the toolchain (build_wasm produces a portable .wasm without it); when absent
+; a clean {ok:false, error:"wasmtime not found"} is returned. On success the
+; process exit code / captured output is surfaced as DATA.
+;   wasm_path : the .wasm module to run
+;   args      : a REQUIRED list of string args passed to the module (the empty
+;               list `(list_of)` — or null — for none); the arity is fixed at 2.
+;   ->        : {ok, exit, stdout, stderr} | {ok:false, error}
+(bind run_wasm
+  (lambda (wasm_path args)
+    (bind ((wasmtime (find_tool "wasmtime")))
+      (if (eq wasmtime null)
+        (tool_missing "wasmtime")
+        (try
+          (bind (
+            (proc_run (svc "process" "run"))
+            (argv (list_of wasmtime wasm_path))
+          )
+            (do
+              (for a (if (eq args null) (list_of) args) (append argv a))
+              (bind ((r (proc_run (assoc (map_of)
+                          "argv" argv
+                          "capture_stdout" true "capture_stderr" true))))
+                (assoc (map_of)
+                  "ok" (get r "success" false)
+                  "exit" (get r "status" null)
+                  "stdout" (get r "stdout" "")
+                  "stderr" (get r "stderr" "")))))
+          (catch err
+            (assoc (map_of) "ok" false
+              "error" (if (eq (value_type err) "map")
+                        (get err "message" (value_to_string err))
+                        (value_to_string err)))))))))
+
+; ── target registry (mirrors driver.caap's `targets` shape) ──────────────────
+; A registry keyed by a short name; each entry the {triple, …} a wasm build
+; pins. The wasm backend emits a portable module (no per-CPU codegen), so the
+; entry is informational — the same flagless-CLI lookup shape driver.caap uses,
+; kept for parity and so a tool can name a board without hard-coding a triple.
+(bind targets
+  (assoc (map_of)
+    "wasm32"
+    (assoc (map_of)
+      "triple" "wasm32-unknown-unknown"
+      "tool" "wat2wasm"
+      "runtime" "wasmtime")))
+
+(export build_wasm run_wasm emit_wat! wat_to_wasm! find_tool targets)

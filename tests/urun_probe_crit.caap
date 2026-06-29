@@ -1,0 +1,4 @@
+; ur-crit probe: opens a critical section (save) and never restores it.
+(defn ur_interrupt_save () u32 0)
+(defn ur_interrupt_restore ((p u32)) i32 0)
+(defn _probe_crit () i32 (do (ur_interrupt_save) 0))

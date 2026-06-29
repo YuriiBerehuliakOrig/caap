@@ -1,0 +1,440 @@
+; stdlib/boot/analyze.caap — the LSP analyze-source command
+; (module stdlib.analyze).
+; MODULE IDENTITY: intentionally the SHORT name `stdlib.analyze`, not the
+; path-canonical `stdlib.boot.analyze` — it is pinned by the tier-exception list
+; in stdlib/semantics/passes/tiers.caap and named by the analyze service surface.
+; Allowlisted in stdlib/CONVENTIONS.md + stdlib_module_identity_check.
+;
+; The LSP brings stdlib/bootstrap.caap up as a session and, for every
+; grammar-extended file, looks up and calls:
+;
+;   (bind ((command (ctfe_compiler_lookup_value compiler
+;                     "stdlib.module.analyze_source")))
+;     (command "<path>"))
+;
+; This module registers that command (and the 2-ary _with_root variant). The
+; result is {definitions: [...]} — each entry {name, kind, span[, form_span,
+; params, calls]} with 6-int spans — the source for outline, hover,
+; go-to-definition, signature help, inlay hints and call hierarchy.
+;
+; CRITICAL: the analysis walks the SYNTAX unit (the surface forms BEFORE
+; expansion, with the engine's true spans) — never the compiled unit, which
+; rebuilds binds and loses name spans. stdlib's own surface forms are
+; understood directly: defn -> function, struct/enum/union -> class,
+; module -> module, bind -> variable (with lambda structure when bound to
+; one); use/import/export contribute no definitions.
+(module stdlib.analyze)
+
+(import stdlib.expand ex)
+(use stdlib.syntax.ast call? name? head_of args_of arg name_of items_of span6 loc_or)
+(use stdlib.lib.collections.sequence contains?)
+
+; ── shared extraction helpers ───────────────────────────────────────────────
+; collect_calls — every name-headed call under `node`, with the callee's
+; span and each argument's span (nulls filtered: a synthetic node carries
+; none). `lambda` heads are structure, not calls.
+(bind collect_calls
+  (lambda (self node out)
+    (when (call? node)
+      (bind ((h (syntax_call_callee node)))
+        (do
+          (when (and (name? h) (not (eq (name_of h) "lambda")))
+            (bind ((sp (span6 h)))
+              (when (not (eq sp null))
+                (append out
+                  (assoc (map_of)
+                    "name" (name_of h)
+                    "span" sp
+                    "args"
+                    (bind ((spans (list_of)))
+                      (do
+                        (for a (args_of node)
+                          (bind ((asp (span6 a)))
+                            (when (not (eq asp null)) (append spans asp))))
+                        spans)))))))
+          (self self h out)
+          (for a (args_of node) (self self a out)))))))
+
+; entry — one definition record; null span (synthetic name) drops the entry
+; downstream, matching the LSP contract.
+(bind entry
+  (lambda (kind name_node form_node)
+    (assoc (map_of)
+      "name" (name_of name_node)
+      "kind" kind
+      "span" (span6 name_node)
+      "form_span"
+      (bind ((fs (span6 form_node)))
+        (if (eq fs null) (span6 name_node) fs)))))
+
+; lambda_entry_fields! — body span, params and call sites for a definition
+; whose value is a (lambda PARAMS body…) node.
+(bind lambda_entry_fields!
+  (lambda (e lam)
+    (bind (
+      (params_node (arg lam 0))
+      (params (list_of))
+      (calls (list_of))
+    )
+      (do
+        ; both kernel param shapes: a call of names, or a literal tuple
+        (if (call? params_node)
+          (for it (items_of params_node)
+            (bind ((nm (name_of it)))
+              (when (not (eq nm null)) (append params nm))))
+          (bind ((v (syntax_literal_value params_node)))
+            (when (not (eq v null))
+              (for p v
+                (when (eq (value_type p) "string") (append params p))))))
+        (for k (sequence_range 1 (size (args_of lam)))
+          (collect_calls collect_calls (arg lam k) calls))
+        (assoc e "params" params)
+        (assoc e "calls" calls)))))
+
+; ── per-form definition extraction ──────────────────────────────────────────
+; analyze_form! — file one top-level SURFACE form's definitions.
+(bind analyze_form!
+  (lambda (form defs)
+    (bind ((h (head_of form)))
+      (cond
+        ((eq h "module")
+          (when (name? (arg form 0))
+            (append defs (entry "module" (arg form 0) form))))
+        ((eq h "defn")
+          (when (name? (arg form 0))
+            (bind ((e (entry "function" (arg form 0) form))
+                   (params (list_of))
+                   (calls (list_of))
+                   (eff (arg form 3))
+                   (body_at (if (and (not (eq eff null))
+                                     (and (name? eff)
+                                          (or (eq (name_of eff) "pure")
+                                              (eq (name_of eff) "impure"))))
+                             4 3)))
+              (do
+                (for clause (items_of (arg form 1))
+                  (when (call? clause)
+                    (bind ((nm (name_of (syntax_call_callee clause))))
+                      (when (not (eq nm null)) (append params nm)))))
+                (for k (sequence_range body_at (size (args_of form)))
+                  (collect_calls collect_calls (arg form k) calls))
+                (assoc e "params" params)
+                (assoc e "calls" calls)
+                (append defs e)))))
+        ((contains? (list_of "struct" "enum" "union") h)
+          (when (name? (arg form 0))
+            (append defs (entry "class" (arg form 0) form))))
+        ((eq h "alias")
+          (when (name? (arg form 0))
+            (append defs (entry "bind" (arg form 0) form))))
+        ((eq h "bind")
+          (when (name? (arg form 0))
+            (bind ((e (entry "bind" (arg form 0) form))
+                   (v (arg form 1)))
+              (do
+                (when (and (call? v) (eq (head_of v) "lambda"))
+                  (lambda_entry_fields! e v))
+                (append defs e)))))
+        ; use / import / re_export / export / expressions: no definitions
+        (else null)))))
+
+; ── semantic gate (diagnostics as data) ─────────────────────────────────────
+; gate_diagnostics! — stdlib's OWN semantic findings for the file, as DATA
+; (never a failure): expand each non-directive form, then run the checker
+; and — when loaded — the type pass over the expanded forms, with the file's
+; use/import names seeded into scope (analyze resolves nothing). Findings
+; are the loader's located strings ("path:line:col: message"). Best-effort:
+; an internal error becomes one diagnostic, definitions still flow.
+(bind directive?
+  (lambda (h)
+    (contains? (list_of "module" "use" "import" "re_export" "export") h)))
+(bind floc (lambda (spec path) (loc_or spec path)))
+(bind gate_diagnostics!
+  (lambda (specs path sink)
+    (try
+      (bind (
+        (scope0 (map_of))
+        (located (list_of))
+        (checker (ctfe_compiler_lookup_value compiler "stdlib.check"))
+        (ti (ctfe_compiler_lookup_value compiler "stdlib.semantics.types.infer" null))
+      )
+        (do
+          ; seed the import surface: use -> symbol names, import -> alias
+          (for spec specs
+            (bind ((h (head_of spec)))
+              (cond
+                ((eq h "use")
+                  (for k (sequence_range 1 (size (args_of spec)))
+                    (bind ((nm (name_of (arg spec k))))
+                      (when (not (eq nm null)) (assoc scope0 nm true)))))
+                ((eq h "import")
+                  (bind ((nm (name_of (arg spec 1))))
+                    (when (not (eq nm null)) (assoc scope0 nm true))))
+                (else null))))
+          ; expand the body forms, expansion findings included
+          (for spec specs
+            (unless (directive? (head_of spec))
+              (bind ((res ((get ex "expand_collect") spec (map_of))))
+                (do
+                  (for d (get res "diagnostics" (list_of))
+                    (when (eq (get d "severity" "error") "error")
+                      (append sink
+                        (string_concat_many
+                          (floc spec path) ": stdlib.expand: "
+                          (get d "message" "expansion error")))))
+                  (append located
+                    (assoc (map_of)
+                      "node" (get res "node")
+                      "loc" (floc spec path)))))))
+          ((get checker "check_forms") located scope0 sink)
+          (when (not (eq ti null))
+            (when_let (cmt (get ti "check_module_types"))
+              (cmt located (map_of) sink)))
+          null))
+      (catch e
+        (append sink
+          (string_concat_many
+            "stdlib.analyze: "
+            (if (eq (value_type e) "map")
+              (get e "message" (value_to_string e))
+              (value_to_string e))))))))
+
+; ── the analyze command ─────────────────────────────────────────────────────
+; surface dispatch — a file opening with (surface KIT) analyzes through the
+; kit's OWN analyze_program (token-precise spans in ITS grammar); the kit is
+; resolved through the loader. Everything else takes the default path below.
+; `kitname` is the loader's surface_of verdict (null => no header); on a kit
+; failure this RAISES — analyze_source catches and reports it as a diagnostic
+; rather than silently degrading to the default analyzer (which would parse
+; surface text as kernel and mislead tooling).
+(bind surface_analyze
+  (lambda (path kitname)
+    (bind (
+      (api (ctfe_compiler_lookup_value compiler "stdlib.load"))
+      (kit ((get api "load_module") kitname))
+      (ap (get kit "analyze_program"))
+      (text ((host_service_export "fs" "read_text" "compile_time") path))
+    )
+      (if (eq ap null)
+        (assoc (map_of) "definitions" (list_of)
+          "diagnostics" (list_of (string_concat_many
+            path ": surface kit \"" kitname
+            "\" exports no analyze_program")))
+        (ap text path)))))
+
+; analyze_source — the LSP command:
+;   PATH -> {definitions: [...], diagnostics: [located string…]}
+; Diagnostics are DATA in the response (stdlib's checker/type pass write to
+; their own sink, not the kernel's DiagnosticSink — the side channel carries
+; nothing here).
+(bind analyze_default
+  (lambda (path)
+    (bind (
+      (unit (ctfe_compiler_load_surface_file_template compiler path))
+      (defs (list_of))
+      (diags (list_of))
+      (specs (list_of))
+    )
+      (do
+        (for form (ctfe_unit_top_level_forms unit)
+          (append specs (ctfe_node_to_spec form)))
+        (for spec specs (analyze_form! spec defs))
+        (gate_diagnostics! specs path diags)
+        (assoc (map_of) "definitions" defs "diagnostics" diags)))))
+
+; analyze_source — surface header present? analyze through its kit; else the
+; default analyzer. A HEADERLESS file is unchanged. A header whose kit cannot
+; be loaded/analyzed no longer falls through silently: it returns a weak-
+; evidence diagnostic (definitions empty) naming the surface failure, so the
+; LSP shows the real problem instead of a misleading default-parse outline.
+(bind analyze_source
+  (lambda (path)
+    (bind (
+      (api     (ctfe_compiler_lookup_value compiler "stdlib.load"))
+      (kitname (try ((get api "surface_of") path) (catch e null)))
+    )
+      (if (eq kitname null)
+        (analyze_default path)
+        ; the kit-load OR the kit's own analyze_program may raise; report it as
+        ; a diagnostic (the original cause distinguishes a missing kit from a
+        ; broken one) rather than silently degrading to the default analyzer.
+        (try (surface_analyze path kitname)
+          (catch e
+            (assoc (map_of) "definitions" (list_of)
+              "diagnostics" (list_of
+                (string_concat_many
+                  path ": surface kit \"" kitname
+                  "\" could not analyze this file: "
+                  (if (eq (value_type e) "map")
+                    (get e "message" (value_to_string e))
+                    (value_to_string e)))))))))))
+
+; ── cross-module imports (B3) ───────────────────────────────────────────────
+; resolve_imports — cross-module go-to-definition data (B3): for each name a
+; `use mod a b` directive brings in, find WHERE it is defined — the module's
+; file path and the defining form's span. The LSP follows these for an
+; imported symbol. Best-effort: an unresolvable module is skipped, never an
+; error; the result rides under "imports" alongside definitions/diagnostics.
+;   path : the file being analyzed (its use-directives are read)
+;   ->   : [{name, module, source_path, span}] (span = def site, may be null)
+;
+; err_text — a non-null readable string for a thrown value: a map's "message"
+; (when present AND non-null), else the value's own display. Used to build the
+; weak diagnostics below; it must never itself yield null, or string_concat_many
+; would throw OUT of the catch and defeat the whole best-effort intent. NOTE:
+; (get e "message" default) returns null for a PRESENT-but-null key, so the
+; explicit null re-check is load-bearing, not redundant.
+(bind err_text
+  (lambda (e)
+    (if (eq (value_type e) "map")
+      (bind ((m (get e "message" null)))
+        (if (eq m null) (value_to_string e) m))
+      (value_to_string e))))
+
+; def_span_in / def_span_in_diag — find `name`'s definition span in `dep_path`.
+; A null span means "not found" OR "analysis failed"; tooling can't tell them
+; apart. def_span_in keeps that (null-compat) shape; def_span_in_diag is the
+; weak-diagnostic sibling: on a real dependency-analysis error it appends a
+; reason to `sink` (a list) so the LSP can distinguish absent from failed,
+; while still returning null. The happy path (a clean hit) is identical.
+(bind def_span_in_diag
+  (lambda (dep_path name sink)
+    (try
+      (bind ((r (analyze_source dep_path)))
+        (bind ((hit (sequence_find (get r "definitions" (list_of))
+                      (lambda (d) (eq (get d "name") name)))))
+          (if (eq hit null) null (get hit "span"))))
+      (catch e
+        (do
+          (append sink
+            (string_concat_many
+              dep_path ": could not analyze dependency for \"" name "\": "
+              (err_text e)))
+          null)))))
+; DEPRECATED compat shim — PREFER def_span_in_diag.
+; def_span_in is the null-only shape: it swallows a dependency-analysis error to
+; null (its own throwaway sink is discarded), so a caller cannot tell "symbol
+; absent" from "analysis failed". def_span_in_diag is the weak-diagnostic API
+; that appends the reason to a `sink` list instead. As of audit #14 this wrapper
+; has NO callers (resolve_imports_diag goes straight through def_span_in_diag);
+; it is retained only as the documented falsy-compat shape and may be removed.
+(bind def_span_in
+  (lambda (dep_path name)
+    (def_span_in_diag dep_path name (list_of))))
+
+; resolve_imports_diag — the richer sibling: returns {imports, diagnostics}
+; where diagnostics carries weak-evidence reasons for any dependency that
+; could not be analyzed (an absent symbol stays a null span, never an error).
+(bind resolve_imports_diag
+  (lambda (path)
+    (bind (
+      (api (ctfe_compiler_lookup_value compiler "stdlib.load"))
+      (unit (ctfe_compiler_load_surface_file_template compiler path
+              (assoc (map_of) "leading_parenthesized_forms_only" true)))
+      (out (list_of))
+      (diags (list_of))
+    )
+      (do
+        (for form (ctfe_unit_top_level_forms unit)
+          (bind ((spec (ctfe_node_to_spec form)))
+            (when (eq (head_of spec) "use")
+              (bind (
+                (modname (name_of (arg spec 0)))
+                (dep_path (if (eq modname null) null
+                            ((get api "module_path") modname)))
+              )
+                (when (not (eq dep_path null))
+                  (for k (sequence_range 1 (size (args_of spec)))
+                    (bind ((nm (name_of (arg spec k))))
+                      (when (not (eq nm null))
+                        (append out
+                          (assoc (map_of)
+                            "name" nm
+                            "module" modname
+                            "source_path" dep_path
+                            "span" (def_span_in_diag dep_path nm diags)))))))))))
+        (assoc (map_of) "imports" out "diagnostics" diags)))))
+; DEPRECATED compat shim — PREFER resolve_imports_diag.
+; resolve_imports is the bare-list shape: just the "imports" of
+; resolve_imports_diag, dropping the "diagnostics" that carry weak-evidence
+; reasons for any dependency that could not be analyzed. As of audit #14 this
+; wrapper has NO callers (analyze_source_with_root uses resolve_imports_diag and
+; surfaces its diagnostics under "tooling_warnings"); it is retained only as the
+; documented bare-list compat shape and may be removed.
+(bind resolve_imports
+  (lambda (path)
+    (get (resolve_imports_diag path) "imports" (list_of))))
+
+; declare_use_roots! / declare_use_roots_diag! — make the file's use-targets
+; resolvable under `root` by the standard convention `a.b.c -> root/a/b/c.caap`:
+; declare a root for the FIRST dotted segment of every use-target, pointing at
+; `root`. (Already-declared prefixes — e.g. the session's own `stdlib` — win
+; and are left alone by declare_root.)
+;
+; declare_use_roots_diag! is the weak-diagnostic sibling: a failure to even
+; read/parse the file's use-directives (the outer try) appends a reason to
+; `sink` rather than silently vanishing, so tooling sees that root-setup was
+; incomplete. Per-root declare_root failures stay best-effort (skipped). It
+; returns null (called for its effect).
+;
+; DEPRECATED compat shim — PREFER declare_use_roots_diag!.
+; declare_use_roots! discards the sink, so a failure to read/parse the file's
+; use-directives silently vanishes. As of audit #14 this wrapper has NO callers
+; (analyze_source_with_root calls declare_use_roots_diag! with its warnings
+; list); it is retained only as the documented falsy-compat shape and may be
+; removed.
+(bind declare_use_roots_diag!
+  (lambda (path root sink)
+    (try
+      (bind (
+        (api (ctfe_compiler_lookup_value compiler "stdlib.load"))
+        (unit (ctfe_compiler_load_surface_file_template compiler path
+                (assoc (map_of) "leading_parenthesized_forms_only" true)))
+      )
+        (for form (ctfe_unit_top_level_forms unit)
+          (bind ((spec (ctfe_node_to_spec form)))
+            (when (and (eq (head_of spec) "use")
+                       (not (eq (name_of (arg spec 0)) null)))
+              (bind ((seg (get (string_split (name_of (arg spec 0)) ".") 0)))
+                (try ((get api "declare_root") seg root)
+                  (catch e null)))))))
+      (catch e
+        (append sink
+          (string_concat_many
+            path ": could not declare use-roots under \"" root "\": "
+            (err_text e)))))))
+(bind declare_use_roots!
+  (lambda (path root)
+    (declare_use_roots_diag! path root (list_of))))
+
+; analyze_source_with_root — the 2-ary variant the LSP prefers when it knows
+; the file's module root. The root makes the file's use-targets resolvable;
+; the per-file analysis is the same, and the result gains an "imports" list
+; resolving each use-imported name to its cross-module definition site. A
+; recoverable miss (a dependency that could not be analyzed, or root-setup
+; that could not read the file) no longer vanishes: it is surfaced under
+; "tooling_warnings" (always present, possibly the empty list), so the LSP can
+; distinguish "no imports" from "import resolution failed".
+(bind analyze_source_with_root
+  (lambda (path root)
+    (bind ((warnings (list_of)))
+      (do
+        (declare_use_roots_diag! path root warnings)
+        (bind (
+          (base (analyze_source path))
+          (ri (try (resolve_imports_diag path)
+                (catch e
+                  (do
+                    (append warnings
+                      (string_concat_many
+                        path ": import resolution failed: "
+                        (err_text e)))
+                    (assoc (map_of) "imports" (list_of) "diagnostics" (list_of))))))
+        )
+          (do
+            (for d (get ri "diagnostics" (list_of)) (append warnings d))
+            (assoc base
+              "imports" (get ri "imports" (list_of))
+              "tooling_warnings" warnings)))))))
+
+(export analyze_source analyze_source_with_root)

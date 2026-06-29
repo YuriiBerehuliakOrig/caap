@@ -1,0 +1,100 @@
+; stdlib/lib/text/char.caap — character-class predicates (module stdlib.lib.text.char).
+;
+; A "char" here is a 1-character string (CAAP has no char type). These power
+; hand-written lexers/parsers and the surface kit. Each is a membership test
+; against a literal class string — O(1) over the fixed alphabets.
+;
+; Scope is ASCII by design (the alphabets below are ASCII); non-ASCII letters
+; and Unicode whitespace are NOT matched. For unicode-aware splitting use
+; lib/text/string.chars (kernel string_chars), which IS unicode-aware.
+(module stdlib.lib.text.char)
+
+(bind digits "0123456789")
+(bind lower  "abcdefghijklmnopqrstuvwxyz")
+(bind upper  "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+(bind spaces " \t\n\r")
+(bind hexdigits "0123456789abcdefABCDEF")
+; the ASCII punctuation block (everything printable that is neither alnum nor a
+; space): the four ranges !"#$%&'()*+,-./  :;<=>?@  [\]^_`  {|}~
+(bind puncts "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+; sentinels minted by codepoint value (no raw control bytes in source): a SPACE
+; (U+0020) bounds the C0 controls from below and a DEL (U+007F) is the lone C1
+; boundary. For ASCII single-byte chars byte order is codepoint order, and every
+; multi-byte UTF-8 char starts with a byte >= 0xC2 (> 0x7F), so it always sorts
+; after DEL — no false positive on non-ASCII (mirrors json.caap's control_char?).
+(bind space_sentinel (bytes->string (bytes_from_list (list_of 32))))
+(bind del_sentinel   (bytes->string (bytes_from_list (list_of 127))))
+
+; is_digit? — is `c` a decimal digit 0-9?
+;   c  : a 1-character string
+;   -> : bool (false for "" or multi-char)
+(defn is_digit? ((c string)) bool
+  (and (eq (size c) 1) (string_contains digits c)))
+
+; is_alpha? — an ASCII letter (either case)?
+(defn is_alpha? ((c string)) bool
+  (and (eq (size c) 1)
+       (or (string_contains lower c) (string_contains upper c))))
+
+; is_alnum? — a letter or a digit?
+(defn is_alnum? ((c string)) bool
+  (or (is_alpha? c) (is_digit? c)))
+
+; is_space? — ASCII whitespace (space, tab, newline, carriage return)?
+(defn is_space? ((c string)) bool
+  (and (eq (size c) 1) (string_contains spaces c)))
+
+; is_upper? / is_lower? — an ASCII letter of the given case.
+(defn is_upper? ((c string)) bool
+  (and (eq (size c) 1) (string_contains upper c)))
+(defn is_lower? ((c string)) bool
+  (and (eq (size c) 1) (string_contains lower c)))
+
+; is_hex_digit? — a hexadecimal digit 0-9 / a-f / A-F (case-insensitive)?
+(defn is_hex_digit? ((c string)) bool
+  (and (eq (size c) 1) (string_contains hexdigits c)))
+
+; is_punct? — an ASCII punctuation character (printable, non-alnum, non-space)?
+(defn is_punct? ((c string)) bool
+  (and (eq (size c) 1) (string_contains puncts c)))
+
+; is_control? — a C0 control (U+0000..U+001F) or DEL (U+007F)? Compares the
+; single char lexicographically against the SPACE / DEL sentinels: c sorts before
+; SPACE iff its codepoint is < 0x20, and DEL is matched directly. Non-ASCII chars
+; sort after DEL, so they are never controls. "" (empty) sorts before SPACE, so
+; the (size c) = 1 guard is what excludes it.
+(defn is_control? ((c string)) bool
+  (and (eq (size c) 1)
+       (or (lt c space_sentinel) (eq c del_sentinel))))
+
+; to_upper — ASCII upper-casing of a single char. A lowercase letter maps to the
+; same-index char in `upper`; every other char (already upper, digit, punct,
+; non-ASCII, "", multi-char) passes through unchanged. The class strings line up
+; index-for-index, so `(string_find lower c)` indexes straight into `upper`.
+(defn to_upper ((c string)) string
+  (if (is_lower? c)
+    (string_slice upper (string_find lower c) (int_add (string_find lower c) 1))
+    c))
+
+; to_lower — the mirror: an uppercase letter maps through `lower`, everything
+; else passes through unchanged.
+(defn to_lower ((c string)) string
+  (if (is_upper? c)
+    (string_slice lower (string_find upper c) (int_add (string_find upper c) 1))
+    c))
+
+; hex_digit_value — numeric value 0..15 of a hex digit "0".."9"/"a".."f"/"A".."F",
+; or -1 for any non-hex char (incl. "" and multi-char). The (size c) = 1 guard
+; matters: string_find treats "" as a match at index 0, so an unguarded ""
+; would read as 0 rather than -1.
+(defn hex_digit_value ((c string)) int
+  (if (not (eq (size c) 1)) -1
+    (cond
+      ((string_contains digits c) (string_find digits c))
+      ((string_contains "abcdef" c) (int_add 10 (string_find "abcdef" c)))
+      ((string_contains "ABCDEF" c) (int_add 10 (string_find "ABCDEF" c)))
+      (else -1))))
+
+(export is_digit? is_alpha? is_alnum? is_space?
+        is_upper? is_lower? is_hex_digit? is_punct? is_control?
+        to_upper to_lower hex_digit_value)

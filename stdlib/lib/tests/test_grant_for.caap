@@ -1,0 +1,44 @@
+; stdlib/lib/tests/test_grant_for.caap — SCOPED takes over the sys grant
+; (stdlib.sys.grant_for).
+;
+; grant_for is the ADDITIVE narrow-read layer over boot/sys_grants.caap's
+; umbrella registry (stdlib.sys.grant.<lib> = { capability, raw }). It lets a
+; restricted embedding take ONLY the op(s) it needs instead of a library's whole
+; grant. This test runs WITHOUT any grant registered — the test runner never
+; runs sys_grants — so it pins the ungranted contract (the same path
+; test_sys_wrap pins for the facade generator):
+;   - grant_of of an ungranted library is null (no ambient authority invented);
+;   - grant_for_operation of any (lib, op) is null when ungranted — never a
+;     silent fabricated callable;
+;   - grant_for_module of an ungranted library is null — no umbrella view.
+; These are shape/lookup assertions only: a meaningful "with-grant" test needs
+; real host capabilities, which a plain eval load does not have.
+
+;; @area: sys
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq)
+(use stdlib.sys.grant_for grant_of grant_for_operation grant_for_module)
+
+(do
+  ; no grant is registered (sys_grants never ran in this session), so every
+  ; lookup must report "ungranted" as null — not a fabricated handle/callable.
+  (assert_eq (grant_of "fs") null
+    "grant_of of an ungranted library is null")
+  (assert_eq (grant_of "no_such_lib") null
+    "grant_of of an unknown library is null")
+
+  ; the NARROWEST take: a single op. Ungranted -> null, the documented shape.
+  (assert_eq (grant_for_operation "fs" "read_text") null
+    "grant_for_operation of an ungranted library op is null")
+  (assert_eq (grant_for_operation "fs" "no_such_op") null
+    "grant_for_operation of an unknown op is null (no fabrication)")
+  (assert_eq (grant_for_operation "no_such_lib" "anything") null
+    "grant_for_operation of an unknown library is null")
+
+  ; the single-library scoped VIEW: ungranted -> null (no umbrella handed back).
+  (assert_eq (grant_for_module "stdlib.example" "fs") null
+    "grant_for_module of an ungranted library is null")
+  (assert_eq (grant_for_module "stdlib.example" "no_such_lib") null
+    "grant_for_module of an unknown library is null")
+  null)

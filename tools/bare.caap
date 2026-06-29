@@ -1,0 +1,8 @@
+;; The empty launch policy: a bootstrap that registers nothing. With it the
+;; CLI's built-in fallback runs the program as a compile-time script on the
+;; bare kernel + CTFE builtins — no stdlib, near-instant startup. Tools that
+;; only need kernel primitives (tools/ast_json.caap, tools/canonicalize.caap)
+;; run fastest this way:
+;;
+;;   caap tools/bare.caap tools/ast_json.caap FILE
+null

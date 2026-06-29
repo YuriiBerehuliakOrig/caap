@@ -1,0 +1,89 @@
+; stdlib/semantics/types/infer/constraint.caap — argument checking for the type
+; pass: the single mismatch sink (`check_one_arg`), the kernel match-guard
+; predicate table (`guard_types`), and the per-call signature check
+; (`check_call_sig`).
+;
+; Split out of types/infer as a SAFE leaf: it consumes the unify leaf
+; (binding/finalizing type variables) and `report.report!`, but holds no walk
+; state and no module store. The facade's walker calls `check_call_sig` for a
+; known signature and reads `guard_types` for match-guard patterns; everything
+; here is pure over its arguments + the diagnostics sink it is handed.
+(module stdlib.semantics.types.infer.constraint)
+
+(use stdlib.syntax.ast literal_of)
+(use stdlib.semantics.types.registry assignable? literal_fits? sized_int? subst_type)
+(use stdlib.semantics.types.infer.report report!)
+(use stdlib.semantics.types.infer.unify unify sig_has_vars? finalize_result)
+
+; ── join + match guards ─────────────────────────────────────────────────────
+; kernel match guard predicates -> the type they prove for the bound name
+(bind guard_types
+  (assoc (map_of)
+    "int?" "int"  "float?" "float"  "str?" "string"  "bool?" "bool"
+    "list?" "list"  "map?" "map"  "null?" "null"))
+
+; ── argument checks ─────────────────────────────────────────────────────────
+; check_one_arg — report a certain mismatch of one argument.
+;   head / i : the callee name and 0-based arg position (for the message)
+;   want     : declared type
+;   anode    : the argument node (for the literal range check)
+;   got      : the inferred type
+;   sink     : diagnostics list
+(bind check_one_arg
+  (lambda (head i want anode got sink)
+    (bind ((lv (literal_of anode)))
+      (cond
+        ((and (sized_int? want)
+              (and (not (eq lv null)) (eq (value_type lv) "int")))
+          (unless (literal_fits? lv want)
+            (report! sink
+              (string_concat_many
+                "`" head "` arg " (int_to_string (int_add i 1))
+                ": literal " (int_to_string lv) " out of range for " want)
+              anode)))
+        ((not (assignable? want got))
+          (report! sink
+            (string_concat_many
+              "`" head "` arg " (int_to_string (int_add i 1))
+              ": expected " want ", got " got)
+            anode))
+        (else null)))))
+
+; check_call_sig — check a call against a fn signature, returning the call's
+; inferred RESULT type. For a non-generic signature this is the original loop:
+; each argument is checked with `check_one_arg`, the result is the declared
+; result verbatim. For a GENERIC one it runs in two passes: first `unify` every
+; parameter to bind the variables from the arguments, then `check_one_arg` each
+; argument against the SUBSTITUTED parameter type (so the assignability and
+; literal-range checks see the instantiated type), and finally substitute the
+; result so `(list T)` flows out as the concrete "list<int>".
+;   head / args / got / ps / result / sink : the call, arg nodes, arg types,
+;          the signature's params + result, the diagnostics list
+;   ->   : the (possibly substituted) result type
+(bind check_call_sig
+  (lambda (head args got ps result sink)
+    (if (not (sig_has_vars? ps result))
+      (do
+        (for i (sequence_range 0 (size args))
+          (when (lt i (size ps))
+            (check_one_arg head i
+              (get (get ps i) "type") (get args i) (get got i) sink)))
+        result)
+      (bind ((subst (map_of)))
+        (do
+          ; pass 1 — bind the variables from every argument
+          (for i (sequence_range 0 (size args))
+            (when (lt i (size ps))
+              (unify (get (get ps i) "type") (get got i) subst sink head i
+                     (get args i))))
+          ; pass 2 — check each argument against its instantiated param type
+          (for i (sequence_range 0 (size args))
+            (when (lt i (size ps))
+              (check_one_arg head i
+                (subst_type (get (get ps i) "type") subst)
+                (get args i) (get got i) sink)))
+          ; instantiate the result with whatever the call bound, collapsing
+          ; any variable still open (a bare/unknown argument left it unbound)
+          (finalize_result (subst_type result subst)))))))
+
+(export guard_types check_one_arg check_call_sig)

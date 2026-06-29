@@ -1,0 +1,92 @@
+; stdlib/lib/tests/test_char.caap — in-language tests for lib/text/char.
+
+;; @area: text
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq)
+(use stdlib.lib.text.char is_digit? is_alpha? is_alnum? is_space?
+     is_upper? is_lower? is_hex_digit? is_punct? is_control?
+     to_upper to_lower hex_digit_value)
+
+(assert_eq (is_digit? "5") true "digit")
+(assert_eq (is_digit? "x") false "not digit")
+(assert_eq (is_digit? "") false "empty not digit")
+(assert_eq (is_digit? "12") false "multi not digit")
+(assert_eq (is_alpha? "a") true "lower alpha")
+(assert_eq (is_alpha? "Z") true "upper alpha")
+(assert_eq (is_alpha? "3") false "digit not alpha")
+(assert_eq (is_alnum? "9") true "alnum digit")
+(assert_eq (is_alnum? "q") true "alnum alpha")
+(assert_eq (is_alnum? "-") false "dash not alnum")
+(assert_eq (is_space? " ") true "space")
+(assert_eq (is_space? "\t") true "tab")
+(assert_eq (is_space? "a") false "alpha not space")
+
+; ASCII-only contract (documented in char.caap): a non-ASCII letter (é, U+00E9)
+; is one character but matches none of the ASCII classes.
+(bind eacute (bytes->string (bytes_from_list (list_of 195 169))))
+(assert_eq (size eacute) 1 "é is one character")
+(assert_eq (is_alpha? eacute) false "non-ASCII letter is not is_alpha?")
+(assert_eq (is_alnum? eacute) false "non-ASCII letter is not is_alnum?")
+
+; is_upper? / is_lower?
+(assert_eq (is_upper? "A") true "upper A")
+(assert_eq (is_upper? "a") false "lower a not upper")
+(assert_eq (is_upper? "5") false "digit not upper")
+(assert_eq (is_lower? "a") true "lower a")
+(assert_eq (is_lower? "A") false "upper A not lower")
+(assert_eq (is_upper? "") false "empty not upper")
+; is_hex_digit? — 0-9 a-f A-F
+(assert_eq (is_hex_digit? "0") true "hex 0")
+(assert_eq (is_hex_digit? "f") true "hex lowercase f")
+(assert_eq (is_hex_digit? "F") true "hex uppercase F")
+(assert_eq (is_hex_digit? "g") false "g not hex")
+(assert_eq (is_hex_digit? "") false "empty not hex")
+; is_punct? — ASCII punctuation only
+(assert_eq (is_punct? "!") true "bang is punct")
+(assert_eq (is_punct? "@") true "at is punct")
+(assert_eq (is_punct? "~") true "tilde is punct")
+(assert_eq (is_punct? "a") false "letter not punct")
+(assert_eq (is_punct? "5") false "digit not punct")
+(assert_eq (is_punct? " ") false "space not punct")
+; is_control? — C0 controls and DEL, never printable / non-ASCII
+(assert_eq (is_control? "\n") true "newline is control")
+(assert_eq (is_control? "\t") true "tab is control")
+(assert_eq (is_control? "\r") true "carriage return is control")
+(assert_eq (is_control? (bytes->string (bytes_from_list (list_of 0)))) true "NUL is control")
+(assert_eq (is_control? (bytes->string (bytes_from_list (list_of 127)))) true "DEL is control")
+(assert_eq (is_control? "a") false "letter not control")
+(assert_eq (is_control? " ") false "space not control")
+(assert_eq (is_control? "") false "empty not control")
+(assert_eq (is_control? eacute) false "non-ASCII char not control")
+
+; to_upper / to_lower — ASCII case conversion; non-letters pass through
+(assert_eq (to_upper "a") "A" "to_upper lowercase letter")
+(assert_eq (to_upper "z") "Z" "to_upper z")
+(assert_eq (to_upper "A") "A" "to_upper already-upper passes through")
+(assert_eq (to_upper "5") "5" "to_upper digit passes through")
+(assert_eq (to_upper "!") "!" "to_upper punct passes through")
+(assert_eq (to_upper "") "" "to_upper empty passes through")
+(assert_eq (to_upper eacute) eacute "to_upper non-ASCII passes through")
+(assert_eq (to_lower "A") "a" "to_lower uppercase letter")
+(assert_eq (to_lower "Z") "z" "to_lower Z")
+(assert_eq (to_lower "a") "a" "to_lower already-lower passes through")
+(assert_eq (to_lower "7") "7" "to_lower digit passes through")
+(assert_eq (to_lower "@") "@" "to_lower punct passes through")
+(assert_eq (to_lower "") "" "to_lower empty passes through")
+(assert_eq (to_lower eacute) eacute "to_lower non-ASCII passes through")
+; round-trip identity for the boundaries of each alphabet
+(assert_eq (to_lower (to_upper "m")) "m" "to_lower . to_upper round-trip")
+
+; hex_digit_value — 0..15 for a hex digit, -1 otherwise
+(assert_eq (hex_digit_value "0") 0 "hex value 0")
+(assert_eq (hex_digit_value "9") 9 "hex value 9")
+(assert_eq (hex_digit_value "a") 10 "hex value lowercase a")
+(assert_eq (hex_digit_value "f") 15 "hex value lowercase f")
+(assert_eq (hex_digit_value "A") 10 "hex value uppercase A")
+(assert_eq (hex_digit_value "F") 15 "hex value uppercase F")
+(assert_eq (hex_digit_value "g") -1 "g not a hex digit")
+(assert_eq (hex_digit_value "G") -1 "G not a hex digit")
+(assert_eq (hex_digit_value "") -1 "empty not a hex digit")
+(assert_eq (hex_digit_value "10") -1 "multi-char not a hex digit")
+(assert_eq (hex_digit_value " ") -1 "space not a hex digit")

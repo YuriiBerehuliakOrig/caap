@@ -1,0 +1,75 @@
+; stdlib/lib/text/cursor.caap — the shared text-cursor / parser protocol
+; (module stdlib.lib.text.cursor).
+;
+; json / toml / csv each walked a PRE-SPLIT char list with the SAME four
+; primitives (char-at, line:col locate, slice, and the {ok}-result shapes).
+; This module is the single source of that protocol so those parsers can share
+; one implementation instead of re-deriving it. Each export mirrors the
+; corresponding private helper in lib/text/json byte-for-byte.
+;
+;   cursor_ch    TEXT I        -> the 1-char string at index I, "" past EOF
+;   cursor_pos   TEXT I        -> "line:col" of char offset I (1-based)
+;   cursor_slice TEXT I0 I1    -> the chars [I0, I1) joined into one string
+;   parse_ok     VALUE I       -> {ok: true,  value: VALUE, i: I}
+;   parse_fail   TEXT I MSG    -> {ok: false, error: "line:col: MSG"}
+;
+; `text` everywhere is the kernel `string_chars` list (split once, O(1) index);
+; "" from cursor_ch is the past-the-end sentinel (it compares equal to nothing
+; real). cursor_pos / parse_fail are the error-path locators.
+(module stdlib.lib.text.cursor)
+
+; ── cursor_ch ───────────────────────────────────────────────────────────────
+; char at index I; "" once I is at or past the end of the char list. Mirrors
+; json's private `ch`.
+(bind cursor_ch
+  (lambda (text i) (get text i "")))
+
+; ── cursor_pos ──────────────────────────────────────────────────────────────
+; "line:col" (both 1-based) of char offset I. A "\n" ends a line: it bumps the
+; line and resets the column; every other char advances the column. Mirrors
+; json's private `pos` exactly.
+(bind cursor_pos
+  (lambda (text i)
+    (bind ((line (ref 1)) (col (ref 1)) (k (ref 0)))
+      (do
+        (while (lt (deref k) i)
+          (do
+            (if (eq (cursor_ch text (deref k)) "\n")
+              (do (set_ref line (int_add (deref line) 1)) (set_ref col 1))
+              (set_ref col (int_add (deref col) 1)))
+            (set_ref k (int_add (deref k) 1))))
+        (string_concat_many
+          (int_to_string (deref line)) ":" (int_to_string (deref col)))))))
+
+; ── cursor_slice ────────────────────────────────────────────────────────────
+; the chars [I0, I1) joined back into one string. Collected into a LOCAL list
+; and joined once (O(n)) rather than concatenated onto a growing accumulator
+; per char (O(n^2)). Mirrors json's private `lexeme`.
+(bind cursor_slice
+  (lambda (text i0 i1)
+    (bind ((parts (list_of)) (k (ref i0)))
+      (do
+        (while (lt (deref k) i1)
+          (do
+            (append parts (cursor_ch text (deref k)))
+            (set_ref k (int_add (deref k) 1))))
+        (sequence_join parts "")))))
+
+; ── parse_ok ────────────────────────────────────────────────────────────────
+; the success result: VALUE produced, with the cursor left at index I. Mirrors
+; json's private `good`.
+(bind parse_ok
+  (lambda (value i)
+    (assoc (map_of) "ok" true "value" value "i" i)))
+
+; ── parse_fail ──────────────────────────────────────────────────────────────
+; the failure result: a "line:col: MESSAGE" located error (DATA, never a throw),
+; the location supplied by cursor_pos. Mirrors json's private `fail` (which
+; additionally prefixes a parser tag like "json: "); callers that want a tag
+; prepend it to MESSAGE.
+(bind parse_fail
+  (lambda (text i message)
+    (assoc (map_of) "ok" false
+      "error" (string_concat_many (cursor_pos text i) ": " message))))
+
+(export cursor_ch cursor_pos cursor_slice parse_ok parse_fail)

@@ -1,0 +1,225 @@
+; stdlib/backend/emit/wasm/instructions.caap — wasm operator/instruction emit
+; (module stdlib.backend.emit.wasm.instructions).
+;
+; The INSTRUCTION seam of the wasm emitter (split out of emit/wasm.caap): the
+; value-materializer (mat), the signed/unsigned + float op tables (sbinops /
+; fbinops), per-function local allocation (fresh_local!), the two-operand
+; arithmetic / comparison / cast emitters (w_binop / w_cmp / w_cast), and the
+; sequence/block/bind combinators (seq_value / block_of / lower_bind). These
+; take the `lower` trampoline as `self` (passed by the lowering layer at call
+; time), so they carry no load-time dependency on lowering — only on the type
+; helpers below.
+(module stdlib.backend.emit.wasm.instructions)
+
+(use stdlib.syntax.ast arg name_of bind_pairs)
+(use stdlib.lib.collections.map clone)
+; signedness / op-slot decisions shared with backend/emit/llvm; only the WAT spelling
+; stays local.
+(use stdlib.backend.codegen_common unsigned? sbinop_index eq_ne?)
+; the type / width helpers this layer renders against.
+(use stdlib.backend.emit.wasm.types w_type w_unify float_t?)
+
+; a VALUE record is {text, type(wasm|null for a bare int literal), ct(caap|null),
+; lit(the literal int when text is null)}. mat renders it at a chosen width: a
+; bare int literal becomes `(<t>.const N)`, anything else is its own text.
+(bind mat
+  (lambda (v t)
+    (cond
+      ((not (eq (get v "text") null)) (get v "text"))
+      ((eq (get v "litfloat") true)
+        (string_concat_many "(" t ".const " (value_to_string (get v "lit")) ")"))
+      (else (string_concat_many "(" t ".const " (int_to_string (get v "lit")) ")")))))
+
+; ── operator tables ─────────────────────────────────────────────────────────
+; `binops` (head -> base op name, identical across targets) and `cmp_heads`
+; come from backend/codegen_common. The wasm-SPECIFIC spellings stay here:
+;   sbinops  — the signed/unsigned op pair {slot 0 signed, slot 1 unsigned};
+;              the SLOT is chosen by codegen_common/sbinop_index, the spelling
+;              (div_s/div_u, …) is wasm's
+;   fbinops  — float arithmetic spelled on the f-typed operand (i32.add-style),
+;              so the base name is `add`/`sub`/… (LLVM spells these fadd/fsub)
+(bind sbinops
+  (assoc (map_of)
+    "int_div" (list_of "div_s" "div_u")
+    "int_mod" (list_of "rem_s" "rem_u")
+    "int_shr" (list_of "shr_s" "shr_u")))
+(bind fbinops
+  (assoc (map_of)
+    "float_add" "add" "float_sub" "sub" "float_mul" "mul" "float_div" "div"))
+
+; ── per-function emission state: {n: local counter, locals: decl list} ───────
+(bind fresh_local!
+  (lambda (st wt)
+    (bind ((n (get st "n")))
+      (do
+        (set_ref n (int_add (deref n) 1))
+        (bind ((lid (string_concat_many "$v" (int_to_string (deref n)))))
+          (do
+            (append (get st "locals") (string_concat_many "(local " lid " " wt ")"))
+            lid))))))
+
+; w_binop — a two-operand arithmetic op. `op` is the fixed suffix (add/…); when
+; null, `signed` is the {signed unsigned} pair and the slot is chosen from the
+; operands' signedness (codegen_common/sbinop_index): UNSIGNED when EITHER
+; operand's CAAP type is unsigned, else signed. This is the SAME rule the LLVM
+; backend (the eval=native reference) already applied to its sdiv/udiv choice,
+; so the two backends now agree for mixed-signedness div/mod/shr — a deliberate
+; parity convergence (the earlier wasm-only rule keyed off just the first
+; operand's type and could disagree with the native binary).
+(bind w_binop
+  (lambda (self node st env fns op signed)
+    (bind (
+      (a (self self (arg node 0) st env fns))
+      (b (self self (arg node 1) st env fns))
+      (t (w_unify (get a "type") (get b "type")))
+      (ct (or (or (get a "ct") (get b "ct")) "int"))
+      (opn (if (eq op null)
+             (get signed (sbinop_index (get a "ct") (get b "ct"))) op))
+    )
+      (assoc (map_of)
+        "text" (string_concat_many "(" t "." opn " " (mat a t) " " (mat b t) ")")
+        "type" t "ct" ct))))
+
+; w_cmp — a comparison; operands unify to a width, the result is an i32 bool.
+(bind w_cmp
+  (lambda (self node st env fns base)
+    (bind (
+      (a (self self (arg node 0) st env fns))
+      (b (self self (arg node 1) st env fns))
+      (t (w_unify (get a "type") (get b "type")))
+      (ct (or (or (get a "ct") (get b "ct")) "int"))
+      (suf (cond
+             ((float_t? t) base)                     ; f64.lt/eq/… — no signedness
+             ((eq_ne? base) base)                    ; eq/ne — signedness-agnostic
+             ((unsigned? ct) (string_concat_many base "_u"))
+             (else (string_concat_many base "_s"))))
+    )
+      (assoc (map_of)
+        "text" (string_concat_many "(" t "." suf " " (mat a t) " " (mat b t) ")")
+        "type" "i32" "ct" "bool"))))
+
+; w_cast — width / representation conversion. The full int<->int + float<->float
+; + int<->float matrix, matching the LLVM backend's `cast` so the SAME source
+; lowers on either target:
+;   int  <-> int    : i32<->i64 wrap/extend, sub-i32 narrowing mask / sign-extend,
+;                     identity within a width
+;   float<-> float  : f32<->f64 demote / promote
+;   int  ->  float  : fNN.convert_iWW_(s|u)  (sign from the source CAAP type)
+;   float ->  int   : iWW.trunc_fNN_s        (signed, like LLVM's fptosi)
+; (The dedicated int_to_float/float_to_int heads cover only i32<->f64; `cast`
+; is the general numeric bridge, e.g. `(cast n f32)`, `(cast x i64)` from a
+; float.) A bare int literal that has not committed to a width arrives as i32.
+(bind w_cast
+  (lambda (self node st env fns)
+    (bind (
+      (x (self self (arg node 0) st env fns))
+      (toct (name_of (arg node 1)))
+      (to (w_type toct))
+    )
+      (do
+        (when (eq to null)
+          (throw (string_concat_many "wasm codegen: cast to unsupported type `"
+            (if (eq toct null) "?" toct) "`")))
+        (bind (
+          (from (if (eq (get x "type") null) "i32" (get x "type")))
+          (fct (or (get x "ct") "int"))
+          (xt (mat x from))
+          (src_float (float_t? from))
+          (dst_float (float_t? to))
+        )
+          (assoc (map_of)
+            "type" to "ct" toct
+            "text"
+            (cond
+              ((eq from to)
+                (cond
+                  ((eq toct "u8")  (string_concat_many "(i32.and " xt " (i32.const 255))"))
+                  ((eq toct "u16") (string_concat_many "(i32.and " xt " (i32.const 65535))"))
+                  ((eq toct "i8")  (string_concat_many "(i32.extend8_s " xt ")"))
+                  ((eq toct "i16") (string_concat_many "(i32.extend16_s " xt ")"))
+                  (else xt)))
+              ; int -> float: convert, signedness from the source CAAP type
+              ((and (not src_float) dst_float)
+                (string_concat_many "(" to ".convert_" from "_"
+                  (if (unsigned? fct) "u" "s") " " xt ")"))
+              ; float -> int: truncate toward zero (signed, matching LLVM fptosi)
+              ((and src_float (not dst_float))
+                (string_concat_many "(" to ".trunc_" from "_s " xt ")"))
+              ((and (eq from "i32") (eq to "i64"))
+                (string_concat_many "(i64.extend_i32_" (if (unsigned? fct) "u" "s") " " xt ")"))
+              ((and (eq from "i64") (eq to "i32"))
+                (string_concat_many "(i32.wrap_i64 " xt ")"))
+              ((and (eq from "f64") (eq to "f32"))
+                (string_concat_many "(f32.demote_f64 " xt ")"))
+              ((and (eq from "f32") (eq to "f64"))
+                (string_concat_many "(f64.promote_f32 " xt ")"))
+              (else (throw (string_concat_many "wasm codegen: cast " from " -> "
+                      to " unsupported"))))))))))
+
+; seq_value — lower a body sequence: each non-final form's value is dropped
+; (void ones emit as-is), the final form is returned raw. -> {pre, last}.
+(bind seq_value
+  (lambda (self forms st env fns)
+    (if (eq (size forms) 0)
+      (assoc (map_of) "pre" "" "last" (assoc (map_of) "text" "" "type" "void"))
+      (bind ((parts (list_of)) (n (size forms)) (last (ref null)))
+        (do
+          (for i (sequence_range 0 n)
+            (bind ((v (self self (get forms i) st env fns)))
+              (if (eq i (int_sub n 1))
+                (set_ref last v)
+                (append parts
+                  (if (eq (get v "type") "void")
+                    (get v "text")
+                    (string_concat_many "(drop " (get v "text") ")"))))))
+          (assoc (map_of) "pre" (sequence_join parts " ") "last" (deref last)))))))
+
+; block_of — wrap a {pre,last} sequence as one folded expr; a non-void result
+; carries `(result T)` so the block composes as a value.
+(bind block_of
+  (lambda (s)
+    (bind (
+      (lastv (get s "last"))
+      (raw (get lastv "type"))
+      (t (if (eq raw null) "i32" raw))
+      (pre (get s "pre"))
+    )
+      (assoc (map_of)
+        "type" t "ct" (get lastv "ct")
+        "text" (string_concat_many
+          "(block " (if (eq t "void") "" (string_concat_many "(result " t ") "))
+          pre (if (eq pre "") "" " ") (mat lastv t) ")")))))
+
+; lower_bind — flat/multi bind: each pair's value goes to a fresh mutable local
+; (let*: a value sees the names bound before it), the body is a block.
+(bind lower_bind
+  (lambda (self node st env fns)
+    (bind ((bp (bind_pairs node)) (env2 (clone env)) (setters (list_of)))
+      (do
+        (for p (get bp "pairs")
+          (bind (
+            (v (self self (get p "value") st env2 fns))
+            (wt (if (eq (get v "type") null) "i32" (get v "type")))
+            (lid (fresh_local! st wt))
+          )
+            (do
+              (append setters
+                (string_concat_many "(local.set " lid " " (mat v wt) ")"))
+              (assoc env2 (get p "name")
+                (assoc (map_of) "local" lid
+                  "text" (string_concat_many "(local.get " lid ")")
+                  "type" wt "ct" (or (get v "ct") "int") "elem" (get v "elem"))))))
+        (bind (
+          (body (block_of (seq_value self (get bp "body") st env2 fns)))
+          (pre (sequence_join setters " "))
+        )
+          (assoc (map_of)
+            "type" (get body "type") "ct" (get body "ct")
+            "text" (string_concat_many
+              "(block " (if (eq (get body "type") "void") ""
+                          (string_concat_many "(result " (get body "type") ") "))
+              pre " " (get body "text") ")")))))))
+
+
+(export mat sbinops fbinops fresh_local! w_binop w_cmp w_cast
+        seq_value block_of lower_bind)

@@ -1,0 +1,47 @@
+; stdlib/lib/tests/test_opt.caap — the optimization-LEVEL registry (boot/opt.caap).
+; Tests the pure level table + cumulativity. It deliberately does NOT call
+; `enable_opt!` (that installs transforms into the shared session registry, which
+; would perturb the rest of the loader corpus) — it queries the table data only.
+
+;; @area: passes
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.boot.opt LEVELS opt_transforms active_opt_level)
+(use stdlib.lib.collections.sequence contains?)
+(do
+  ; the level ladder
+  (assert_true (value_eq LEVELS (list_of "O0" "O1" "O2" "O3")) "levels O0..O3")
+  ; O0 is empty
+  (assert_eq (size (opt_transforms "O0")) 0 "O0 enables no transforms")
+  ; O1 — exactly the cheap sound local set
+  (bind ((o1 (opt_transforms "O1")))
+    (do
+      (assert_eq (size o1) 4 "O1 has 4 transforms")
+      (for nm (list_of "constfold" "dce" "simplify" "algebra")
+        (assert_true (contains? o1 nm) (string_concat_many "O1 contains " nm)))))
+  ; O2 ⊇ O1, adding cse/inline/licm/peval
+  (bind ((o1 (opt_transforms "O1")) (o2 (opt_transforms "O2")))
+    (do
+      (for nm o1 (assert_true (contains? o2 nm) (string_concat_many "O2 superset of O1: " nm)))
+      (for nm (list_of "cse" "inline" "licm" "peval")
+        (assert_true (contains? o2 nm) (string_concat_many "O2 contains " nm)))
+      (assert_eq (size o2) 8 "O2 has 8 transforms (O1 + 4)")))
+  ; O3 ⊇ O2, adding dead_store + ccp — both now SSA-BACKED (the ssa_dce/ssa_ccp modules
+  ; register under these names, composing the SSA across-control pass with the
+  ; conservative one); NOT a separate ssa_* entry, and NOT pe.
+  (bind ((o2 (opt_transforms "O2")) (o3 (opt_transforms "O3")))
+    (do
+      (for nm o2 (assert_true (contains? o3 nm) (string_concat_many "O3 superset of O2: " nm)))
+      (for nm (list_of "dead_store" "ccp")
+        (assert_true (contains? o3 nm) (string_concat_many "O3 contains " nm)))
+      ; the SSA precision lives INSIDE dead_store/ccp now — no standalone ssa_* transform
+      (for nm (list_of "ssa_dce" "ssa_ccp")
+        (assert_true (not (contains? o3 nm))
+          (string_concat_many "O3 has no standalone " nm " (folded into dead_store/ccp)")))
+      (assert_true (not (contains? o3 "pe"))
+        "pe is NOT in any level (not behaviour-preserving on general code)")
+      (assert_eq (size o3) 10 "O3 has 10 transforms (O2 + dead_store + ccp, both SSA-backed)")))
+  ; the test never enabled a level, so the session's active level is the default
+  (assert_eq (active_opt_level) "O0" "default active level is O0 (test keeps the corpus clean)")
+  true)

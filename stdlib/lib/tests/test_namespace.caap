@@ -1,0 +1,57 @@
+; stdlib/lib/tests/test_namespace.caap — the namespace primitive (stdlib.lib.namespace).
+
+;; @area: semantics
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.namespace
+  ns_of ns_get ns_has ns_keys ns_merge ns_merge_keep ns_conflicts
+  ns_subset ns_nest ns_qualify ns_resolve)
+
+(do
+  ; ── build + lookup ──────────────────────────────────────────────────────────
+  (bind ((a (ns_of (list_of "x" "y") (list_of 1 2))))
+    (do
+      (assert_eq (ns_get a "x") 1 "ns_of/ns_get binds x")
+      (assert_eq (ns_get a "y") 2 "ns_of/ns_get binds y")
+      (assert_true (ns_has a "x") "ns_has finds a bound name")
+      (assert_true (not (ns_has a "z")) "ns_has is false for an unbound name")
+      (assert_eq (size (ns_keys a)) 2 "ns_keys lists the bound names")))
+
+  ; ── merge policies + conflict detection ─────────────────────────────────────
+  (bind (
+    (a (ns_of (list_of "k" "only_a") (list_of "A" 10)))
+    (b (ns_of (list_of "k" "only_b") (list_of "B" 20)))
+  )
+    (do
+      (assert_eq (ns_get (ns_merge a b) "k") "B" "ns_merge is last-wins (b overrides a)")
+      (assert_eq (ns_get (ns_merge_keep a b) "k") "A" "ns_merge_keep is first-wins (a wins)")
+      (assert_eq (ns_get (ns_merge_keep a b) "only_b") 20 "ns_merge_keep still adds b's fresh names")
+      (assert_eq (size (ns_conflicts a b)) 1 "ns_conflicts reports the shared name")
+      (assert_eq (get (ns_conflicts a b) 0) "k" "ns_conflicts names the clash")))
+
+  ; ── subset ──────────────────────────────────────────────────────────────────
+  (bind ((a (ns_of (list_of "p" "q" "r") (list_of 1 2 3))))
+    (do
+      (assert_eq (size (ns_keys (ns_subset a (list_of "p" "r" "absent")))) 2
+        "ns_subset keeps present names, skips absent")
+      (assert_true (not (ns_has (ns_subset a (list_of "p")) "q")) "ns_subset drops the rest")))
+
+  ; ── nest + qualified dotted resolve ─────────────────────────────────────────
+  (bind (
+    (inner (ns_of (list_of "encode") (list_of "ENC")))
+    (outer (ns_nest "hex" inner))
+  )
+    (do
+      (assert_eq (ns_resolve outer "hex.encode") "ENC"
+        "ns_nest + ns_resolve walk a sub-namespace by dotted name")
+      (assert_eq (ns_resolve outer "hex.missing") null "ns_resolve is null for an absent leaf")
+      (assert_eq (ns_resolve outer "nope.encode") null "ns_resolve is null for an absent branch")))
+
+  ; ── qualify ─────────────────────────────────────────────────────────────────
+  (bind ((q (ns_qualify "text" (ns_of (list_of "trim") (list_of "T")))))
+    (do
+      (assert_true (ns_has q "text.trim") "ns_qualify prefixes keys")
+      (assert_eq (ns_get q "text.trim") "T" "ns_qualify preserves bindings")
+      (assert_true (not (ns_has q "trim")) "ns_qualify drops the unqualified key")))
+  true)

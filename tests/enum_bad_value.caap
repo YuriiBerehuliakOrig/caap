@@ -1,0 +1,5 @@
+; enum_bad_value — an explicit enum value that is not an integer literal is a
+; certain error, never a silent fall-through to auto-numbering.
+(module stdlib.fixtures.enum_bad_value)
+(enum Color (red 0) (green "x"))
+(export green)

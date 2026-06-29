@@ -1,0 +1,66 @@
+; stdlib/bare/cpu.caap — CPU instruction helpers over the `asm` primitive
+; (module stdlib.bare.cpu).
+;
+; Thin wrappers that emit a single privileged/CPU instruction through the
+; kernel `asm` primitive (`(asm "template" "constraints" result_ty arg…)` →
+; `call … asm sideeffect`). The instruction templates below are ARM Cortex-M
+; (thumb) mnemonics — these helpers are ARM-specific by construction, the same
+; way `examples/urun/ur_port` is. A different ISA would supply its own
+; `cpu.caap` (the wrapper shape is portable; the mnemonic is not).
+;
+; SCOPE — NATIVE/clike-targeted (inline asm lowers in the LLVM/WASM backends,
+; reached by a native program's `(use …)` through the backend prep path). NOT
+; loadable by the plain eval loader — `asm` is a native-only head and inline
+; assembly has no meaning in the CTFE sandbox. See stdlib/bare/README.md.
+;
+; Each wrapper returns 0 so it is usable as an expression. `asm … sideeffect`
+; guarantees the instruction is never dropped by the optimizer.
+(module stdlib.bare.cpu)
+
+; ── fully working: single-instruction wrappers ───────────────────────────────
+; nop — no-op; a cycle of delay / a pipeline placeholder.
+(defn nop () i32 (mutation) (do (asm "nop"  "" void) 0))
+
+; wfi / wfe — Wait For Interrupt / Wait For Event: halt the core until an
+; interrupt (wfi) or event (wfe) wakes it. The idle-loop primitive — a power-
+; saving spin that the scheduler's idle task runs instead of a busy loop.
+(defn wfi () i32 (mutation) (do (asm "wfi"  "" void) 0))
+(defn wfe () i32 (mutation) (do (asm "wfe"  "" void) 0))
+
+; sev — Send Event: wake other cores parked on `wfe` (a no-op effect on a
+; single-core part, but the instruction is valid and harmless).
+(defn sev () i32 (mutation) (do (asm "sev"  "" void) 0))
+
+; ── memory barriers (ARMv7-M data/instruction synchronization) ───────────────
+; dmb / dsb / isb — Data Memory Barrier / Data Synchronization Barrier /
+; Instruction Synchronization Barrier. Order memory accesses / drain the write
+; buffer / flush the pipeline — needed after reprogramming MPU/SCB registers or
+; before enabling an interrupt source. Plain instruction emits, so they lower
+; through `asm` with no extra mechanism.
+(defn dmb () i32 (mutation) (do (asm "dmb"  "" void) 0))
+(defn dsb () i32 (mutation) (do (asm "dsb"  "" void) 0))
+(defn isb () i32 (mutation) (do (asm "isb"  "" void) 0))
+
+; ── IRQ masking (PRIMASK) — the single-core mutual-exclusion primitive ───────
+; irq_disable / irq_enable — set / clear PRIMASK via `cpsid i` / `cpsie i`,
+; masking / unmasking all maskable interrupts. On a single-core Cortex-M this
+; IS the synchronization mechanism against the scheduler (no ldrex/strex
+; needed); stdlib.bare.critical pairs them into an enter/leave critical section.
+(defn irq_disable () i32 (mutation) (do (asm "cpsid i" "" void) 0))
+(defn irq_enable  () i32 (mutation) (do (asm "cpsie i" "" void) 0))
+
+; ── PRIMASK save / restore — for a NESTING-safe critical section ─────────────
+; primask_read / primask_write use an `asm` OUTPUT operand (`$0` with the `=r`
+; constraint) and an input operand (`r`) — both lower cleanly through the
+; backend. primask_read returns the current PRIMASK so a critical section can
+; mask, do work, then RESTORE the prior state with primask_write instead of
+; unconditionally re-enabling IRQs (which would be wrong if the section was
+; entered with interrupts already masked).
+;   primask_read  -> the current PRIMASK (bit 0 set => IRQs already masked)
+;   primask_write : the PRIMASK value to restore
+(defn primask_read  () u32 (mutation) (asm "mrs $0, primask" "=r" u32))
+(defn primask_write ((v u32)) i32 (mutation)
+  (do (asm "msr primask, $0" "r" void v) 0))
+
+(export nop wfi wfe sev dmb dsb isb
+        irq_disable irq_enable primask_read primask_write)

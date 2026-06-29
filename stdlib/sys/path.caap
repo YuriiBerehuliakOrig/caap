@@ -1,0 +1,141 @@
+; stdlib/sys/path.caap — facade for the host "path" library (filesystem paths).
+;
+; OS-aware path manipulation (join/basename/normalize/…) backed by the host's
+; std::path semantics. This is the SYSTEM path facade; the pure-string helpers in
+; stdlib.lib.text.path are a separate, host-free library. All ops are `pure` — no
+; I/O, just string/path algebra — so they fold at compile time. Two layers, one
+; file (the boilerplate lives in stdlib.sys.wrap):
+;   1. The visible, TYPED surface (`ops`): each function with its parameters
+;      (name + type) and return type. verify_facade checks this against the
+;      catalog, so the declaration cannot drift.
+;   2. CALLABLE wrappers: dual-phase callables from boot/sys_grants.caap, with the
+;      capability handle partially applied. Without the grant the module still
+;      loads — wrappers are self-describing throwing stubs that raise
+;      "requires a sys grant" when called (declaration-only mode).
+(module stdlib.sys.path)
+
+(use stdlib.sys.verify op p)
+(use stdlib.sys.wrap make_facade)
+
+(bind ops
+  (list_of
+    (op "join"           (list_of (p "parts" "string[]")) "string" "pure")
+    (op "basename"       (list_of (p "path" "string")) "string" "pure")
+    (op "dirname"        (list_of (p "path" "string")) "string" "pure")
+    (op "extension"      (list_of (p "path" "string")) "string|null" "pure")
+    (op "stem"           (list_of (p "path" "string")) "string" "pure")
+    (op "with_extension" (list_of (p "path" "string") (p "extension" "string")) "string" "pure")
+    (op "is_absolute"    (list_of (p "path" "string")) "bool" "pure")
+    (op "normalize"      (list_of (p "path" "string")) "string" "pure")
+    (op "split"          (list_of (p "path" "string")) "list<string>" "pure")
+    (op "strip_prefix"   (list_of (p "path" "string") (p "prefix" "string")) "string|null" "pure")))
+
+; one call: file the typed surface AND build the wrapper bundle. Each export
+; below reads its (capability-applied, or null) callable from this bundle.
+(bind sys (make_facade "path" ops))
+
+(bind join           (get sys "join"))
+(bind basename       (get sys "basename"))
+(bind dirname        (get sys "dirname"))
+(bind extension      (get sys "extension"))
+(bind stem           (get sys "stem"))
+(bind with_extension (get sys "with_extension"))
+(bind is_absolute    (get sys "is_absolute"))
+(bind normalize      (get sys "normalize"))
+(bind split          (get sys "split"))
+(bind strip_prefix   (get sys "strip_prefix"))
+
+; ── relpath — a PURE, grant-free lexical relative path ───────────────────────
+; relpath is NOT a host op (caap-sys has no `relpath`), so it is NOT declared in
+; `ops` — adding it there would trip verify_facade's "not provided by caap-sys"
+; drift. It is OS-path algebra computed entirely in-language: no capability
+; handle, no I/O, no filesystem. The helpers below mirror the host's lexical
+; `normalize` (`.` drops, `..` pops a prior real component, a leading `..` on a
+; relative path is preserved, `..` is a no-op at root) so a caller need not hold
+; a sys grant to relate two paths. (The pure-string twin lives in
+; stdlib.lib.text.path; this one stays self-contained at the sys tier.)
+
+; rel_absolute? — does `p` begin at the filesystem root?
+(bind rel_absolute?
+  (lambda (p) (string_starts_with p "/")))
+
+; rel_split — `p`'s non-empty components ("/a//b/" and "a/b" both -> ["a" "b"]),
+; a purely lexical split with no "."/".." resolution.
+(bind rel_split
+  (lambda (p)
+    (sequence_filter (string_split p "/")
+      (lambda (part) (not (eq part ""))))))
+
+; rel_normalize — collapse "."/".." lexically, matching the host `normalize`:
+; "." drops; ".." pops the previous REAL component, else is kept on a relative
+; path (cannot ascend a known parent) or dropped at root; the result keeps the
+; path's absolute/relative kind. "" and "/" normalize as the host does.
+(bind rel_normalize
+  (lambda (p)
+    (bind (
+      (abs (rel_absolute? p))
+      (out (ref (list_of)))
+    )
+      (do
+        (for part (rel_split p)
+          (cond
+            ((eq part ".") null)
+            ((eq part "..")
+              (bind ((cur (deref out)) (k (size (deref out))))
+                (if (and (gt k 0) (not (eq (get cur (int_sub k 1)) "..")))
+                  ; pop a real trailing component
+                  (set_ref out (sequence_take cur (int_sub k 1)))
+                  ; nothing real to pop: keep ".." only on a relative path
+                  (unless abs (append (deref out) "..")))))
+            (else (append (deref out) part))))
+        (bind ((parts (deref out)) (body (sequence_join parts "/")))
+          (cond
+            (abs (string_concat_many "/" body))
+            ((eq (size parts) 0) ".")
+            (else body)))))))
+
+; common_len — how many leading components `a` and `b` share.
+(bind common_len
+  (lambda (a b)
+    (bind (
+      (i (ref 0)) (go (ref true))
+      (n (if (lt (size a) (size b)) (size a) (size b)))
+    )
+      (do
+        (while (and (deref go) (lt (deref i) n))
+          (if (eq (get a (deref i)) (get b (deref i)))
+            (set_ref i (int_add (deref i) 1))
+            (set_ref go false)))
+        (deref i)))))
+
+; relpath — the lexical relative path FROM directory `from` TO `to`, such that
+; (normalize (join (list_of from result))) reaches (normalize to). Both inputs
+; are lexically normalized; the shared leading components drop, each remaining
+; `from` component becomes a "..", and the remaining `to` components follow.
+; "/a" -> "/a/b/c" yields "b/c"; "/a/b/c" -> "/a" yields "../.."; equal paths
+; yield ".". When the two paths are of different kinds (one absolute, one
+; relative) no lexical relation exists, so the normalized `to` is returned.
+;   from / to : two OS paths of the SAME kind (both absolute or both relative)
+;   ->        : the relative path string
+(bind relpath
+  (lambda (from to)
+    (bind (
+      (nf (rel_normalize from))
+      (nt (rel_normalize to))
+    )
+      (if (not (eq (rel_absolute? nf) (rel_absolute? nt)))
+        nt
+        (bind (
+          (fs (rel_split nf))
+          (ts (rel_split nt))
+          (shared (common_len fs ts))
+          (ups (sequence_map (sequence_range shared (size fs)) (lambda (i) "..")))
+          (rest (sequence_drop ts shared))
+          (parts (sequence_flatten (list_of ups rest)))
+        )
+          (if (eq (size parts) 0) "." (sequence_join parts "/")))))))
+
+(export ops
+        join basename dirname extension stem with_extension
+        is_absolute normalize split strip_prefix
+        relpath)

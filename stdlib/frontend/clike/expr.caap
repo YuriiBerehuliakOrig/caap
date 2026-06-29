@@ -1,0 +1,872 @@
+; stdlib/frontend/clike/expr.caap - expression lowering for stdlib.frontend.clike.
+;
+; Owns precedence tables, expression parsing, pointer/subscript/cast lowering, and
+; the statement-lowering service map that connects expression parsing to block.caap.
+(module stdlib.frontend.clike.expr)
+
+(use stdlib.frontend.surface parse_forms)
+(use stdlib.frontend.clike.ast sym lit call calln literal_of call? head_is? arg
+     name_of head_of)
+(use stdlib.frontend.clike.sequence map sequence_drop sequence_join)
+(use stdlib.semantics.types.registry known_type? resolve)
+(use stdlib.frontend.clike.grammar clike_units)
+(use stdlib.frontend.clike.tokens
+     tval titems tsym? tnum? tstr? tlist? tloc oops split_dots split_commas)
+(use stdlib.frontend.clike.sem_tokens st_emit! st_name!)
+(use stdlib.frontend.clike.state
+     local_types value_types field_types fn_rets local_globals local_consts
+     local_volatile_consts local_enums)
+(use stdlib.frontend.clike.block block_lower_block)
+(import stdlib.frontend.clike.types clike_types)
+
+; ── expressions: precedence climbing over registry-backed operator tables ───
+(bind cmp_ops (map_of))
+(bind add_ops (map_of))
+(bind mul_ops (map_of))
+(bind shift_ops (map_of))
+(bind band_ops (map_of))
+(bind bxor_ops (map_of))
+(bind bor_ops (map_of))
+(bind assign_op (map_of))
+
+; infix_tier_map — returns the mutable registry table for one precedence tier.
+(bind infix_tier_map
+  (lambda (tier)
+    (cond ((eq tier "cmp") cmp_ops)
+          ((eq tier "add") add_ops)
+          ((eq tier "mul") mul_ops)
+          ((eq tier "shift") shift_ops)
+          ((eq tier "band") band_ops)
+          ((eq tier "bxor") bxor_ops)
+          ((eq tier "bor") bor_ops)
+          (else (throw (string_concat_many "unknown clike infix tier `" tier "`"))))))
+
+; register_infix_op! — registers a binary operator token to lower through a head.
+(bind register_infix_op!
+  (lambda (tier token lower_head)
+    (assoc (infix_tier_map tier) token lower_head)))
+
+; register_assign_op! — registers a compound assignment token like `+=`.
+(bind register_assign_op!
+  (lambda (token lower_head)
+    (assoc assign_op token lower_head)))
+
+(register_infix_op! "cmp" "==" "eq")
+(register_infix_op! "cmp" "!=" "ne")
+(register_infix_op! "cmp" "<" "lt")
+(register_infix_op! "cmp" ">" "gt")
+(register_infix_op! "cmp" "<=" "le")
+(register_infix_op! "cmp" ">=" "ge")
+(register_infix_op! "add" "+" "int_add")
+(register_infix_op! "add" "-" "int_sub")
+(register_infix_op! "mul" "*" "int_mul")
+(register_infix_op! "mul" "/" "int_div")
+(register_infix_op! "mul" "%" "int_mod")
+(register_infix_op! "shift" "<<" "int_shl")
+(register_infix_op! "shift" ">>" "int_shr")
+(register_infix_op! "band" "&" "int_and")
+(register_infix_op! "bxor" "^" "int_xor")
+(register_infix_op! "bor" "|" "int_or")
+(register_assign_op! "+=" "int_add")
+(register_assign_op! "-=" "int_sub")
+(register_assign_op! "*=" "int_mul")
+(register_assign_op! "/=" "int_div")
+(register_assign_op! "%=" "int_mod")
+(register_assign_op! "&=" "int_and")
+(register_assign_op! "|=" "int_or")
+(register_assign_op! "^=" "int_xor")
+(register_assign_op! "<<=" "int_shl")
+(register_assign_op! ">>=" "int_shr")
+; assign_tok? — true when a token starts plain or compound assignment.
+(bind assign_tok?
+  (lambda (tk) (and (tsym? tk null)
+                    (or (eq (tval tk) "=") (contains assign_op (tval tk))))))
+; apply_assign — the value to STORE: plain rhs for `=`, else (op (read) rhs) for a
+; compound op, where `read` is the spec reading the current LHS value.
+(bind apply_assign
+  (lambda (optok read rhs)
+    (if (tsym? optok "=")
+      rhs
+      (calln (get assign_op (tval optok)) (list_of read rhs)))))
+; incr_value — the value `x++`/`x--` stores: x ± 1, reusing the +/- builtins from
+; add_ops (so the increment desugar lives in one place, beside apply_assign).
+(bind incr_value
+  (lambda (op read)
+    (calln (get add_ops (if (tsym? op "++") "+" "-")) (list_of read (lit 1)))))
+
+; Type parsing lives in stdlib.frontend.clike.types. The facade preserves the
+; original local binding names and supplies instrumentation/diagnostic services.
+; clike_type_services — service map for type parsing with semantic-token output.
+(bind clike_type_services
+  (lambda ()
+    (assoc (map_of) "st_emit!" st_emit! "oops" oops)))
+; clike_quiet_type_services — type-parser services with semantic tokens disabled.
+(bind clike_quiet_type_services
+  (lambda ()
+    (assoc (map_of) "st_emit!" null "oops" oops)))
+; read_type — reads a type spelling at `i` and emits semantic-token details.
+(bind read_type
+  (lambda (toks i)
+    ((get clike_types "read_type") (clike_type_services) toks i)))
+; read_type_quiet — reads a type spelling without semantic-token side effects.
+(bind read_type_quiet
+  (lambda (toks i)
+    ((get clike_types "read_type") (clike_quiet_type_services) toks i)))
+; resolve_type_head — splits a broad declaration head into metadata and type.
+(bind resolve_type_head
+  (lambda (toks start end)
+    ((get clike_types "resolve_type_head") (clike_type_services) toks start end)))
+; param_spec — converts a parsed param record into the lowered signature spec.
+(bind param_spec
+  (lambda (pr)
+    (bind ((p ((get clike_types "param_spec") (clike_type_services) pr)))
+      (assoc p "spec"
+        (call (sym (get p "name")) (list_of (sym (get p "type"))))))))
+
+; op_set / ident_tok? — the lexer tags identifiers AND operators both as
+; "symbol", so a declaration detector tells a TYPE base (an identifier) from an
+; operator (`=`, `*`, …) by membership here. DERIVED from the precedence +
+; compound-assignment tables above, so adding an operator to a table registers it
+; automatically (no parallel list to keep in sync), PLUS the operators that map to
+; no builtin: structural (`->` `=` `,` `;`), short-circuit logical (`&&` `||` `!`),
+; bitwise NOT (`~`) and the increments (`++` `--`). The lexer regex (rule "op")
+; must lex this same set.
+(bind structural_ops
+  (assoc (map_of) "->" true "=" true "," true ";" true
+                  "&&" true "||" true "!" true "~" true "++" true "--" true))
+; operator_token? — tells whether a symbol spelling is registered as an operator.
+(bind operator_token?
+  (lambda (v)
+    (or (contains structural_ops v)
+        (or (contains assign_op v)
+            (bind ((r (ref false)))
+              (do
+                (for tbl (list_of cmp_ops add_ops mul_ops shift_ops
+                                  band_ops bxor_ops bor_ops)
+                  (when (contains tbl v) (set_ref r true)))
+                (deref r)))))))
+; ident_tok? — true when a symbol token should be treated as an identifier/name.
+(bind ident_tok?
+  (lambda (t) (and (tsym? t null) (not (operator_token? (tval t))))))
+
+; ── per-file lowering state ──────────────────────────────────────────────────
+; The concrete maps live in stdlib.frontend.clike.state. This facade reads and
+; mutates them through accessors so every lower_program call can reset the whole
+; per-file record in one place.
+
+; type_known? stays as the facade-local gate name; implementation details live
+; in stdlib.frontend.clike.types with the rest of type spelling/parsing policy.
+(bind type_known?
+  (lambda (nm)
+    ((get clike_types "type_known?") nm)))
+
+; MUTABILITY. Variables are CONST by default; `mut` makes them assignable. A
+; const local is a plain value binding (read as a bare name); a `mut` local is a
+; ref cell (read via deref, written via set_ref). `env`/`local_globals` map a
+; name to "mut" or "const". A GLOBAL is always memory (read via deref) — `mut`
+; only controls whether it may be assigned.
+;   name_is_cell? — read through a deref (mut local, or any global)?
+(bind name_is_cell?
+  (lambda (env nm)
+    (or (eq (get env nm) "mut")
+        (not (eq (get (local_globals) nm) null)))))
+;   read_name — the spec that READS a (possibly dotted-head) name.
+(bind read_name
+  (lambda (env nm)
+    (if (name_is_cell? env nm)
+      (calln "deref" (list_of (sym nm)))
+      (sym nm))))
+;   name_writable? — may `name = …` assign it (declared `mut`)?
+(bind name_writable?
+  (lambda (env nm)
+    (or (eq (get env nm) "mut")
+        (eq (get (local_globals) nm) "mut"))))
+
+; the mutually recursive expression levels share one dispatch record `P`
+; (the recursion idiom over a map, since the levels reference each other)
+(bind P (map_of))
+
+; ── numeric-like symbol atoms (0xE000ED04, 0b1010, invalid suffixes) ─────────
+; The grammar only keeps digit-leading non-decimal atoms together. Expression
+; semantics decides which spellings are real literals and reports the rest here.
+(bind hex_digit_val
+  (assoc (map_of)
+    "0" 0 "1" 1 "2" 2 "3" 3 "4" 4 "5" 5 "6" 6 "7" 7 "8" 8 "9" 9
+    "a" 10 "b" 11 "c" 12 "d" 13 "e" 14 "f" 15
+    "A" 10 "B" 11 "C" 12 "D" 13 "E" 14 "F" 15))
+; decimal_digit? — true for one ASCII decimal digit.
+(bind decimal_digit?
+  (lambda (ch) (string_contains "0123456789" ch)))
+; numeric_atom? — true for a symbol spelling that starts with a digit.
+(bind numeric_atom?
+  (lambda (s)
+    (and (gt (size s) 0)
+         (decimal_digit? (string_slice s 0 1)))))
+; radix_literal? — recognizes the semantic prefixes accepted as radix literals.
+(bind radix_literal?
+  (lambda (s)
+    (and (ge (size s) 2)
+         (and (eq (string_slice s 0 1) "0")
+              (bind ((p (string_slice s 1 2)))
+                (or (eq p "x") (or (eq p "X") (or (eq p "b") (eq p "B")))))))))
+; radix_digit? — validates one digit against the chosen radix.
+(bind radix_digit?
+  (lambda (ch radix)
+    (if (eq radix 2)
+      (or (eq ch "0") (eq ch "1"))
+      (string_contains "0123456789abcdefABCDEF" ch))))
+; parse_radix — folds a validated 0x/0b token into an integer literal value.
+(bind parse_radix
+  (lambda (t)
+    (bind ((s (tval t))
+           (p (string_slice s 1 2))
+           (radix (if (or (eq p "x") (eq p "X")) 16 2))
+           (digits (string_slice s 2 (size s)))
+           (acc (ref 0)))
+      (do
+        (unless (gt (size digits) 0)
+          (oops (string_concat_many "invalid numeric literal `" s "`") t))
+        (for ch (string_chars digits)
+          (unless (radix_digit? ch radix)
+            (oops (string_concat_many "invalid numeric literal `" s "`") t))
+          (set_ref acc (int_add (int_mul (deref acc) radix)
+                                (get hex_digit_val ch 0))))
+        (deref acc)))))
+
+; primary_number — lowers a lexer decimal integer token to a literal spec.
+(bind primary_number
+  (lambda (t i)
+    (do
+      (st_emit! t "number" (list_of))
+      (assoc (map_of) "spec" (lit (tval t)) "i" (int_add i 1)))))
+
+; primary_radix — lowers a radix numeric atom after semantic validation.
+(bind primary_radix
+  (lambda (t i)
+    (do
+      (st_emit! t "number" (list_of))
+      (assoc (map_of) "spec" (lit (parse_radix t)) "i" (int_add i 1)))))
+
+; primary_numeric_atom — handles digit-leading symbol atoms or rejects them.
+(bind primary_numeric_atom
+  (lambda (t i)
+    (if (radix_literal? (tval t))
+      (primary_radix t i)
+      (oops (string_concat_many "invalid numeric literal `" (tval t) "`") t))))
+
+; primary_paren — lowers a parenthesized expression using the full parser.
+(bind primary_paren
+  (lambda (t i env)
+    (assoc (map_of)
+      "spec" ((get P "full") (titems t) env)
+      "i" (int_add i 1))))
+
+; primary_string — lowers a string token, including `${...}` interpolation.
+(bind primary_string
+  (lambda (t i env)
+    (do
+      (st_emit! t "string" (list_of))
+      (assoc (map_of)
+        "spec" ((get P "interp") (tval t) env t)
+        "i" (int_add i 1)))))
+
+; primary_call — lowers `name(args...)` by parsing comma-separated arguments.
+(bind primary_call
+  (lambda (t nxt i env)
+    (do
+      (st_emit! t "function" (list_of))
+      (assoc (map_of)
+        "spec" (calln (tval t)
+                 (map (split_commas (titems nxt))
+                   (lambda (ts) ((get P "full") ts env))))
+        "i" (int_add i 2)))))
+
+; struct_literal_type? — decides whether `Name { ... }` can be a struct literal.
+(bind struct_literal_type?
+  (lambda (t nxt)
+    (and (tlist? nxt "brace")
+         (and (or (known_type? (tval t))
+                  (and (contains (local_types) (tval t))
+                       (gt (size (get (local_types) (tval t) (list_of))) 0)))
+              (not (contains (local_enums) (tval t)))))))
+
+; primary_struct_literal — lowers a recognized `Type { field expr, ... }`.
+(bind primary_struct_literal
+  (lambda (t nxt i env)
+    (do
+      (st_emit! t "type" (list_of))
+      (unless (or (known_type? (tval t))
+                  (contains (local_types) (tval t)))
+        (throw (string_concat_many
+          "clike: " (tloc t) "unknown struct type `"
+          (tval t) "` in literal")))
+      (assoc (map_of)
+        "spec" ((get P "slit") (tval t) (titems nxt) env t)
+        "i" (int_add i 2)))))
+
+; const_name? — true when a bare local const should read as `(const value)`.
+(bind const_name?
+  (lambda (t)
+    (and (eq (string_find (tval t) "." 0) null)
+         (contains (local_consts) (tval t)))))
+
+; primary_const_name — lowers a const binding to an explicit const form.
+(bind primary_const_name
+  (lambda (t i env)
+    (do
+      (st_name! t env)
+      (assoc (map_of)
+        "spec" (calln "const" (list_of (get (local_consts) (tval t))))
+        "i" (int_add i 1)))))
+
+; primary_name — lowers a bare or dotted name, inserting deref/get as needed.
+(bind primary_name
+  (lambda (t i env)
+    (bind (
+      (parts (split_dots (tval t)))
+      (head (get parts 0))
+      (acc (ref (read_name env head)))
+      (k (ref 1))
+    )
+      (do
+        (st_name! t env)
+        (while (lt (deref k) (size parts))
+          (do
+            (set_ref acc (calln "get"
+              (list_of (deref acc)
+                       (lit (get parts (deref k)))
+                       (lit null))))
+            (set_ref k (int_add (deref k) 1))))
+        (assoc (map_of) "spec" (deref acc) "i" (int_add i 1))))))
+
+(bind primary_handlers (list_of))
+; register_primary_handler! — adds an ordered primary-expression parser hook.
+(bind register_primary_handler!
+  (lambda (name priority parse)
+    (append primary_handlers
+      (assoc (map_of) "name" name "priority" priority "parse" parse))))
+
+; parse_primary — selects the first matching registered primary handler.
+(bind parse_primary
+  (lambda (toks i env)
+    (bind ((best (ref null)) (bestp (ref 1000000)))
+      (do
+        (for row primary_handlers
+          (when (lt (get row "priority") (deref bestp))
+            (bind ((r ((get row "parse") toks i env)))
+              (when (not (eq r null))
+                (do
+                  (set_ref best r)
+                  (set_ref bestp (get row "priority")))))))
+        (if (eq (deref best) null)
+          (oops "expected an expression" (get toks i))
+          (deref best))))))
+
+(register_primary_handler! "number" 10
+  (lambda (toks i env)
+    (bind ((t (get toks i)))
+      (if (tnum? t) (primary_number t i) null))))
+(register_primary_handler! "numeric-atom" 20
+  (lambda (toks i env)
+    (bind ((t (get toks i)))
+      (if (and (tsym? t null) (numeric_atom? (tval t)))
+        (primary_numeric_atom t i)
+        null))))
+(register_primary_handler! "bool" 30
+  (lambda (toks i env)
+    (bind ((t (get toks i)))
+      (cond
+        ((and (tsym? t null) (eq (tval t) "true"))
+          (assoc (map_of) "spec" (lit true) "i" (int_add i 1)))
+        ((and (tsym? t null) (eq (tval t) "false"))
+          (assoc (map_of) "spec" (lit false) "i" (int_add i 1)))
+        (else null)))))
+(register_primary_handler! "paren" 40
+  (lambda (toks i env)
+    (bind ((t (get toks i)))
+      (if (tlist? t "paren") (primary_paren t i env) null))))
+(register_primary_handler! "string" 50
+  (lambda (toks i env)
+    (bind ((t (get toks i)))
+      (if (tstr? t) (primary_string t i env) null))))
+(register_primary_handler! "symbol" 1000
+  (lambda (toks i env)
+    (bind ((t (get toks i)))
+      (if (tsym? t null)
+        (bind ((nxt (get toks (int_add i 1))))
+          (cond
+            ((tlist? nxt "paren") (primary_call t nxt i env))
+            ((struct_literal_type? t nxt) (primary_struct_literal t nxt i env))
+            ((const_name? t) (primary_const_name t i env))
+            (else (primary_name t i env))))
+        null))))
+
+; interp — split a string on `${…}` and build string_concat_many; the
+; embedded expression text re-parses under the clike grammar itself.
+; The literal run between interpolations accumulates as a list of one-char
+; fragments and is joined ONCE per run (sequence_join), not concatenated
+; character-by-character — the emitted (lit …) node is byte-identical.
+(bind interp
+  (lambda (text env at)
+    (bind (
+      (parts (list_of))
+      (cur (ref (list_of))) (i (ref 0)) (n (size text))
+      (flush-cur (lambda () (sequence_join (deref cur) "")))
+    )
+      (do
+        (while (lt (deref i) n)
+          (bind ((c (string_slice text (deref i) (int_add (deref i) 1))))
+            (if (and (eq c "$")
+                     (eq (string_slice text (int_add (deref i) 1)
+                                        (int_add (deref i) 2)) "{"))
+              (bind ((close (string_find text "}" (deref i))))
+                (do
+                  (when (eq close null)
+                    (throw (string_concat_many
+                      "clike: " (tloc at) "unterminated ${ in string")))
+                  (when (gt (size (deref cur)) 0)
+                    (do (append parts (lit (flush-cur))) (set_ref cur (list_of))))
+                  (bind ((etext (string_slice text (int_add (deref i) 2) close)))
+                    (bind ((pr (parse_forms (clike_units) etext null)))
+                      (do
+                        (unless (get pr "ok" false)
+                          (throw (string_concat_many
+                            "clike: " (tloc at) "bad ${…} expression: "
+                            (value_to_string (get pr "error")))))
+                        (append parts
+                          (calln "value_to_string"
+                            (list_of ((get P "full")
+                                      (titems (get (get pr "forms" (list_of))
+                                                   0))
+                                      env)))))))
+                  (set_ref i (int_add close 1))))
+              (do
+                (append (deref cur) c)
+                (set_ref i (int_add (deref i) 1))))))
+        (when (gt (size (deref cur)) 0) (append parts (lit (flush-cur))))
+        (cond
+          ((eq (size parts) 0) (lit ""))
+          ((eq (size parts) 1) (get parts 0))
+          (else (calln "string_concat_many" parts)))))))
+(assoc P "interp" interp)
+
+; struct_literal — `Type { field expr, … }`: field groups by name, reordered
+; into the registry's declared field order, then (make_Type …).
+(bind struct_literal
+  (lambda (tname items env at)
+    (bind (
+      (d (resolve tname))
+      (fnames (if (eq d null)
+                (get (local_types) tname (list_of))
+                (bind ((out (list_of)))
+                  (do (for f (get d "fields" (list_of))
+                        (append out (get f "name")))
+                      out))))
+      (given (map_of))
+    )
+      (do
+        (for grp (split_commas items)
+          (do
+            (unless (and (gt (size grp) 1) (tsym? (get grp 0) null))
+              (oops "expected `field expr` in struct literal" (get grp 0)))
+            (assoc given (tval (get grp 0))
+              ((get P "full") (sequence_drop grp 1) env))))
+        (bind ((args (list_of)) (missing (map_of)))
+          (do
+            (for fname fnames
+              (bind ((v (get given fname)))
+                (if (eq v null)
+                  (assoc missing "v" fname)
+                  (append args v))))
+            (when (not (eq (get missing "v") null))
+              (throw (string_concat_many
+                "clike: " (tloc at) "struct literal `" tname
+                "` is missing field `" (get missing "v") "`")))
+            (unless (eq (size (map_keys given)) (size fnames))
+              (throw (string_concat_many
+                "clike: " (tloc at) "struct literal `" tname
+                "` has unknown fields")))
+            (calln (string_concat_many "make_" tname) args)))))))
+(assoc P "slit" struct_literal)
+
+; ── pointer-operand detection (for pointer-aware `as` / `+`) ─────────────────
+; ptr_elem_of — the pointee element type of a `ptr_<T>` type name, else null.
+(bind ptr_elem_of
+  (lambda (ty)
+    (if (and (not (eq ty null)) (string_starts_with ty "ptr_"))
+      (string_slice ty 4)
+      null)))
+; operand_ptr_elem — does the SOURCE operand toks[start..end) denote a known
+; POINTER? Returns its pointee element type (so a cast/arith can lower to
+; ptr_to_int / ptr_add), else null. Covers the common forms: a bare value NAME
+; (value_types), a call result `f(…)` (fn_rets), and a single field access
+; `a->field` (field_types via a's struct). Anything else is conservatively NOT a
+; pointer — keeping the existing int/cast lowering, which is never wrong.
+(bind operand_ptr_elem
+  (lambda (toks start end)
+    (bind ((t (get toks start)))
+      (cond
+        ((and (eq end (int_add start 1)) (tsym? t null))
+          (ptr_elem_of (get (value_types) (tval t))))
+        ((and (eq end (int_add start 2))
+              (and (tsym? t null) (tlist? (get toks (int_add start 1)) "paren")))
+          (if (eq (tval t) "fn_ptr")
+            "fn"                              ; fn_ptr(F) yields a function pointer
+            (ptr_elem_of (get (fn_rets) (tval t)))))
+        ((and (eq end (int_add start 3))
+              (and (tsym? t null)
+                   (and (tsym? (get toks (int_add start 1)) "->")
+                        (tsym? (get toks (int_add start 2)) null))))
+          (bind ((struct (ptr_elem_of (get (value_types) (tval t)))))
+            (if (eq struct null) null
+              (ptr_elem_of (get (field_types)
+                (string_concat_many struct "." (tval (get toks (int_add start 2)))))))))
+        (else null)))))
+
+; spec_ptr_elem — infers the pointee element type from an already-lowered spec.
+(bind spec_ptr_elem
+  (lambda (sp)
+    (cond
+      ((not (eq (name_of sp) null))
+        (ptr_elem_of (get (value_types) (name_of sp))))
+      ((head_is? sp "deref")
+        (bind ((nm (name_of (arg sp 0))))
+          (if (eq nm null) null (ptr_elem_of (get (value_types) nm)))))
+      ((head_is? sp "fn_ptr") "fn")
+      ((head_is? sp "int_to_ptr") (name_of (arg sp 1)))
+      ((head_is? sp "ptr_add") (spec_ptr_elem (arg sp 0)))
+      ((head_is? sp "field_ptr")
+        (bind ((base_elem (spec_ptr_elem (arg sp 0)))
+               (field (literal_of (arg sp 1))))
+          (if (or (eq base_elem null) (eq field null))
+            null
+            (get (field_types) (string_concat_many base_elem "." field)))))
+      ((head_is? sp "ptr_read")
+        (ptr_elem_of (spec_ptr_elem (arg sp 0))))
+        ((call? sp) (ptr_elem_of (get (fn_rets) (head_of sp))))
+      (else null))))
+
+; parse_level — left-associative (a OP b OP c) over one precedence tier.
+(bind parse_level
+  (lambda (toks i env opmap next)
+    (bind ((st (next toks i env)) (out (map_of))
+           ; is the running left operand a POINTER? (its pointee element, or null)
+           (pe (ref (operand_ptr_elem toks i (get st "i")))))
+      (do
+        (assoc out "spec" (get st "spec"))
+        (assoc out "i" (get st "i"))
+        (while (bind ((t (get toks (get out "i" 0))))
+                 (and (tsym? t null)
+                      (not (eq (get opmap (tval t)) null))))
+          (bind (
+            (opname (get opmap (tval (get toks (get out "i" 0)))))
+            (rhs (next toks (int_add (get out "i" 0) 1) env))
+          )
+            (do
+              (if (and (eq opname "int_add") (not (eq (deref pe) null)))
+                ; POINTER + integer -> ptr_add (the backend scales by the element
+                ; type); the result stays a pointer of the same element type.
+                (assoc out "spec"
+                  (calln "ptr_add" (list_of (get out "spec") (get rhs "spec"))))
+                (do
+                  (assoc out "spec"
+                    (calln opname (list_of (get out "spec") (get rhs "spec"))))
+                  (set_ref pe null)))   ; any other result is not a pointer
+              (assoc out "i" (get rhs "i")))))
+        out))))
+
+; parse_postfix — a primary followed by zero or more POSTFIX accesses:
+;   p->field   a POINTER field read (C arrow): (ptr_read (field_ptr p "f")).
+;              Chains (`a->b->c`) and a dotted field after the arrow (`p->a.b`
+;              = field b of the struct value p->a) both work. The dot `.` access
+;              on a struct VALUE stays in parse_primary; `->` is for pointers.
+;   a[i]       an array SUBSCRIPT read: (ptr_read (ptr_add a i)) — `a` decays to
+;              a typed element pointer, so this reads element `i` (the index is
+;              in ELEMENT units, like ptr_add). For a flat multi-dimensional
+;              buffer the caller computes the row-major offset: `a[i*M + j]`
+;              (an array stays ONE contiguous buffer — see read_type — so a
+;              chained `a[i][j]` would double-deref and is REJECTED, located).
+;   The `[i]`-as-subscript reading lives here, in expression position; the same
+;   token in TYPE position (`T[N]`) is consumed by read_type, never reaching it.
+(bind subscript? (lambda (t) (tlist? t "bracket")))
+; subscript_store? — from index k (the first bracket after a name), skip the
+; run of consecutive `[…]` tokens; true iff an `=` immediately follows the run.
+; That marks a SUBSCRIPT STORE (`a[i] = v`, or chained `a[i][j] = v`). A run not
+; followed by `=` is a READ expression and is left to parse_postfix, which
+; rejects a chained read with its own (read-side) located message.
+(bind subscript_store?
+  (lambda (toks k)
+    (bind ((m (ref k)))
+      (do
+        (while (subscript? (get toks (deref m)))
+          (set_ref m (int_add (deref m) 1)))
+        (tsym? (get toks (deref m)) "=")))))
+(bind postfix_handlers (list_of))
+; register_postfix_handler! — adds an ordered postfix-expression parser hook.
+(bind register_postfix_handler!
+  (lambda (name priority parse)
+    (append postfix_handlers
+      (assoc (map_of) "name" name "priority" priority "parse" parse))))
+
+; find_postfix_handler — finds the best matching postfix hook in a priority band.
+(bind find_postfix_handler
+  (lambda (toks j acc env minp maxp)
+    (bind ((best (ref null)) (bestp (ref 1000000)))
+      (do
+        (for row postfix_handlers
+          (when (and (ge (get row "priority") minp)
+                     (and (lt (get row "priority") maxp)
+                          (lt (get row "priority") (deref bestp))))
+            (bind ((r ((get row "parse") toks j acc env)))
+              (when (not (eq r null))
+                (do (set_ref best r)
+                    (set_ref bestp (get row "priority")))))))
+        (deref best)))))
+
+; parse_postfix — repeatedly applies regular postfix handlers after a primary.
+(bind parse_postfix
+  (lambda (toks i env)
+    (bind (
+      (st (parse_primary toks i env))
+      (acc (ref (get st "spec")))
+      (j (ref (get st "i")))
+      (go (ref true))
+    )
+      (do
+        (while (deref go)
+          (bind ((r (find_postfix_handler toks (deref j) (deref acc) env 0 1000)))
+            (if (eq r null)
+              (set_ref go false)
+              (do
+                (set_ref acc (get r "spec"))
+                (set_ref j (get r "i"))))))
+        (assoc (map_of) "spec" (deref acc) "i" (deref j))))))
+
+; postfix subscript handler — lowers `a[i]` reads through ptr_add/ptr_read.
+(register_postfix_handler! "subscript" 10
+  (lambda (toks j acc env)
+    (if (subscript? (get toks j))
+      (bind ((br (get toks j)) (its (titems (get toks j))))
+        (do
+          (when (eq (size its) 0)
+            (oops "expected `[index]` (an empty subscript)" br))
+          (when (subscript? (get toks (int_add j 1)))
+            (oops (string_concat_many
+              "chained subscript `a[i][j]` is not supported — a "
+              "multi-dimensional array is one flat buffer; index the "
+              "row-major offset, e.g. `a[i*M + j]`")
+              (get toks (int_add j 1))))
+          (assoc (map_of)
+            "spec" (calln "ptr_read"
+                     (list_of (calln "ptr_add"
+                       (list_of acc ((get P "full") its env)))))
+            "i" (int_add j 1))))
+      null)))
+; postfix field handler — lowers `p->field` reads through field_ptr/ptr_read.
+(register_postfix_handler! "field" 20
+  (lambda (toks j acc env)
+    (if (tsym? (get toks j) "->")
+      (bind ((fld (get toks (int_add j 1))))
+        (do
+          (unless (tsym? fld null)
+            (oops "expected a field name after `->`" fld))
+          (st_emit! fld "property" (list_of))
+          (bind ((parts (split_dots (tval fld))) (k (ref 1))
+                 (out (ref (calln "ptr_read"
+                             (list_of (calln "field_ptr"
+                               (list_of acc (lit (get parts 0)))))))))
+            (do
+              (while (lt (deref k) (size parts))
+                (do
+                  (set_ref out (calln "get"
+                    (list_of (deref out) (lit (get parts (deref k))) (lit null))))
+                  (set_ref k (int_add (deref k) 1))))
+              (assoc (map_of) "spec" (deref out) "i" (int_add j 2))))))
+      null)))
+
+; postfix cast handler — lowers `expr as T` through cast/int_to_ptr/ptr_to_int.
+(register_postfix_handler! "cast" 1000
+  (lambda (toks j acc env)
+    (if (tsym? (get toks j) "as")
+      (bind ((ty (read_type toks (int_add j 1)))
+             (pe (spec_ptr_elem acc)))
+        (assoc (map_of)
+          "spec"
+          (cond
+            ((string_starts_with (get ty "name") "ptr_")
+              (calln "int_to_ptr"
+                (list_of acc (sym (string_slice (get ty "name") 4)))))
+            ((not (eq pe null))
+              (calln "cast"
+                (list_of (calln "ptr_to_int" (list_of acc))
+                         (sym (get ty "name")))))
+            (else
+              (calln "cast" (list_of acc (sym (get ty "name"))))))
+          "i" (get ty "i")))
+      null)))
+
+; parse_unary — prefix pointer operators: `*e` dereferences (read through the
+; pointer, (ptr_read e)) and `&name` takes the address of a name (its cell/base
+; pointer — the bare name without the read-deref). Binds tighter than the binary
+; operators, looser than postfix `->`.
+(bind prefix_ops (map_of))
+; register_prefix_op! — registers a prefix operator parser/lowerer hook.
+(bind register_prefix_op!
+  (lambda (token lower)
+    (assoc prefix_ops token (assoc (map_of) "lower" lower))))
+
+; parse_unary — dispatches registered prefix operators or falls through postfix.
+(bind parse_unary
+  (lambda (toks i env)
+    (bind ((t (get toks i)))
+      (bind ((row (if (tsym? t null) (get prefix_ops (tval t) null) null)))
+        (if (eq row null)
+          (parse_postfix toks i env)
+          ((get row "lower") toks i env))))))
+
+; prefix `*` — dereferences a pointer expression.
+(register_prefix_op! "*"
+  (lambda (toks i env)
+    (bind ((r (parse_unary toks (int_add i 1) env)))
+      (assoc (map_of)
+        "spec" (calln "ptr_read" (list_of (get r "spec")))
+        "i" (get r "i")))))
+; prefix `!` — lowers logical not to a native-safe if expression.
+(register_prefix_op! "!"
+  (lambda (toks i env)
+    (bind ((r (parse_unary toks (int_add i 1) env)))
+      (assoc (map_of)
+        "spec" (calln "if" (list_of (get r "spec") (lit false) (lit true)))
+        "i" (get r "i")))))
+; prefix `~` — lowers bitwise not to `int_not`.
+(register_prefix_op! "~"
+  (lambda (toks i env)
+    (bind ((r (parse_unary toks (int_add i 1) env)))
+      (assoc (map_of)
+        "spec" (calln "int_not" (list_of (get r "spec")))
+        "i" (get r "i")))))
+; prefix `&` — returns the address of a name, field, or subscript lvalue.
+(register_prefix_op! "&"
+  (lambda (toks i env)
+    (bind ((nx (get toks (int_add i 1)))
+           (nx2 (get toks (int_add i 2))))
+      (if (and (tsym? nx null) (or (tsym? nx2 "->") (tlist? nx2 "bracket")))
+        (bind ((r (parse_postfix toks (int_add i 1) env)) (sp (get r "spec" null)))
+          (if (and (call? sp) (head_is? sp "ptr_read"))
+            (assoc (map_of) "spec" (arg sp 0) "i" (get r "i"))
+            (oops "`&` expects an addressable lvalue (name, `e->field`, `a[i]`)" nx)))
+        (if (tsym? nx null)
+          (assoc (map_of) "spec" (sym (tval nx)) "i" (int_add i 2))
+          (oops "expected a name or lvalue after `&`" nx))))))
+
+; parse_cast — `EXPR as T` is a postfix type cast, desugaring to (cast EXPR T)
+; (the same builtin the native backend already lowers). Binds tighter than the
+; binary operators (like Rust): `a + b as u32` is `a + (b as u32)`. `T` may carry
+; pointer modifiers (`as TX_TIMER*` -> ptr_TX_TIMER) via read_type.
+(bind parse_cast
+  (lambda (toks i env)
+    (bind ((st (parse_unary toks i env)) (out (map_of)))
+      (do
+        (assoc out "spec" (get st "spec"))
+        (assoc out "i" (get st "i"))
+        (bind ((go (ref true)))
+          (while (deref go)
+            (bind ((r (find_postfix_handler toks (get out "i" 0)
+                       (get out "spec") env 1000 2000)))
+              (if (eq r null)
+                (set_ref go false)
+                (do
+                  (assoc out "spec" (get r "spec"))
+                  (assoc out "i" (get r "i")))))))
+        out))))
+; parse_mul — parses multiplicative operators.
+(bind parse_mul   (lambda (toks i env) (parse_level toks i env mul_ops   parse_cast)))
+; parse_add — parses additive operators.
+(bind parse_add   (lambda (toks i env) (parse_level toks i env add_ops   parse_mul)))
+; parse_shift — parses shift operators.
+(bind parse_shift (lambda (toks i env) (parse_level toks i env shift_ops parse_add)))
+; parse_cmp — parses comparison operators.
+(bind parse_cmp   (lambda (toks i env) (parse_level toks i env cmp_ops   parse_shift)))
+; parse_band — parses bitwise-and operators.
+(bind parse_band  (lambda (toks i env) (parse_level toks i env band_ops  parse_cmp)))
+; parse_bxor — parses bitwise-xor operators.
+(bind parse_bxor  (lambda (toks i env) (parse_level toks i env bxor_ops  parse_band)))
+; parse_bor — parses bitwise-or operators.
+(bind parse_bor   (lambda (toks i env) (parse_level toks i env bor_ops   parse_bxor)))
+; && and || are SHORT-CIRCUIT, and the native backend has no `and`/`or` head, so
+; they desugar to `if` (which matches the eval `and`/`or` truthiness):
+;   a && b  ->  (if a b false)        a || b  ->  (if a true b)
+; A null then/else slot means "use the right operand's spec". Left-associative.
+(bind parse_logical
+  (lambda (toks i env op then_t else_t next)
+    (bind ((st (next toks i env)) (out (map_of)))
+      (do
+        (assoc out "spec" (get st "spec"))
+        (assoc out "i" (get st "i"))
+        (while (tsym? (get toks (get out "i" 0)) op)
+          (bind ((rhs (next toks (int_add (get out "i" 0) 1) env)))
+            (do
+              (assoc out "spec"
+                (calln "if" (list_of (get out "spec")
+                              (if (eq then_t null) (get rhs "spec") then_t)
+                              (if (eq else_t null) (get rhs "spec") else_t))))
+              (assoc out "i" (get rhs "i")))))
+        out))))
+; parse_land — parses short-circuit `&&`.
+(bind parse_land (lambda (toks i env)
+  (parse_logical toks i env "&&" null (lit false) parse_bor)))
+; parse_lor — parses short-circuit `||`.
+(bind parse_lor (lambda (toks i env)
+  (parse_logical toks i env "||" (lit true) null parse_land)))
+(bind parse_expr parse_lor)
+
+; parse_expr_full — an expression that must consume its WHOLE token list.
+(bind parse_expr_full
+  (lambda (toks env)
+    (bind ((r (parse_expr toks 0 env)))
+      (do
+        (when (lt (get r "i" 0) (size toks))
+          (oops "trailing tokens after expression"
+                (get toks (get r "i" 0))))
+        (get r "spec")))))
+(assoc P "full" parse_expr_full)
+
+; ── statements ──────────────────────────────────────────────────────────────
+; Statement lowering lives in stdlib.frontend.clike.block. The facade keeps
+; expression parsing, semantic tokens, and file-state ownership, then passes
+; those hooks through this service map.
+; clike_block_services — assembles the callbacks block lowering depends on.
+(bind clike_block_services
+  (lambda ()
+    (assoc (map_of)
+      "parse_expr" parse_expr
+      "full_expr" parse_expr_full
+      "read_type" read_type
+      "read_type_quiet" read_type_quiet
+      "resolve_type_head" resolve_type_head
+      "ident_tok?" ident_tok?
+      "assign_tok?" assign_tok?
+      "read_name" read_name
+      "name_writable?" name_writable?
+      "st_emit!" st_emit!
+      "st_name!" st_name!
+      "apply_assign" apply_assign
+      "incr_value" incr_value
+      "subscript_store?" subscript_store?
+      "subscript?" subscript?
+      "type_known?" type_known?
+      "volatile_consts" local_volatile_consts
+      "value_types" value_types)))
+
+; lower_block — delegates block lowering through the clike expression services.
+(bind lower_block
+  (lambda (self toks env brk tail?)
+    (block_lower_block (clike_block_services) self toks env brk tail?)))
+
+(export parse_expr parse_expr_full lower_block
+        read_type param_spec type_known? ident_tok? assign_tok?
+        resolve_type_head read_type_quiet
+        read_name name_writable? apply_assign incr_value
+        subscript_store? subscript?
+        register_infix_op! register_assign_op! register_prefix_op!
+        register_primary_handler! register_postfix_handler!)

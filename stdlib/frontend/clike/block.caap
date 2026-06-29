@@ -1,0 +1,710 @@
+; stdlib/frontend/clike/block.caap - statement lowering for stdlib.frontend.clike.
+;
+; This module is deliberately parameterized by a small service map supplied by
+; the facade. Expression parsing, semantic-token emission, and file-state maps
+; stay owned by stdlib.frontend.clike; this file owns only statement dispatch.
+(module stdlib.frontend.clike.block)
+
+(use stdlib.frontend.clike.ast sym lit calln literal_of call? head_is? arg)
+(use stdlib.syntax.ir gensym)
+(use stdlib.lib.collections.map clone)
+(use stdlib.semantics.types.registry sized_int? literal_fits?)
+(use stdlib.frontend.clike.tokens
+     tkind tval titems tsym? tnum? tlist? tloc stamp oops split_commas)
+(use stdlib.frontend.clike.meta meta_bag)
+(use stdlib.frontend.clike.decls validate_attrs)
+
+(bind body_seq
+  (lambda (specs)
+    (if (eq (size specs) 1) (get specs 0) (calln "do" specs))))
+
+(bind brk_push
+  (lambda (brk frame)
+    (bind ((nb (list_of)))
+      (do
+        (when (not (eq brk null)) (for f brk (append nb f)))
+        (append nb frame)
+        nb))))
+
+(bind brk_has?
+  (lambda (brk nm)
+    (bind ((r (ref false)))
+      (do
+        (when (not (eq brk null))
+          (for f brk (when (eq (get f "label") nm) (set_ref r true))))
+        (deref r)))))
+
+(bind break_sets
+  (lambda (brk target)
+    (bind ((n (size brk)) (start (ref (int_sub n 1))) (found (ref false)) (sets (list_of)))
+      (do
+        (when (not (eq target null))
+          (bind ((k (ref (int_sub n 1))))
+            (while (ge (deref k) 0)
+              (do
+                (when (and (not (deref found))
+                           (eq (get (get brk (deref k)) "label") target))
+                  (do (set_ref start (deref k)) (set_ref found true)))
+                (set_ref k (int_sub (deref k) 1))))))
+        (bind ((j (ref (deref start))))
+          (while (lt (deref j) n)
+            (do
+              (bind ((fr (get brk (deref j))))
+                (do
+                  (set_ref (get fr "used") true)
+                  (append sets
+                    (calln "set_ref" (list_of (sym (get fr "name")) (lit true))))))
+              (set_ref j (int_add (deref j) 1)))))
+        (if (eq (size sets) 1) (get sets 0) (calln "do" sets))))))
+
+(bind skip_if_chain
+  (lambda (S toks idx env)
+    (bind ((c ((get S "parse_expr") toks (int_add idx 1) env))
+           (after_then (int_add (get c "i" 0) 1)))
+      (if (tsym? (get toks after_then) "else")
+        (if (tsym? (get toks (int_add after_then 1)) "if")
+          (skip_if_chain S toks (int_add after_then 1) env)
+          (int_add after_then 2))
+        after_then))))
+
+(bind ptr_field_assign_stmt?
+  (lambda (S toks i)
+    (bind ((t (get toks i)))
+      (and (tsym? t null)
+           (and (tsym? (get toks (int_add i 1)) "->")
+                (and (tsym? (get toks (int_add i 2)) null)
+                     (or ((get S "assign_tok?") (get toks (int_add i 3)))
+                         (or (tsym? (get toks (int_add i 3)) "++")
+                             (tsym? (get toks (int_add i 3)) "--")))))))))
+
+(bind subscript_store_stmt?
+  (lambda (S toks i)
+    (bind ((t (get toks i)))
+      (and (tsym? t null)
+           (and (tlist? (get toks (int_add i 1)) "bracket")
+                ((get S "subscript_store?") toks (int_add i 1)))))))
+
+(bind dotted_assign_stmt?
+  (lambda (toks i)
+    (bind ((t (get toks i)))
+      (and (tsym? t null)
+           (and (string_contains (tval t) ".")
+                (tsym? (get toks (int_add i 1)) "="))))))
+
+(bind local_decl_stmt?
+  (lambda (S toks i)
+    (bind ((t (get toks i)) (j (ref (int_add i 1)))
+           (saw_head (ref false)) (saw_array (ref false))
+           (done (ref false)))
+      (do
+        (while (not (deref done))
+          (bind ((tk (get toks (deref j))))
+            (cond
+              ((tsym? tk "=") (set_ref done true))
+              ((tsym? tk "*")
+                (set_ref j (int_add (deref j) 1)))
+              ((tlist? tk "bracket")
+                (do
+                  (set_ref saw_array true)
+                  (set_ref j (int_add (deref j) 1))))
+              ((tsym? tk null)
+                (do
+                  (set_ref saw_head true)
+                  (set_ref j (int_add (deref j) 1))))
+              ((or (tsym? tk "<") (or (tsym? tk ">") (tsym? tk ",")))
+                (set_ref j (int_add (deref j) 1)))
+              (else (set_ref done true)))))
+      (and ((get S "ident_tok?") t)
+           (and (deref saw_head)
+                (or (tsym? (get toks (deref j)) "=")
+                    (deref saw_array))))))))
+
+(bind first_eq_after
+  (lambda (toks pos)
+    (bind ((p (ref pos)) (out (ref null)))
+      (do
+        (while (and (eq (deref out) null) (lt (deref p) (size toks)))
+          (do
+            (when (tsym? (get toks (deref p)) "=")
+              (set_ref out (deref p)))
+            (set_ref p (int_add (deref p) 1))))
+        (deref out)))))
+
+(bind name_assign_stmt?
+  (lambda (S toks i)
+    (bind ((t (get toks i)))
+      (and (tsym? t null)
+           (or ((get S "assign_tok?") (get toks (int_add i 1)))
+               (or (tsym? (get toks (int_add i 1)) "++")
+                   (tsym? (get toks (int_add i 1)) "--")))))))
+
+(bind volatile_const_of
+  (lambda (S nm)
+    (get ((get S "volatile_consts")) nm null)))
+
+(bind lower_return_stmt!
+  (lambda (S toks i env out)
+    (bind ((t (get toks i))
+           (r ((get S "parse_expr") toks (int_add i 1) env)))
+      (do
+        ((get S "st_emit!") t "keyword" (list_of))
+        (unless (eq (get r "i" 0) (size toks))
+          (throw (string_concat_many "clike: " (tloc t)
+            "`return` is only supported as a guard `if cond { return "
+            "E }` or as a block's final statement (native codegen has "
+            "no non-local exit)")))
+        (append out (stamp (get r "spec") t))
+        (get r "i")))))
+
+(bind lower_break_stmt!
+  (lambda (S toks i brk out)
+    (bind ((t (get toks i)))
+      (do
+        ((get S "st_emit!") t "keyword" (list_of))
+        (when (eq brk null)
+          (throw (string_concat_many
+            "clike: " (tloc t) "break outside of a while loop")))
+        (bind (
+          (nt (get toks (int_add i 1)))
+          (named (and ((get S "ident_tok?") nt) (brk_has? brk (tval nt))))
+          (legacy (and ((get S "ident_tok?") nt) (eq (tval nt) "loop")))
+        )
+          (do
+            (append out (stamp
+              (break_sets brk (if named (tval nt) null)) t))
+            (int_add i (if (or named legacy) 2 1))))))))
+
+(bind lower_ptr_field_assign_stmt!
+  (lambda (S toks i env out)
+    (bind (
+      (t (get toks i))
+      (head (tval (get toks i)))
+      (fld (get toks (int_add i 2)))
+      (subject ((get S "read_name") env head))
+      (op (get toks (int_add i 3)))
+      (fptr (calln "field_ptr" (list_of subject (lit (tval fld)))))
+      (fread (calln "ptr_read" (list_of fptr)))
+      (_lhs (do ((get S "st_name!") (get toks i) env)
+                ((get S "st_emit!") fld "property" (list_of))))
+    )
+      (if (or (tsym? op "++") (tsym? op "--"))
+        (do
+          (append out (stamp
+            (calln "ptr_write"
+              (list_of fptr ((get S "incr_value") op fread)))
+            t))
+          (int_add i 4))
+        (bind ((r ((get S "parse_expr") toks (int_add i 4) env)))
+          (do
+            (append out (stamp
+              (calln "ptr_write"
+                (list_of fptr ((get S "apply_assign") op fread (get r "spec"))))
+              t))
+            (get r "i")))))))
+
+(bind lower_subscript_store_stmt!
+  (lambda (S toks i env out)
+    (bind (
+      (t (get toks i))
+      (subject ((get S "read_name") env (tval (get toks i))))
+      (its (titems (get toks (int_add i 1))))
+      (_lhs ((get S "st_name!") (get toks i) env))
+    )
+      (do
+        (when ((get S "subscript?") (get toks (int_add i 2)))
+          (oops (string_concat_many
+            "chained subscript `a[i][j] = …` is not supported — a "
+            "multi-dimensional array is one flat buffer; store at "
+            "the row-major offset, e.g. `a[i*M + j] = …`")
+            (get toks (int_add i 2))))
+        (when (eq (size its) 0)
+          (oops "expected `[index]` before `=` (an empty subscript)" t))
+        (bind ((r ((get S "parse_expr") toks (int_add i 3) env)))
+          (do
+            (append out (stamp
+              (calln "ptr_write"
+                (list_of (calln "ptr_add"
+                           (list_of subject ((get S "full_expr") its env)))
+                         (get r "spec")))
+              t))
+            (get r "i")))))))
+
+(bind lower_dotted_assign_stmt!
+  (lambda (S toks i env out)
+    (bind (
+      (t (get toks i))
+      (parts (string_split (tval (get toks i)) "."))
+      (head (get parts 0))
+      (subject (ref ((get S "read_name") env head)))
+      (k (ref 1))
+      (_lhs ((get S "st_name!") (get toks i) env))
+    )
+      (do
+        (while (lt (deref k) (int_sub (size parts) 1))
+          (do
+            (set_ref subject (calln "get"
+              (list_of (deref subject)
+                       (lit (get parts (deref k)))
+                       (lit null))))
+            (set_ref k (int_add (deref k) 1))))
+        (bind ((r ((get S "parse_expr") toks (int_add i 2) env)))
+          (do
+            (append out (stamp
+              (calln "assoc"
+                (list_of (deref subject)
+                         (lit (get parts (int_sub (size parts) 1)))
+                         (get r "spec")))
+              t))
+            (get r "i")))))))
+
+(bind lower_local_decl_stmt!
+  (lambda (S toks i env out)
+    (bind (
+      (t (get toks i))
+      (raw_tyi ((get S "read_type_quiet") toks (int_add i 1)))
+      (array_decl (and (get raw_tyi "array" false)
+                       (not (tsym? (get toks (get raw_tyi "i")) "="))))
+      (eq_at (first_eq_after toks (int_add i 1)))
+      (head (if array_decl null
+              ((get S "resolve_type_head") toks (int_add i 1) eq_at)))
+      (tyi (if array_decl raw_tyi (get head "type")))
+      (attrs2 (if array_decl
+                (assoc (meta_bag) "i" (get raw_tyi "i"))
+                (assoc (get head "attrs") "i" eq_at)))
+      (eqpos (get attrs2 "i"))
+      (_nm ((get S "st_emit!") (get toks i) "variable"
+             (if (get attrs2 "mut") (list_of "declaration")
+                         (list_of "readonly" "declaration"))))
+    )
+      (do
+        (validate_attrs attrs2 "local" t)
+        (if (get tyi "array" false)
+        (do
+          (unless ((get S "type_known?") (get tyi "elem"))
+            (throw (string_concat_many
+              "clike: " (tloc t) "unknown element type `"
+              (get tyi "elem") "` in array `" (tval t) "`")))
+          (append out (stamp
+            (calln "bind"
+              (list_of (sym (tval t))
+                (calln "array_local"
+                  (list_of (lit (get tyi "count"))
+                           (sym (get tyi "elem"))))))
+            t))
+          (assoc env (tval t) "const")
+          eqpos)
+        (bind ((tyname (get tyi "name")))
+          (do
+            (unless (tsym? (get toks eqpos) "=")
+              (oops (string_concat_many
+                "expected `name [mut] type = value` declaring `"
+                (tval t) "`") t))
+            (unless ((get S "type_known?") tyname)
+              (throw (string_concat_many
+                "clike: " (tloc t) "unknown type `" tyname
+                "` in the declaration of `" (tval t) "`")))
+            (assoc ((get S "value_types")) (tval t) tyname)
+            (bind ((r ((get S "parse_expr") toks (int_add eqpos 1) env)))
+              (do
+                (bind ((lv (literal_of (get r "spec"))))
+                  (when (and (sized_int? tyname)
+                             (and (not (eq lv null))
+                                  (eq (value_type lv) "int")))
+                    (unless (literal_fits? lv tyname)
+                      (throw (string_concat_many
+                        "clike: " (tloc t) "literal "
+                        (int_to_string lv) " out of range for "
+                        tyname " (declaration of `" (tval t) "`)")))))
+                (if (get attrs2 "mut")
+                  (do
+                    (append out (stamp
+                      (calln "bind"
+                        (list_of (sym (tval t))
+                                 (calln "ref" (list_of (get r "spec")))))
+                      t))
+                    (assoc env (tval t) "mut"))
+                  (do
+                    (append out (stamp
+                      (calln "bind"
+                        (list_of (sym (tval t)) (get r "spec")))
+                      t))
+                    (assoc env (tval t) "const")))
+                (get r "i"))))))))))
+
+(bind lower_while_stmt!
+  (lambda (S self toks i env brk out)
+    (bind (
+      (t (get toks i))
+      (lt1 (get toks (int_add i 1)))
+      (lt2 (get toks (int_add i 2)))
+      ; `while LABEL cond {` — LABEL is present iff lt1 is an ident and lt2 BEGINS
+      ; the condition rather than continuing lt1 as an operator. lt2 = ident/number
+      ; (a fresh primary) or a PURE prefix-unary `!`/`~` (`while p !is_null(x) {`):
+      ; those are never infix, so `<ident> !…` can only be label + condition. `*`/`&`
+      ; (also infix mul/and) and `(` (a call on lt1) stay AMBIGUOUS, so excluded.
+      (labeled (and ((get S "ident_tok?") lt1)
+                    (or ((get S "ident_tok?") lt2) (tnum? lt2)
+                        (tsym? lt2 "!") (tsym? lt2 "~"))))
+      (label (if labeled (tval lt1) null))
+      (cstart (if labeled (int_add i 2) (int_add i 1)))
+      (_kw ((get S "st_emit!") (get toks i) "keyword" (list_of)))
+    )
+      (bind ((c ((get S "parse_expr") toks cstart env)))
+        (bind (
+          (blk (get toks (get c "i" 0)))
+          (flag (gensym "brk"))
+          (used (ref false))
+        )
+          (do
+            (unless (tlist? blk "brace")
+              (oops "expected `{` after while condition" blk))
+            (bind ((body (self self (titems blk) (clone env)
+                               (brk_push brk
+                                 (assoc (map_of) "label" label
+                                                 "name" flag
+                                                 "used" used))
+                               false)))
+              (if (deref used)
+                (do
+                  (append out (stamp
+                    (calln "bind"
+                      (list_of (sym flag)
+                        (calln "ref" (list_of (lit false)))))
+                    t))
+                  (append out
+                    (calln "while"
+                      (list_of
+                        (calln "if"
+                          (list_of
+                            (calln "deref" (list_of (sym flag)))
+                            (lit false)
+                            (get c "spec")))
+                        (body_seq body)))))
+                (append out (stamp
+                  (calln "while"
+                    (list_of (get c "spec") (body_seq body)))
+                  t))))
+            (int_add (get c "i" 0) 1)))))))
+
+(bind lower_match_stmt!
+  (lambda (S self toks i env brk tail? out)
+    (bind ((t (get toks i))
+           (c ((get S "parse_expr") toks (int_add i 1) env))
+           (_kw ((get S "st_emit!") (get toks i) "keyword" (list_of))))
+      (bind (
+        (blk (get toks (get c "i" 0)))
+        (nexti (int_add (get c "i" 0) 1))
+        (arm_tail? (and tail? (eq (int_add (get c "i" 0) 1) (size toks))))
+        (arms (list_of))
+        (default_body (ref null))
+      )
+        (do
+          (unless (tlist? blk "brace")
+            (oops "expected `{` after match subject" blk))
+          (for grp (split_commas (titems blk))
+            (when (gt (size grp) 0)
+              (bind ((gp ((get S "parse_expr") grp 0 env)))
+                (bind (
+                  (arrow (get grp (get gp "i" 0)))
+                  (body_blk (get grp (int_add (get gp "i" 0) 1)))
+                )
+                  (do
+                    (unless (tsym? arrow "=>")
+                      (oops "expected `=>` in match arm" arrow))
+                    (unless (tlist? body_blk "brace")
+                      (oops "expected `{ … }` after `=>`" body_blk))
+                    (bind ((body (body_seq (self self (titems body_blk)
+                                                 (clone env) brk arm_tail?))))
+                      (if (tsym? (get grp 0) "_")
+                        (set_ref default_body body)
+                        (append arms (assoc (map_of)
+                          "test" (calln "eq"
+                                   (list_of (get c "spec") (get gp "spec")))
+                          "body" body)))))))))
+          (when (eq (deref default_body) null)
+            (throw (string_concat_many
+              "clike: " (tloc t)
+              "match must have a `_ => { … }` default arm")))
+          (bind ((acc (ref (deref default_body))) (k (ref (size arms))))
+            (do
+              (while (gt (deref k) 0)
+                (do
+                  (set_ref k (int_sub (deref k) 1))
+                  (bind ((a (get arms (deref k))))
+                    (set_ref acc (calln "if"
+                      (list_of (get a "test") (get a "body") (deref acc)))))))
+              (append out (stamp (deref acc) t))))
+          nexti)))))
+
+(bind if_guard_return?
+  (lambda (toks c blk els)
+    (and (not (tsym? els "else"))
+         (and (gt (size (titems blk)) 0)
+              (and (tsym? (get (titems blk) 0) "return")
+                   (lt (int_add (get c "i" 0) 1) (size toks)))))))
+
+(bind lower_if_guard_return!
+  (lambda (S self toks env brk tail? out t c blk)
+    (bind (
+      (eexpr ((get S "full_expr") (sequence_drop (titems blk) 1) env))
+      (rest_toks (sequence_drop toks (int_add (get c "i" 0) 1)))
+    )
+      (do
+        (append out (stamp
+          (calln "if"
+            (list_of (get c "spec")
+              eexpr
+              (body_seq (self self rest_toks (clone env) brk tail?))))
+          t))
+        (size toks)))))
+
+(bind lower_else_if_chain!
+  (lambda (S self toks env brk tail? out t c blk)
+    (bind (
+      (cstart (int_add (get c "i" 0) 2))
+      (cend (skip_if_chain S toks (int_add (get c "i" 0) 2) env))
+    )
+      (bind (
+        (arm_tail? (and tail? (eq cend (size toks))))
+        (arm_toks (sequence_take
+                    (sequence_drop toks cstart)
+                    (int_sub cend cstart)))
+      )
+        (do
+          (append out (stamp
+            (calln "if"
+              (list_of (get c "spec")
+                (body_seq (self self (titems blk) (clone env) brk arm_tail?))
+                (body_seq (self self arm_toks (clone env) brk arm_tail?))))
+            t))
+          cend)))))
+
+(bind lower_else_block!
+  (lambda (S self toks env brk tail? out c blk eblk)
+    (bind (
+      (nexti (int_add (get c "i" 0) 3))
+      (arm_tail? (and tail? (eq (int_add (get c "i" 0) 3) (size toks))))
+    )
+      (do
+        (unless (tlist? eblk "brace")
+          (oops "expected `{` or `if` after else" eblk))
+        (append out
+          (calln "if"
+            (list_of (get c "spec")
+              (body_seq (self self (titems blk) (clone env) brk arm_tail?))
+              (body_seq (self self (titems eblk) (clone env) brk arm_tail?)))))
+        nexti))))
+
+(bind lower_if_with_else!
+  (lambda (S self toks i env brk tail? out t c blk els)
+    (bind ((eblk (get toks (int_add (get c "i" 0) 2)))
+           (_kw ((get S "st_emit!") els "keyword" (list_of))))
+      (if (tsym? eblk "if")
+        (lower_else_if_chain! S self toks env brk tail? out t c blk)
+        (lower_else_block! S self toks env brk tail? out c blk eblk)))))
+
+(bind lower_else_less_if!
+  (lambda (S self toks env brk tail? out t c blk)
+    (bind ((nexti (int_add (get c "i" 0) 1)))
+      (do
+        (when (and tail? (eq nexti (size toks)))
+          (throw (string_concat_many
+            "clike: " (tloc t)
+            "else-less `if` cannot be a block's value "
+            "(it would return 0 when false) — add an "
+            "else, or a trailing expression")))
+        (append out (stamp
+          (calln "if"
+            (list_of (get c "spec")
+              (body_seq (self self (titems blk) (clone env) brk false))
+              (lit 0)))
+          t))
+        nexti))))
+
+(bind lower_if_stmt!
+  (lambda (S self toks i env brk tail? out)
+    (bind ((t (get toks i))
+           (c ((get S "parse_expr") toks (int_add i 1) env))
+           (_kw ((get S "st_emit!") (get toks i) "keyword" (list_of))))
+      (bind ((blk (get toks (get c "i" 0)))
+             (els (get toks (int_add (get c "i" 0) 1))))
+        (do
+          (unless (tlist? blk "brace")
+            (oops "expected `{` after if condition" blk))
+          (cond
+            ((if_guard_return? toks c blk els)
+              (lower_if_guard_return! S self toks env brk tail? out t c blk))
+            ((tsym? els "else")
+              (lower_if_with_else! S self toks i env brk tail? out t c blk els))
+            (else
+              (lower_else_less_if! S self toks env brk tail? out t c blk))))))))
+
+(bind lower_name_assign_stmt!
+  (lambda (S toks i env out)
+    (bind ((t (get toks i))
+           (vconst (volatile_const_of S (tval (get toks i))))
+           (op (get toks (int_add i 1))))
+      (do
+        ((get S "st_name!") t env)
+        (if (not (eq vconst null))
+          (do
+            (unless (tsym? op "=")
+              (throw (string_concat_many
+                "clike: " (tloc op)
+                "volatile register assignment supports only `=`")))
+            (bind ((r ((get S "parse_expr") toks (int_add i 2) env)))
+              (do
+                (append out (stamp
+                  (calln "volatile_write"
+                    (list_of (get vconst "addr")
+                             (sym (get vconst "type"))
+                             (get r "spec")))
+                  t))
+                (get r "i"))))
+          (do
+            (unless ((get S "name_writable?") env (tval t))
+              (throw (string_concat_many
+                "clike: " (tloc t) "cannot assign to `" (tval t)
+                "` — it is const (declare it `" (tval t)
+                " mut <type> = …`) or was never declared")))
+          (if (or (tsym? op "++") (tsym? op "--"))
+            (do
+              (append out (stamp
+                (calln "set_ref"
+                  (list_of (sym (tval t))
+                    ((get S "incr_value") op ((get S "read_name") env (tval t)))))
+                t))
+              (int_add i 2))
+            (bind ((r ((get S "parse_expr") toks (int_add i 2) env)))
+              (do
+                (append out (stamp
+                  (calln "set_ref"
+                    (list_of (sym (tval t))
+                      ((get S "apply_assign") op ((get S "read_name") env (tval t))
+                                     (get r "spec"))))
+                  t))
+                (get r "i"))))))))))
+
+(bind lower_expr_stmt!
+  (lambda (S toks i env out)
+    (bind ((t (get toks i))
+           (r ((get S "parse_expr") toks i env))
+           (sp (get r "spec"))
+           (j (get r "i"))
+           (optok (get toks j)))
+      ; a GENERAL lvalue STORE: the parsed expression is a `(ptr_read ADDR)` — a
+      ; field/subscript read through a pointer — and an assign / compound-op / `++` /
+      ; `--` token follows, so store back through ADDR. Covers paren-headed / nested
+      ; lvalues the NAME-led detectors miss, e.g. `(&n->hook)->next = v`. A plain
+      ; expression statement (no trailing assign) is unaffected.
+      (if (and (call? sp) (head_is? sp "ptr_read")
+               (or ((get S "assign_tok?") optok)
+                   (or (tsym? optok "++") (tsym? optok "--"))))
+        (bind ((addr (arg sp 0)))
+          (if (tsym? optok "=")
+            ; PLAIN assignment: ADDR appears exactly ONCE (no read-back).
+            (bind ((rhs ((get S "parse_expr") toks (int_add j 1) env)))
+              (do
+                (append out (stamp (calln "ptr_write" (list_of addr (get rhs "spec"))) t))
+                (get rhs "i")))
+            ; COMPOUND (`OP=`) or `++`/`--`: a read-modify-write, so evaluate ADDR
+            ; ONCE into a temp cell (a sub-expression like a[g()] must not run twice).
+            (bind ((g  (gensym "lv"))
+                   (gd (calln "deref" (list_of (sym g))))
+                   (rd (calln "ptr_read" (list_of gd))))
+              (do
+                (append out (stamp
+                  (calln "bind" (list_of (sym g) (calln "ref" (list_of addr)))) t))
+                (if (or (tsym? optok "++") (tsym? optok "--"))
+                  (do
+                    (append out (stamp
+                      (calln "ptr_write" (list_of gd ((get S "incr_value") optok rd))) t))
+                    (int_add j 1))
+                  (bind ((rhs ((get S "parse_expr") toks (int_add j 1) env)))
+                    (do
+                      (append out (stamp
+                        (calln "ptr_write" (list_of gd
+                          ((get S "apply_assign") optok rd (get rhs "spec")))) t))
+                      (get rhs "i"))))))))
+        (do
+          (append out (stamp sp t))
+          j)))))
+
+(bind stmt_handlers (list_of))
+
+(bind register_statement!
+  (lambda (name priority match lower)
+    (append stmt_handlers
+      (assoc (map_of) "name" name "priority" priority
+                       "match" match "lower" lower))))
+
+(bind find_statement_handler
+  (lambda (S self toks i env brk tail?)
+    (bind ((best (ref null)) (bestp (ref 1000000)))
+      (do
+        (for row stmt_handlers
+          (when (and (lt (get row "priority") (deref bestp))
+                     ((get row "match") S self toks i env brk tail?))
+            (do
+              (set_ref best row)
+              (set_ref bestp (get row "priority")))))
+        (deref best)))))
+
+(register_statement! "semicolon" 10
+  (lambda (S self toks i env brk tail?) (tsym? (get toks i) ";"))
+  (lambda (S self toks i env brk tail? out) (int_add i 1)))
+(register_statement! "return" 20
+  (lambda (S self toks i env brk tail?) (tsym? (get toks i) "return"))
+  (lambda (S self toks i env brk tail? out)
+    (lower_return_stmt! S toks i env out)))
+(register_statement! "break" 30
+  (lambda (S self toks i env brk tail?) (tsym? (get toks i) "break"))
+  (lambda (S self toks i env brk tail? out)
+    (lower_break_stmt! S toks i brk out)))
+(register_statement! "ptr-field-assign" 40
+  (lambda (S self toks i env brk tail?) (ptr_field_assign_stmt? S toks i))
+  (lambda (S self toks i env brk tail? out)
+    (lower_ptr_field_assign_stmt! S toks i env out)))
+(register_statement! "subscript-store" 50
+  (lambda (S self toks i env brk tail?) (subscript_store_stmt? S toks i))
+  (lambda (S self toks i env brk tail? out)
+    (lower_subscript_store_stmt! S toks i env out)))
+(register_statement! "dotted-assign" 60
+  (lambda (S self toks i env brk tail?) (dotted_assign_stmt? toks i))
+  (lambda (S self toks i env brk tail? out)
+    (lower_dotted_assign_stmt! S toks i env out)))
+(register_statement! "while" 70
+  (lambda (S self toks i env brk tail?) (tsym? (get toks i) "while"))
+  (lambda (S self toks i env brk tail? out)
+    (lower_while_stmt! S self toks i env brk out)))
+(register_statement! "match" 80
+  (lambda (S self toks i env brk tail?) (tsym? (get toks i) "match"))
+  (lambda (S self toks i env brk tail? out)
+    (lower_match_stmt! S self toks i env brk tail? out)))
+(register_statement! "if" 90
+  (lambda (S self toks i env brk tail?) (tsym? (get toks i) "if"))
+  (lambda (S self toks i env brk tail? out)
+    (lower_if_stmt! S self toks i env brk tail? out)))
+(register_statement! "local-decl" 100
+  (lambda (S self toks i env brk tail?) (local_decl_stmt? S toks i))
+  (lambda (S self toks i env brk tail? out)
+    (lower_local_decl_stmt! S toks i env out)))
+(register_statement! "name-assign" 110
+  (lambda (S self toks i env brk tail?) (name_assign_stmt? S toks i))
+  (lambda (S self toks i env brk tail? out)
+    (lower_name_assign_stmt! S toks i env out)))
+(register_statement! "expr" 10000
+  (lambda (S self toks i env brk tail?) true)
+  (lambda (S self toks i env brk tail? out)
+    (lower_expr_stmt! S toks i env out)))
+
+(bind block_lower_block
+  (lambda (S self toks env brk tail?)
+    (bind ((out (list_of)) (i (ref 0)))
+      (do
+        (while (lt (deref i) (size toks))
+          (bind ((h (find_statement_handler S self toks (deref i) env brk tail?)))
+            (set_ref i ((get h "lower") S self toks (deref i) env brk tail? out))))
+        out))))
+
+(export block_lower_block register_statement!)

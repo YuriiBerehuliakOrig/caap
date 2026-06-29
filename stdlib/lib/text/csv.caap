@@ -1,0 +1,276 @@
+; stdlib/lib/text/csv.caap — RFC-4180 CSV/TSV in pure CAAP (module
+; stdlib.lib.text.csv). Mirrors lib/text/json's char-walk + ref-cursor parser
+; and located-error shape.
+;
+;   csv_parse          TEXT [OPTS] -> {ok: true, rows} | {ok: false, error}
+;   csv_parse_headers  TEXT [OPTS] -> list of maps (first row = header keys)
+;   csv_emit           ROWS [OPTS] -> CSV text
+;   csv_emit_records   MAPS [HEADERS [OPTS]] -> CSV text (header row + a row per map)
+;
+; rows is a list of rows, each a list of string fields. RFC-4180 quoting:
+; a field may be wrapped in double quotes, inside which a literal quote is
+; written as "" and delimiters / CR / LF are taken verbatim. Row terminators
+; are CRLF or LF (a lone CR is also accepted). The delimiter defaults to ","
+; (pass {"delimiter": "\t"} for TSV). A malformed quote yields a DATA result
+; {ok: false, error} carrying a "line:col:" located message (same shape as
+; json_parse), never a throw.
+;
+; OPTS keys (all optional):
+;   "delimiter"  field separator, one character           (default ",")
+;   "newline"    row terminator written by the emitters   (default "\r\n")
+(module stdlib.lib.text.csv)
+
+; ── option helpers ──────────────────────────────────────────────────────────
+(bind opt_delimiter
+  (lambda (opts) (if (eq opts null) "," (get opts "delimiter" ","))))
+(bind opt_newline
+  (lambda (opts) (if (eq opts null) "\r\n" (get opts "newline" "\r\n"))))
+
+; ── cursor helpers ──────────────────────────────────────────────────────────
+; the parser walks a PRE-SPLIT char list (kernel string_chars, O(n) once);
+; `text` everywhere below is that list and indexing is O(1). `ch` past the end
+; yields "" (a sentinel that compares equal to nothing real).
+(bind ch
+  (lambda (text i) (get text i "")))
+
+; pos — "line:col" of char offset `i` (error paths only). A row terminator is
+; CRLF or LF; either ends a line, so col resets on "\n" (the CR before it is
+; counted like any other char, matching json's per-char column walk).
+(bind pos
+  (lambda (text i)
+    (bind ((line (ref 1)) (col (ref 1)) (k (ref 0)))
+      (do
+        (while (lt (deref k) i)
+          (do
+            (if (eq (ch text (deref k)) "\n")
+              (do (set_ref line (int_add (deref line) 1)) (set_ref col 1))
+              (set_ref col (int_add (deref col) 1)))
+            (set_ref k (int_add (deref k) 1))))
+        (string_concat_many
+          (int_to_string (deref line)) ":" (int_to_string (deref col)))))))
+
+(bind fail
+  (lambda (text i message)
+    (assoc (map_of) "ok" false
+      "error" (string_concat_many "csv: " (pos text i) ": " message))))
+
+; ── field readers ───────────────────────────────────────────────────────────
+; collect — chars [i0, i1) joined back into one string (single pass, single
+; allocation per field via list-accumulate + sequence_join, no per-char concat).
+(bind collect
+  (lambda (text i0 i1)
+    (bind ((parts (list_of)) (k (ref i0)))
+      (do
+        (while (lt (deref k) i1)
+          (do
+            (append parts (ch text (deref k)))
+            (set_ref k (int_add (deref k) 1))))
+        (sequence_join parts "")))))
+
+; read_quoted — a "…"-quoted field starting AT the opening quote (i0 points at
+; it). Returns {ok, value, i} where i is the index just past the closing quote,
+; or a located fail on an unterminated quote. A "" inside the field is one
+; literal quote; the field ends at the first lone ".
+(bind read_quoted
+  (lambda (text i0)
+    (bind ((parts (list_of)) (i (ref (int_add i0 1))) (res (ref null)))
+      (do
+        (while (eq (deref res) null)
+          (bind ((c (ch text (deref i))))
+            (cond
+              ((eq c "")
+                (set_ref res (fail text i0 "unterminated quoted field")))
+              ((eq c "\"")
+                (if (eq (ch text (int_add (deref i) 1)) "\"")
+                  (do                                  ; "" -> one literal quote
+                    (append parts "\"")
+                    (set_ref i (int_add (deref i) 2)))
+                  (set_ref res                         ; lone " closes the field
+                    (assoc (map_of) "ok" true
+                      "value" (sequence_join parts "")
+                      "i" (int_add (deref i) 1)))))
+              (else
+                (do
+                  (append parts c)
+                  (set_ref i (int_add (deref i) 1)))))))
+        (deref res)))))
+
+; read_unquoted — a bare field: everything up to the delimiter, CR, LF, or EOF.
+; Always succeeds (the empty string is a valid field).
+(bind read_unquoted
+  (lambda (text i0 delim)
+    (bind ((i (ref i0)))
+      (do
+        (while (bind ((c (ch text (deref i))))
+                 (and (not (eq c ""))
+                   (and (not (eq c delim))
+                     (and (not (eq c "\n")) (not (eq c "\r"))))))
+          (set_ref i (int_add (deref i) 1)))
+        (assoc (map_of) "ok" true
+          "value" (collect text i0 (deref i)) "i" (deref i))))))
+
+; read_field — dispatch on the first char: a leading " starts a quoted field
+; (RFC-4180 only treats a quote as special at the field start), otherwise bare.
+; A quoted field must be followed by a delimiter, a row terminator, or EOF —
+; stray content after the closing quote (e.g. "a"b) is a located error.
+(bind read_field
+  (lambda (text i0 delim)
+    (if (not (eq (ch text i0) "\""))
+      (read_unquoted text i0 delim)
+      (bind ((r (read_quoted text i0)))
+        (if (not (get r "ok" false))
+          r
+          (bind ((after (ch text (get r "i" 0))))
+            (if (or (eq after "") (or (eq after delim)
+                    (or (eq after "\n") (eq after "\r"))))
+              r
+              (fail text (get r "i" 0)
+                "unexpected text after a quoted field"))))))))
+
+; ── row / document ──────────────────────────────────────────────────────────
+; skip_newline — consume one row terminator (CRLF, LF, or a lone CR) at `i`;
+; returns the index just past it (i unchanged when `i` isn't a terminator).
+(bind skip_newline
+  (lambda (text i)
+    (cond
+      ((and (eq (ch text i) "\r") (eq (ch text (int_add i 1)) "\n"))
+        (int_add i 2))
+      ((or (eq (ch text i) "\n") (eq (ch text i) "\r"))
+        (int_add i 1))
+      (else i))))
+
+; read_row — one row of fields starting at i0. A row is always at least one
+; field (an empty line parses to a single empty field). Stops at a row
+; terminator or EOF. Returns {ok, row, i} (i at the terminator/EOF), or a fail.
+(bind read_row
+  (lambda (text i0 delim)
+    (bind ((row (list_of)) (i (ref i0)) (res (ref null)))
+      (do
+        (while (eq (deref res) null)
+          (bind ((f (read_field text (deref i) delim)))
+            (if (not (get f "ok" false))
+              (set_ref res f)
+              (do
+                (append row (get f "value"))
+                (set_ref i (get f "i" 0))
+                (bind ((c (ch text (deref i))))
+                  (if (eq c delim)
+                    (set_ref i (int_add (deref i) 1))   ; more fields follow
+                    (set_ref res                         ; row ends (term/EOF)
+                      (assoc (map_of) "ok" true "row" row "i" (deref i)))))))))
+        (deref res)))))
+
+; csv_parse — TEXT [OPTS] -> {ok: true, rows} | {ok: false, error}.
+; A trailing newline does NOT yield a spurious empty final row; a non-empty
+; final line with no terminator is its own row. Empty input -> zero rows.
+(bind csv_parse
+  (lambda (raw &rest)
+    (bind ((opts (get rest 0 null))
+           (delim (opt_delimiter opts))
+           (text (string_chars raw))
+           (rows (list_of)) (i (ref 0)) (res (ref null)))
+      (do
+        (while (and (eq (deref res) null) (lt (deref i) (size text)))
+          (bind ((r (read_row text (deref i) delim)))
+            (if (not (get r "ok" false))
+              (set_ref res r)
+              (do
+                (append rows (get r "row"))
+                ; advance past the row terminator; bail if nothing was consumed
+                ; (defensive — read_row always lands on a term/EOF, never mid-row)
+                (bind ((next (skip_newline text (get r "i" 0))))
+                  (if (le next (deref i))
+                    (set_ref res (assoc (map_of) "ok" true "rows" rows))
+                    (set_ref i next)))))))
+        (if (not (eq (deref res) null))
+          (deref res)
+          (assoc (map_of) "ok" true "rows" rows))))))
+
+; csv_parse_headers — TEXT [OPTS] -> list of maps. The first row supplies the
+; keys; each later row becomes a map {header[k]: field[k]}. A short row leaves
+; the missing trailing keys unset; extra fields past the header are dropped.
+; On a parse error returns the SAME {ok: false, error} record as csv_parse
+; (callers that want maps should still check "ok").
+(bind csv_parse_headers
+  (lambda (raw &rest)
+    (bind ((opts (get rest 0 null))
+           (parsed (csv_parse raw opts)))
+      (if (not (get parsed "ok" false))
+        parsed
+        (bind ((rows (get parsed "rows")) (out (list_of)))
+          (if (eq (size rows) 0)
+            out
+            (bind ((header (get rows 0)) (ncol (size (get rows 0))) (r (ref 1)))
+              (do
+                (while (lt (deref r) (size rows))
+                  (bind ((row (get rows (deref r))) (m (map_of)) (k (ref 0)))
+                    (do
+                      (while (and (lt (deref k) ncol) (lt (deref k) (size row)))
+                        (do
+                          (assoc m (get header (deref k)) (get row (deref k)))
+                          (set_ref k (int_add (deref k) 1))))
+                      (append out m)
+                      (set_ref r (int_add (deref r) 1)))))
+                out))))))))
+
+; ── emit ────────────────────────────────────────────────────────────────────
+; needs_quote? — a field must be quoted when it contains the delimiter, a
+; double quote, CR, or LF (RFC-4180 §2.6/§2.7).
+(bind needs_quote?
+  (lambda (s delim)
+    (or (string_contains s delim)
+      (or (string_contains s "\"")
+        (or (string_contains s "\n") (string_contains s "\r"))))))
+
+; double_quotes — replace each " with "" (escape for a quoted field).
+(bind double_quotes
+  (lambda (s) (sequence_join (string_split s "\"") "\"\"")))
+
+; emit_field — one field, quoted (with doubled inner quotes) only when needed.
+(bind emit_field
+  (lambda (s delim)
+    (if (needs_quote? s delim)
+      (string_concat_many "\"" (double_quotes s) "\"")
+      s)))
+
+; csv_emit — ROWS [OPTS] -> CSV text. Each row's fields are joined by the
+; delimiter; rows are joined by the newline (default CRLF). Built with a
+; list-accumulate + single join per level — no per-field string_concat loop.
+(bind csv_emit
+  (lambda (rows &rest)
+    (bind ((opts (get rest 0 null))
+           (delim (opt_delimiter opts))
+           (nl (opt_newline opts))
+           (lines (list_of)))
+      (do
+        (for row rows
+          (bind ((cells (list_of)))
+            (do
+              (for field row
+                (append cells (emit_field field delim)))
+              (append lines (sequence_join cells delim)))))
+        (sequence_join lines nl)))))
+
+; csv_emit_records — MAPS [HEADERS [OPTS]] -> CSV text with a header row.
+; HEADERS (a list of key strings) fixes the column order; when omitted the keys
+; of the first map define it. A map missing a header key emits an empty field.
+; The optional third arg is the same OPTS map csv_emit takes (delimiter/newline).
+(bind csv_emit_records
+  (lambda (maps &rest)
+    (bind ((headers (get rest 0 null))
+           (opts (get rest 1 null))
+           (cols (if (not (eq headers null))
+                   headers
+                   (if (eq (size maps) 0) (list_of) (map_keys (get maps 0)))))
+           (rows (list_of)))
+      (do
+        (append rows cols)
+        (for m maps
+          (bind ((row (list_of)))
+            (do
+              (for k cols
+                (append row (get m k "")))
+              (append rows row))))
+        (csv_emit rows opts)))))
+
+(export csv_parse csv_parse_headers csv_emit csv_emit_records)

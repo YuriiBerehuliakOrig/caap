@@ -1,0 +1,86 @@
+{
+  "$comment": "Канонічний індекс агентів і скілів CAAP. Джерело правди — .agents/. sync.py читає цей файл, щоб матеріалізувати/звірити активні скіли воркспейса (.claude/skills, .claude/agents). Версії бампай при зміні вмісту відповідного файлу.",
+  "manifestVersion": "1.0.0",
+  "format": "claude-code",
+  "canonicalRoot": ".agents",
+  "targets": {
+    "skills": ".claude/skills",
+    "agents": ".claude/agents"
+  },
+  "conventions": "conventions.md",
+  "skills": [
+    {
+      "name": "caap-refactor",
+      "version": "1.0.0",
+      "file": "skills/caap-refactor.md",
+      "summary": "Правки .caap через span-based scripts/caap_refactor.py (зберігає форматування, авто caap check)."
+    },
+    {
+      "name": "build-and-test",
+      "version": "1.0.0",
+      "file": "skills/build-and-test.md",
+      "summary": "Збірка, тестові тіри, гейти (strict/acceptance/production), запуск бінарника caap."
+    },
+    {
+      "name": "caap-language",
+      "version": "1.0.0",
+      "file": "skills/caap-language.md",
+      "summary": "Синтаксис/семантика/примітиви CAAP; навігація по KERNEL_REFERENCE; CTFE vs runtime."
+    },
+    {
+      "name": "builtins-analysis",
+      "version": "1.0.0",
+      "file": "skills/builtins-analysis.md",
+      "summary": "Необхідність/коректність/зручність builtin'ів і CTFE-примітивів; keep/merge/move-to-stdlib."
+    },
+    {
+      "name": "stdlib-optimization",
+      "version": "1.0.0",
+      "file": "skills/stdlib-optimization.md",
+      "summary": "Найоптимальніший механізм у stdlib + правильна фаза (PE/FoldPolicy); згортання дублювання."
+    },
+    {
+      "name": "docs-generation",
+      "version": "1.0.0",
+      "file": "skills/docs-generation.md",
+      "summary": "Синхронізація KERNEL_REFERENCE / stdlib-reference з кодом, з явною фазою кожного запису."
+    },
+    {
+      "name": "readability-refactor",
+      "version": "1.0.0",
+      "file": "skills/readability-refactor.md",
+      "summary": "Поведінкозберігальне згортання дублювання (граматика/демо/патерни) з golden lowered-виводом."
+    }
+  ],
+  "agents": [
+    {
+      "name": "caap-reviewer",
+      "version": "1.0.0",
+      "file": "agents/caap-reviewer.md",
+      "skills": ["build-and-test", "caap-refactor", "caap-language"]
+    },
+    {
+      "name": "stdlib-author",
+      "version": "1.0.0",
+      "file": "agents/stdlib-author.md",
+      "skills": ["caap-refactor", "caap-language", "stdlib-optimization"]
+    },
+    {
+      "name": "host-runtime-engineer",
+      "version": "1.0.0",
+      "file": "agents/host-runtime-engineer.md",
+      "skills": ["build-and-test", "builtins-analysis"]
+    },
+    {
+      "name": "docs-writer",
+      "version": "1.0.0",
+      "file": "agents/docs-writer.md",
+      "skills": ["docs-generation", "caap-language"]
+    }
+  ],
+  "playbooks": [
+    { "name": "add-builtin", "version": "1.0.0", "file": "playbooks/add-builtin.md" },
+    { "name": "add-ctfe-primitive", "version": "1.0.0", "file": "playbooks/add-ctfe-primitive.md" },
+    { "name": "add-host-service", "version": "1.0.0", "file": "playbooks/add-host-service.md" }
+  ]
+}

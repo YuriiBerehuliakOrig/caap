@@ -1,0 +1,501 @@
+; stdlib/lib/collections/algo.caap — graph traversal/ordering + sequence and
+; traverse helpers, built ON TOP of graph.caap, sequence.caap, result.caap and
+; option.caap (this module re-derives none of them).
+;
+; GRAPH algorithms take a graph in the adjacency shape graph.caap defines
+; (a map: node -> [successor…]). They iterate nodes in declaration order
+; (the adjacency map's key order) and edges in successor-list order, so every
+; result is DETERMINISTIC. A "visited" set is a map node->true, queried with
+; `contains` (so node identity follows map-key identity).
+;
+; SEQUENCE extras round out the fold-family the base sequence module leaves
+; out (fold_right/scan/chunk/windows/zip_with/unzip) and re-export the
+; group_by/zip/sort_by facades under clean names.
+;
+; TRAVERSE collects a list of Result/Option into a Result/Option of list,
+; short-circuiting on the first failure.
+(module stdlib.lib.collections.algo)
+
+(use stdlib.lib.collections.graph nodes successors)
+(use stdlib.lib.collections.sequence each fold reverse range)
+(use stdlib.lib.collections.result ok ok?)
+(use stdlib.lib.collections.option some none some?)
+
+; ── graph traversal ─────────────────────────────────────────────────────────
+
+; bfs — breadth-first node order from `start` (inclusive), successors visited
+; in list order. Unreachable nodes are omitted; a `start` with no entry still
+; yields [start].
+;   g / start : the graph and the source node
+;   ->        : a fresh list of nodes in BFS visitation order
+(bind bfs
+  (lambda (g start)
+    (bind ((order (list_of)) (seen (map_of)) (queue (list_of start)) (head (ref 0)))
+      (do
+        (assoc seen start true)
+        (while (lt (deref head) (size queue))
+          (bind ((n (get queue (deref head))))
+            (do
+              (set_ref head (int_add (deref head) 1))
+              (append order n)
+              (each (successors g n)
+                (lambda (d)
+                  (unless (contains seen d)
+                    (do (assoc seen d true) (append queue d))))))))
+        order))))
+
+; dfs — depth-first node order from `start` (inclusive), pre-order, successors
+; visited in list order.
+;   g / start : the graph and the source node
+;   ->        : a fresh list of nodes in DFS pre-order
+(bind dfs
+  (lambda (g start)
+    (bind ((order (list_of)) (seen (map_of)) (go (ref null)))
+      (do
+        (set_ref go
+          (lambda (n)
+            (unless (contains seen n)
+              (do
+                (assoc seen n true)
+                (append order n)
+                (each (successors g n) (lambda (d) ((deref go) d)))))))
+        ((deref go) start)
+        order))))
+
+; reachable — every node reachable from `start`, `start` included, in DFS
+; pre-order. (The set of reachable nodes as a deterministically ordered list;
+; build a set from it with set.caap's set_of if membership is what you need.)
+;   g / start : the graph and the source node
+;   ->        : a fresh list of reachable nodes
+(bind reachable
+  (lambda (g start) (dfs g start)))
+
+; distances — a fresh map node->int of the BFS hop count from `src` to every
+; reachable node (`src` itself is 0). Unreachable nodes get no entry. Since BFS
+; visits in non-decreasing distance order, the first time a node is seen is its
+; shortest hop count.
+;   g / src : the graph and the source node
+;   ->      : a fresh map {node -> distance}
+(bind distances
+  (lambda (g src)
+    (bind ((dist (map_of)) (queue (list_of src)) (head (ref 0)))
+      (do
+        (assoc dist src 0)
+        (while (lt (deref head) (size queue))
+          (bind ((n (get queue (deref head))) (dn (get dist n 0)))
+            (do
+              (set_ref head (int_add (deref head) 1))
+              (each (successors g n)
+                (lambda (d)
+                  (unless (contains dist d)
+                    (do (assoc dist d (int_add dn 1)) (append queue d))))))))
+        dist))))
+
+; bfs_path — a SHORTEST path (fewest edges) from `src` to `dst` as a list of
+; nodes [src … dst], or null when `dst` is unreachable. BFS with parent
+; pointers; `src == dst` yields [src]. Successors are explored in list order, so
+; among equally short paths the result is deterministic.
+;   g / src / dst : the graph and the two endpoints
+;   ->            : the node path, or null
+(bind bfs_path
+  (lambda (g src dst)
+    (bind (
+      (parent (map_of))         ; node -> its predecessor on the BFS tree
+      (seen (map_of))           ; node -> true once enqueued
+      (queue (list_of src))
+      (head (ref 0))
+      (found (ref false))
+    )
+      (do
+        (assoc seen src true)
+        (while (and (lt (deref head) (size queue)) (not (deref found)))
+          (bind ((n (get queue (deref head))))
+            (do
+              (set_ref head (int_add (deref head) 1))
+              (if (eq n dst)
+                (set_ref found true)
+                (each (successors g n)
+                  (lambda (d)
+                    (unless (contains seen d)
+                      (do
+                        (assoc seen d true)
+                        (assoc parent d n)
+                        (append queue d)))))))))
+        ; reconstruct by walking parent pointers back from dst, then reverse
+        (if (or (deref found) (eq src dst))
+          (bind ((path (list_of)) (cur (ref dst)) (go (ref true)))
+            (do
+              (while (deref go)
+                (do
+                  (append path (deref cur))
+                  (if (eq (deref cur) src)
+                    (set_ref go false)
+                    (set_ref cur (get parent (deref cur))))))
+              (reverse path)))
+          null)))))
+
+; ── topological order / cycle detection ─────────────────────────────────────
+
+; in_degree — a fresh map node->int counting incoming edges; every declared
+; node (and any successor-only node) gets an entry (0 when no predecessors).
+(bind in_degree
+  (lambda (g)
+    (bind ((deg (map_of)))
+      (do
+        (each (nodes g) (lambda (n) (assoc deg n 0)))
+        (each (nodes g)
+          (lambda (n)
+            (each (successors g n)
+              (lambda (d)
+                (do
+                  (unless (contains deg d) (assoc deg d 0))
+                  (assoc deg d (int_add (get deg d 0) 1)))))))
+        deg))))
+
+; topo_sort — nodes in a topological order (every edge points forward), or
+; null when `g` has a cycle. Kahn's algorithm: repeatedly emit a node whose
+; in-degree has fallen to 0, draining ready nodes in declaration order so the
+; result is deterministic.
+;   g  : the graph
+;   -> : a fresh list of all nodes, or null on a cycle
+(bind topo_sort
+  (lambda (g)
+    (bind ((deg (in_degree g)) (order (list_of)) (queue (list_of)) (head (ref 0)))
+      (do
+        ; seed with the zero-in-degree nodes, in declaration order
+        (each (map_keys deg)
+          (lambda (n) (when (eq (get deg n 0) 0) (append queue n))))
+        (while (lt (deref head) (size queue))
+          (bind ((n (get queue (deref head))))
+            (do
+              (set_ref head (int_add (deref head) 1))
+              (append order n)
+              (each (successors g n)
+                (lambda (d)
+                  (bind ((nd (int_sub (get deg d 0) 1)))
+                    (do
+                      (assoc deg d nd)
+                      (when (eq nd 0) (append queue d)))))))))
+        ; emitted every node ⇒ acyclic; otherwise a cycle blocked some nodes
+        (if (eq (size order) (size (map_keys deg))) order null)))))
+
+; has_cycle? — does `g` contain a directed cycle?
+;   g  : the graph
+;   -> : bool (true iff topo_sort fails)
+(bind has_cycle?
+  (lambda (g) (eq (topo_sort g) null)))
+
+; ── strongly connected components (Tarjan) ──────────────────────────────────
+
+; min_int — the smaller of two ints (a local helper for low-link updates).
+(bind min_int (lambda (a b) (if (lt a b) a b)))
+
+; scc — the strongly connected components of `g`. Each component is a list of
+; mutually reachable nodes; a node with no cycle through it is a singleton.
+; Tarjan's algorithm: one DFS, tracking discovery index and low-link, popping
+; a component when a node's low-link equals its own index. Components come out
+; in reverse-topological order of the condensation; nodes inside a component
+; follow stack (reverse-discovery) order — both deterministic for a fixed
+; declaration/successor order.
+;   g  : the graph
+;   -> : a fresh list of components (each a list of nodes)
+(bind scc
+  (lambda (g)
+    (bind (
+      (index (ref 0))           ; next discovery index to hand out
+      (idx_of (map_of))         ; node -> discovery index
+      (low_of (map_of))         ; node -> low-link
+      (on_stack (map_of))       ; node -> true while on the Tarjan stack
+      (stack (list_of))         ; the current DFS stack of nodes
+      (comps (list_of))         ; the finished components
+      (visit (ref null))
+    )
+      (do
+        (set_ref visit
+          (lambda (n)
+            (do
+              (assoc idx_of n (deref index))
+              (assoc low_of n (deref index))
+              (set_ref index (int_add (deref index) 1))
+              (append stack n)
+              (assoc on_stack n true)
+              (each (successors g n)
+                (lambda (d)
+                  (cond
+                    ((not (contains idx_of d))
+                      (do
+                        ((deref visit) d)
+                        (assoc low_of n (min_int (get low_of n) (get low_of d)))))
+                    ((eq (get on_stack d false) true)
+                      (assoc low_of n (min_int (get low_of n) (get idx_of d)))))))
+              ; root of a component: peel it off the stack
+              (when (eq (get low_of n) (get idx_of n))
+                (bind ((comp (list_of)) (go (ref true)))
+                  (do
+                    (while (deref go)
+                      (bind ((w (get stack (int_sub (size stack) 1))))
+                        (do
+                          (list_remove_at stack (int_sub (size stack) 1))
+                          (assoc on_stack w false)
+                          (append comp w)
+                          (when (eq w n) (set_ref go false)))))
+                    (append comps comp)))))))
+        (each (nodes g) (lambda (n) (unless (contains idx_of n) ((deref visit) n))))
+        comps))))
+
+; ── undirected components / cycle witness / reachability ─────────────────────
+
+; symmetrize — a fresh adjacency map where every directed edge `a -> b` of `g`
+; induces BOTH `a -> b` and `b -> a` (the undirected view). Every declared node
+; and every successor-only node gets an entry. Neighbour lists may contain a
+; node more than once (parallel/forward+back edges); the BFS in
+; connected_components is guarded by a seen-set, so duplicates are harmless.
+;   g  : the directed graph
+;   -> : a fresh symmetric adjacency map
+(bind symmetrize
+  (lambda (g)
+    (bind ((out (map_of)))
+      (do
+        (each (nodes g) (lambda (n) (unless (contains out n) (assoc out n (list_of)))))
+        (each (nodes g)
+          (lambda (n)
+            (each (successors g n)
+              (lambda (d)
+                (do
+                  (unless (contains out n) (assoc out n (list_of)))
+                  (unless (contains out d) (assoc out d (list_of)))
+                  (append (get out n) d)
+                  (append (get out d) n))))))
+        out))))
+
+; connected_components — the UNDIRECTED connected components of `g`: edge
+; direction is ignored (a -> b connects a and b either way). Each component is a
+; list of its nodes; components and the nodes within them follow declaration /
+; discovery order, so the result is deterministic. Singleton (isolated) nodes
+; are their own components.
+;   g  : the directed graph
+;   -> : a fresh list of components (each a list of nodes)
+(bind connected_components
+  (lambda (g)
+    (bind ((u (symmetrize g)) (seen (map_of)) (comps (list_of)))
+      (do
+        (each (map_keys u)
+          (lambda (start)
+            (unless (contains seen start)
+              (bind ((comp (list_of)) (queue (list_of start)) (head (ref 0)))
+                (do
+                  (assoc seen start true)
+                  (while (lt (deref head) (size queue))
+                    (bind ((n (get queue (deref head))))
+                      (do
+                        (set_ref head (int_add (deref head) 1))
+                        (append comp n)
+                        (each (get u n (list_of))
+                          (lambda (d)
+                            (unless (contains seen d)
+                              (do (assoc seen d true) (append queue d))))))))
+                  (append comps comp))))))
+        comps))))
+
+; find_cycle — an actual directed cycle of `g` as a node list [v … v] (the
+; first node repeated at the end to close the loop), or null when `g` is a DAG.
+; DFS with three colours: white (unseen), grey (on the current recursion path),
+; black (done). A grey successor is a back-edge — the cycle runs along the
+; recursion stack from that successor down to the current node. Parent pointers
+; on the grey path reconstruct it. Deterministic for a fixed declaration /
+; successor order.
+;   g  : the directed graph
+;   -> : a closed cycle as a node list, or null
+(bind find_cycle
+  (lambda (g)
+    (bind (
+      (color (map_of))          ; node -> "grey" | "black" (absent = white)
+      (parent (map_of))         ; node -> its predecessor on the current DFS path
+      (found (ref null))        ; the back-edge target once a cycle is hit
+      (cur_at (ref null))       ; the node whose edge closed the cycle
+      (visit (ref null))
+    )
+      (do
+        (set_ref visit
+          (lambda (n)
+            (when (eq (deref found) null)
+              (do
+                (assoc color n "grey")
+                (each (successors g n)
+                  (lambda (d)
+                    (when (eq (deref found) null)
+                      (cond
+                        ((not (contains color d))      ; white: recurse
+                          (do (assoc parent d n) ((deref visit) d)))
+                        ((eq (get color d "") "grey")  ; back-edge: cycle found
+                          (do (set_ref found d) (set_ref cur_at n)))))))
+                (assoc color n "black")))))
+        (each (nodes g) (lambda (n) (unless (contains color n) ((deref visit) n))))
+        ; reconstruct: walk parents from cur_at back up to the back-edge target
+        (if (eq (deref found) null)
+          null
+          (bind ((path (list_of)) (cur (ref (deref cur_at))) (go (ref true)))
+            (do
+              (while (deref go)
+                (do
+                  (append path (deref cur))
+                  (if (eq (deref cur) (deref found))
+                    (set_ref go false)
+                    (set_ref cur (get parent (deref cur))))))
+              ; path is [cur_at … found] (current-to-target); reverse to walk the
+              ; cycle forward, then repeat the start node to close the loop
+              (bind ((cyc (reverse path)))
+                (do (append cyc (deref found)) cyc)))))))))
+
+; transitive_closure — a fresh map node -> reachable-set (a map node->true) of
+; every node reachable from it by a path of ONE OR MORE edges. A node appears in
+; its own set only when it lies on a cycle (it can reach itself). Built by a
+; per-node BFS over successors, so reachability follows edge direction.
+;   g  : the directed graph
+;   -> : a fresh map {node -> {reachable-node -> true}}
+(bind transitive_closure
+  (lambda (g)
+    (bind ((out (map_of)))
+      (do
+        (each (nodes g)
+          (lambda (start)
+            (bind ((reach (map_of)) (queue (list_of)) (head (ref 0)))
+              (do
+                ; seed with start's direct successors (path length >= 1)
+                (each (successors g start)
+                  (lambda (d)
+                    (unless (contains reach d) (do (assoc reach d true) (append queue d)))))
+                (while (lt (deref head) (size queue))
+                  (bind ((n (get queue (deref head))))
+                    (do
+                      (set_ref head (int_add (deref head) 1))
+                      (each (successors g n)
+                        (lambda (d)
+                          (unless (contains reach d)
+                            (do (assoc reach d true) (append queue d))))))))
+                (assoc out start reach)))))
+        out))))
+
+; ── sequence fold-family extras ─────────────────────────────────────────────
+
+; fold_right — fold from the right: f(x0, f(x1, … f(xn, init))). The mirror of
+; sequence's left fold; `f` is (item acc) -> acc, so the accumulator is the
+; SECOND argument (opposite of fold's (acc item)).
+;   f / init / xs : the combiner, the seed, the list
+;   ->            : the right-folded accumulator
+(bind fold_right
+  (lambda (f init xs)
+    (fold (reverse xs) init (lambda (acc x) (f x acc)))))
+
+; scan — a running left-fold: the list of successive accumulators, starting
+; with `init`. (scan f init [a b]) -> [init, f(init,a), f(f(init,a),b)].
+;   f / init / xs : the combiner (acc item)->acc, the seed, the list
+;   ->            : a fresh list of length (size xs)+1 of intermediate accs
+(bind scan
+  (lambda (f init xs)
+    (bind ((out (list_of init)) (acc (ref init)))
+      (do
+        (each xs (lambda (x) (do (set_ref acc (f (deref acc) x)) (append out (deref acc)))))
+        out))))
+
+; chunk — split `xs` into consecutive sublists of size `n` (the last may be
+; shorter). `n` must be positive.
+;   n / xs : the chunk size and the list
+;   ->     : a fresh list of sublists
+(bind chunk
+  (lambda (n xs)
+    (bind ((out (list_of)) (cur (ref (list_of))))
+      (do
+        (each xs
+          (lambda (x)
+            (do
+              (append (deref cur) x)
+              (when (eq (size (deref cur)) n)
+                (do (append out (deref cur)) (set_ref cur (list_of)))))))
+        (when (gt (size (deref cur)) 0) (append out (deref cur)))
+        out))))
+
+; windows — every contiguous sublist of size `n` (sliding by 1). Empty when
+; `n` exceeds the list length.
+;   n / xs : the window size and the list
+;   ->     : a fresh list of length-n windows, in order
+(bind windows
+  (lambda (n xs)
+    (bind ((out (list_of)))
+      (do
+        (when (and (gt n 0) (lt (int_sub n 1) (size xs)))
+          (each (range 0 (int_add (int_sub (size xs) n) 1))
+            (lambda (i)
+              (bind ((w (list_of)))
+                (do
+                  (each (range i (int_add i n)) (lambda (j) (append w (get xs j))))
+                  (append out w))))))
+        out))))
+
+; zip_with — combine two lists elementwise with `f`, stopping at the shorter.
+;   f / xs / ys : the combiner (x y)->z and the two lists
+;   ->          : a fresh list of f's results
+(bind zip_with
+  (lambda (f xs ys)
+    (bind ((out (list_of)) (n (if (lt (size xs) (size ys)) (size xs) (size ys))))
+      (do
+        (each (range 0 n) (lambda (i) (append out (f (get xs i) (get ys i)))))
+        out))))
+
+; unzip — split a list of [a b] pairs into {first, second}: the lists of all
+; firsts and all seconds. The inverse of `zip` (whose pairs are 2-lists).
+;   pairs : a list of 2-element lists
+;   ->    : a map {first: [a…], second: [b…]}
+(bind unzip
+  (lambda (pairs)
+    (bind ((firsts (list_of)) (seconds (list_of)))
+      (do
+        (each pairs
+          (lambda (p) (do (append firsts (get p 0)) (append seconds (get p 1)))))
+        (assoc (map_of) "first" firsts "second" seconds)))))
+
+; ── clean-named facades over kernel sequence_* ──────────────────────────────
+; group_by/zip/sort_by are first-class builtins; a facade is just a rename.
+(bind group_by sequence_group_by)   ; (seq key_fn) -> map key -> [item…]
+(bind zip      sequence_zip)         ; (a b)        -> list of [a b] pairs
+(bind sort_by  sequence_sort_by)     ; (seq key_fn) -> sorted list
+
+; ── traverse (collect) ──────────────────────────────────────────────────────
+
+; traverse_result — turn a list of Results into a Result of the value list.
+; Short-circuits on the FIRST err (returning that err); ok only when every
+; element is ok.
+;   xs : a list of Results
+;   -> : (ok [value…]) when all ok, else the first err Result
+(bind traverse_result
+  (lambda (xs)
+    (bind ((out (list_of)) (failed (ref null)))
+      (do
+        (each xs
+          (lambda (r)
+            (when (eq (deref failed) null)
+              (if (ok? r) (append out (get r "value")) (set_ref failed r)))))
+        (if (eq (deref failed) null) (ok out) (deref failed))))))
+
+; traverse_option — turn a list of Options into an Option of the value list.
+; Short-circuits on the FIRST none; some only when every element is some.
+;   xs : a list of Options
+;   -> : (some [value…]) when all some, else (none)
+(bind traverse_option
+  (lambda (xs)
+    (bind ((out (list_of)) (missing (ref false)))
+      (do
+        (each xs
+          (lambda (o)
+            (unless (deref missing)
+              (if (some? o) (append out (get o "value")) (set_ref missing true)))))
+        (if (deref missing) (none) (some out))))))
+
+(export
+  ; graph
+  bfs dfs reachable distances bfs_path topo_sort has_cycle? scc in_degree
+  connected_components find_cycle transitive_closure
+  ; sequence extras
+  fold_right scan chunk windows zip_with unzip group_by zip sort_by
+  ; traverse
+  traverse_result traverse_option)

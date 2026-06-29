@@ -1,0 +1,9 @@
+; tests/const_unknown.caap — (const …) over a plain local lambda:
+; no signature, so its effect cannot be PROVEN pure; refused under the loader.
+(module stdlib.fixtures.const_unknown)
+
+(bind twice (lambda (x) (int_mul x 2)))
+
+(bind k (const (twice 3)))
+
+(export k)

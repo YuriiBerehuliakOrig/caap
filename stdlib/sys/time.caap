@@ -1,0 +1,38 @@
+; stdlib/sys/time.caap — facade for the host "time" library.
+;
+; Two layers, one file (the boilerplate lives in stdlib.sys.wrap):
+;   1. The visible, TYPED surface (`ops`): each function with its parameters
+;      (name + type) and return type. verify_facade checks this against the
+;      catalog, so the declaration cannot drift.
+;   2. CALLABLE wrappers: dual-phase callables from boot/sys_grants.caap, with
+;      the capability handle partially applied. Each phase's sandbox policy
+;      gates behaviour. Without the grant the module still loads — wrappers are
+;      self-describing throwing stubs that raise "requires a sys grant" when
+;      called (declaration-only mode).
+; `make_facade` files the typed surface AND builds the wrapper bundle in one
+; step; each export reads its wrapper from that bundle.
+(module stdlib.sys.time)
+
+(use stdlib.sys.verify op p)
+(use stdlib.sys.wrap make_facade)
+
+(bind ops
+  (list_of
+    (op "monotonic_ns" (list_of) "int" "impure")
+    (op "now_unix_ns" (list_of) "int" "impure")
+    (op "sleep_ms" (list_of (p "ms" "int")) "null" "impure")
+    (op "unix_millis" (list_of) "int" "impure")
+    (op "unix_seconds" (list_of) "int" "impure")))
+
+; one call: file the typed surface AND build the wrapper bundle. Each export
+; below reads its (capability-applied, or null) callable from this bundle.
+(bind sys (make_facade "time" ops))
+
+(bind monotonic_ns (get sys "monotonic_ns"))
+(bind now_unix_ns  (get sys "now_unix_ns"))
+(bind sleep_ms     (get sys "sleep_ms"))
+(bind unix_millis  (get sys "unix_millis"))
+(bind unix_seconds (get sys "unix_seconds"))
+
+(export ops
+        monotonic_ns now_unix_ns sleep_ms unix_millis unix_seconds)

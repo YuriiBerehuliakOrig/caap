@@ -1,0 +1,265 @@
+; stdlib/lib/tests/test_algo.caap — in-language tests for lib/collections/algo.
+; NOTE on equality: the kernel `eq` compares lists by IDENTITY (Rc::ptr_eq), so
+; list results are checked with `deep_eq` (structural), reserving `assert_eq`
+; for scalars (ints/strings/bools/null).
+
+;; @area: collections
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.collections.algo
+  bfs dfs reachable distances bfs_path topo_sort has_cycle? scc in_degree
+  connected_components find_cycle transitive_closure
+  fold_right scan chunk windows zip_with unzip group_by zip sort_by
+  traverse_result traverse_option)
+(use stdlib.lib.collections.sequence contains? index_of length sum)
+(use stdlib.lib.collections.result ok err ok? err? error_code)
+(use stdlib.lib.collections.option some none some? none? option_unwrap)
+(use stdlib.lib.core.equal deep_eq)
+
+; ── local test helpers (defined before the test body that uses them) ─────────
+
+; all_singletons? — true when every component in `comps` has exactly one node.
+(bind all_singletons?
+  (lambda (comps)
+    (sequence_all comps (lambda (c) (eq (size c) 1)))))
+
+; find_component — the component in `comps` that contains node `n` (or null).
+(bind find_component
+  (lambda (comps n)
+    (sequence_find comps (lambda (c) (sequence_any c (lambda (x) (eq x n)))))))
+
+; valid_cycle? — true when `cyc` (a node list [v … v], closed) is an actual
+; directed cycle of `g`: length >= 2, the first and last node coincide, and
+; every consecutive pair is a real edge.
+(bind valid_cycle?
+  (lambda (g cyc)
+    (and (ge (size cyc) 2)
+         (and (eq (get cyc 0) (get cyc (int_sub (size cyc) 1)))
+              (sequence_all (sequence_range 0 (int_sub (size cyc) 1))
+                (lambda (i)
+                  (contains (get g (get cyc i) (list_of)) (get cyc (int_add i 1)))))))))
+
+(do
+  ; ── a small DAG:  a -> b, a -> c, b -> d, c -> d ─────────────────────────
+  (bind ((dag (assoc (map_of)
+                 "a" (list_of "b" "c")
+                 "b" (list_of "d")
+                 "c" (list_of "d")
+                 "d" (list_of))))
+    (do
+      ; bfs visits a, then its successors b/c (in list order), then d
+      (assert_true (deep_eq (bfs dag "a") (list_of "a" "b" "c" "d")) "bfs order")
+      ; dfs pre-order goes deep first: a, b, d, then c (d already seen)
+      (assert_true (deep_eq (dfs dag "a") (list_of "a" "b" "d" "c")) "dfs pre-order")
+      ; reachable from a is every node; from d only d
+      (assert_eq (length (reachable dag "a")) 4 "reachable from a = all 4")
+      (assert_true (deep_eq (reachable dag "d") (list_of "d")) "reachable from leaf d = [d]")
+
+      ; distances: hop count from a (a=0, b/c=1, d=2)
+      (bind ((dist (distances dag "a")))
+        (do
+          (assert_eq (get dist "a" -1) 0 "distance a->a = 0")
+          (assert_eq (get dist "b" -1) 1 "distance a->b = 1")
+          (assert_eq (get dist "c" -1) 1 "distance a->c = 1")
+          (assert_eq (get dist "d" -1) 2 "distance a->d = 2 (two hops)")))
+      ; distances from a leaf reaches only itself
+      (assert_eq (size (distances dag "d")) 1 "distances from leaf d covers only d")
+
+      ; bfs_path: a shortest path a..d has 3 nodes; b is explored before c
+      (bind ((p (bfs_path dag "a" "d")))
+        (do
+          (assert_eq (length p) 3 "bfs_path a->d has 3 nodes")
+          (assert_eq (get p 0) "a" "bfs_path starts at src")
+          (assert_eq (get p 2) "d" "bfs_path ends at dst")
+          (assert_true (deep_eq p (list_of "a" "b" "d")) "bfs_path takes the first shortest route")))
+      ; src == dst is the singleton path; unreachable target is null
+      (assert_true (deep_eq (bfs_path dag "a" "a") (list_of "a")) "bfs_path src==dst -> [src]")
+      (assert_eq (bfs_path dag "d" "a") null "bfs_path to an unreachable node is null")
+
+      ; topo_sort is a valid linearisation: every edge points forward
+      (bind ((order (topo_sort dag)))
+        (do
+          (assert_eq (length order) 4 "topo covers every node")
+          (assert_true (lt (index_of order "a") (index_of order "b")) "a before b")
+          (assert_true (lt (index_of order "a") (index_of order "c")) "a before c")
+          (assert_true (lt (index_of order "b") (index_of order "d")) "b before d")
+          (assert_true (lt (index_of order "c") (index_of order "d")) "c before d")))
+      (assert_eq (has_cycle? dag) false "DAG has no cycle")
+
+      ; in_degree: a has 0, b/c have 1, d has 2
+      (bind ((deg (in_degree dag)))
+        (do
+          (assert_eq (get deg "a" 0) 0 "in_degree a = 0")
+          (assert_eq (get deg "b" 0) 1 "in_degree b = 1")
+          (assert_eq (get deg "d" 0) 2 "in_degree d = 2")))
+
+      ; every node is its own singleton SCC in a DAG
+      (assert_eq (length (scc dag)) 4 "DAG: 4 singleton SCCs")
+      (assert_true (all_singletons? (scc dag)) "DAG SCCs are all singletons")))
+
+  ; ── a cyclic graph:  x -> y -> z -> x, plus a tail z -> w ────────────────
+  (bind ((cyc (assoc (map_of)
+                 "x" (list_of "y")
+                 "y" (list_of "z")
+                 "z" (list_of "x" "w")
+                 "w" (list_of))))
+    (do
+      (assert_eq (topo_sort cyc) null "cyclic graph -> topo_sort null")
+      (assert_eq (has_cycle? cyc) true "cyclic graph has a cycle")
+      ; bfs/dfs still terminate and cover the reachable set
+      (assert_eq (length (bfs cyc "x")) 4 "bfs covers all 4 in the cycle+tail")
+      (assert_true (contains? (reachable cyc "x") "w") "w reachable past the cycle")
+      ; scc: {x,y,z} is one component, w is its own
+      (bind ((comps (scc cyc)))
+        (do
+          (assert_eq (length comps) 2 "cyclic graph -> 2 SCCs")
+          (bind ((big (find_component comps "x")))
+            (do
+              (assert_eq (length big) 3 "the cycle SCC has 3 nodes")
+              (assert_true (contains? big "y") "y in the cycle SCC")
+              (assert_true (contains? big "z") "z in the cycle SCC")))
+          (bind ((tail (find_component comps "w")))
+            (assert_eq (length tail) 1 "w is its own singleton SCC"))))
+      ; find_cycle returns an actual closed cycle through x,y,z
+      (bind ((cy (find_cycle cyc)))
+        (do
+          (assert_true (not (eq cy null)) "find_cycle finds a cycle in a cyclic graph")
+          (assert_true (valid_cycle? cyc cy) "find_cycle returns a real closed cycle (consecutive edges)")
+          ; the only cycle here is x->y->z->x, so it has 3 distinct nodes (+ the
+          ; repeated closing node) all drawn from {x,y,z}
+          (assert_eq (length cy) 4 "the x->y->z->x cycle is 4 nodes when closed")
+          (assert_true (contains? cy "x") "cycle includes x")
+          (assert_true (contains? cy "y") "cycle includes y")
+          (assert_true (contains? cy "z") "cycle includes z")
+          (assert_eq (contains? cy "w") false "the tail node w is not on the cycle")))
+      ; transitive_closure: x reaches everything; w reaches nothing
+      (bind ((tc (transitive_closure cyc)))
+        (do
+          (assert_true (contains (get tc "x") "w") "tc: x reaches w (past the cycle)")
+          (assert_true (contains (get tc "x") "y") "tc: x reaches y")
+          (assert_true (contains (get tc "x") "x") "tc: x reaches itself (it is on a cycle)")
+          (assert_eq (size (get tc "w")) 0 "tc: the sink w reaches nothing")
+          (assert_true (contains (get tc "y") "x") "tc: y reaches x around the cycle")))))
+
+  ; ── connected_components (UNDIRECTED) ────────────────────────────────────────
+  ; two separate undirected blobs: {a-b-c} and {d-e}, plus an isolated node f.
+  ; Edges are directed but components ignore direction.
+  (bind ((cc (assoc (map_of)
+                "a" (list_of "b")
+                "b" (list_of "c")
+                "c" (list_of)
+                "d" (list_of "e")
+                "e" (list_of)
+                "f" (list_of))))
+    (do
+      (bind ((comps (connected_components cc)))
+        (do
+          (assert_eq (length comps) 3 "three undirected components {a,b,c} {d,e} {f}")
+          (bind ((abc (find_component comps "a")))
+            (do
+              (assert_eq (length abc) 3 "{a,b,c} component has 3 nodes")
+              (assert_true (contains? abc "b") "b joined via a->b (direction ignored)")
+              (assert_true (contains? abc "c") "c joined via b->c")))
+          (bind ((de (find_component comps "d")))
+            (do
+              (assert_eq (length de) 2 "{d,e} component has 2 nodes")
+              ; e reaches d only against the edge direction — undirected links it
+              (assert_true (contains? de "e") "e is in d's undirected component")))
+          (bind ((ff (find_component comps "f")))
+            (assert_eq (length ff) 1 "isolated node f is its own component"))))
+      ; a graph with one weakly-connected blob is a single component even though
+      ; some nodes are unreachable following edge direction
+      (bind ((chain (assoc (map_of) "p" (list_of "q") "q" (list_of "r") "r" (list_of))))
+        (assert_eq (length (connected_components chain)) 1 "a directed chain is one undirected component"))))
+
+  ; find_cycle on a DAG is null
+  (bind ((dag2 (assoc (map_of) "a" (list_of "b" "c") "b" (list_of "c") "c" (list_of))))
+    (do
+      (assert_eq (find_cycle dag2) null "find_cycle of a DAG is null")
+      ; self-loop is the smallest cycle: a -> a
+      (bind ((selfg (assoc (map_of) "a" (list_of "a"))))
+        (bind ((sc (find_cycle selfg)))
+          (do
+            (assert_true (not (eq sc null)) "find_cycle finds a self-loop")
+            (assert_true (valid_cycle? selfg sc) "self-loop is a valid closed cycle")
+            (assert_true (deep_eq sc (list_of "a" "a")) "self-loop cycle is [a a]"))))
+      ; transitive_closure of a DAG: a reaches b,c; b reaches c; c reaches none;
+      ; and no node reaches itself (no cycles)
+      (bind ((tc2 (transitive_closure dag2)))
+        (do
+          (assert_eq (size (get tc2 "a")) 2 "tc DAG: a reaches {b,c}")
+          (assert_true (contains (get tc2 "a") "c") "tc DAG: a reaches c transitively")
+          (assert_eq (contains (get tc2 "a") "a") false "tc DAG: a does not reach itself")
+          (assert_eq (size (get tc2 "c")) 0 "tc DAG: sink c reaches nothing")))))
+
+  ; ── fold_right vs fold_left ──────────────────────────────────────────────
+  ; right-fold associates from the right: f("a", f("b", f("c", ".")))
+  (assert_eq
+    (fold_right (lambda (x acc) (string_concat_many x acc)) "." (list_of "a" "b" "c"))
+    "abc." "fold_right right-associates")
+  ; numerically right-fold of subtraction differs from a left-fold:
+  ;   right: 1-(2-(3-0)) = 2 ;  a left-fold would give ((0-1)-2)-3 = -6
+  (assert_eq
+    (fold_right (lambda (x acc) (int_sub x acc)) 0 (list_of 1 2 3))
+    2 "fold_right subtraction 1-(2-(3-0)) = 2")
+
+  ; ── scan ─────────────────────────────────────────────────────────────────
+  (assert_true
+    (deep_eq (scan (lambda (acc x) (int_add acc x)) 0 (list_of 1 2 3)) (list_of 0 1 3 6))
+    "scan running sums")
+
+  ; ── chunk ────────────────────────────────────────────────────────────────
+  (bind ((cs (chunk 2 (list_of 1 2 3 4 5))))
+    (do
+      (assert_eq (length cs) 3 "chunk(2,[1..5]) -> 3 chunks")
+      (assert_true (deep_eq (get cs 0) (list_of 1 2)) "first chunk")
+      (assert_true (deep_eq (get cs 2) (list_of 5)) "last chunk is short")))
+
+  ; ── windows ──────────────────────────────────────────────────────────────
+  (bind ((ws (windows 2 (list_of 1 2 3 4))))
+    (do
+      (assert_eq (length ws) 3 "windows(2,[1..4]) -> 3 windows")
+      (assert_true (deep_eq (get ws 0) (list_of 1 2)) "first window")
+      (assert_true (deep_eq (get ws 2) (list_of 3 4)) "last window")))
+  (assert_eq (length (windows 5 (list_of 1 2 3))) 0 "window larger than list -> empty")
+
+  ; ── zip_with / zip / unzip ───────────────────────────────────────────────
+  (assert_true
+    (deep_eq (zip_with (lambda (a b) (int_add a b)) (list_of 1 2 3) (list_of 10 20 30))
+             (list_of 11 22 33))
+    "zip_with +")
+  (assert_eq
+    (length (zip_with (lambda (a b) (int_add a b)) (list_of 1 2) (list_of 10 20 30)))
+    2 "zip_with stops at the shorter")
+  (bind ((u (unzip (zip (list_of 1 2 3) (list_of "a" "b" "c")))))
+    (do
+      (assert_true (deep_eq (get u "first") (list_of 1 2 3)) "unzip firsts")
+      (assert_true (deep_eq (get u "second") (list_of "a" "b" "c")) "unzip seconds")))
+
+  ; ── group_by / sort_by facades ───────────────────────────────────────────
+  (bind ((groups (group_by (list_of 1 2 3 4 5 6) (lambda (x) (int_mod x 2)))))
+    (do
+      (assert_eq (length (get groups 0)) 3 "group_by evens")
+      (assert_eq (length (get groups 1)) 3 "group_by odds")))
+  (assert_true (deep_eq (sort_by (list_of 3 1 2) (lambda (x) x)) (list_of 1 2 3)) "sort_by")
+
+  ; ── traverse_result ──────────────────────────────────────────────────────
+  (bind ((all_ok (traverse_result (list_of (ok 1) (ok 2) (ok 3)))))
+    (do
+      (assert_true (ok? all_ok) "traverse_result of all ok is ok")
+      (assert_true (deep_eq (get all_ok "value") (list_of 1 2 3)) "traverse_result collects the values")
+      (assert_eq (sum (get all_ok "value")) 6 "collected values sum to 6")))
+  (bind ((has_err (traverse_result (list_of (ok 1) (err "E1" "boom") (ok 3)))))
+    (do
+      (assert_true (err? has_err) "traverse_result short-circuits on err")
+      (assert_eq (error_code has_err) "E1" "returns the first err")))
+
+  ; ── traverse_option ──────────────────────────────────────────────────────
+  (bind ((all_some (traverse_option (list_of (some 1) (some 2)))))
+    (do
+      (assert_true (some? all_some) "traverse_option of all some is some")
+      (assert_true (deep_eq (option_unwrap all_some) (list_of 1 2)) "collected option values")))
+  (assert_true (none? (traverse_option (list_of (some 1) (none) (some 3))))
+    "traverse_option short-circuits on none")
+  true)

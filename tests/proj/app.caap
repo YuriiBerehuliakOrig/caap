@@ -1,0 +1,6 @@
+; proj/app.caap — uses proj.lib; analyze_source_with_root resolves the
+; imported `helper` to its definition site in lib.caap.
+(module proj.app)
+(use proj.lib helper)
+(defn run () int (helper 21))
+(export run)

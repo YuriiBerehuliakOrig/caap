@@ -1,0 +1,51 @@
+; stdlib/lib/tests/test_comparator.caap — comparator combinators.
+
+;; @area: collections
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.collections.comparator
+     natural reverse by_key by_key_with then_by lexicographic
+     min_with max_with clamp_with least greatest)
+
+(do
+  ; natural structural order
+  (assert_eq (natural 1 2) -1 "1 < 2")
+  (assert_eq (natural 2 2) 0 "2 == 2")
+  (assert_eq (natural "b" "a") 1 "\"b\" > \"a\"")
+  ; reverse flips
+  (assert_eq ((reverse natural) 1 2) 1 "reversed: 1 ranks after 2")
+  ; by_key — compare maps by a field
+  (bind ((by_age (by_key (lambda (p) (get p "age")))))
+    (do
+      (assert_eq (by_age (assoc (map_of) "age" 30) (assoc (map_of) "age" 40)) -1 "30 < 40 by age")
+      (assert_eq (by_age (assoc (map_of) "age" 40) (assoc (map_of) "age" 40)) 0 "equal age")))
+  ; by_key_with — descending by key length
+  (assert_eq ((by_key_with size (reverse natural)) (list_of 1 2) (list_of 1)) -1
+             "longer list ranks first under reverse-by-size")
+  ; then_by / lexicographic — sort by age, tie-break by name
+  (bind ((by_age (by_key (lambda (p) (get p "age"))))
+         (by_name (by_key (lambda (p) (get p "name"))))
+         (cmp (then_by by_age by_name))
+         (lex (lexicographic (list_of by_age by_name)))
+         (al (assoc (map_of) "age" 30 "name" "al"))
+         (bo (assoc (map_of) "age" 30 "name" "bo")))
+    (do
+      (assert_eq (cmp al bo) -1 "same age -> tie-break by name (al < bo)")
+      (assert_eq (lex al bo) -1 "lexicographic agrees")
+      (assert_eq (cmp al al) 0 "fully equal")))
+  ; empty lexicographic = all-equal
+  (assert_eq ((lexicographic (list_of)) 5 9) 0 "empty lexicographic is all-equal")
+  ; min_with / max_with / clamp_with
+  (assert_eq (min_with natural 3 7) 3 "min 3 7 = 3")
+  (assert_eq (max_with natural 3 7) 7 "max 3 7 = 7")
+  (assert_eq (clamp_with natural 5 0 3) 3 "clamp 5 into [0,3] = 3")
+  (assert_eq (clamp_with natural -1 0 3) 0 "clamp -1 into [0,3] = 0")
+  (assert_eq (clamp_with natural 2 0 3) 2 "clamp 2 into [0,3] = 2")
+  ; least / greatest over a list
+  (assert_eq (least natural (list_of 5 2 8 1 9)) 1 "least = 1")
+  (assert_eq (greatest natural (list_of 5 2 8 1 9)) 9 "greatest = 9")
+  (assert_eq (least natural (list_of)) null "least of empty = null")
+  ; greatest by descending = least
+  (assert_eq (greatest (reverse natural) (list_of 5 2 8)) 2 "greatest under reverse = the min")
+  true)

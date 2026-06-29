@@ -1,0 +1,194 @@
+; stdlib/semantics/passes/ssa_licm.caap — loop-invariant code motion that hoists an
+; invariant `(deref r)` of a non-escaping ref, using SSA promotability analysis to
+; prove the read is safe to lift (module stdlib.semantics.passes.ssa_licm).
+;
+; ── Phase-2 unification: THIS module provides the `licm` transform at -O2/-O3 ──
+; `licm_unified_node` composes the invariant-deref hoist (ssa_licm_node) with the
+; conservative licm (licm.caap's licm_node), and `register!` installs it under the name
+; "licm". opt.caap's O2 loads THIS module for "licm" — no separate "ssa_licm" transform;
+; the deref-hoist precision is folded into licm itself. licm.caap stays the conservative
+; core (this module wraps it); the import direction ssa_licm -> licm is the existing one,
+; so no dependency cycle is introduced.
+;
+; ── what this hoists that licm CANNOT ─────────────────────────────────────────
+; licm's totality whitelist (licm_pure?) rejects `deref` outright, so licm NEVER
+; hoists a ref read — even a `(deref r)` whose ref r is never written in the loop and
+; is read every iteration. That read is loop-INVARIANT, but licm leaves it inside.
+;
+; ssa_licm recovers exactly this: an unmutated, NON-ESCAPING ref's `(deref r)` is a
+; loop-invariant pure leaf. Two facts make hoisting it sound:
+;   * r ∈ promotable_refs(body) — the SSA escape analysis proves r never escapes (no
+;     closure/structure captures it), so NOTHING outside the loop body's syntax can
+;     mutate it; the ONLY writes are literal `(set_ref r …)`, which collect_mutated sees;
+;   * r ∉ mutated(loop) — no `(set_ref r …)` in the loop, so r is constant across
+;     iterations. `(deref r)` is also TOTAL (a ref read never throws), so lifting it onto
+;     the loop's zero-trip path can never move a throw.
+; Everything else reuses licm's HARDENED machinery verbatim: the mutated/escape scan
+; (collect_mutated), the deref-of-mutated guard (reads_mutated_ref?), RULE A (bail on
+; ANY nested binder — no inner scope can shadow a hoisted name), RULE B (hygienic hoist
+; name), scope_stable?, and replace_occurrences. We change ONLY the invariant-LEAF set:
+; a promotable-ref deref joins literals/names as a pure leaf. So ssa_licm stays inside
+; licm's proven soundness envelope; the only new claim is "an unmutated non-escaping
+; ref's read is invariant", which the two facts above establish. A larger pure invariant
+; expression OVER such a deref (e.g. `(eq (deref r) k)`, within licm's total whitelist)
+; rides out with it. Bail (return the loop unchanged) is always behaviour-preserving.
+(module stdlib.semantics.passes.ssa_licm)
+
+(use stdlib.syntax.ast
+  call? name? literal? head_of head_is? args_of arg callee name_of sym calln walk)
+(use stdlib.syntax.ir transform free_names)
+(use stdlib.lib.collections.sequence any? all?)
+(use stdlib.semantics.passes.licm
+  pure_head? collect_mutated reads_mutated_ref? bound_names_in scope_stable?
+  has_nested_binder? hygienic_hoist_name replace_occurrences licm_node)
+(use stdlib.semantics.ssa promotable_refs)
+(use stdlib.semantics.passes.registry install_transform!)
+
+; ── purity with the promotable-deref relaxation ───────────────────────────────
+; ssa_pure? — licm_pure?'s total-purity walk, EXCEPT a `(deref r)` for a promotable ref
+; r is a pure LEAF (an invariant ref read; invariant? separately proves r is unmutated).
+; Every other call must still be a total `pure_head?` (eq/ne/not@1/value_type@1) over
+; pure subterms — we add NO new total-op claim, only the promotable-deref leaf.
+(bind ssa_pure?
+  (lambda (self node promo)
+    (cond
+      ((and (call? node) (head_is? node "deref") (name? (arg node 0))
+            (eq (get promo (name_of (arg node 0)) false) true))
+        true)
+      ((literal? node) true)
+      ((name? node) true)
+      ((call? node)
+        (bind ((h (head_of node)))
+          (and (pure_head? h)
+               (and (if (or (eq h "not") (eq h "value_type")) (eq (size (args_of node)) 1) true)
+                    (all? (args_of node) (lambda (a) (self self a promo)))))))
+      (else false))))
+
+; invariant? — pure (with the promotable-deref leaf), no free name mutated, derefs no
+; mutated ref. The free-name + reads_mutated_ref? guards together force the promotable
+; ref of a hoisted deref to be UNMUTATED in the loop (its name is free in `(deref r)`).
+(bind invariant?
+  (lambda (e mutated promo)
+    (and (ssa_pure? ssa_pure? e promo)
+         (and (not (any? (free_names e)
+                     (lambda (fn) (eq (get mutated fn false) true))))
+              (not (reads_mutated_ref? e mutated))))))
+
+; hoistable? — invariant AND a non-trivial computation (a call). A bare `(deref r)` is
+; a call, so an invariant promotable-ref read IS hoistable (the core win).
+(bind hoistable?
+  (lambda (e mutated promo) (and (call? e) (invariant? e mutated promo))))
+
+; find_invariant — the outermost (maximal) hoistable subexpression in a pre-order walk,
+; never descending into a nested binder's scope (lambda/bind/catch). Mirrors licm's walk
+; with `promo` threaded through hoistable?.
+(bind find_invariant_walk
+  (lambda (self node mutated inner_bound promo)
+    (cond
+      ((not (call? node)) null)
+      ((head_is? node "lambda") null)
+      ((head_is? node "bind") null)
+      ((head_is? node "catch") null)
+      ((and (hoistable? node mutated promo) (scope_stable? node inner_bound)) node)
+      (else
+        (bind ((found (ref null)))
+          (do
+            (bind ((rc (self self (callee node) mutated inner_bound promo)))
+              (when (not (eq rc null)) (set_ref found rc)))
+            (for a (args_of node)
+              (when (eq (deref found) null)
+                (bind ((r (self self a mutated inner_bound promo)))
+                  (when (not (eq r null)) (set_ref found r)))))
+            (deref found)))))))
+(bind find_invariant
+  (lambda (node mutated inner_bound promo)
+    (find_invariant_walk find_invariant_walk node mutated inner_bound promo)))
+
+; ── the per-loop driver (mirrors licm_one_while, with promo) ──────────────────
+; ssa_licm_one_while — hoist invariant promotable-deref expressions out of one
+; `(while cond body)`, iterating to a fixpoint (bounded). Bails (RULE A) on an unknown
+; mutation place or ANY nested binder. Each hoist name is hygienic (RULE B).
+(bind ssa_licm_one_while
+  (lambda (node promo)
+    (bind ((mres (collect_mutated node)))
+      (if (or (eq (get mres "unknown") true) (has_nested_binder? node))
+        null
+        (bind ((mutated (get mres "mutated"))
+               (inner_bound (bound_names_in node))
+               (prelude (list_of))
+               (cur_cond (ref (arg node 0)))
+               (cur_body (ref (arg node 1)))
+               (steps (ref 0)) (done (ref false)))
+          (do
+            (while (and (not (deref done)) (lt (deref steps) 64))
+              (bind ((cand
+                       (bind ((fb (find_invariant (deref cur_body) mutated inner_bound promo)))
+                         (if (eq fb null)
+                           (find_invariant (deref cur_cond) mutated inner_bound promo)
+                           fb))))
+                (if (eq cand null)
+                  (set_ref done true)
+                  (bind ((g (hygienic_hoist_name node)))
+                    (do
+                      (append prelude (assoc (map_of) "name" g "value" cand))
+                      (set_ref cur_cond (replace_occurrences (deref cur_cond) cand (sym g)))
+                      (set_ref cur_body (replace_occurrences (deref cur_body) cand (sym g)))
+                      (set_ref steps (int_add (deref steps) 1)))))))
+            (if (eq (size prelude) 0)
+              null
+              (bind ((inner (ref (calln "while" (list_of (deref cur_cond) (deref cur_body)))))
+                     (i (ref (int_sub (size prelude) 1))))
+                (do
+                  (while (ge (deref i) 0)
+                    (bind ((p (get prelude (deref i))))
+                      (do
+                        (set_ref inner
+                          (calln "bind"
+                            (list_of (sym (get p "name")) (get p "value") (deref inner))))
+                        (set_ref i (int_sub (deref i) 1)))))
+                  (deref inner))))))))))
+
+; ── the public core ───────────────────────────────────────────────────────────
+; ssa_licm_node — rewrite every `(while …)` in `node`, bottom-up (inner loops first).
+; promotable_refs is computed ONCE over the whole node (ref names — and thus their
+; non-escape — are stable under the transform, which only hoists reads, never rebinds a
+; ref), and threaded into each loop's hoist.
+; has_while? — does `node` contain any `(while …)`? ssa_licm only rewrites loops, so
+; with no loop the promotable_refs walk + the transform pass are pure no-ops. At -O2/-O3
+; this runs on EVERY located form; gating on a loop's presence (most forms have none)
+; skips that wasted work with ZERO change in result.
+(bind has_while?
+  (lambda (node)
+    (bind ((hit (ref false)))
+      (do (walk node (lambda (n) (when (and (call? n) (head_is? n "while")) (set_ref hit true))))
+          (deref hit)))))
+(bind ssa_licm_node
+  (lambda (node)
+    (if (not (has_while? node))
+      node
+      (bind ((promo (promotable_refs node)))
+        (transform node
+          (lambda (n) (if (head_is? n "while") (ssa_licm_one_while n promo) null)))))))
+
+; ── the UNIFIED licm node: SSA invariant-deref hoist, then the conservative licm ─────
+; licm_unified_node — the SSA-backed `licm` (Phase-2 unification). The COMPOSITION of the
+; two hoists, each behaviour-preserving, so the whole is:
+;   1. ssa_licm_node — hoist an invariant promotable-ref `(deref r)` out of a loop;
+;   2. licm_node — the conservative whitelist hoist, which can now ALSO hoist a pure
+;      invariant expression OVER the deref-name ssa_licm bound just before the loop
+;      (e.g. `(eq g k)`), so composing the two strictly extends what is hoisted.
+; The import direction ssa_licm -> licm already exists (for the hardened helpers), so
+; composing here needs no new edge and no change to licm.caap (it stays the core).
+(bind licm_unified_node
+  (lambda (node) (licm_node (ssa_licm_node node))))
+
+; ── transform entry + registration ───────────────────────────────────────────
+(bind run
+  (lambda (located)
+    (for f located (assoc f "node" (licm_unified_node (get f "node"))))))
+
+; register! — install the UNIFIED LICM under the name "licm" (it SUPERSEDES the
+; conservative licm's registration; opt.caap's O2 loads THIS module for "licm").
+(bind register! (lambda () (install_transform! "licm" run)))
+
+(export ssa_licm_node licm_unified_node run register!)

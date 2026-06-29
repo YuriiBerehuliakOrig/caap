@@ -1,0 +1,134 @@
+; stdlib/lib/tests/test_grant_for_attenuation.caap — SCOPED grants ATTENUATE
+; (stdlib.sys.grant_for), the with-grant side.
+;
+; test_grant_for.caap pins the UNGRANTED contract (every take is null when
+; sys_grants never ran). This file pins the OTHER half — that once a grant IS
+; registered, the scoped takes hand back STRICTLY LESS than the umbrella and a
+; taker cannot widen back to it. The runner never runs boot/sys_grants.caap (that
+; needs the real `sys` capability), so — exactly as test_sys_wrap drives the
+; facade generator on a synthetic op table — this test registers a SYNTHETIC
+; grant directly into the compiler registry under the same key grant_of reads
+; (stdlib.sys.grant.<lib> = { capability, raw }). The "capability" is a sentinel
+; value and each raw op a plain (cap arg…) callable, so we can OBSERVE that:
+;   - grant_for_operation narrows to ONE op: the granted op works in-scope (the
+;     handle is partially applied away, so the taker calls (op arg), never
+;     (op <handle> arg)), while a DIFFERENT op of the SAME library is reachable
+;     only as its OWN separate take, and an unknown op is null;
+;   - grant_for_module gives a SINGLE-library view that cannot reach ANOTHER
+;     library's grant, and whose fresh `raw` is DECOUPLED from the live registry
+;     (mutating the view's copy does not mutate the registry, and vice versa).
+; Together these attest the policy in docs/mechanisms/stdlib-sys-grant-policy.md:
+; the scoped takes hand out LESS than the umbrella, never more.
+
+;; @area: sys
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true assert_false assert_nil)
+(use stdlib.sys.grant_for grant_of grant_for_operation grant_for_module)
+
+(do
+  ; ---- mock the registry the way sys_grants.caap would, but synthetically. ----
+  ; Two libraries, each with their own ops, so we can probe sibling-op and
+  ; cross-library reach. The "capability" is a sentinel STRING (a real grant's
+  ; handle is an opaque value); each raw op is a (cap arg) callable that folds the
+  ; sentinel into its result, so a passing positive case PROVES the handle was
+  ; partially applied by grant_for_operation (the taker never passes it).
+  (bind (
+    (cap_a "CAP-A")
+    (cap_b "CAP-B")
+    ; lib A: read_text + write_text (siblings under one grant)
+    (raw_a (assoc (map_of)
+             "read_text"  (lambda (cap arg) (string_concat_many cap ":read:" arg))
+             "write_text" (lambda (cap arg) (string_concat_many cap ":write:" arg))))
+    ; lib B: a distinct op, to prove A's takes cannot reach B
+    (raw_b (assoc (map_of)
+             "send" (lambda (cap arg) (string_concat_many cap ":send:" arg))))
+    (lib_a "__attn_lib_a")
+    (lib_b "__attn_lib_b")
+    ; NB — no registry cleanup, by design. The corpus loads each test file in its
+    ; OWN fresh session clone (common::eval_ok), and the keys above are unique to
+    ; this file, so the synthetic grants cannot leak into another test. A cleanup
+    ; is ALSO impossible here: ctfe_compiler_register_value REFUSES overwrites
+    ; (registry.rs), so "dropping" a key by re-registering it null would itself
+    ; raise "compiler registry already contains …".
+  )
+    (do
+      (ctfe_compiler_register_value compiler
+        (string_concat_many "stdlib.sys.grant." lib_a)
+        (assoc (map_of) "capability" cap_a "raw" raw_a))
+      (ctfe_compiler_register_value compiler
+        (string_concat_many "stdlib.sys.grant." lib_b)
+        (assoc (map_of) "capability" cap_b "raw" raw_b))
+
+      ; run the assertions directly: eval_ok turns any throw (a failed assert)
+      ; into a named test failure, so no try/catch cleanup wrapper is needed.
+      (do
+          ; sanity: grant_of now finds the registered umbrella grant for lib A.
+          (assert_true (not (eq (grant_of lib_a) null))
+            "grant_of finds the registered grant for lib A")
+
+          ; ---- (1) grant_for_operation narrows to exactly ONE op. ------------
+          ; The granted op WORKS in-scope, with the handle partially applied
+          ; away: the taker calls (op arg) and the result carries the sentinel,
+          ; proving grant_for_operation — not the taker — supplied the handle.
+          (bind ((read_text (grant_for_operation lib_a "read_text")))
+            (do
+              (assert_true (not (eq read_text null))
+                "grant_for_operation hands back the granted op as a callable")
+              (assert_eq (read_text "/x") "CAP-A:read:/x"
+                "the granted op works in-scope with the handle partially applied")))
+
+          ; a DIFFERENT op of the SAME library is reachable only as ITS OWN
+          ; narrow take — the read_text take above did NOT widen to it.
+          (bind ((write_text (grant_for_operation lib_a "write_text")))
+            (assert_eq (write_text "/y") "CAP-A:write:/y"
+              "a sibling op is reachable only as its OWN separate narrow take"))
+
+          ; an UNKNOWN op of a GRANTED library is null, not a fabricated callable
+          ; — the narrow take cannot manufacture a new op (this exercises the
+          ; present-grant/absent-op path, since lib A IS granted above).
+          (assert_nil (grant_for_operation lib_a "no_such_op")
+            "an unknown op of a granted library is null (no fabrication)")
+
+          ; the narrow take never hands back the capability handle itself: the
+          ; return is a bare callable, never the { capability, raw } grant map —
+          ; so a single-op taker cannot read the handle and re-project new ops.
+          (assert_false (eq (value_type (grant_for_operation lib_a "read_text")) "map")
+            "grant_for_operation returns a bare callable, never the grant map/handle")
+
+          ; ---- (2) grant_for_module is a SINGLE-library, DECOUPLED view. -----
+          (bind ((view_a (grant_for_module "stdlib.example.a" lib_a)))
+            (do
+              (assert_true (not (eq view_a null))
+                "grant_for_module hands back a view for a granted library")
+              (assert_eq (get view_a "for_module") "stdlib.example.a"
+                "the view records the module it was minted for")
+              ; the view exposes ONLY lib A's ops — not lib B's `send`.
+              (bind ((view_raw (get view_a "raw")))
+                (do
+                  (assert_true (not (eq (get view_raw "read_text" null) null))
+                    "the single-library view exposes its own library's ops")
+                  (assert_nil (get view_raw "send" null)
+                    "the single-library view cannot reach ANOTHER library's op")))
+
+              ; DECOUPLING: the view's `raw` is a FRESH copy, so adding a key to
+              ; it must NOT reach back into the live registry grant. Maps mutate
+              ; in place, so were the view sharing the registry's raw map, this
+              ; assoc would land in the registry and the assertion would fail.
+              (bind ((view_raw (get view_a "raw")))
+                (do
+                  (assoc view_raw "smuggled" (lambda (cap arg) "X"))
+                  ; the live registry grant is untouched by the view-side mutation
+                  (assert_nil (get (get (grant_of lib_a) "raw") "smuggled" null)
+                    "mutating the view's raw does NOT mutate the live registry grant")
+                  ; and the smuggled key is not reachable through the live grant
+                  (assert_nil (grant_for_operation lib_a "smuggled")
+                    "the smuggled op is not reachable through the live grant")))))
+
+          ; a view for lib A genuinely cannot manufacture lib B's authority: B is
+          ; reachable only via ITS OWN grant, never through A's scoped view.
+          (bind ((view_a (grant_for_module "stdlib.example.a" lib_a)))
+            (assert_nil (get (get view_a "raw") "send" null)
+              "lib A's view cannot reach lib B's grant (cross-library isolation)"))
+
+          null))))

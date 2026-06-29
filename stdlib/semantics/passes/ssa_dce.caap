@@ -1,0 +1,417 @@
+; stdlib/semantics/passes/ssa_dce.caap — SSA-based dead-store / dead-code
+; elimination as a whole-module TRANSFORM (module stdlib.semantics.passes.ssa_dce).
+;
+; ── Phase-2 unification: THIS module provides the `dead_store` transform at -O3 ──
+; `dead_store_unified_node` composes the SSA cross-control elimination (ssa_dce_node,
+; below) with the conservative straight-line dead_store (dead_store.caap's
+; dead_store_node), and `register!` installs it under the name "dead_store". opt.caap's
+; O3 loads THIS module for "dead_store" — there is no longer a separate "ssa_dce"
+; transform; the SSA precision is folded into dead_store itself. dead_store.caap stays
+; the conservative core (this module wraps it); the import direction ssa_dce ->
+; dead_store is the existing one, so no dependency cycle is introduced.
+;
+; ── what this removes that the straight-line dead_store CANNOT ────────────────
+; The conservative `dead_store` pass (its sibling) is provably sound by acting ONLY
+; on a flat straight-line `(do …)` with no control flow: a body containing an `if`
+; makes it BAIL (remove nothing). So a store that is dead ACROSS a control-flow
+; merge — assigned on each arm of an `if`, then UNCONDITIONALLY overwritten before
+; any read — is left intact by `dead_store`, because the body is not straight-line.
+;
+; This pass removes exactly that case. It works in SSA FORM (stdlib.semantics.ssa),
+; where a control-flow merge of a ref is an EXPLICIT φ and every write is a single-
+; assignment VERSION binding. The SSA use-def chain (not block-granular liveness)
+; proves whether ANY read observes a version — across arms, merges, everything — so
+; a version with no observing read is provably dead even when it sits on an if-arm.
+;
+; ── the worked example (THE win) ─────────────────────────────────────────────
+;   (bind "r" (ref 0)
+;     (do (if c (set_ref r 9) (set_ref r 8))   ; ← arm-stores r:=9 / r:=8
+;         (set_ref r 2)                          ; ← unconditional overwrite
+;         (deref r)))                            ; ← the only read sees r=2
+; to_ssa promotes r and emits (rendered):
+;   (bind "r__0" 0
+;     (bind "r__3" (if c (bind "r__1" 9 r__1) (bind "r__2" 8 r__2))
+;        (__phi__ r__1 r__2)                     ; ← the merge witness
+;        (bind "r__4" 2 r__4)))
+; Here r__1 (=9) and r__2 (=8) are each used ONLY by the φ; the φ defines the merged
+; version r__3; r__3 has ZERO uses (it is overwritten by r__4 before the deref reads
+; r__4). So r__1/r__2 are TRANSITIVELY dead (their one use is a φ whose merged
+; version is dead). Both have a pure literal value, so dropping their version-binders
+; is sound — and removes the dead arm-stores the straight-line pass leaves behind.
+;
+; ── the analysis: transitive deadness through φ ──────────────────────────────
+; A VERSION `ver` is DEAD when EVERY recorded use of it is "discounted": a use that
+; is a φ node whose MERGED version is itself dead does not count (a value consumed
+; only by a dead φ is dead). A use that is NOT a φ (a `(deref …)` materialised as a
+; version read) is a REAL read and keeps the version live. Iterated to a FIXPOINT:
+;   * seed: every version with ZERO recorded uses is dead.
+;   * relax: a version all of whose uses are φ-args of already-dead-merged φs is dead.
+; `ssa_version_uses` gives the use nodes; `ssa_phis` + a scan of the SSA node give the
+; φ→merged-version map (a φ sits as a statement inside its merged version's binder).
+;
+; ── the transform: drop a dead, PURE version-binder ──────────────────────────
+; For each version proven dead whose defining value is `pure_value?` (the SAME total-
+; AND-effect-free classifier the straight-line dead_store uses — only a value that can
+; neither throw nor have an effect may be deleted), we DROP its version binder
+; `(bind "ver" val rest…)`, splicing `rest…` in its place. The version name may still
+; appear in `rest` as the SSA tail self-read `(bind "ver" val ver)`; since `val` is
+; pure+total, we substitute `val` for every remaining `(sym ver)` (sound: re-
+; evaluating a pure+total value changes nothing). The φ statement that referenced the
+; version is left for `from_ssa` to drop (it never erases a φ's effect — a φ has
+; none). Finally `from_ssa` materialises executable IR with NO φ surviving.
+;
+; ── soundness / conservatism ─────────────────────────────────────────────────
+; CONSERVATIVE by construction, in three independent ways:
+;   * UNSUPPORTED bodies are returned VERBATIM (to_ssa is identity on them, but we
+;     also guard explicitly): nothing is ever touched outside the SSA-promotable case.
+;   * Only a version PROVEN to have zero transitive (φ-discounted) uses is dropped —
+;     the SSA use-def chain is exact, so this is correct across control flow.
+;   * Only a version whose value is `pure_value?` (no effect, total — cannot throw on
+;     any input) is dropped; an effectful or possibly-throwing value is KEPT, so no
+;     effect is lost and no throw is suppressed.
+; A missed drop is fine; a wrong drop would be a miscompile, and every gate above
+; forbids one. Round-trip behaviour preservation (eval before == eval after) is the
+; floor the test corpus asserts on the win, a live store, an effectful value, and a
+; while loop (bail).
+;
+; Opt-in: register! installs it as a load-time transform (not in the base pipeline).
+(module stdlib.semantics.passes.ssa_dce)
+
+(use stdlib.syntax.ast
+  call? name? args_of name_of callee call mkbind bind_pairs walk)
+(use stdlib.semantics.ssa
+  to_ssa from_ssa supported? promotable_refs ssa_node ssa_view
+  ssa_phis ssa_version_def ssa_version_uses ssa_versions is_phi?)
+(use stdlib.semantics.passes.dead_store pure_value? dead_store_node)
+(use stdlib.semantics.passes.registry install_transform!)
+
+; ── φ → merged version ───────────────────────────────────────────────────────
+; phi_merged_versions — walk the SSA node and map EACH φ STATEMENT to the version
+; it merges into. The SSA layout binds the merged version with the φ as a no-op
+; statement in its binder body:  (bind "r__m" (if …) (__phi__ a b) <rest>). So a φ
+; that appears as a statement of a `(bind "r__m" …)` body has merged version r__m.
+; We return a map keyed by the φ's argument signature ("a|b|…") -> merged version.
+; (Two φ with the same arg signature are degenerate and would collide, but distinct
+; merges have distinct argument versions in SSA, so the signature is a stable key.)
+(bind phi_sig
+  (lambda (phi_node)
+    (bind ((parts (list_of)))
+      (do
+        (for a (args_of phi_node)
+          (append parts (if (name? a) (name_of a) (value_to_string a))))
+        (sequence_join parts "|")))))
+
+(bind phi_merged_versions
+  (lambda (node)
+    (bind ((out (map_of)))
+      (do
+        (walk node
+          (lambda (n)
+            (when (and (call? n) (not (eq (bind_pairs n) null)))
+              (bind ((bp (bind_pairs n)) (pairs (get bp "pairs")) (bdy (get bp "body")))
+                (when (gt (size pairs) 0)
+                  (bind ((merged (get (get pairs 0) "name")))
+                    (for s bdy
+                      (when (and (call? s) (is_phi? s))
+                        (assoc out (phi_sig s) merged)))))))))
+        out))))
+
+; ── per-version φ-argument occurrences ───────────────────────────────────────
+; sig_of_names — the φ signature ("a|b|…") computed straight from a list of version-
+; name STRINGS (how ssa_phis records a φ's args). It matches phi_sig's output for a
+; φ whose args are all `(sym name)` nodes — the SSA-form φ shape — so it keys into the
+; same merged map phi_merged_versions built from the live φ nodes.
+(bind sig_of_names
+  (lambda (names) (sequence_join names "|")))
+
+; phi_arg_merges — map each VERSION to the LIST of merged versions of the φ that
+; list it as an argument. A version `r__1` that feeds the φ `(__phi__ r__1 r__2)`
+; (which defines the merged version `r__3`) gets `r__1 -> [r__3]`. When a version
+; feeds several φ (rare) it accumulates each merged version. A version's recorded
+; USE for a φ-fed arm is the arm-tail read that produces the merged value (the SSA
+; transform records it as a plain `(sym ver)` read, NOT as the φ node), so we read
+; the arg→merge relationship from `ssa_phis` (the φ list), not from the use nodes.
+(bind phi_arg_merges
+  (lambda (w)
+    (bind ((merged (phi_merged_versions (ssa_node w))) (out (map_of)))
+      (do
+        (for p (ssa_phis w)
+          (bind ((args (get p "args" (list_of))) (m (get merged (sig_of_names args) null)))
+            (when (not (eq m null))
+              (for a args
+                (do
+                  (when (eq (get out a null) null) (assoc out a (list_of)))
+                  (append (get out a) m))))))
+        out))))
+
+; ── transitive deadness through φ ────────────────────────────────────────────
+; dead_versions — the SET (version -> true) of versions with NO transitive,
+; φ-discounted uses, computed to a FIXPOINT.
+;
+; A version `ver` is DEAD when every recorded USE of it is "accounted for" by a φ
+; whose merged version is itself dead. Concretely: let `nuses` be the number of
+; recorded uses of `ver` and `dead_merge_args` be the number of φ-argument
+; occurrences of `ver` whose merged version is ALREADY known dead. Each φ-fed arm
+; contributes EXACTLY one recorded use (the arm-tail read the φ merges), so when
+; every use is covered by a dead-merge φ-arg (`nuses <= dead_merge_args`), no LIVE
+; read observes `ver` and it is dead. A use NOT covered by a dead φ (a real
+; `(deref …)`) keeps `ver` live. Zero uses is trivially dead. Relaxed to a FIXPOINT
+; (a φ merge becoming dead can make its argument versions dead, and so on).
+(bind dead_versions
+  (lambda (w)
+    (bind (
+      (vers (ssa_versions w))
+      (arg_merges (phi_arg_merges w))
+      (dead (map_of))
+    )
+      (do
+        (bind (
+          ; ver_dead? — are all recorded uses of `ver` covered by dead-merge φ args?
+          (ver_dead?
+            (lambda (ver)
+              (bind (
+                (nuses (size (ssa_version_uses w ver)))
+                (merges (get arg_merges ver (list_of)))
+                (covered (ref 0))
+              )
+                (do
+                  (for m merges
+                    (when (eq (get dead m false) true)
+                      (set_ref covered (int_add (deref covered) 1))))
+                  (le nuses (deref covered))))))
+          (changed (ref true))
+        )
+          (do
+            ; fixpoint: keep relaxing while any version newly becomes dead.
+            (while (deref changed)
+              (do
+                (set_ref changed false)
+                (for ver vers
+                  (when (and (not (eq (get dead ver false) true)) (ver_dead? ver))
+                    (do (assoc dead ver true) (set_ref changed true))))))
+            dead))))))
+
+; ── drop one dead, pure version binder (LOCAL, with a safety bail) ────────────
+; drop_version — remove the binder `(bind "ver" val rest…)` for the dead, pure
+; version `ver`: substitute `val` for every read `(sym ver)` IN ITS OWN BODY (the SSA
+; tail self-read), then splice the body in place of the binder. `mkbind` collapses a
+; binder with no remaining pairs to `(do rest…)` / the single body form. Recurses
+; everywhere else so a nested binder is reached.
+;
+; SAFETY BAIL: a version's reads are normally confined to its binder body, but in a
+; multi-ref co-promotion the SSA `do`-threading can leave a read of `ver` in the
+; ENCLOSING scope (outside its `(bind "ver" …)` form) and the binder's value subtree
+; can be SHARED by another version's recorded def — removing it would strand a name or
+; corrupt that other computation. So after building the candidate result we CHECK
+; whether any `(sym ver)` survives ANYWHERE; if one does, the drop would have stranded
+; it, so we KEEP the original node unchanged (conservative — a missed drop, never a
+; miscompile). This is what restricts removal to the clean, single-scope case.
+(bind subst_in_body
+  (lambda (self node ver val)
+    (cond
+      ((and (name? node) (eq (name_of node) ver)) val)
+      ((not (call? node)) node)
+      (else
+        (call (self self (callee node) ver val)
+          (bind ((out (list_of)))
+            (do
+              (for a (args_of node) (append out (self self a ver val)))
+              out)))))))
+
+(bind splice_one
+  (lambda (self node ver val)
+    (cond
+      ((not (call? node)) node)
+      ((not (eq (bind_pairs node) null))
+        (bind ((bp (bind_pairs node)) (pairs (get bp "pairs")) (bdy (get bp "body")))
+          (if (and (gt (size pairs) 0) (eq (get (get pairs 0) "name") ver))
+            ; ver's binder: drop the first pair; substitute val into the body (the SSA
+            ; tail self-read); keep any later pairs as binders over it.
+            (bind ((rest_pairs (list_of)) (i (ref 1)) (new_body (list_of)))
+              (do
+                (while (lt (deref i) (size pairs))
+                  (do (append rest_pairs (get pairs (deref i)))
+                      (set_ref i (int_add (deref i) 1))))
+                (for b bdy (append new_body (subst_in_body subst_in_body b ver val)))
+                (mkbind rest_pairs new_body)))
+            ; another binder: recurse into pair values + body.
+            (bind ((op (list_of)) (ob (list_of)))
+              (do
+                (for p pairs
+                  (append op (assoc (map_of) "name" (get p "name")
+                               "value" (self self (get p "value") ver val))))
+                (for b bdy (append ob (self self b ver val)))
+                (mkbind op ob))))))
+      (else
+        (call (self self (callee node) ver val)
+          (bind ((out (list_of)))
+            (do
+              (for a (args_of node) (append out (self self a ver val)))
+              out)))))))
+
+; mentions_outside_phi? — does `(sym nm)` appear anywhere in `node` OTHER THAN inside a
+; `(__phi__ …)` node? A residual reference inside a φ is harmless — from_ssa erases
+; every φ, so a `(sym ver)` that survives ONLY as a φ argument is never evaluated. We
+; therefore skip φ subtrees when checking for a STRANDED (would-be-evaluated) read.
+(bind mentions_outside_phi?
+  (lambda (self node nm)
+    (cond
+      ((and (name? node) (eq (name_of node) nm)) true)
+      ((not (call? node)) false)
+      ((is_phi? node) false)                       ; φ args are erased by from_ssa
+      (else
+        (or (self self (callee node) nm)
+            (bind ((hit (ref false)))
+              (do
+                (for a (args_of node)
+                  (when (self self a nm) (set_ref hit true)))
+                (deref hit))))))))
+
+(bind drop_version
+  (lambda (node ver val)
+    (bind ((candidate (splice_one splice_one node ver val)))
+      ; conservative bail: if a read of ver would be STRANDED (the version escaped its
+      ; binder body into the enclosing scope, or its binder's value subtree is shared by
+      ; another version's def — both arise only in multi-ref co-promotions), keep the
+      ; node unchanged. A residual ref inside a φ is fine (from_ssa erases φ), so it is
+      ; not counted. A missed drop, never a miscompile.
+      (if (mentions_outside_phi? mentions_outside_phi? candidate ver) node candidate))))
+
+; ── round-trip well-scopedness guard ─────────────────────────────────────────
+; This pass TRUSTS the SSA round-trip: it assumes `from_ssa(to_ssa(body))` evaluates
+; exactly as `body` for every SUPPORTED body (the cardinal invariant of ssa.caap). If
+; to_ssa ever produces a structure where a versioned name `X__N` is REFERENCED but not
+; BOUND — a co-promotion / scoping defect — then the round-trip is already broken for
+; that body, BEFORE this pass touches anything, and we must NOT trust it. So we verify
+; the PLAIN round-trip is well-scoped over its version names and BAIL (return `body`
+; verbatim) if it is not. This makes the pass robust to any such upstream defect: a
+; missed optimisation on a quirky body, never a miscompile.
+
+; version_name? — does the identifier `nm` look like an SSA version (`base__N`)? We key
+; only on the reserved `__` segment (the version separator ver_name uses), which a
+; written user identifier can never contain (the checker forbids `__` in source).
+(bind version_name?
+  (lambda (nm)
+    (bind ((hit (ref false)) (i (ref 0)) (n (if (eq nm null) 0 (size nm))))
+      (do
+        (while (lt (deref i) (int_sub n 1))
+          (do
+            (when (and (eq (string_slice nm (deref i) (int_add (deref i) 1)) "_")
+                       (eq (string_slice nm (int_add (deref i) 1) (int_add (deref i) 2)) "_"))
+              (set_ref hit true))
+            (set_ref i (int_add (deref i) 1))))
+        (deref hit)))))
+
+; version_well_scoped? — is every REFERENCED version name (`(sym X__N)`) in LEXICAL
+; SCOPE at its reference site? A LEXICAL check (not mere global boundness): a canonical
+; `(bind "v1" e1 "v2" e2 … body…)` is let* — each pair name scopes over LATER pair
+; values and the body, but NOT over earlier ones, and NOT outside the form. We thread
+; the in-scope version-name set `env` (a map name->true) accordingly. A `(sym X__N)`
+; whose name is not in `env` is a STRANDED reference — the SSA round-trip put a version
+; out of scope (an upstream to_ssa scoping defect), so the round-trip is not trustworthy
+; and we must bail. Non-version names are ignored (the body's ordinary identifiers are
+; out of our concern; we only police the versions to_ssa introduced).
+(bind version_well_scoped?
+  (lambda (node)
+    (bind ((ok (ref true)))
+      (do
+        (bind (
+          (env_has? (lambda (env nm) (eq (get env nm false) true)))
+          (env_with
+            (lambda (env nm)
+              (bind ((c (map_of)))
+                (do (for k (map_keys env) (assoc c k true)) (assoc c nm true) c))))
+          (scan
+            (lambda (self n env)
+              (cond
+                ((and (name? n) (not (eq (name_of n) null)) (version_name? (name_of n)))
+                  (when (not (env_has? env (name_of n))) (set_ref ok false)))
+                ((not (call? n)) null)
+                ; canonical bind: let* — extend env per pair (over later values + body).
+                ((not (eq (bind_pairs n) null))
+                  (bind ((bp (bind_pairs n)) (pairs (get bp "pairs")) (bdy (get bp "body"))
+                         (cur (ref env)))
+                    (do
+                      (for p pairs
+                        (do
+                          (self self (get p "value") (deref cur))
+                          (when (version_name? (get p "name"))
+                            (set_ref cur (env_with (deref cur) (get p "name"))))))
+                      (for b bdy (self self b (deref cur))))))
+                ; any other call: recurse into callee + args under the same env.
+                (else
+                  (do
+                    (self self (callee n) env)
+                    (for a (args_of n) (self self a env)))))))
+        )
+          (scan scan node (map_of)))
+        (deref ok)))))
+
+; ── the core: drop every dead pure version, then materialise executable IR ────
+; ssa_dce_node — SSA-based dead-store / dead-code elimination over ONE body form.
+;   1. ssa = to_ssa(body); if NOT supported?, return body verbatim (conservative).
+;   2. guards — return body verbatim (touch nothing) unless BOTH hold:
+;      (a) exactly ONE ref is promoted. With several refs co-promoted, to_ssa threads
+;          each renamer over the others' merge subtrees, which can mis-yield an arm
+;          (a value that is BOUND in the round-trip but semantically wrong). A lexical-
+;          scope check cannot see a wrong-but-bound value, so we conservatively decline
+;          the multi-ref case entirely; the single-ref case is what the win needs.
+;      (b) the PLAIN round-trip is version-well-scoped (every `(sym X__N)` is in lexical
+;          scope). A stranded version name means to_ssa put a version out of scope on
+;          this body, so the round-trip is not behaviour-faithful and we must not trust
+;          it. Together (a)+(b) keep us on bodies where the round-trip is sound.
+;   3. compute the transitively-dead version set; for each dead version whose def
+;      value is pure_value?, drop its version binder (substituting its pure value).
+;   4. from_ssa the rewritten SSA node -> executable IR (no φ survives).
+; Because the SSA use-def chain proves no read observes a dropped version, the result
+; is behaviour-preserving even across control flow.
+(bind ssa_dce_node
+  (lambda (body)
+    (if (not (supported? body))
+      body
+      (if (not (eq (size (map_keys (promotable_refs body))) 1))
+        body                                          ; guard (a): single promoted ref
+        (bind (
+          (w (to_ssa body))
+          (node (ref (ssa_node w)))
+        )
+          ; guard (b): the plain round-trip must be version-well-scoped.
+          (if (not (version_well_scoped? (from_ssa w)))
+            body
+            (bind ((dead (dead_versions w)))
+              (do
+                ; drop each dead version whose defining value is pure (no effect, total).
+                (for ver (ssa_versions w)
+                  (when (eq (get dead ver false) true)
+                    (bind ((val (ssa_version_def w ver)))
+                      (when (and (not (eq val null)) (pure_value? val))
+                        (set_ref node (drop_version (deref node) ver val))))))
+                ; materialise: from_ssa over the rewritten node + the original view.
+                (from_ssa (assoc (map_of) "node" (deref node) "view" (ssa_view w)))))))))))
+
+; ── the UNIFIED dead_store node: SSA cross-control kill, then the conservative pass ─
+; dead_store_unified_node — the SSA-backed `dead_store`. The COMPOSITION of the two
+; dead-store eliminations, each behaviour-preserving, so the whole is:
+;   1. ssa_dce_node — kills a store dead ACROSS control flow (a value overwritten on a
+;      later path before any read), bailing to identity on any unsupported body;
+;   2. dead_store_node — the conservative straight-line elimination, catching the
+;      flat-spine dead stores SSA's promotability gate declines.
+; Phase-2 unification: ONE `dead_store` transform that tries SSA first and falls back
+; to the conservative path. The import direction ssa_dce -> dead_store already exists
+; (for pure_value?), so composing here needs no new edge or change to dead_store.caap.
+(bind dead_store_unified_node
+  (lambda (node) (dead_store_node (ssa_dce_node node))))
+
+; ── transform plumbing (mirrors dead_store / ccp) ────────────────────────────
+; run — the transform entry: rewrite every located form IN PLACE.
+(bind run
+  (lambda (located)
+    (for f located
+      (assoc f "node" (dead_store_unified_node (get f "node"))))))
+
+; register! — install the UNIFIED dead-store elimination under the name "dead_store"
+; (SUPERSEDES the conservative dead_store's registration; opt.caap's O3 loads THIS
+; module for "dead_store"). Idempotent.
+(bind register! (lambda () (install_transform! "dead_store" run)))
+
+(export ssa_dce_node dead_store_unified_node run register!)

@@ -1,0 +1,211 @@
+; stdlib/lib/collections/graph.caap — graphs as data + DOT rendering
+; (module stdlib.lib.collections.graph).
+;
+; A graph is a plain map: node -> list of successor nodes. The loader's
+; dependency graph (stdlib.load "dep_graph") has exactly this shape, and so
+; does any adjacency map you build by hand. Queries are TOTAL (a node with no
+; entry has no successors); edits are PURE (fresh maps, input untouched);
+; to_dot renders any such map for Graphviz.
+(module stdlib.lib.collections.graph)
+
+(use stdlib.lib.collections.sequence each fold)
+
+(bind esc
+  (lambda (s) (string_replace s "\"" "\\\"")))
+
+; ── queries (total) ─────────────────────────────────────────────────────────
+
+; nodes — the declared nodes (the adjacency map's keys).
+;   g  : the graph
+;   -> : a list of node keys (successor-only nodes are not listed)
+(bind nodes (lambda (g) (map_keys g)))
+
+; successors — the out-neighbours of `n`, or [] when `n` is unknown.
+;   g / n : the graph and a node
+;   ->    : the successor list (empty for a node with no entry)
+(bind successors (lambda (g n) (get g n (list_of))))
+
+; has_node? — is `n` a declared node of `g`?
+;   g / n : the graph and a node
+;   ->    : bool
+(bind has_node? (lambda (g n) (contains g n)))
+
+; has_edge? — is there an edge `from -> to`?
+;   g / from / to : the graph and the two endpoints
+;   ->            : bool (false when `from` is unknown)
+(bind has_edge?
+  (lambda (g from to)
+    (bind ((out (ref false)))
+      (do
+        (each (successors g from) (lambda (d) (when (eq d to) (set_ref out true))))
+        (deref out)))))
+
+; node_count — how many nodes are declared.
+;   g  : the graph
+;   -> : int
+(bind node_count (lambda (g) (size g)))
+
+; predecessors — the in-neighbours of `n`: every node with an edge `m -> n`.
+; There is no reverse index, so this scans every edge (O(V+E)). A node with
+; parallel edges into `n` appears once per edge (mirroring successors' handling
+; of parallel edges).
+;   g / n : the graph and a node
+;   ->    : a fresh list of predecessor nodes (empty when `n` has none)
+(bind predecessors
+  (lambda (g n)
+    (bind ((out (list_of)))
+      (do
+        (each (map_keys g)
+          (lambda (m)
+            (each (get g m (list_of))
+              (lambda (d) (when (eq d n) (append out m))))))
+        out))))
+
+; out_degree — how many edges leave `n` (parallel edges counted); 0 when `n`
+; is unknown.
+;   g / n : the graph and a node
+;   ->    : int
+(bind out_degree (lambda (g n) (size (get g n (list_of)))))
+
+; in_degree — how many edges enter `n` (parallel edges counted). Scans every
+; edge, like predecessors.
+;   g / n : the graph and a node
+;   ->    : int
+(bind in_degree (lambda (g n) (size (predecessors g n))))
+
+; edge_count — the total number of edges (counting parallel edges).
+;   g  : the graph
+;   -> : int
+(bind edge_count
+  (lambda (g)
+    (fold (map_keys g) 0
+      (lambda (acc n) (int_add acc (size (get g n (list_of))))))))
+
+; ── edits (pure; each yields a fresh graph) ─────────────────────────────────
+
+; add_edge — a fresh graph with `from -> to` added.
+;   g / from / to : the graph and the two endpoints
+;   ->            : a fresh graph; `from` (and `to`, as an isolated node) are
+;                   created if absent, so the result is always well-formed
+(bind add_edge
+  (lambda (g from to)
+    (bind ((out (map_of)))
+      (do
+        ; copy every existing adjacency list (fresh, so input is untouched)
+        (for n (map_keys g)
+          (bind ((adj (list_of)))
+            (do (each (get g n (list_of)) (lambda (d) (append adj d)))
+                (assoc out n adj))))
+        ; ensure both endpoints exist, then append the new edge
+        (unless (contains out from) (assoc out from (list_of)))
+        (unless (contains out to)   (assoc out to (list_of)))
+        (append (get out from) to)
+        out))))
+
+; add_node — a fresh graph with `n` present as a node (an isolated node when it
+; was absent). IDEMPOTENT: if `n` already has an entry its successor list is
+; copied through unchanged. Input untouched.
+;   g / n : the graph and the node to ensure
+;   ->    : a fresh graph containing `n`
+(bind add_node
+  (lambda (g n)
+    (bind ((out (map_of)))
+      (do
+        (for k (map_keys g)
+          (bind ((adj (list_of)))
+            (do (each (get g k (list_of)) (lambda (d) (append adj d)))
+                (assoc out k adj))))
+        (unless (contains out n) (assoc out n (list_of)))
+        out))))
+
+; add_edges — a fresh graph with every `[from to]` pair in `pairs` added (each
+; like add_edge: missing endpoints are created). A bulk add_edge.
+;   g / pairs : the graph and a list of 2-element [from to] lists
+;   ->        : a fresh graph with all the edges
+(bind add_edges
+  (lambda (g pairs)
+    (bind ((acc (ref g)))
+      (do
+        (each pairs
+          (lambda (p) (set_ref acc (add_edge (deref acc) (get p 0) (get p 1)))))
+        (deref acc)))))
+
+; from_edges — build a fresh graph from a list of `[from to]` edge pairs. Every
+; endpoint becomes a node; the result is the empty graph when `pairs` is empty.
+;   pairs : a list of 2-element [from to] lists
+;   ->    : a fresh graph holding exactly those edges
+(bind from_edges
+  (lambda (pairs) (add_edges (map_of) pairs)))
+
+; transpose — a fresh graph with every edge reversed (`a -> b` becomes
+; `b -> a`). Isolated declared nodes survive (they seed the result).
+;   g  : the graph
+;   -> : a fresh graph
+(bind transpose
+  (lambda (g)
+    (bind ((out (map_of)))
+      (do
+        (for n (map_keys g) (assoc out n (list_of)))   ; preserve every node
+        (for n (map_keys g)
+          (each (get g n (list_of))
+            (lambda (d)
+              (do
+                (unless (contains out d) (assoc out d (list_of)))
+                (append (get out d) n)))))
+        out))))
+
+; remove_edge — a fresh graph with every `from -> to` edge dropped. Both
+; endpoints survive as nodes (only the edge goes); unknown endpoints are a
+; no-op. The inverse of add_edge.
+;   g / from / to : the graph and the two endpoints
+;   ->            : a fresh graph (input untouched)
+(bind remove_edge
+  (lambda (g from to)
+    (bind ((out (map_of)))
+      (do
+        (for n (map_keys g)
+          (bind ((adj (list_of)))
+            (do
+              (each (get g n (list_of))
+                (lambda (d) (unless (and (eq n from) (eq d to)) (append adj d))))
+              (assoc out n adj))))
+        out))))
+
+; remove_node — a fresh graph with `n` deleted: its own entry is dropped and
+; every edge pointing AT it is removed from the other nodes' successor lists.
+;   g / n : the graph and the node to delete
+;   ->    : a fresh graph without `n` (input untouched)
+(bind remove_node
+  (lambda (g n)
+    (bind ((out (map_of)))
+      (do
+        (for k (map_keys g)
+          (unless (eq k n)
+            (bind ((adj (list_of)))
+              (do
+                (each (get g k (list_of))
+                  (lambda (d) (unless (eq d n) (append adj d))))
+                (assoc out k adj)))))
+        out))))
+
+; ── rendering ───────────────────────────────────────────────────────────────
+
+; to_dot — a digraph as DOT text. Nodes without edges still appear.
+;   g     : map node -> [successor…]
+;   title : the digraph name
+(defn to_dot ((g map) (title string)) string
+  (bind ((out (ref (string_concat_many "digraph \"" (esc title) "\" {\n"))))
+    (do
+      (for n (map_keys g)
+        (do
+          (set_ref out (string_concat_many
+            (deref out) "  \"" (esc n) "\";\n"))
+          (for d (get g n (list_of))
+            (set_ref out (string_concat_many
+              (deref out) "  \"" (esc n) "\" -> \"" (esc d) "\";\n")))))
+      (string_concat_many (deref out) "}\n"))))
+
+(export nodes successors has_node? has_edge? node_count edge_count
+        predecessors out_degree in_degree
+        add_edge add_node add_edges from_edges
+        transpose remove_edge remove_node to_dot)

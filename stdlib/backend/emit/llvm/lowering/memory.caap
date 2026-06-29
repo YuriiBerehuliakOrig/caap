@@ -1,0 +1,39 @@
+; stdlib/backend/emit/llvm/lowering/memory.caap - pointer/memory lowering helpers.
+;
+; Internal leaf behind stdlib.backend.emit.llvm.lowering.
+(module stdlib.backend.emit.llvm.lowering.memory)
+
+(use stdlib.backend.emit.llvm.types ptr_cell)
+(use stdlib.backend.emit.llvm.instructions tmp! emit!)
+
+(bind lower_ptr_to_int
+  (lambda (self args st env fns)
+    (bind (
+      (r (self self (get args 0) st env fns))
+      (n (tmp! st))
+    )
+      (do
+        (unless (eq (get r "type") "ptr")
+          (throw "native codegen: ptr_to_int expects a pointer"))
+        (emit! st (string_concat_many
+          n " = ptrtoint ptr " (get r "repr" "?") " to i64"))
+        (assoc (map_of) "repr" n "type" "i64" "ct" "u64")))))
+
+(bind lower_ptr_add
+  (lambda (self args st env fns)
+    (bind (
+      (r (self self (get args 0) st env fns))
+      (n (self self (get args 1) st env fns))
+      (nt (if (eq (get n "type") null) "i64" (get n "type")))
+      (p (tmp! st))
+    )
+      (do
+        (unless (eq (get r "type") "ptr")
+          (throw "native codegen: ptr_add expects a pointer"))
+        (emit! st (string_concat_many
+          p " = getelementptr " (get r "elem" "?")
+          ", ptr " (get r "repr" "?") ", " nt " " (get n "repr" "?")))
+        (ptr_cell p (get r "elemct")
+                  (get (get st "prog" (map_of)) "structs" (map_of)))))))
+
+(export lower_ptr_to_int lower_ptr_add)

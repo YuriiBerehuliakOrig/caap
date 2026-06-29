@@ -1,0 +1,407 @@
+; stdlib/semantics/passes/inline.caap — interprocedural INLINER (module
+; stdlib.semantics.passes.inline).
+;
+; The first CONSUMER of the call-graph facts callgraph.caap publishes. Where
+; peval/simplify rewrite WITHIN a form, this looks ACROSS the module: a small,
+; non-recursive, single-call-site top-level helper is folded into its one
+; caller, and the now-dead definition is dropped.
+;
+;   read facts   `(fact_of "callgraph" name edges)`     — the call edges
+;                `(fact_of "callgraph.recursive" name false)` — the recursive set
+;                (the EXACT keys callgraph.caap publishes under; this module only
+;                READS them, never recomputes the graph).
+;   candidate    a top-level `(bind h <lambda>)` whose helper `h` is
+;                  - NON-recursive (recursion guard — never inline a self-call),
+;                  - SMALL (body node-count under a cost cap), and
+;                  - referenced at EXACTLY ONE call site in the whole module
+;                    (and not exported, not used as a non-call value).
+;   inline       at that one site `(h a0 a1 …)` -> `(bind ("p0" a0 …) body)` —
+;                a let* over the arguments (beta, NOT naive substitution), so
+;                each argument is evaluated EXACTLY ONCE: no effect duplication,
+;                no capture (subst_safe-grade hygiene via the canonical bind).
+;                Then the helper's top-level definition is removed.
+;
+; CONSERVATIVE by construction. Anything it cannot prove safe — a recursive
+; helper, a fact it never saw, a parameter shape it cannot read, an argument
+; that would be captured, an arity it cannot match, a helper touched anywhere
+; but its single call head — is LEFT EXACTLY AS IS. Behaviour-preserving: the
+; inlined `bind` has the same evaluation order and arity as the call it
+; replaces, and a helper is only dropped once its sole reference is consumed.
+(module stdlib.semantics.passes.inline)
+
+(use stdlib.syntax.ast
+  call? name? literal? literal_of name_of head_of head_is? callee args_of arg
+  items_of string_lit? bind_pairs def_of sym lit call calln walk)
+(use stdlib.syntax.ir transform free_names)
+(use stdlib.lib.collections.sequence any? all? contains? range)
+(use stdlib.lib.collections.map clone)
+(use stdlib.semantics.passes.registry install_transform! fact_of)
+
+; cost_cap — the size budget: a helper body with more than this many nodes is
+; too big to be worth duplicating into its caller (single-call-site means no
+; size blow-up, but a giant body still hurts readability/locality). Generous
+; because the single-call-site rule already bounds total code growth.
+(bind cost_cap 32)
+
+; node_cost — the number of nodes in a tree (calls + names + literals). The
+; size half of the inline heuristic.
+(bind node_cost_walk
+  (lambda (self node)
+    (if (not (call? node))
+      1
+      (bind ((n (ref 1)))
+        (do
+          (set_ref n (int_add (deref n) (self self (callee node))))
+          (for a (args_of node)
+            (set_ref n (int_add (deref n) (self self a))))
+          (deref n))))))
+(bind node_cost (lambda (node) (node_cost_walk node_cost_walk node)))
+
+; lambda_params — a lambda's parameter NAME strings, or null when the parameter
+; list is not the readable literal-tuple shape (the loader's top-level helpers
+; always are; anything else we refuse to inline rather than guess).
+(bind lambda_params
+  (lambda (lam)
+    (if (not (head_is? lam "lambda"))
+      null
+      (bind ((p0 (arg lam 0)))
+        (if (not (literal? p0))
+          null
+          (bind ((v (literal_of p0)))
+            (if (eq v null)
+              null
+              (if (all? v (lambda (p) (eq (value_type p) "string")))
+                v
+                null))))))))
+
+; lambda_body — a single-body lambda's body spec, or null when the lambda has
+; anything other than exactly one body form (params + one body). A multi-body
+; `(lambda (p…) a b)` we leave alone: turning it into a let* body is the same
+; do-sequence question peval already owns, and not the inliner's job.
+(bind lambda_body
+  (lambda (lam)
+    (if (and (head_is? lam "lambda") (eq (size (args_of lam)) 2))
+      (arg lam 1)
+      null)))
+
+; ── binder-aware reference analysis (over the WHOLE module) ──────────────────
+; A raw name walk would miscount a SHADOWED reference: `(lambda (h) (h x))` calls
+; the PARAMETER `h`, not a module helper named `h`. These walks track binders
+; (lambda params + both `bind` shapes) so only FREE occurrences of the helper
+; name count — the exact scoping ir.caap's free_names uses, specialised to one
+; name and split into "head call sites" vs "value uses".
+
+; binder_param_names — a lambda parameter list's NAME strings, either kernel
+; shape (literal tuple of strings | a call of name nodes). The local twin of
+; ir.caap's (un-exported) binder_params.
+(bind binder_param_names
+  (lambda (pnode)
+    (bind ((out (list_of)))
+      (do
+        (cond
+          ((literal? pnode)
+            (bind ((v (literal_of pnode)))
+              (when (not (eq v null))
+                (for p v (when (eq (value_type p) "string") (append out p))))))
+          ((call? pnode)
+            (for it (items_of pnode)
+              (bind ((nm (name_of it))) (when (not (eq nm null)) (append out nm)))))
+          (else null))
+        out))))
+
+; free_refs — walk `node` tracking bound names; classify every FREE occurrence of
+; `name` by position:
+;   heads  — the CALL NODE `(name a…)` of a free head reference (so the inline
+;            site keeps its arguments; an inline_call needs the whole call)
+;   values — the NAME NODE of a free reference in any non-head (value) position
+;            (a higher-order use / export / nested-callee position) — these make
+;            the helper unsafe to inline + drop (the reference would dangle)
+; `bound` maps in-scope names -> true; a name shadowed by a binder is NOT free,
+; so a `(lambda (name) (name …))` shadow is correctly NOT collected.
+(bind free_refs_walk
+  (lambda (self name node bound heads values)
+    (cond
+      ; a bare name in a VALUE position: a free reference that is NOT a call head
+      ; (a higher-order use / export operand) — unsafe to inline + drop.
+      ((name? node)
+        (when (and (eq (name_of node) name) (not (eq (get bound name) true)))
+          (append values node)))
+      ((call? node)
+        (bind ((h (head_of node)) (args (args_of node)) (cal (callee node)))
+          (cond
+            ; lambda: params scope over the body forms (args 1..)
+            ((eq h "lambda")
+              (bind ((child (clone bound)))
+                (do
+                  (for p (binder_param_names (get args 0)) (assoc child p true))
+                  (for k (range 1 (size args))
+                    (self self name (get args k) child heads values)))))
+            ; flat bind `(bind <name> value rest…)`: name scopes over rest
+            ((and (eq h "bind") (name? (get args 0)))
+              (bind ((child (clone bound)))
+                (do
+                  (self self name (get args 1) bound heads values)
+                  (assoc child (name_of (get args 0)) true)
+                  (for k (range 2 (size args))
+                    (self self name (get args k) child heads values)))))
+            ; canonical bind `(bind "n" v … body…)`: let* — each value sees the
+            ; names bound before it; body sees them all
+            ((and (eq h "bind") (string_lit? (get args 0)))
+              (bind ((bp (bind_pairs node)) (child (clone bound)))
+                (do
+                  (for p (get bp "pairs" (list_of))
+                    (do
+                      (self self name (get p "value") child heads values)
+                      (assoc child (get p "name") true)))
+                  (for b (get bp "body" (list_of))
+                    (self self name b child heads values)))))
+            (else
+              (do
+                ; HEAD position: a NAME-headed call whose head is a free `name` is
+                ; an inline SITE — record the whole CALL (inline_call needs its
+                ; args). The head name itself is NOT walked as a value. A nested
+                ; non-name callee (head_of null) is walked as a value instead.
+                (if (and (eq h name) (not (eq (get bound name) true)))
+                  (append heads node)
+                  (when (call? cal) (self self name cal bound heads values)))
+                ; arguments are value positions
+                (for a args (self self name a bound heads values)))))))
+      (else null))))
+(bind free_refs
+  (lambda (name node)
+    (bind ((heads (list_of)) (values (list_of)))
+      (do
+        (free_refs_walk free_refs_walk name node (map_of) heads values)
+        (assoc (map_of) "heads" heads "values" values)))))
+
+; bound_names — every name BOUND by a binder anywhere in `node` (lambda params,
+; both `bind` shapes). The capture set: if the helper body references a FREE name
+; that the caller binds here, splicing the body in would re-capture it.
+(bind bound_names
+  (lambda (node)
+    (bind ((out (map_of)))
+      (do
+        (walk node
+          (lambda (n)
+            (when (call? n)
+              (bind ((h (head_of n)) (args (args_of n)))
+                (cond
+                  ((eq h "lambda")
+                    (for p (binder_param_names (get args 0)) (assoc out p true)))
+                  ((and (eq h "bind") (name? (get args 0)))
+                    (assoc out (name_of (get args 0)) true))
+                  ((and (eq h "bind") (string_lit? (get args 0)))
+                    (for p (get (bind_pairs n) "pairs" (list_of))
+                      (assoc out (get p "name") true)))
+                  (else null))))))
+        out))))
+
+; ── inline-site rewrite ──────────────────────────────────────────────────────
+
+; capture_safe? — no argument mentions any parameter name. A parameter is not in
+; scope at the call site, so such a name is a DIFFERENT outer binding that the
+; let* we build would wrongly capture. (The exact test simplify's beta uses.)
+(bind capture_safe?
+  (lambda (params args)
+    (not (any? args
+      (lambda (a)
+        (any? (free_names a)
+          (lambda (fn) (any? params (lambda (p) (eq p fn))))))))))
+
+; inline_call — `(h a0 a1 …)` -> `(bind ("p0" a0 "p1" a1 …) body)` (a let* over
+; the arguments, then the helper body), or null when it cannot be done safely
+; (arity mismatch, a parameter shape we can't read, capture). Pure: builds a new
+; tree, never mutates the call.
+;   helper : the helper's lambda value
+;   site   : the call node `(h a…)`
+(bind inline_call
+  (lambda (helper site)
+    (bind ((params (lambda_params helper)) (body (lambda_body helper)))
+      (if (or (eq params null) (eq body null))
+        null
+        (bind ((args (args_of site)))
+          (if (not (and (eq (size params) (size args))
+                        (capture_safe? params args)))
+            null
+            (bind ((parts (list_of)))
+              (do
+                (for i (sequence_range 0 (size params))
+                  (do
+                    (append parts (lit (get params i)))
+                    (append parts (get args i))))
+                (append parts body)
+                (call (sym "bind") parts)))))))))
+
+; inline_site — rewrite EVERY call `(name …)` of `helper` inside `node`. There
+; is exactly one such site for the helpers we choose, but the bottom-up
+; transform handles it uniformly (and a site it cannot inline safely is left
+; intact — the candidate was rejected upstream, so this is belt-and-braces).
+(bind inline_site
+  (lambda (name helper node)
+    (transform node
+      (lambda (n)
+        (if (and (call? n) (eq (head_of n) name))
+          (inline_call helper n)
+          null)))))
+
+; ── the module-level driver ──────────────────────────────────────────────────
+
+; recursive? — read the recursive FACT callgraph published (a soft miss yields
+; false). The caller ALSO requires a PRESENT edge fact before trusting any of
+; this (see candidate?), so a false here only ever means "callgraph ran and did
+; NOT mark it recursive", never "no facts at all".
+(bind recursive?
+  (lambda (name) (eq (fact_of "callgraph.recursive" name false) true)))
+
+; def_index — the index in `located` of the top-level definition of `name`
+; (a 2-arg `(bind …)` whose def_of name matches), or -1.
+(bind def_index
+  (lambda (located name)
+    (bind ((idx (ref -1)))
+      (do
+        (for i (sequence_range 0 (size located))
+          (when (eq (deref idx) -1)
+            (bind ((d (def_of (get (get located i) "node"))))
+              (when (and (not (eq d null)) (eq (get d "name") name))
+                (set_ref idx i)))))
+        (deref idx)))))
+
+; body_capture_safe? — would splicing `body` (a helper with parameters `params`)
+; into `caller` re-capture any of body's FREE names? body's free names, minus the
+; params we re-bind, are the names that must keep resolving to the SAME binding
+; after the move; if any is bound somewhere in `caller`, inlining would silently
+; rebind it (the loader leaves a top-level helper at module scope, so its body's
+; free names resolve at module scope — a caller-local binder of the same name is
+; a DIFFERENT binding). Refuse such an inline.
+(bind body_capture_safe?
+  (lambda (params body caller)
+    (bind ((bn (bound_names caller)) (ok (ref true)))
+      (do
+        (for fn (free_names body)
+          (when (and (not (any? params (lambda (p) (eq p fn))))
+                     (eq (get bn fn) true))
+            (set_ref ok false)))
+        (deref ok)))))
+
+; site_inlinable? — is the actual call node `site` safe to fold for this helper:
+; arity matches and no argument would be captured (capture_safe?). The guard that
+; stops `run` from dropping a helper whose ONE site cannot in fact be inlined
+; (which would leave a dangling reference) — candidate? requires this, so the
+; def is only removed when its sole call site truly disappears.
+(bind site_inlinable?
+  (lambda (params site)
+    (and (eq (size params) (size (args_of site)))
+         (capture_safe? params (args_of site)))))
+
+; candidate? — is top-level helper `name` (value `val`) safe + worth inlining?
+; ALL must hold; any failure leaves it untouched:
+;   - a `(lambda (p…) body)` with a single body and readable params
+;   - we HAVE a callgraph edge fact for it (the producer ran; without it we
+;     refuse to act on a graph we never saw)
+;   - NON-recursive (the recursion guard)
+;   - SMALL (body under the cost cap)
+;   - referenced EXACTLY ONCE module-wide as a FREE call head, never as a value
+;     (binder-aware: a `(lambda (name) (name …))` shadow does NOT count) — so
+;     dropping the definition leaves nothing dangling
+;   - the SOLE site has matching arity + capture-safe args, and the helper body's
+;     free names are not re-captured by the caller's binders (the move is sound)
+(bind candidate?
+  (lambda (located name val)
+    (bind ((params (lambda_params val)) (body (lambda_body val)))
+      (if (or (eq params null) (eq body null))
+        false
+        ; an absent edge fact (fact_of … null) means callgraph never ran on this
+        ; module yet — refuse rather than inline against a graph we never saw.
+        (if (eq (fact_of "callgraph" name null) null)
+          false
+          (if (recursive? name)
+            false
+            (if (gt (node_cost body) cost_cap)
+              false
+              ; collect FREE references across every OTHER top-level form (the
+              ; helper's own definition is skipped — a self-reference in its body
+              ; is already ruled out by recursive? and must not miscount). The
+              ; caller form is the one holding the sole free head.
+              (bind (
+                (def_i (def_index located name))
+                (heads (list_of)) (values (list_of)) (caller (ref null))
+              )
+                (do
+                  (for i (range 0 (size located))
+                    (when (not (eq i def_i))
+                      (bind ((nd (get (get located i) "node"))
+                             (r (free_refs name nd)))
+                        (do
+                          (for h (get r "heads")
+                            (do (append heads h) (set_ref caller nd)))
+                          (for v (get r "values") (append values v))))))
+                  ; exactly one free call-head reference, never a value position
+                  (and (eq (size heads) 1)
+                       (and (eq (size values) 0)
+                            ; and that one site is genuinely foldable here
+                            (and (site_inlinable? params (get heads 0))
+                                 (body_capture_safe? params body (deref caller))))))))))))))
+
+; run — the transform entry. Pick inline candidates from the call-graph facts,
+; fold each into its single caller IN PLACE, then drop the inlined helper's
+; definition. Two phases: phase 1 chooses the candidate set over the ORIGINAL
+; module (decided before any rewrite); phase 2 inlines each, RE-VALIDATING the
+; sole site against the LIVE module first. The re-validation makes the result
+; order-independent: when one target's body holds another's call site, inlining
+; the outer one MOVES the inner site into a new scope — re-checking arity +
+; capture there means we only fold (and drop) when it is still provably safe,
+; and a target that no longer validates is simply left untouched (its def kept).
+(bind run
+  (lambda (located)
+    (bind ((targets (list_of)))
+      (do
+        ; phase 1 — collect every safe candidate over the original module
+        (for f located
+          (bind ((d (def_of (get f "node"))))
+            (when (and (not (eq d null))
+                       (candidate? located (get d "name") (get d "value")))
+              (append targets
+                (assoc (map_of) "name" (get d "name") "val" (get d "value"))))))
+        ; phase 2 — inline each target whose sole site STILL validates, then drop
+        ; its definition. RE-checking candidacy on the live `located` (minus the
+        ; target's own def, already what candidate? skips) keeps it sound under
+        ; any processing order.
+        (for t targets
+          (bind ((name (get t "name")) (val (get t "val")))
+            (when (candidate? located name val)
+              (do
+                ; rewrite the sole call site in every form (the helper's own def
+                ; is a 2-arg bind whose value is the lambda — its head is `bind`,
+                ; not the helper, so the def form is untouched by inline_site)
+                (for f located
+                  (assoc f "node" (inline_site name val (get f "node"))))
+                ; drop the now-dead definition (re-find its index: an earlier
+                ; target's removal may have shifted it)
+                (bind ((di (def_index located name)))
+                  (when (not (eq di -1)) (list_remove_at located di)))))))))))
+
+; inline_node — the testable core: inline `name` (helper `val`) into a SINGLE
+; standalone node and return the rewritten node. The site-rewrite half of `run`,
+; exposed for tests that drive one call site without a whole `located` list.
+(bind inline_node
+  (lambda (name val node) (inline_site name val node)))
+
+; register! — install the inliner as a load-time TRANSFORM (idempotent).
+;
+; The load pipeline is `expand → run_transforms → gate(check + run_passes)`, so a
+; transform runs BEFORE the callgraph PASS that publishes the facts. The fact
+; store is SESSION-LIVED, so the call graph a given module's transform sees is
+; the one the callgraph pass left from EARLIER loads in the session; on the very
+; first load of a module no facts exist yet and `candidate?` refuses every helper
+; (it bails on an absent edge fact). So as a load-time transform the inliner only
+; ever fires for a module re-analysed within a session — which is precisely the
+; conservative, behaviour-preserving stance: never inline against a graph this
+; load has not seen. The PRIMARY consumer path is a tool/driver that runs
+; callgraph's `analyze`/`check_module` (populating the facts) and THEN calls this
+; module's `run` (or `inline_node`) directly — exactly what the test does. Pairs
+; naturally AFTER peval, which prunes any dead bind the drop leaves behind.
+(bind register!
+  (lambda () (install_transform! "inline" run)))
+
+(export node_cost lambda_params lambda_body free_refs inline_call inline_site
+        inline_node candidate? run register!)

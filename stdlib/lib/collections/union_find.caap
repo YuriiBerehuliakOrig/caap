@@ -1,0 +1,167 @@
+; stdlib/lib/collections/union_find.caap — disjoint-set (union-find) with path compression + union-by-rank.
+;
+; A union-find tracks a partition of STRING element keys into disjoint sets
+; (kernel maps are string-keyed; string nodes match graph.caap). The structure
+; is a plain map with three fields:
+;   "parent" : {elem -> parent elem}  (a root is its own parent)
+;   "rank"   : {elem -> int}          (an upper bound on the tree height)
+;   "count"  : int                    (the number of disjoint sets)
+;
+; Every operation is PURE: it returns a FRESH structure and never mutates its
+; input (the `out` accumulators are the function's own fresh state, so mutating
+; them stays effect-free). `uf_find` carries path compression — it returns the
+; root AND a structure whose walked nodes now point straight at that root.
+(module stdlib.lib.collections.union_find)
+
+; ── internal helpers (not exported) ─────────────────────────────────────────
+
+; copy_map — a fresh shallow copy of map `m` (so the input is never mutated).
+; A single-argument `map_merge` is the kernel's fresh-copy idiom (same trick
+; bimap.caap uses); values here are always scalars, so a shallow copy suffices.
+(bind copy_map (lambda (m) (map_merge m)))
+
+; uf_rebuild — a fresh uf from explicit parent/rank maps and a set count.
+(bind uf_rebuild
+  (lambda (parent rank count)
+    (assoc (map_of) "parent" parent "rank" rank "count" count)))
+
+; ── construction ────────────────────────────────────────────────────────────
+
+; uf_new — an empty union-find (no elements, zero sets).
+;   -> : a fresh union-find
+(bind uf_new
+  (lambda () (uf_rebuild (map_of) (map_of) 0)))
+
+; uf_member? — is `x` already a known element of `uf`?
+;   uf / x : a union-find and a candidate element
+;   ->     : bool
+(bind uf_member?
+  (lambda (uf x) (contains (get uf "parent" (map_of)) x)))
+
+; uf_make_set — a fresh uf with `x` added as its own singleton set.
+; Idempotent: if `x` is already present the uf is returned unchanged (a fresh
+; copy with the same partition).
+;   uf / x : a union-find and the element to introduce
+;   ->     : a fresh union-find (input untouched)
+(bind uf_make_set
+  (lambda (uf x)
+    (if (uf_member? uf x)
+        (uf_rebuild (copy_map (get uf "parent" (map_of)))
+                    (copy_map (get uf "rank" (map_of)))
+                    (get uf "count" 0))
+        (bind ((parent (copy_map (get uf "parent" (map_of))))
+               (rank   (copy_map (get uf "rank" (map_of)))))
+          (do
+            (assoc parent x x)   ; a fresh element is its own root
+            (assoc rank x 0)
+            (uf_rebuild parent rank (int_add (get uf "count" 0) 1)))))))
+
+; ── find (with path compression) ────────────────────────────────────────────
+
+; uf_find — the representative root of `x`, with path compression.
+; If `x` is unknown it is auto-introduced as its own singleton first.
+;   uf / x : a union-find and the element to resolve
+;   ->     : {"root": r, "uf": uf'} where uf' is a fresh structure whose nodes
+;            along the walked path now point directly at the root `r`
+(bind uf_find
+  (lambda (uf x)
+    (bind ((base (if (uf_member? uf x) uf (uf_make_set uf x)))
+           (parent (copy_map (get base "parent" (map_of))))
+           (rank   (copy_map (get base "rank" (map_of))))
+           ; walk to the root, recording every node on the path
+           (cur  (ref x))
+           (path (list_of)))
+      (do
+        (while (not (eq (get parent (deref cur) (deref cur)) (deref cur)))
+          (do
+            (append path (deref cur))
+            (set_ref cur (get parent (deref cur) (deref cur)))))
+        (bind ((root (deref cur)))
+          (do
+            ; path compression: every walked node points straight at the root
+            (for n path (assoc parent n root))
+            (assoc (map_of)
+              "root" root
+              "uf"   (uf_rebuild parent rank (get base "count" 0)))))))))
+
+; ── union (by rank) ─────────────────────────────────────────────────────────
+
+; uf_union — a fresh uf in which the sets containing `a` and `b` are merged.
+; Both elements are auto-introduced if absent. Union is by rank: the shorter
+; tree hangs under the taller; on a tie the new root's rank grows by one. If
+; `a` and `b` are already connected the partition is unchanged.
+;   uf / a / b : a union-find and the two elements to connect
+;   ->         : a fresh union-find (input untouched)
+(bind uf_union
+  (lambda (uf a b)
+    (bind ((fa (uf_find uf a))
+           (ra (get fa "root"))
+           (uf1 (get fa "uf"))
+           (fb (uf_find uf1 b))
+           (rb (get fb "root"))
+           (uf2 (get fb "uf")))
+      (if (eq ra rb)
+          uf2                                   ; already in the same set
+          (bind ((parent (copy_map (get uf2 "parent" (map_of))))
+                 (rank   (copy_map (get uf2 "rank" (map_of))))
+                 (rank_a (get rank ra 0))
+                 (rank_b (get rank rb 0))
+                 (count1 (int_sub (get uf2 "count" 0) 1)))
+            (cond
+              ((lt rank_a rank_b)
+               (do (assoc parent ra rb)
+                   (uf_rebuild parent rank count1)))
+              ((gt rank_a rank_b)
+               (do (assoc parent rb ra)
+                   (uf_rebuild parent rank count1)))
+              (else
+               (do (assoc parent rb ra)
+                   (assoc rank ra (int_add rank_a 1))   ; tie: taller by one
+                   (uf_rebuild parent rank count1)))))))))
+
+; ── queries ─────────────────────────────────────────────────────────────────
+
+; uf_connected? — are `a` and `b` in the same set?
+;   uf / a / b : a union-find and the two elements to compare
+;   ->         : {"value": bool, "uf": uf'} where uf' carries the path
+;                compression performed by the two underlying finds
+(bind uf_connected?
+  (lambda (uf a b)
+    (bind ((fa (uf_find uf a))
+           (ra (get fa "root"))
+           (fb (uf_find (get fa "uf") b))
+           (rb (get fb "root")))
+      (assoc (map_of)
+        "value" (eq ra rb)
+        "uf"    (get fb "uf")))))
+
+; uf_count — the number of disjoint sets currently tracked.
+;   uf : a union-find
+;   -> : int
+(bind uf_count
+  (lambda (uf) (get uf "count" 0)))
+
+; uf_sets — the components, each a list of its members.
+; Members are grouped by their representative root (resolved without mutating
+; `uf`). Order within and across components is unspecified.
+;   uf : a union-find
+;   -> : a list of components (each a non-empty list of element keys)
+(bind uf_sets
+  (lambda (uf)
+    (bind ((parent (get uf "parent" (map_of)))
+           (groups (map_of))            ; root -> member list
+           (cur (ref uf)))
+      (do
+        (for x (map_keys parent)
+          (bind ((f (uf_find (deref cur) x))
+                 (root (get f "root")))
+            (do
+              (set_ref cur (get f "uf"))          ; thread compression forward
+              (unless (contains groups root) (assoc groups root (list_of)))
+              (append (get groups root) x))))
+        ; collect the grouped member lists as the result
+        (bind ((out (list_of)))
+          (do (for r (map_keys groups) (append out (get groups r))) out))))))
+
+(export uf_new uf_member? uf_make_set uf_find uf_union
+        uf_connected? uf_count uf_sets)

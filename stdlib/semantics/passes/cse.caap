@@ -1,0 +1,325 @@
+; stdlib/semantics/passes/cse.caap — common-subexpression elimination as a
+; whole-module TRANSFORM (module stdlib.semantics.passes.cse).
+;
+; Tree CSE / value numbering: within ONE top-level expression body, find a
+; maximal PURE subexpression that occurs two or more times (structural equality
+; via node_eq), bind it ONCE to a fresh name, and replace every occurrence with
+; that name. `(int_add (int_mul a b) (int_mul a b))` becomes
+; `(bind "cse__gN" (int_mul a b) (int_add (sym cse__gN) (sym cse__gN)))`.
+;
+; ── why this is behavior-preserving ─────────────────────────────────────────
+; A transform is a REWRITE that must be a no-op on observable behavior — a wrong
+; rewrite is a miscompile — so this pass is deliberately conservative and only
+; ever touches subexpressions it can PROVE are safe to deduplicate:
+;
+;   referential transparency — a CSE candidate is a call to a head that is, per
+;     the kernel vocabulary, a `builtin` (NOT a special form: if/and/or/lambda/
+;     do/bind have control-flow or binding semantics and are excluded), `pure`,
+;     and whose result is an IMMUTABLE SCALAR (int/bool/string/float). That
+;     last clause is the load-bearing one: it excludes every fresh-mutable
+;     allocator (list_of/map_of/string_split/…) — binding one shared object and
+;     reusing it would alias it, so a later in-place mutation would leak across
+;     uses — and it excludes `deref`/`ref` (result `any`/`ref`: deref reads
+;     mutable state whose value can change between occurrences, ref allocates).
+;     gensym (a fresh string each call) is excluded by name. Every argument must
+;     itself be cse_pure? OR a leaf (a name or literal), so the WHOLE candidate
+;     subtree is effect-free and yields the same value at every occurrence.
+;     Binding such a value once and reusing it reorders nothing, duplicates no
+;     effect, and drops no effect.
+;
+;   domination — the hoisted bind WRAPS the whole expression, so the new binding
+;     dominates every occurrence and every free name the candidate reads is
+;     still in scope at the wrap point (it is the SAME expression, just wrapped).
+;
+;   PURE-BUILTIN SPINE ONLY (the single rule that makes the other two hold) —
+;     candidates are collected ONLY along a spine of nested pure-builtin calls:
+;     we descend into a call's arguments only when its head is cse_safe_head?.
+;     Because every such head is `kind == "builtin"`, the descent STOPS at any
+;     `if`/`and`/`or`/`cond` (a conditional arm), any `bind`/`do` (a binding
+;     body), and any `lambda` (a parameter scope). This one restriction gives
+;     all three correctness properties at once:
+;       - a candidate on the spine is UNCONDITIONALLY evaluated, so hoisting it
+;         to the front never makes a previously-skipped (possibly trapping, e.g.
+;         int_div-by-zero) computation run — `(if g a (f x x))` is left alone;
+;       - no `bind`/`lambda` binder is crossed, so the candidate's free names
+;         denote the SAME bindings at the wrap point as at each occurrence — a
+;         shadowing inner `(bind "a" … (g a))` is never unified with an outer
+;         `(g a)` (node_eq is scope-blind, so this guard, not node_eq, is what
+;         makes unification safe);
+;       - those free names are all free in the whole expression, so the wrapping
+;         bind has them in scope (re-checked defensively via free_names).
+;     A twin of the chosen candidate hiding OFF the spine (count_all > on-spine
+;     count) also blocks the hoist. When anything is uncertain, the tree is left
+;     unchanged.
+;
+; Runs after expansion and before the check gate, like constfold/simplify.
+(module stdlib.semantics.passes.cse)
+
+(use stdlib.syntax.ast
+  call? name? literal? head_of callee args_of call sym mkbind)
+(use stdlib.syntax.ir node_eq free_names gensym)
+(use stdlib.semantics.passes.registry install_transform!)
+
+; ── purity (the CSE-safe predicate) ─────────────────────────────────────────
+; vocab — the kernel's callable vocabulary (name -> {kind, pure, result, …}).
+(bind vocab (ctfe_kernel_vocabulary))
+
+; scalar_results — the IMMUTABLE result types: a value of one of these is a
+; copy-by-value scalar, so reusing one binding for it can never alias a mutable
+; object. (list/map/bytes/ref/any are all excluded by their absence here.)
+(bind scalar_results
+  (bind ((m (map_of)))
+    (do
+      (for t (list_of "int" "bool" "string" "float") (assoc m t true))
+      m)))
+
+; cse_unsafe_heads — heads the vocabulary flags `pure` and scalar-returning but
+; which are NOT referentially transparent for CSE: gensym returns a FRESH unique
+; string on every call (deduplicating two would wrongly unify distinct names);
+; runtime_error throws (not a value to reuse). Belt-and-braces over the
+; result-type filter.
+(bind cse_unsafe_heads
+  (bind ((m (map_of)))
+    (do
+      (for h (list_of "gensym" "runtime_error") (assoc m h true))
+      m)))
+
+; cse_safe_head? — is `h` a head whose call is a pure function of its args
+; yielding an immutable scalar (so a call to it is CSE-able if its args are)?
+;   - known builtin (kind == "builtin"): excludes special forms (if/and/or/
+;     lambda/do/bind/apply) and unknown user heads (conservative default reject)
+;   - pure (per the vocabulary)
+;   - immutable scalar result (excludes mutable allocators, deref/ref)
+;   - not in the explicit unsafe set (gensym/runtime_error)
+(bind cse_safe_head?
+  (lambda (h)
+    (if (eq h null) false
+      (bind ((e (get vocab h null)))
+        (and (not (eq e null))
+          (and (eq (get e "kind" null) "builtin")
+            (and (eq (get e "pure" false) true)
+              (and (eq (get scalar_results (get e "result" null) false) true)
+                   (not (eq (get cse_unsafe_heads h false) true))))))))))
+
+; cse_pure? — is `node` a CSE-able subexpression? It must be a call to a
+; cse_safe_head?, and EVERY argument must itself be cse_pure? or a leaf (a name
+; — same value at every occurrence in one scope — or a literal). A call to an
+; unsafe head ANYWHERE inside (e.g. a nested deref) makes the whole node unsafe.
+; The `self self` idiom carries the recursion (top-level binds are let*-scoped,
+; so a function cannot forward-reference one defined after it).
+(bind cse_pure_walk
+  (lambda (self node)
+    (and (call? node)
+      (and (cse_safe_head? (head_of node))
+        (bind ((ok (ref true)))
+          (do
+            (for n (args_of node)
+              (when (not (or (name? n) (or (literal? n) (self self n))))
+                (set_ref ok false)))
+            (deref ok)))))))
+(bind cse_pure?
+  (lambda (node) (cse_pure_walk cse_pure_walk node)))
+
+; ── candidate collection ────────────────────────────────────────────────────
+; collect_candidates — every cse_pure? subexpression reachable from `node`
+; THROUGH A PURE-BUILTIN SPINE ONLY, with its occurrence count. This single
+; restriction is what makes the rewrite provably safe; it subsumes the lambda
+; wall and the bind/conditional walls in one rule:
+;
+;   We descend into the ARGUMENTS of a call only when that call's head is itself
+;   cse_safe_head? (a pure, total-or-trapping, immutable-scalar BUILTIN). Every
+;   such head is `kind == "builtin"` — so `if`/`and`/`or`/`cond`/`bind`/`lambda`/
+;   `do`/`apply` (all `kind == "special"`) STOP the descent: we never look inside
+;   a conditional arm, a binding body, or a lambda body.
+;
+; Consequences, each a correctness guarantee:
+;   - unconditional evaluation: a candidate on a pure-builtin spine is evaluated
+;     on EVERY run of the enclosing expression (no `if`/`and`/`or` was crossed),
+;     so hoisting it to the front never makes a previously-skipped (and possibly
+;     trapping, e.g. int_div-by-zero) computation run — same observable behavior.
+;   - no shadowing / capture: no `bind` or `lambda` binder was crossed, so the
+;     candidate's free names denote the SAME bindings at the wrap point as at
+;     each occurrence (node_eq, scope-blind, is therefore safe to unify on).
+;   - domination: those free names are all free in the whole expression, so the
+;     wrapping bind has them in scope (verified again, defensively, in hoist_one
+;     via free_names).
+;
+; The accumulator is a list of {node, count}; we count by node_eq (structural).
+(bind bump_candidate!
+  (lambda (cands node)
+    (bind ((hit (ref false)))
+      (do
+        (for c cands
+          (when (node_eq (get c "node") node)
+            (do (assoc c "count" (int_add (get c "count") 1))
+                (set_ref hit true))))
+        (when (not (deref hit))
+          (append cands (assoc (map_of) "node" node "count" 1)))))))
+
+; collect_walk — `node` is already known to sit on a pure-builtin spine (the
+; caller only recurses through cse_safe_head? args). Record it if it is itself a
+; CSE candidate, then descend into its args ONLY when its head keeps the spine
+; pure; a non-safe head ends the spine here (its sub-arguments are not collected,
+; since a binder/conditional may lie within).
+(bind collect_walk
+  (lambda (self node cands)
+    (when (and (call? node) (cse_safe_head? (head_of node)))
+      (do
+        (when (cse_pure? node) (bump_candidate! cands node))
+        (for a (args_of node) (self self a cands))))))
+
+; collect_candidates — collect candidates on the pure-builtin spine rooted at
+; `node`. If `node`'s own head is not cse_safe_head?, collect_walk records
+; nothing and descends nowhere: CSE then fires only when the WHOLE expression is
+; a pure-builtin spine, which is exactly the domination/unconditional-evaluation
+; precondition above. (A conditional/binding/lambda at the root therefore leaves
+; the tree untouched — conservative by construction.)
+(bind collect_candidates
+  (lambda (node)
+    (bind ((cands (list_of)))
+      (do (collect_walk collect_walk node cands) cands))))
+
+; ── choosing the subexpression to hoist ─────────────────────────────────────
+; node_size — a structural size, to pick the LARGEST repeated subexpression
+; first (a maximal CSE: hoisting (int_mul a b) is better than hoisting just `a`,
+; and avoids the inner one being separately hoisted when it only repeats because
+; the outer one does).
+(bind node_size
+  (lambda (node)
+    (if (call? node)
+      (bind ((acc (ref 1)))
+        (do
+          (for a (args_of node)
+            (set_ref acc (int_add (deref acc) (node_size a))))
+          (deref acc)))
+      1)))
+
+; best_candidate — the repeated (count >= 2) candidate with the greatest
+; node_size, or null when none repeats. Largest-first makes the rewrite maximal
+; and the fixpoint converge from the outside in.
+(bind best_candidate
+  (lambda (cands)
+    (bind ((best (ref null)) (best_sz (ref 0)))
+      (do
+        (for c cands
+          (when (ge (get c "count") 2)
+            (bind ((sz (node_size (get c "node"))))
+              (when (gt sz (deref best_sz))
+                (do (set_ref best (get c "node"))
+                    (set_ref best_sz sz))))))
+        (deref best)))))
+
+; ── one hoist step ──────────────────────────────────────────────────────────
+; replace_occurrences — rewrite every occurrence of `target` with the name node
+; `repl`, but ONLY along the pure-builtin spine (the exact region collect_walk
+; visited). It stops at any non-safe head, so a structural twin of `target`
+; hiding inside a conditional arm / binding body / lambda is left INTACT — its
+; meaning (a possibly-different binding of a shadowed name, or a conditionally-
+; evaluated value) must not be unified with the dominating, unconditional one.
+; Spine-rebuild is manual (not ir.transform) precisely so the recursion can gate
+; on the head and refuse to enter off-spine subtrees.
+(bind replace_walk
+  (lambda (self node target repl)
+    (cond
+      ((node_eq node target) repl)
+      ((and (call? node) (cse_safe_head? (head_of node)))
+        ; rebuild the spine node, donating its ORIGINAL span so located
+        ; diagnostics survive (the C3 span-inheritance ir.transform also does)
+        (ctfe_spec_with_span
+          (call (callee node)
+            (bind ((out (list_of)))
+              (do
+                (for a (args_of node)
+                  (append out (self self a target repl)))
+                out)))
+          node))
+      (else node))))
+(bind replace_occurrences
+  (lambda (node target repl) (replace_walk replace_walk node target repl)))
+
+; count_all — total structural occurrences of `target` ANYWHERE in `node`,
+; crossing every boundary (lambda/bind/conditional included). The safety valve:
+; collect counts occurrences ON the pure spine only; if count_all exceeds that,
+; a twin lurks OFF the spine, and unifying it would be unsafe — so hoist_one
+; refuses. (replace_occurrences already won't rewrite it, but bailing keeps the
+; bound name from being introduced for a value that still recomputes elsewhere,
+; and preserves the no-surprise invariant that we only CSE when ALL twins move.)
+(bind count_all
+  (lambda (node target)
+    (bind ((acc (ref 0)))
+      (do
+        (bind ((walk2
+          (lambda (self n)
+            (when (call? n)
+              (do
+                (when (node_eq n target) (set_ref acc (int_add (deref acc) 1)))
+                (self self (callee n))
+                (for a (args_of n) (self self a)))))))
+          (walk2 walk2 node))
+        (deref acc)))))
+
+; subset? — every name in `needed` is present in `have` (both name lists).
+(bind subset?
+  (lambda (needed have)
+    (bind ((s (map_of)) (ok (ref true)))
+      (do
+        (for h have (assoc s h true))
+        (for n needed (when (not (eq (get s n false) true)) (set_ref ok false)))
+        (deref ok)))))
+
+; hoist_one — perform ONE maximal CSE on `node`, or return null when nothing is
+; safe to do. Picks the largest repeated on-spine pure candidate, then applies
+; THREE independent safety gates (any failing → no rewrite):
+;   1. on-spine count == total count (count_all): no twin hides off the spine.
+;   2. every free name of the candidate is free in the WHOLE expression
+;      (free_names): the wrapping bind dominates and has those names in scope.
+;   3. (implicit) the candidate is cse_pure? by construction of collect.
+(bind hoist_one
+  (lambda (node)
+    (bind ((cands (collect_candidates node)) (best (best_candidate cands)))
+      (if (eq best null) null
+        (bind ((coll (ref 0)))
+          (do
+            (for c cands
+              (when (node_eq (get c "node") best) (set_ref coll (get c "count"))))
+            (if (or (not (eq (count_all node best) (deref coll)))
+                    (not (subset? (free_names best) (free_names node))))
+              null  ; a twin lurks off-spine, or a free name escapes scope — skip
+              (bind (
+                (g (gensym "cse"))
+                (replaced (replace_occurrences node best (sym g)))
+              )
+                (mkbind (list_of (assoc (map_of) "name" g "value" best))
+                        (list_of replaced))))))))))
+
+; ── the core: cse_node ──────────────────────────────────────────────────────
+; cse_node — CSE one expression to a bounded fixpoint (largest repeated pure
+; subexpression first, then the next, …). Bounded at 64 hoists — far beyond any
+; real expression — so a pathological input can never spin. Each step is
+; behavior-preserving, so their composition is.
+(bind cse_node
+  (lambda (node)
+    (bind ((cur (ref node)) (steps (ref 0)) (done (ref false)))
+      (do
+        (while (and (not (deref done)) (lt (deref steps) 64))
+          (bind ((nxt (hoist_one (deref cur))))
+            (if (eq nxt null)
+              (set_ref done true)
+              (do (set_ref cur nxt)
+                  (set_ref steps (int_add (deref steps) 1))))))
+        (deref cur)))))
+
+; run — the transform entry: rewrite every located form IN PLACE.
+(bind run
+  (lambda (located)
+    (for f located
+      (assoc f "node" (cse_node (get f "node"))))))
+
+; register! — install CSE as a load-time TRANSFORM (idempotent).
+(bind register! (lambda () (install_transform! "cse" run)))
+
+; cse_pure? / cse_safe_head? are exported so the SSA-based value-numbering pass
+; (ssa_gvn) can reuse the EXACT same purity gate — a value is keyed/reused only when
+; it is a pure scalar-result builtin expression over leaves (never a deref/effect),
+; so two structurally-equal occurrences provably hold the same value.
+(export cse_node run register! cse_pure? cse_safe_head?)

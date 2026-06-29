@@ -1,0 +1,47 @@
+; stdlib/semantics/passes/typed_fact_helpers.caap — additive strict readers over
+; the typed-fact channel (module stdlib.semantics.passes.typed_fact_helpers).
+;
+; stdlib.semantics.passes.registry's typed facts already enforce a schema and
+; already throw on a missing key — `fact_typed_of` IS the loud read. These two
+; helpers add the small ergonomic layer on top, so a consumer expresses intent
+; at the call site rather than re-deriving the guard each time:
+;   fact_require!         — the strict read; an alias of fact_typed_of's
+;                           "the producer must have recorded this" contract,
+;                           named so the assertion reads as one.
+;   fact_require_default  — the soft read framed in the SAME vocabulary: use the
+;                           recorded value when present (guarded by fact_typed?),
+;                           otherwise fall back to `default` WITHOUT throwing.
+;
+; This is additive over the registry's typed API — it imports the existing
+; accessors and adds no new store, no new schema mechanism, no node type. Both
+; helpers read the same backing store, so soft readers (fact_of) still see the
+; values. A namespace must already be declared (fact_schema!) — the typed
+; accessors throw otherwise, which is the contract we want.
+(module stdlib.semantics.passes.typed_fact_helpers)
+(use stdlib.semantics.passes.registry fact_typed_of fact_typed?)
+
+; fact_require! — assert the producer recorded `key` in `ns`, returning its
+; value. A thin, intention-revealing alias of fact_typed_of: a missing key (or
+; an undeclared namespace) is a CERTAIN throw, never a default. Reach for this
+; when a consumer depends on a producer having run.
+;   ns  : the typed-fact namespace
+;   key : the required key
+;   ->  : the recorded value (throws when absent / namespace undeclared)
+(bind fact_require!
+  (lambda (ns key) (fact_typed_of ns key)))
+
+; fact_require_default — the recorded value at `key` when present, else
+; `default`. The non-throwing companion: it guards with fact_typed? so a missing
+; key (or an undeclared namespace) yields `default` instead of an error. Use it
+; when absence is legitimately a fallback, not a contract breach.
+;   ns      : the typed-fact namespace
+;   key     : the key
+;   default : the value to return when the key is absent
+;   ->      : the recorded value, or `default`
+(bind fact_require_default
+  (lambda (ns key default)
+    (if (fact_typed? ns key)
+      (fact_typed_of ns key)
+      default)))
+
+(export fact_require! fact_require_default)

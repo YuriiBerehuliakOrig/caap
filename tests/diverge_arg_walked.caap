@@ -1,0 +1,9 @@
+; diverge_arg_walked — P-I reachability must still WALK the argument of a
+; diverging control form, so a type error INSIDE it is reported (the arg-0
+; walk). Here the thrown value is `(int_add "s" 1)` — `int_add` is declared
+; `(int int)`, so passing a string is a CERTAIN mismatch. Even though `throw`
+; never returns, its argument is evaluated, so the diagnostic must still fire
+; (the reachability analysis annotates divergence WITHOUT cutting the walk).
+(module stdlib.fixtures.diverge_arg_walked)
+(bind boom (lambda () (throw (int_add "s" 1))))
+(export boom)

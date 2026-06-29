@@ -1,0 +1,23 @@
+; stdlib/lib/crypto/legacy.caap — the deprecated-digest facade
+; (module stdlib.lib.crypto.legacy).
+;
+; SHA-1 and MD5 are cryptographically BROKEN: practical collisions exist for
+; both (MD5 since 2004, SHA-1's SHAttered collision in 2017), so NEITHER offers
+; collision resistance and NEITHER may be used for new security work —
+; signatures, certificates, password storage, content addressing, or any check
+; an adversary could attack. They survive ONLY for interop with legacy systems
+; and formats that still mandate them (old protocol fields, checksums against
+; published MD5/SHA-1 sums). For any new security need prefer `sha256` (or the
+; HMAC-SHA-256-based KDFs in stdlib.lib.crypto.kdf).
+;
+; This module is a NAMED, deliberately-conspicuous home that re-publishes md5 and
+; sha1 from stdlib.lib.crypto.digest WITHOUT removing them there (digest keeps
+; the implementations and the known-answer vectors). Importing from
+; `stdlib.lib.crypto.legacy` is the in-code signal that a weak digest is a
+; conscious legacy/interop choice, not an oversight.
+(module stdlib.lib.crypto.legacy)
+
+; sha1 / md5 live in stdlib.lib.crypto.digest; re_export brings them into scope
+; here and re-publishes them as this module's own — one implementation, one set
+; of test vectors, a separate import path that flags the weak choice.
+(re_export stdlib.lib.crypto.digest sha1 md5)

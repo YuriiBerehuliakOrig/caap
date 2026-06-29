@@ -1,0 +1,385 @@
+; stdlib/backend/emit/llvm/instructions.caap — operator tables, the call-table
+; signature builder, the per-function emission helpers, and string interning for
+; the LLVM emitter (module stdlib.backend.emit.llvm.instructions).
+;
+; This leaf holds the head -> op-name tables (sbinops/fbinops/cmps/fcmps/
+; float_bitcasts), fn_entry (one function's native signature), the emit/alloca/
+; label/tmp/open_block/need_declare emission primitives over the per-function
+; state `st`, the LLVM c-string escaping + string_global! interning, and the
+; full-debug dbg_spill_local!. It depends on the debug and types leaves only.
+(module stdlib.backend.emit.llvm.instructions)
+
+(use stdlib.semantics.types.records lambda_param_names)
+(use stdlib.syntax.ast head_of arg)
+(use stdlib.backend.codegen_common unify_int byte_hex)
+(use stdlib.lib.text.buffer buf_new push_str to_string)
+(use stdlib.backend.emit.llvm.debug
+     di_ref di_set_loc! di_type_ref di_local_bind!)
+(use stdlib.backend.emit.llvm.types
+     ll_to_caap render_t ll_of di_array!)
+
+; `binops` — signedness-agnostic two-operand integer ops (bitwise shl included
+; — a left shift is the same instruction for both signs). The head -> base
+; op-name table is identical across targets, so it comes from
+; backend/codegen_common; LLVM prefixes the operand width itself (`add i32`).
+
+; signedness-DEPENDENT two-operand ops: {signed unsigned}. The instruction is
+; chosen from the operands' CAAP type (a u* type -> unsigned), so OS code over
+; u32/u64 (page tables, masks) divides/shifts correctly. The dynamic kernel
+; int and arithmetic results default to signed.
+(bind sbinops
+  (assoc (map_of)
+    "int_div" (list_of "sdiv" "udiv")
+    "int_mod" (list_of "srem" "urem")
+    "int_shr" (list_of "ashr" "lshr")))
+
+; floating-point two-operand ops (kernel `float_*` heads). The dynamic kernel
+; float is f64, so a bare float literal defaults to "double".
+(bind fbinops
+  (assoc (map_of)
+    "float_add" "fadd" "float_sub" "fsub"
+    "float_mul" "fmul" "float_div" "fdiv"))
+
+; float<->int bit-reinterpretations (the kernel's float_to_bits/bits_to_float
+; inverse bit-casts). Each lowers to one LLVM `bitcast` with the head's FIXED
+; source/dest type (equal width) and the resulting CAAP type marker (`ct`).
+; f64<->i64 (8 bytes), f32<->i32 (4 bytes). The storage codegen emits these so
+; a float field encodes/decodes byte-identically to the eval byte runtime.
+(bind float_bitcasts
+  (assoc (map_of)
+    "float_to_bits"     (assoc (map_of) "from" "double" "to" "i64"    "ct" "int")
+    "bits_to_float"     (assoc (map_of) "from" "i64"    "to" "double" "ct" "float")
+    "float_to_bits_f32" (assoc (map_of) "from" "float"  "to" "i32"    "ct" "int")
+    "bits_to_float_f32" (assoc (map_of) "from" "i32"    "to" "float"  "ct" "float")))
+
+(bind cmps
+  (assoc (map_of)
+    "lt" "slt" "gt" "sgt" "le" "sle" "ge" "sge" "eq" "eq" "ne" "ne"))
+
+; fcmps — ordered float predicates for the same comparison heads.
+(bind fcmps
+  (assoc (map_of)
+    "lt" "olt" "gt" "ogt" "le" "ole" "ge" "oge" "eq" "oeq" "ne" "one"))
+
+; funify — the shared float width of two operands (null = a bare float literal
+; that adopts the other side; two literals default to "double").
+(bind funify
+  (lambda (a b)
+    (cond
+      ((eq a null) (if (eq b null) "double" b))
+      ((eq b null) a)
+      ((eq a b) a)
+      (else (throw (string_concat_many
+        "native codegen: mixed float widths " a " vs " b))))))
+
+; fn_entry — one function's native signature for the call table.
+;   pair : a prep_units pair {name, value, sig|null}
+;   ->   : {name, pnames, ptypes(ll), ctypes(caap), result(ll), cresult} —
+;          throws on an unsupported type or a non-function value.
+; A sig-less pair (plain bind, e.g. main) defaults every slot to the dynamic
+; int — exactly what an untyped program means.
+(bind fn_entry
+  (lambda (pair structs)
+    (bind (
+      (name (get pair "name"))
+      (value (get pair "value"))
+      (sig (get pair "sig"))
+      (ctor_of (get pair "ctor_of"))
+    )
+      (do
+        (unless (eq (head_of value) "lambda")
+          (throw (string_concat_many
+            "native codegen: `" name "` is not a function binding")))
+        (if (not (eq ctor_of null))
+          ; a struct constructor: the declaration IS the signature, and the
+          ; body is generated (an insertvalue chain), never lowered
+          (bind (
+            (fields (get structs ctor_of (list_of)))
+            (pnames (list_of)) (ptypes (list_of)) (ctypes (list_of))
+          )
+            (do
+              (for f fields
+                (bind ((lt_ (ll_of (get f "type") structs)))
+                  (do
+                    (when (eq lt_ null)
+                      (throw (string_concat_many
+                        "native codegen: struct `" ctor_of "` field type `"
+                        (get f "type" "?") "` is not lowerable")))
+                    (append pnames (get f "name"))
+                    (append ptypes lt_)
+                    (append ctypes (get f "type")))))
+              (assoc (map_of)
+                "name" name "pnames" pnames
+                "ptypes" ptypes "ctypes" ctypes
+                "result" (string_concat_many "%" ctor_of)
+                "cresult" ctor_of
+                "ctor" ctor_of)))
+          (bind (
+            (pnames (lambda_param_names (arg value 0)))
+            (ptypes (list_of))
+            (ctypes (list_of))
+            (cresult (if (eq sig null) "int" (get sig "result")))
+          )
+            (do
+              (if (eq sig null)
+                (for pn pnames
+                  (do (append ptypes "i32") (append ctypes "int")))
+                (for pr (get sig "params" (list_of))
+                  (bind ((lt_ (ll_of (get pr "type") structs)))
+                    (do
+                      (when (eq lt_ null)
+                        (throw (string_concat_many
+                          "native codegen: `" name "` parameter type `"
+                          (get pr "type" "?") "` is not lowerable")))
+                      (append ptypes lt_)
+                      (append ctypes (get pr "type"))))))
+              (bind ((rt (ll_of cresult structs)))
+                (do
+                  (when (eq rt null)
+                    (throw (string_concat_many
+                      "native codegen: `" name "` result type `"
+                      cresult "` is not lowerable")))
+                  (assoc (map_of)
+                    "name" name "pnames" pnames
+                    "ptypes" ptypes "ctypes" ctypes
+                    "result" rt "cresult" cresult))))))))))
+
+; ── per-function emission state ─────────────────────────────────────────────
+; st = {n: counter ref, lines: list, block: ref current-label}
+
+(bind tmp!
+  (lambda (st)
+    (bind ((n (get st "n")))
+      (do (set_ref n (int_add (deref n) 1))
+          (string_concat_many "%t" (int_to_string (deref n)))))))
+
+(bind label!
+  (lambda (st prefix)
+    (bind ((n (get st "n")))
+      (do (set_ref n (int_add (deref n) 1))
+          (string_concat_many prefix (int_to_string (deref n)))))))
+
+; dbg_suffix — the trailing `, !dbg !L` for the current instruction, or "" when
+; debug is off / no location is active. Reading st's dbg context keeps every
+; emit! call site untouched: with debug "none" the suffix is always "" and the
+; emitted text is byte-identical to a non-debug build.
+(bind dbg_suffix
+  (lambda (st)
+    (bind ((dbg (get st "dbg")))
+      (if (or (eq dbg null) (not (get dbg "on?")))
+        ""
+        (bind ((loc (deref (get dbg "loc"))))
+          (if (eq loc null) ""
+            (string_concat_many ", !dbg !" (int_to_string loc))))))))
+
+(bind emit!
+  (lambda (st line)
+    (append (get st "lines")
+      (string_concat_many "  " line (dbg_suffix st)))))
+
+; alloca! — stack cells go to the ENTRY block (collected separately and
+; spliced in by emit_fn), so a ref inside a loop body allocates once.
+(bind alloca!
+  (lambda (st line)
+    (append (get st "allocas") (string_concat_many "  " line))))
+
+(bind open_block!
+  (lambda (st label)
+    (do
+      (append (get st "lines") (string_concat_many label ":"))
+      (set_ref (get st "block") label))))
+
+; need_declare! — record a runtime symbol the program calls; emit_program
+; prints each declare once, before the function bodies.
+(bind need_declare!
+  (lambda (st symbol signature)
+    (assoc (get (get st "prog" (map_of)) "declares" (map_of))
+           symbol signature)))
+
+; ll_str_hex — one byte (0..255) as the two-uppercase-hex-digit `\XX` LLVM
+; c-string escape (e.g. 0xC3 -> "\C3").
+(bind ll_str_hex
+  (lambda (b)
+    (string_concat_many "\\" (byte_hex b "0123456789ABCDEF"))))
+
+; ll_str_printable — the raw printable-ASCII bytes 0x20..0x7E that an LLVM c"…"
+; constant admits verbatim, indexed by (byte - 0x20). `"` and `\` are present
+; here for index alignment but never reached (escaped explicitly below).
+(bind ll_str_printable
+  " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~")
+
+; ll_str_escape — escape a string for an LLVM c"…" constant, BYTE BY BYTE over
+; its UTF-8 encoding (string->bytes). LLVM c-string syntax only admits the raw
+; printable ASCII bytes 0x20..0x7E except `"` (0x22) and `\` (0x5C); every other
+; byte — controls, DEL, and the >0x7F continuation/lead bytes of a multi-byte
+; codepoint — MUST be written as `\XX`. Each `\XX` is one buffer byte, so the
+; emitted array length stays string_byte_length, not the char count.
+(bind ll_str_escape
+  (lambda (s)
+    (bind (
+      (bl (bytes_to_list (string->bytes s)))
+      (out (buf_new))
+      (i (ref 0))
+    )
+      (do
+        (while (lt (deref i) (size bl))
+          (bind ((b (get bl (deref i) 0)))
+            (do
+              (push_str out
+                (if (or (eq b 34) (eq b 92) (lt b 32) (gt b 126))
+                    (ll_str_hex b)
+                    (string_slice ll_str_printable
+                      (int_sub b 32) (int_sub b 31))))
+              (set_ref i (int_add (deref i) 1)))))
+        (to_string out)))))
+
+; string_global! — intern a string literal as a program global; the value is
+; the runtime string aggregate { ptr, i64 }. Both the array dimension and the
+; i64 length are the UTF-8 BYTE length (string_byte_length), so a multi-byte
+; literal points at a correctly sized buffer.
+(bind string_global!
+  (lambda (st s)
+    (bind (
+      (esc (ll_str_escape s))
+      (blen (string_byte_length s))
+      (prog (get st "prog" (map_of)))
+      (n (get prog "n"))
+    )
+      (do
+        (set_ref n (int_add (deref n) 1))
+        (bind ((gname (string_concat_many "@.s" (int_to_string (deref n)))))
+          (do
+            (append (get prog "globals")
+              (string_concat_many
+                gname " = private unnamed_addr constant ["
+                (int_to_string blen) " x i8] c\"" esc "\""))
+            (assoc (map_of)
+              "repr" (string_concat_many
+                       "{ ptr " gname ", i64 " (int_to_string blen) " }")
+              "type" "str"
+              "ct" "string")))))))
+
+; unify — the shared width of two operand types (null = an int literal that
+; adopts the other side; two literals default to i32). The width logic is shared
+; with the wasm backend (codegen_common/unify_int); only the diagnostic voice
+; ("native codegen:") and the 32-bit tag are LLVM's.
+(bind unify (lambda (a b) (unify_int a b "i32" "native codegen")))
+
+; dbg_spill_local! — "full" debug: give a `bind`-local a debugger-visible memory
+; location WITHOUT touching the codegen path. `v` is the local's already-lowered
+; value record (its SSA `repr`/`type`/`ct`); the body keeps using that SSA `%`.
+; Additively we (1) alloca a debug-only slot, (2) store the SSA value into it,
+; (3) llvm.dbg.declare it as a DILocalVariable with NO `arg:` (a local, arg: 0).
+; The spill is gated on `full?`; it is a no-op otherwise, so with debug off /
+; line-tables nothing is emitted and the IR is byte-identical. A local with no
+; lowerable LLVM type (a bare untyped literal, or a string) is skipped: there is
+; no width to spill and guessing one would be a silent fallback. `node` supplies
+; the declaration's source line via its span (0 when span-less).
+;
+; Arrays: an `array_local` value DECAYS to a typed pointer (its value record is
+; type "ptr"), but it ALSO carries the original array shape ("array_len" /
+; "array_elem_ct", attached at the array_local site and ignored by codegen). When
+; full-debug is on and that length is present AND the element type is describable,
+; the local is described as a genuine DW_TAG_array_type whose !DIDeclare points
+; DIRECTLY at the [N x T] buffer (`repr` is the buffer's own hoisted address — no
+; debug spill, the storage already lives there). When the element is undescribable
+; (di_array! returns null), the value falls back to the decayed-pointer
+; description below (a DW_TAG_pointer_type via di_type_ref/di_composite!), never a
+; null-typed local — LLVM's DWARF backend crashes dereferencing a null type.
+(bind dbg_spill_local!
+  (lambda (st vn v node)
+    (bind ((dbg (get st "dbg")))
+      (when (and (not (eq dbg null)) (get dbg "full?"))
+        (bind (
+          (lt_ (get v "type"))
+          (repr (get v "repr"))
+        )
+          ; only a value with a concrete scalar/aggregate LLVM type and an SSA
+          ; (or constant) repr is spillable; "str" is the runtime aggregate and
+          ; null is a width-less literal — both are skipped, not faked
+          (when (and (not (eq lt_ null)) (not (eq lt_ "str")) (not (eq repr null)))
+            (bind (
+              (structs (get (get st "prog" (map_of)) "structs" (map_of)))
+              (composite? (get st "composite?"))
+              (sp (ctfe_spec_span node))
+              (line (if (or (eq sp null) (eq (get sp "start_line") null))
+                      0 (get sp "start_line" 0)))
+              ; an `array_local`'s described DWARF type (or null when this local
+              ; is not an array, or its element is undescribable -> fall back)
+              (array_tref
+                (bind ((alen (get v "array_len")))
+                  (if (eq alen null) null
+                    (bind ((aid (di_array! dbg alen
+                                  (get v "array_elem_ct") structs)))
+                      (if (eq aid null) null (di_ref aid))))))
+              ; the DWARF type for this local. Prefer the value's own CAAP type
+              ; (a struct/pointer describes via the composite path). When it has
+              ; none (an untyped arithmetic result, or a `ref`/decayed pointer)
+              ; reconstruct one:
+              ;   - a scalar value -> the CAAP name of its LLVM scalar;
+              ;   - a pointer value carrying an element type -> the `ptr_<elem>`
+              ;     pointer-type name (a DW_TAG_pointer_type to the pointee),
+              ; so the local is a TYPED DW_TAG_variable. A null-typed local is
+              ; NOT emitted: LLVM's DWARF backend dereferences the variable's
+              ; type and crashes on a null one, so an undescribable local is
+              ; skipped (best-effort, never a broken build) rather than faked.
+              (ct (cond
+                    ((not (eq (get v "ct") null)) (get v "ct"))
+                    ((and (eq lt_ "ptr") (not (eq (get v "elemct") null)))
+                      (string_concat_many "ptr_" (get v "elemct")))
+                    (else (ll_to_caap lt_))))
+              ; the array type takes precedence when describable; otherwise the
+              ; usual scalar/struct/pointer type ref (the fall-back also covers a
+              ; non-array local and an array with an undescribable element)
+              (tref (if (not (eq array_tref null)) array_tref
+                      (di_type_ref dbg ct structs composite?)))
+            )
+              (when (not (eq tref "null"))
+                (bind (
+                  (var (di_local_bind! dbg vn line tref))
+                  ; the dbg.declare needs a !dbg location in this fn's scope; set
+                  ; it to the local's declaration line, then restore the parent
+                  ; loc so the next sibling is not mis-attributed.
+                  (saved (deref (get dbg "loc")))
+                )
+                  (do
+                    (need_declare! st "llvm.dbg.declare"
+                      "declare void @llvm.dbg.declare(metadata, metadata, metadata)")
+                    (if (not (eq array_tref null))
+                      ; an array local: declare DIRECTLY over the [N x T] buffer
+                      ; (`repr` is its own hoisted address) — no debug spill, the
+                      ; array storage already lives at that stable address.
+                      (do
+                        (di_set_loc! dbg line 0)
+                        (emit! st (string_concat_many
+                          "call void @llvm.dbg.declare(metadata ptr " repr
+                          ", metadata " (di_ref var)
+                          ", metadata !DIExpression())")))
+                      ; the scalar/struct/pointer path: spill the SSA value into a
+                      ; debug-only slot and declare that. A per-function-unique
+                      ; slot name: a `bind`-local can be SHADOWED (two `n`s in
+                      ; nested binds), so suffix the readable name with the
+                      ; emission counter to keep the SSA value name unique. The
+                      ; DILocalVariable still carries the SOURCE name. The store
+                      ; tags with the PARENT loc (di_set_loc! runs after it), so
+                      ; this leg is byte-identical to before.
+                      (bind (
+                        (n (get st "n"))
+                        (uniq (do (set_ref n (int_add (deref n) 1)) (deref n)))
+                        (slot (string_concat_many "%" vn ".dbg" (int_to_string uniq)))
+                      )
+                        (do
+                          (alloca! st (string_concat_many
+                            slot " = alloca " (render_t lt_)))
+                          (emit! st (string_concat_many
+                            "store " (render_t lt_) " " repr ", ptr " slot))
+                          (di_set_loc! dbg line 0)
+                          (emit! st (string_concat_many
+                            "call void @llvm.dbg.declare(metadata ptr " slot
+                            ", metadata " (di_ref var)
+                            ", metadata !DIExpression())")))))
+                    (set_ref (get dbg "loc") saved)))))))))))
+
+(export sbinops fbinops float_bitcasts cmps fcmps funify fn_entry tmp! label!
+        dbg_suffix emit! alloca! open_block! need_declare! ll_str_hex
+        ll_str_printable ll_str_escape string_global! unify dbg_spill_local!)

@@ -1,0 +1,117 @@
+; stdlib/lib/crypto/checksum.caap — non-cryptographic checksums in pure CAAP
+; (module stdlib.lib.crypto.checksum).
+;
+; The coherent home for integrity checksums: error-detecting codes used by
+; archive/binary formats and transport layers, NOT message digests (those live
+; in crypto/digest.caap) and NOT in-memory dictionary hashes (lib/hash.caap).
+;
+; CRC-32 and FNV-1a are RE-EXPORTED from lib/hash so there is a single source of
+; truth — storage/binary.caap and lib/hash already agree on the CRC-32 poly
+; 0xEDB88320, and re-exporting keeps callers that want "the checksum library"
+; from hand-rolling a second copy. crc32c and adler32 are the genuinely new
+; codes this module adds.
+;
+; All algorithms here are 32-bit-word codes. The kernel int is i64 and its
+; bitwise/arithmetic builtins are CHECKED (clean errors, never wrap), so every
+; accumulation is MASKED back to 32 bits with `(int_and … mask32)` to wrap
+; exactly like a real `u32`. That masking is the whole correctness story — drop
+; a mask and the i64 value drifts and the checksum is wrong; the known-answer
+; vectors in tests/test_checksum.caap catch any such bug.
+;
+; Every function accepts `v` as a string (its UTF-8 bytes are checksummed) OR a
+; list of byte ints (0..255) it already holds, via the shared bytes_of idiom.
+(module stdlib.lib.crypto.checksum)
+
+(use stdlib.lib.collections.sequence each range)
+; crc32 / fnv1a / fnv1a_64 live in lib/hash; re_export both brings them into
+; scope here (the dispatcher calls them) and re-publishes them as this module's
+; own — a single source of truth, the canonical facade idiom (cf. prelude.caap).
+(re_export stdlib.lib.hash crc32 fnv1a fnv1a_64)
+; raise! gives the unknown-algorithm path a structured diag.error (a protocol
+; error map carrying a code, message, and the offending name) instead of a bare
+; thrown string — a contract violation a catcher can dispatch on by code.
+(use stdlib.lib.diag.error raise!)
+
+; mask32 — 0xFFFFFFFF, the 32-bit wrap-around mask.
+(bind mask32 4294967295)
+
+; m32 — confine `x` to 32 bits (the checked builtins never overflow because we
+; mask after every xor/shift/add).
+(bind m32 (lambda (x) (int_and x mask32)))
+
+; bytes_of — a string's UTF-8 bytes as a list of ints 0..255; a value that is
+; already such a list passes through. Mirrors lib/hash.bytes_of so a caller can
+; checksum a string directly or a byte list it already holds, identically.
+(bind bytes_of
+  (lambda (v)
+    (if (eq (value_type v) "string")
+      (bytes_to_list (string->bytes v))
+      v)))
+
+; ── crc32 (re-export) ────────────────────────────────────────────────────────
+; CRC-32 (poly 0xEDB88320) — re-exported from lib/hash so this checksum library
+; and storage/binary.caap share ONE implementation. crc32("") = 0,
+; crc32("123456789") = 0xCBF43926 = 3421780262.
+
+; ── crc32c (Castagnoli) ──────────────────────────────────────────────────────
+; CRC-32C (poly 0x82F63B78 = 2197175160, the reflected Castagnoli polynomial) —
+; the same table-free reflected bit loop as CRC-32 but a different poly, the code
+; iSCSI / ext4 / SSE4.2 `crc32` use. init/final XOR 0xFFFFFFFF; masked to 32 bits
+; at each step so a byte list and a string of the same content agree.
+;   v  : a string, or a list of byte ints (0..255)
+;   -> : the standard CRC-32C (0 .. 4294967295)
+; crc32c("") = 0, crc32c("123456789") = 0xE3069283 = 3808858755.
+(defn crc32c ((v any)) int
+  (bind ((crc (ref mask32)) (bytes (bytes_of v)))
+    (do
+      (each bytes
+        (lambda (b)
+          (do
+            (set_ref crc (m32 (int_xor (deref crc) b)))
+            (each (range 0 8)
+              (lambda (_k)
+                (if (eq (int_and (deref crc) 1) 1)
+                  (set_ref crc (m32 (int_xor (int_shr (deref crc) 1) 2197175160)))
+                  (set_ref crc (int_shr (deref crc) 1))))))))
+      (m32 (int_xor (deref crc) mask32)))))
+
+; ── adler32 ──────────────────────────────────────────────────────────────────
+; Adler-32 (zlib) — two running sums `a` and `b` taken mod 65521 (the largest
+; prime below 2^16), combined as (b << 16) | a. `a` starts at 1, `b` at 0; per
+; byte a += byte, b += a, both reduced mod the prime. Reducing each step keeps
+; both sums well inside i64 (no overflow even before the mod).
+;   v  : a string, or a list of byte ints (0..255)
+;   -> : the standard Adler-32 (0 .. 4294967295)
+; adler32("") = 1, adler32("Wikipedia") = 0x11E60398 = 300286872.
+(defn adler32 ((v any)) int
+  (bind ((a (ref 1)) (b (ref 0)) (prime 65521) (bytes (bytes_of v)))
+    (do
+      (each bytes
+        (lambda (byte)
+          (do
+            (set_ref a (int_mod (int_add (deref a) byte) prime))
+            (set_ref b (int_mod (int_add (deref b) (deref a)) prime)))))
+      (m32 (int_or (int_shl (deref b) 16) (deref a))))))
+
+; ── checksum (dispatcher) ────────────────────────────────────────────────────
+; checksum — dispatch by algorithm name to the matching function above. Names:
+; "crc32", "crc32c", "adler32", "fnv1a", "fnv1a_64". An unknown name `raise!`s a
+; structured diag.error (code "stdlib.crypto.checksum.unknown_algorithm", the
+; offending name under data "name") — a contract violation must surface, not
+; silently fall back.
+;   name : the algorithm name (string)
+;   v    : a string, or a list of byte ints (0..255)
+;   -> : the named checksum
+(defn checksum ((name string) (v any)) int
+  (if (eq name "crc32") (crc32 v)
+  (if (eq name "crc32c") (crc32c v)
+  (if (eq name "adler32") (adler32 v)
+  (if (eq name "fnv1a") (fnv1a v)
+  (if (eq name "fnv1a_64") (fnv1a_64 v)
+    (raise! "stdlib.crypto.checksum.unknown_algorithm"
+      "checksum: unknown algorithm"
+      (assoc (map_of) "name" name))))))))
+
+; crc32 / fnv1a / fnv1a_64 are re-published above via re_export; this lists only
+; the codes implemented here plus the dispatcher.
+(export crc32c adler32 checksum)

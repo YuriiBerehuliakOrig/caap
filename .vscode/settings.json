@@ -1,3 +1,12 @@
 {
-    "chatgpt.runCodexInWindowsSubsystemForLinux": true
+    // Leave these empty so the extension uses target/debug, target/release, or PATH.
+    "caap.server.path": "",
+    "caap.dap.path": "",
+    "caap.trace.server": "off",
+    // Force semantic tokens on regardless of theme so the LSP colors functions,
+    // parameters and types (incl. grammar-extended bodies like demo.caap).
+    "editor.semanticHighlighting.enabled": true,
+    "[caap]": {
+        "editor.semanticHighlighting.enabled": true
+    }
 }

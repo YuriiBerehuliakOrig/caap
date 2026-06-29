@@ -1,0 +1,77 @@
+; stdlib/lib/tests/test_constfold.caap — constant folding of pure literal calls.
+
+;; @area: passes
+;; @kind: regression
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.constfold fold_node)
+(use stdlib.syntax.ast sym lit calln call? literal? literal_of)
+
+(do
+  ; ── a pure literal call folds to its value ──
+  (assert_eq (literal_of (fold_node (calln "int_add" (list_of (lit 2) (lit 3))))) 5
+    "(int_add 2 3) folds to 5")
+
+  ; ── nested folds bottom-up in one pass ──
+  (assert_eq
+    (literal_of (fold_node
+      (calln "int_add"
+        (list_of (calln "int_mul" (list_of (lit 2) (lit 3))) (lit 1)))))
+    7
+    "(int_add (int_mul 2 3) 1) folds to 7")
+
+  ; ── comparison folds to a bool ──
+  (assert_eq (literal_of (fold_node (calln "lt" (list_of (lit 1) (lit 2))))) true
+    "(lt 1 2) folds to true")
+
+  ; ── a non-literal argument prevents folding ──
+  (assert_true (call? (fold_node (calln "int_add" (list_of (sym "x") (lit 3)))))
+    "(int_add x 3) is left as a call")
+
+  ; ── an impure head is never folded ──
+  (assert_true (call? (fold_node (calln "println" (list_of (lit 5)))))
+    "(println 5) is not folded")
+
+  ; ── a throwing eval (div by zero) is caught, expression left intact ──
+  (assert_true (call? (fold_node (calln "int_div" (list_of (lit 1) (lit 0)))))
+    "(int_div 1 0) is left intact, not folded")
+
+  ; ── bitwise ops fold ──
+  (assert_eq (literal_of (fold_node (calln "int_and" (list_of (lit 6) (lit 3))))) 2
+    "(int_and 6 3) folds to 2")
+  (assert_eq (literal_of (fold_node (calln "int_or" (list_of (lit 4) (lit 1))))) 5
+    "(int_or 4 1) folds to 5")
+  (assert_eq (literal_of (fold_node (calln "int_xor" (list_of (lit 6) (lit 3))))) 5
+    "(int_xor 6 3) folds to 5")
+  (assert_eq (literal_of (fold_node (calln "int_shl" (list_of (lit 1) (lit 3))))) 8
+    "(int_shl 1 3) folds to 8")
+  (assert_eq (literal_of (fold_node (calln "int_not" (list_of (lit 0))))) -1
+    "(int_not 0) folds to -1")
+
+  ; ── a throwing shift (out-of-range) is caught, expression left intact ──
+  (assert_true (call? (fold_node (calln "int_shl" (list_of (lit 1) (lit 70)))))
+    "(int_shl 1 70) is left intact (shift out of range), not folded")
+
+  ; ── string predicates fold to bools ──
+  (assert_eq
+    (literal_of (fold_node
+      (calln "string_starts_with" (list_of (lit "hello") (lit "he"))))) true
+    "(string_starts_with \"hello\" \"he\") folds to true")
+  (assert_eq
+    (literal_of (fold_node
+      (calln "string_contains" (list_of (lit "hello") (lit "zz"))))) false
+    "(string_contains \"hello\" \"zz\") folds to false")
+  (assert_eq
+    (literal_of (fold_node
+      (calln "string_slice" (list_of (lit "hello") (lit 1) (lit 3))))) "el"
+    "(string_slice \"hello\" 1 3) folds to \"el\"")
+
+  ; ── string equality folds (eq/lt work on strings) ──
+  (assert_eq (literal_of (fold_node (calln "eq" (list_of (lit "a") (lit "a"))))) true
+    "(eq \"a\" \"a\") folds to true")
+  (assert_eq (literal_of (fold_node (calln "lt" (list_of (lit "a") (lit "b"))))) true
+    "(lt \"a\" \"b\") folds to true")
+
+  ; ── a MUTABLE collection builder is NOT folded (would bake a shared object) ──
+  (assert_true (call? (fold_node (calln "list_of" (list_of (lit 1) (lit 2)))))
+    "(list_of 1 2) is NOT folded (mutable-collection aliasing)"))

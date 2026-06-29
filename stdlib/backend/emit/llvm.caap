@@ -1,0 +1,69 @@
+; stdlib/backend/emit/llvm.caap — stdlib's OWN LLVM IR emitter (tier 4 codegen).
+;
+; Consumes prep_units' flat program (root + inlined dependencies) and emits
+; LLVM IR text directly — the function signatures come from OUR defn
+; markers: a (defn f ((a u8)) u8 …)
+; really becomes `define i8 @f(i8 %a)`, so the stdlib type system drives the
+; native ABI.
+;
+; The supported subset is deliberately small and CERTAIN (anything else is a
+; named diagnostic, never wrong code):
+;   - int arithmetic  int_add/int_sub/int_mul       -> add/sub/mul
+;   - comparisons     lt/gt/le/ge/eq/ne             -> icmp (i1)
+;   - control         3-arm `if` (cond/case sugar)  -> br + phi
+;                     `while`                       -> loop blocks
+;   - state           ref/deref/set_ref             -> alloca/load/store
+;                     (every alloca is hoisted to the entry block — a ref
+;                     inside a loop body allocates once; its init store
+;                     stays in place, so each iteration re-initializes)
+;   - locals          flat/multi bind               -> SSA values
+;   - structs         (struct …) -> named LLVM aggregates: the constructor
+;                     is an insertvalue chain, (get p "field" d) is
+;                     extractvalue (the default is not evaluated natively)
+;   - strings         literals, parameters/results ({ ptr, i64 } ABI),
+;                     string_concat_many and eq via caap-sys-runtime symbols
+;   - direct calls between the program's functions
+;   - pointers        int_to_ptr/ptr_to_int, ptr_read/ptr_write (= deref/
+;                     set_ref), ptr_add (typed getelementptr); `ptr_<elem>`
+;                     types in signatures. Walk arrays / page tables by index.
+;   - inline asm      (asm "tmpl" "constraints" result_ty arg…) — privileged
+;                     CPU instructions (cli/hlt/lidt/rdtsc/in/out); `void`
+;                     result for no-value ops; emitted `sideeffect`.
+;   - MMIO            (volatile_read addr ty) / (volatile_write addr ty v)
+;                     — raw hardware access: the integer address is
+;                     inttoptr'd and the load/store is `volatile` (never
+;                     elided/reordered by the optimizer). NATIVE-ONLY: there
+;                     is no memory-mapped hardware under the CTFE interpreter.
+;   - runtime IO      (println x) — string or i32, via the caap-sys-runtime
+;                     symbols (the native linker provides them); string
+;                     literals become program globals ({ ptr, i64 } values;
+;                     escaped byte-by-byte over the UTF-8 encoding — any byte
+;                     that is not raw-printable ASCII becomes \XX; the i64
+;                     length is the UTF-8 byte length)
+;   - literals        int (adopts the expected width), bool, string
+; Sized types use NATIVE width semantics (an i8 add wraps); the dynamic
+; kernel int maps to i32. main's narrower int result widens to the i32 exit
+; code (zext for u*, sext otherwise).
+;
+; ── FACADE ──────────────────────────────────────────────────────────────────
+; The emitter was split (C8 readability pass, with explicit authorization to
+; override the former KEEP-MONOLITHIC note) into acyclic submodules under
+; stdlib/backend/emit/llvm/, lowest layer first:
+;   debug         — target policy (set_target!/…) + the DWARF `di_*` infra
+;   types         — CAAP<->LLVM type lowering + DWARF composite/array builders
+;   instructions  — op tables, fn_entry, the emit/alloca/… primitives, strings
+;   lowering      — the recursive expression walker (lower_dispatch / lower)
+;   emit          — emit_fn / emit_core + the public entry points
+; Each layer only depends on lower/equal layers (debug<types<instructions<
+; lowering<emit), so there is no forward reference and the emitted IR is
+; byte-identical to the former single file. This facade `use`s the leaves and
+; re-publishes the SAME public contract the one file exposed.
+(module stdlib.backend.emit.llvm)
+
+(use stdlib.backend.emit.llvm.debug set_target! clear_target! emit_with_target)
+(use stdlib.backend.emit.llvm.emit
+     emit_program emit_program_debug emit_freestanding emit_freestanding_debug)
+
+(export emit_program emit_program_debug
+        emit_freestanding emit_freestanding_debug
+        set_target! clear_target! emit_with_target)

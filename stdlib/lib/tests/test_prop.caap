@@ -1,0 +1,86 @@
+; stdlib/lib/tests/test_prop.caap — in-language tests for lib/prop.
+; Loading this file runs the assertions; a thrown "FAIL: …" is the failure
+; signal. Everything here is DETERMINISTIC (forall is fixed-seeded), so the
+; outcome is reproducible run to run.
+
+;; @area: core
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.diag.error raise!)
+(use stdlib.lib.prop
+  assert_false assert_ne assert_nil assert_approx assert_contains
+  assert_throws assert_error
+  new_rng gen_int gen_bool gen_string gen_list forall forall_seed default_seed)
+
+(do
+  ; ── the richer assertions pass on their happy paths ──
+  (assert_false false "assert_false on false")
+  (assert_ne 1 2 "assert_ne on distinct ints")
+  (assert_ne (list_of 1) (list_of 1 2) "assert_ne on distinct lists")
+  (assert_nil null "assert_nil on null")
+  (assert_approx 0.1 0.1000001 0.001 "assert_approx within eps")
+  (assert_contains "hello world" "world" "assert_contains substring")
+  (assert_contains (list_of 1 2 3) 2 "assert_contains list membership")
+
+  ; ── assert_throws: a div-by-zero thunk throws, so the assertion passes ──
+  (assert_throws (lambda () (int_div 1 0)) "assert_throws on div-by-zero")
+
+  ; ── assert_error: matches a thrown protocol error by its code ──
+  (assert_error
+    (lambda () (raise! "test.boom" "kaboom" null))
+    "test.boom"
+    "assert_error matches the error code")
+
+  ; ── property: (int_add x 0) == x holds for 50 random ints ──
+  (forall
+    (lambda (rng) (gen_int rng -1000 1000))
+    (lambda (x) (eq (int_add x 0) x))
+    50)
+
+  ; ── generators thread state and stay in range (a small spot-check) ──
+  (bind ((r0 (new_rng 7)))
+    (bind ((g (gen_int r0 5 5)))
+      (assert_eq (get g "value") 5 "gen_int collapses a point range to lo")))
+  (bind ((s (gen_string (new_rng 3) 0)))
+    (assert_eq (get s "value") "" "gen_string of maxlen 0 is empty"))
+  (assert_true
+    (le (size (get (gen_list (new_rng 9)
+                             (lambda (rng) (gen_bool rng)) 4) "value")) 4)
+    "gen_list respects maxlen")
+
+  ; ── a property that SHOULD fail: forall throws, caught via assert_throws ──
+  (assert_throws
+    (lambda ()
+      (forall
+        (lambda (rng) (gen_int rng 1 1000))
+        (lambda (x) (lt x 0))        ; never true for x in [1,1000]
+        20))
+    "a false property makes forall throw")
+
+  ; ── forall_seed: a caller-supplied seed; a passing property still passes ──
+  (forall_seed
+    (lambda (rng) (gen_int rng -1000 1000))
+    (lambda (x) (eq (int_mul x 1) x))
+    30 12345)
+
+  ; ── the failure message REPORTS the seed, so a run can be replayed ──
+  (bind ((msg (try (do
+                     (forall_seed
+                       (lambda (rng) (gen_int rng 1 1000))
+                       (lambda (x) (lt x 0))     ; always fails
+                       10 777)
+                     "")
+                   (catch e e))))
+    (do
+      (assert_true (string_contains msg "property failed") "forall_seed throws on failure")
+      (assert_true (string_contains msg "seed 777") "the failure message reports the seed")))
+
+  ; ── default_seed: forall is forall_seed at the default seed (same outcome) ──
+  ; both run the same generator/property at the same seed -> both pass identically
+  (forall (lambda (rng) (gen_int rng 0 10)) (lambda (x) (le 0 x)) 10)
+  (forall_seed (lambda (rng) (gen_int rng 0 10)) (lambda (x) (le 0 x)) 10 default_seed)
+  ; and default_seed is a plain int the caller can read/reuse
+  (assert_true (eq (value_type default_seed) "int") "default_seed is an int")
+
+  true)

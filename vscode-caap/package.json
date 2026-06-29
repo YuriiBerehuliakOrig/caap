@@ -1,0 +1,140 @@
+{
+  "name": "vscode-caap",
+  "displayName": "CAAP",
+  "description": "Syntax highlighting, diagnostics, outline, hover and go-to-definition for CAAP via caap-lsp.",
+  "version": "0.1.0",
+  "publisher": "caap",
+  "engines": {
+    "vscode": "^1.84.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Debuggers"
+  ],
+  "keywords": [
+    "caap",
+    "ctfe",
+    "language server",
+    "debugger"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:caap"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "caap.restartServer",
+        "title": "CAAP: Restart Language Server"
+      }
+    ],
+    "languages": [
+      {
+        "id": "caap",
+        "aliases": ["CAAP", "caap"],
+        "extensions": [".caap"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "caap",
+        "scopeName": "source.caap",
+        "path": "./syntaxes/caap.tmLanguage.json"
+      }
+    ],
+    "configurationDefaults": {
+      "[caap]": {
+        "editor.semanticHighlighting.enabled": true
+      }
+    },
+    "configuration": {
+      "title": "CAAP",
+      "properties": {
+        "caap.server.path": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the caap-lsp binary. If empty, the extension looks for `caap-lsp` on PATH."
+        },
+        "caap.dap.path": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the caap-dap binary (compile-time debugger). If empty, the extension looks under target/debug|release and then on PATH."
+        },
+        "caap.trace.server": {
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "description": "Traces the communication between VS Code and the CAAP language server."
+        }
+      }
+    },
+    "breakpoints": [
+      { "language": "caap" }
+    ],
+    "debuggers": [
+      {
+        "type": "caap",
+        "label": "CAAP CTFE Debugger",
+        "languages": ["caap"],
+        "configurationAttributes": {
+          "launch": {
+            "required": ["bootstrap"],
+            "properties": {
+              "bootstrap": {
+                "type": "string",
+                "description": "Path to the stdlib bootstrap entry to load (e.g. ${workspaceFolder}/stdlib/bootstrap.caap). Stepped directly when no program/entry is given.",
+                "default": "${workspaceFolder}/stdlib/bootstrap.caap"
+              },
+              "program": {
+                "type": "string",
+                "description": "A source .caap file to run under the debugger (run_source). Program output is captured to the Debug Console."
+              },
+              "root": {
+                "type": "string",
+                "description": "Module root for run_from_root (the directory passed as --root).",
+                "default": "${workspaceFolder}"
+              },
+              "entry": {
+                "type": "string",
+                "description": "Module name to run from `root` (run_from_root)."
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Pause at the first evaluated expression.",
+                "default": true
+              },
+              "dapPath": {
+                "type": "string",
+                "description": "Override path to the caap-dap binary."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "caap",
+            "request": "launch",
+            "name": "CAAP: Step stdlib bootstrap",
+            "bootstrap": "${workspaceFolder}/stdlib/bootstrap.caap",
+            "root": "${workspaceFolder}",
+            "stopOnEntry": true
+          }
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.84.0",
+    "typescript": "^5.3.0"
+  }
+}

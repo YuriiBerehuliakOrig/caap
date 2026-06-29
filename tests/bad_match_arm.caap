@@ -1,0 +1,11 @@
+; tests/bad_match_arm.caap — a match guard TYPES
+; its binding: (str? s) proves s is a string, so passing it to int_add is a
+; certain load-time error.
+(module stdlib.fixtures.bad_match_arm)
+
+(defn weird ((x any)) int
+  (match x
+    ((str? s) (int_add s 1))
+    (else 0)))
+
+(export weird)

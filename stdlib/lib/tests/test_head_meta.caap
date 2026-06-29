@@ -1,0 +1,97 @@
+; stdlib/lib/tests/test_head_meta.caap — the DRIFT GUARD for the single-source
+; head-metadata table (stdlib/semantics/head_meta.caap).
+;
+; Three optimization passes each carry their own hand-written head whitelist:
+;   constfold.caap  pure_heads        — foldable pure-scalar heads
+;   dce.caap        total_pure_heads  — droppable pure+total heads
+;   licm.caap       pure_total_heads  — hoistable never-throw scalar heads
+; head_meta.caap factors the underlying per-head facts into ONE table. This test
+; proves each pass list is STILL EXACTLY derivable from that table:
+;   constfold pure_heads      == { h : pure? AND scalar_result? }
+;   dce       total_pure_heads == { h : pure? AND total? }
+;   licm      pure_total_heads == { h : total? AND scalar_result? AND (not may_throw?) }
+; over the UNION domain (every head named in head_metadata). The check is
+; BIDIRECTIONAL: no head in a pass list may fail its derivation (no STALE entry),
+; and no head the derivation selects may be missing from the pass list (no GAP),
+; except for a small DOCUMENTED known_gaps set per pass (see below: `value_type` is a
+; pre-existing conservatism gap in constfold/dce that the single source exposes). The
+; known_gaps are themselves checked — a resolved or unjustified gap fails too. If the
+; table and a pass list otherwise drift apart, this fails naming the head.
+
+;; @area: passes
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_true)
+(use stdlib.semantics.head_meta
+  head_metadata pure? total? scalar_result? may_throw?)
+(use stdlib.semantics.passes.constfold pure_heads)
+(use stdlib.semantics.passes.dce total_pure_heads)
+(use stdlib.semantics.passes.licm pure_total_heads)
+
+(do
+  (bind (
+    ; in_table? — is head `h` present (set true) in a pass's {name->true} table?
+    (in_table? (lambda (table h) (eq (get table h false) true)))
+
+    ; assert_derivation — prove `pass_table` == { h in domain : (derive h) }.
+    ; domain : the head names over which the derivation is evaluated (the union,
+    ;          i.e. every key of head_metadata).
+    ; derive : (h)->bool, the pass's membership predicate over the axes.
+    ; Two directions, each naming the offending head on failure:
+    ;   (1) GAP   — a head the derivation SELECTS is absent from the pass table.
+    ;   (2) STALE — a head IN the pass table the derivation does NOT select.
+    (assert_derivation
+      (lambda (label domain pass_table derive known_gaps)
+        (do
+          ; (1) every derived head must be in the pass table — UNLESS it is a
+          ;     documented KNOWN GAP (a head the pass conservatively omits).
+          (for h domain
+            (when (and (derive h) (not (in_table? pass_table h)))
+              (assert_true (eq (get known_gaps h false) true)
+                (string_concat_many
+                  label ": head_meta derives `" h
+                  "` but it is MISSING from the pass table (axis drift — add it to the "
+                  "pass table, or, if intentional, to this pass's known_gaps)"))))
+          ; (1b) every KNOWN GAP must STILL be a genuine gap: head_meta derives it AND
+          ;      the pass really omits it. If a gap was resolved (or no longer derived),
+          ;      this fails so the stale exception is dropped — keeps the list honest.
+          (for h (map_keys known_gaps)
+            (do
+              (assert_true (derive h)
+                (string_concat_many label ": known_gap `" h
+                  "` is no longer derived by head_meta — drop it from known_gaps"))
+              (assert_true (not (in_table? pass_table h))
+                (string_concat_many label ": known_gap `" h
+                  "` is now IN the pass table (gap resolved) — drop it from known_gaps"))))
+          ; (2) every head in the pass table must be derived by head_meta (no STALE entry)
+          (for h (map_keys pass_table)
+            (assert_true (derive h)
+              (string_concat_many
+                label ": pass table lists `" h
+                "` but head_meta does NOT derive it (axis drift)"))))))
+
+    (domain (map_keys head_metadata))
+    ; KNOWN GAPS — pre-existing conservatism the single-source table EXPOSES (a real
+    ; finding, not a table error): `value_type` is pure + total + scalar_result (axis-
+    ; identical to eq/ne/not), so head_meta derives it as foldable (constfold) and
+    ; droppable (dce) — yet the constfold/dce authors never listed it, while licm DOES
+    ; include it in its total whitelist. So `value_type` is a missed optimization in
+    ; constfold/dce. Recorded here pending a decision to add it (a tiny, sound behavior
+    ; change deliberately deferred out of this additive change). licm has no gap.
+    (cf_gaps  (assoc (map_of) "value_type" true))
+    (dce_gaps (assoc (map_of) "value_type" true))
+    (no_gaps  (map_of))
+  )
+    (do
+      ; ── constfold: foldable == pure AND immutable-scalar result ──
+      (assert_derivation "constfold" domain pure_heads
+        (lambda (h) (and (pure? h) (scalar_result? h))) cf_gaps)
+
+      ; ── dce: droppable == pure AND total ──
+      (assert_derivation "dce" domain total_pure_heads
+        (lambda (h) (and (pure? h) (total? h))) dce_gaps)
+
+      ; ── licm: hoistable == total AND scalar AND never-throws ──
+      (assert_derivation "licm" domain pure_total_heads
+        (lambda (h)
+          (and (total? h) (and (scalar_result? h) (not (may_throw? h))))) no_gaps))))

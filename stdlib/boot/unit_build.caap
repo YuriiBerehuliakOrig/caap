@@ -1,0 +1,148 @@
+; stdlib/boot/unit_build.caap — UNIT assembly (module stdlib.unit_build).
+; MODULE IDENTITY: a RAW bootstrap script (run via ctfe_compiler_execute_bootstrap_file /
+; run_expanded BEFORE the `module` form is a bound name), so it carries NO `(module …)`
+; form — adding one would raise `unknown name: module`. Its registry identity is set
+; explicitly via ctfe_compiler_register_value. Allowlisted in stdlib/CONVENTIONS.md +
+; stdlib_module_identity_check (caap/tests/stdlib_governance_tests.rs).
+;
+; Turn a module's parsed injections + body into its export VALUE: resolve the
+; imports, seed the type env, expand each form, run user transforms, drive the
+; gate (check + type pass), then evaluate the body with the imports bound and
+; build the export map. The heart of `load = read -> expand -> check -> typecheck
+; -> eval`, lifted out of the loader as its own responsibility. `make` binds it
+; over the gate driver (`checked`) and the namespace/import helpers the orchestrator
+; resolved; it holds no loader state (directive PARSING + registry bookkeeping stay
+; in the orchestrator, which calls build_value with injections already parsed).
+(do
+  (bind (
+    (make
+      (lambda (checked resolve_import get_export export_map_spec expand_collect)
+        (bind (
+          ; build_value — assemble the module's export value from injections + body.
+          ;   injections   : [{kind, module, alias|names}] from import/use/re_export
+          ;   body         : [{spec, loc}] body forms with their source locations
+          ;   export_names : names from export/re_export; empty => last body form is value
+          ;   importer     : this module's name (for diagnostics)
+          ;   module_loc   : the (module …) directive's location (for synthetic forms)
+          ; Per body form: expand (collecting located diagnostics), then run the
+          ; checker + type pass over the expanded forms — every finding carries its
+          ; "path:line:col". Only a clean module evaluates: imports are injected as
+          ; lambda params + apply (never values in syntax).
+          (build_value
+            (lambda (injections body export_names importer module_loc)
+              (bind (
+                (params (list_of))
+                (values (list_of))
+                ; seed the type env with signatures of use-injected functions, so
+                ; cross-module calls to typed fns are checked at THIS call site
+                (ti (ctfe_compiler_lookup_value compiler "stdlib.semantics.types.infer" null))
+                (type_env (map_of))
+                (located (list_of))   ; {spec, loc} incl. the synthetic export map
+                (expanded (list_of))  ; {node, loc} after expansion
+                (sink (list_of))      ; located findings from ALL load-time phases
+                ; (param…) as a spec — shared by the body wrapper and the const eval
+                ; below (lazy: params are filled by the injection loop first)
+                (param_list_spec
+                  (lambda ()
+                    (syntax_call
+                      (syntax_name (get params 0))
+                      (sequence_map (sequence_drop params 1)
+                        (lambda (p) (syntax_name p))))))
+                ; ctx extras for the expansion — module awareness for forms:
+                ; effect_of answers from the seeded type env (signatures of
+                ; use-imports carry their settled effect), so `const` can fold
+                ; imported pure fns and refuse impure/unproven ones.
+                (effect_of
+                  (lambda (nm)
+                    (bind ((e (get type_env nm)))
+                      (if (and (eq (value_type e) "map") (eq (get e "kind") "fn"))
+                        (get e "effect")
+                        null))))
+                ; an eval with this module's imports BOUND (same wrap-and-apply trick
+                ; as the body itself), so a folded expression may call them
+                (eval_with_imports
+                  (lambda (spec)
+                    (if (eq (size params) 0)
+                      (ctfe_eval_node spec)
+                      (apply
+                        (ctfe_eval_node
+                          (syntax_call (syntax_name "lambda")
+                            (list_of (param_list_spec) spec)))
+                        values))))
+                (extras
+                  (assoc (map_of) "effect_of" effect_of "eval" eval_with_imports))
+              )
+                (do
+                  ; turn each injection into one-or-more (param, value) pairs
+                  (for inj injections
+                    (with_map inj (
+                      (kind "kind") (mod "module") (alias "alias")
+                      (names "names") (at "loc")
+                    )
+                      (if (eq kind "namespace")
+                        (do
+                          (append params alias)
+                          (append values (resolve_import mod)))
+                        ; symbols: bind each validated name directly
+                        (bind ((exports (resolve_import mod)))
+                          (for nm names
+                            (do
+                              (append params nm)
+                              (append values (get_export exports nm importer mod at))
+                              (when_let (sig_of (if (eq ti null) null (get ti "sig_of")))
+                                (when_let (s (sig_of mod nm))
+                                  (assoc type_env nm s)))))))))
+                  ; the form list: the body, plus the synthetic export map at the end
+                  (for f body (append located f))
+                  (when (gt (size export_names) 0)
+                    (append located
+                      (assoc (map_of)
+                        "spec" (export_map_spec export_names)
+                        "loc" module_loc)))
+                  ; expand each form, keeping expansion errors located too
+                  (for f located
+                    (bind ((res (expand_collect (get f "spec") extras)))
+                      (do
+                        (for d (get res "diagnostics" (list_of))
+                          (when (eq (get d "severity" "error") "error")
+                            (append sink
+                              (string_concat_many
+                                (get f "loc" "<unknown>") ": stdlib.expand: "
+                                (get d "message" "expansion error")))))
+                        (append expanded
+                          (assoc (map_of)
+                            "node" (get res "node")
+                            "loc" (get f "loc" "<unknown>"))))))
+                  ; USER transform passes (stdlib.semantics.passes.registry) rewrite the expanded
+                  ; forms BEFORE the gate — what gets checked is exactly what gets
+                  ; evaluated; looked up by name like the type pass (zero cost when
+                  ; the kit was never loaded)
+                  (bind ((pk (ctfe_compiler_lookup_value compiler "stdlib.semantics.passes.registry" null)))
+                    (when_let (rt (if (eq pk null) null (get pk "run_transforms")))
+                      (rt expanded)))
+                  ; the gate: checker + type pass; fail with EVERYTHING found
+                  (bind ((scope0 (map_of)))
+                    (do
+                      (for p params (assoc scope0 p true))
+                      (checked expanded importer scope0 type_env sink)))
+                  (when (gt (size sink) 0)
+                    (runtime_error
+                      (string_concat_many
+                        "stdlib: module \"" importer "\" failed load-time checks: "
+                        (sequence_join sink "; "))))
+                  ; evaluate: forms are already expanded; wrap + apply the imports
+                  (bind ((body_do
+                           (syntax_call (syntax_name "do")
+                             (sequence_map expanded (lambda (r) (get r "node"))))))
+                    (if (eq (size params) 0)
+                      (ctfe_eval_node body_do)
+                      (apply
+                        (ctfe_eval_node
+                          (syntax_call (syntax_name "lambda")
+                            (list_of (param_list_spec) body_do)))
+                        values)))))))
+        )
+          (assoc (map_of) "build_value" build_value))))
+  )
+    (ctfe_compiler_register_value compiler "stdlib.unit_build"
+      (assoc (map_of) "make" make))))

@@ -1,8 +1,12 @@
+//! Batch error-recovery parsing (the `recovery` feature): split input at sync
+//! points, parse each segment, and collect [`RecoveredParse`] results plus the
+//! errors, instead of failing on the first error.
+
 use std::collections::BTreeMap;
 
 use regex::Regex;
 
-use crate::diagnostics_utils::{compute_line_offsets, line_col};
+use crate::diagnostics_utils::{compute_line_offsets, line_col_u32};
 use crate::error::ParseError;
 use crate::grammar::Grammar;
 use crate::types::ParseValue;
@@ -12,15 +16,20 @@ use crate::types::ParseValue;
 /// A text that could be inserted to recover from a parse error.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryInsertCandidate {
+    /// The candidate insertion text.
     pub text: String,
+    /// A human-readable label for the candidate.
     pub label: String,
 }
 
 /// A token span that could be deleted to recover from a parse error.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryDeleteCandidate {
+    /// Inclusive start byte offset of the deletable span.
     pub start: usize,
+    /// Exclusive end byte offset of the deletable span.
     pub end: usize,
+    /// The text covered by the span.
     pub text: String,
 }
 
@@ -37,6 +46,8 @@ pub struct RecoveryConfig {
     pub local_tolerance: bool,
     /// Maximum text length of an insertable candidate.
     pub local_insert_max_length: usize,
+    /// Maximum number of parse attempts performed by one recovery run.
+    pub max_recovery_attempts: usize,
 }
 
 impl Default for RecoveryConfig {
@@ -47,6 +58,7 @@ impl Default for RecoveryConfig {
             max_errors: 5,
             local_tolerance: true,
             local_insert_max_length: DEFAULT_LOCAL_INSERT_MAX_LENGTH,
+            max_recovery_attempts: DEFAULT_MAX_RECOVERY_ATTEMPTS,
         }
     }
 }
@@ -56,32 +68,37 @@ pub type RecoveredParse = (Vec<ParseValue>, Vec<ParseError>);
 
 const DEFAULT_LOCAL_INSERT_MAX_LENGTH: usize = 8;
 const DEFAULT_LOCAL_INSERT_MAX_CANDIDATES: usize = 4;
+const DEFAULT_MAX_RECOVERY_ATTEMPTS: usize = 1024;
 
 // ── Normalisation helpers ──────────────────────────────────────────────────
 
 /// Validate and normalise a list of sync tokens.
-pub fn normalize_sync_tokens(tokens: &[String]) -> Result<Vec<String>, String> {
+pub fn normalize_sync_tokens(tokens: &[String]) -> Result<Vec<String>, ParseError> {
     for t in tokens {
         if t.is_empty() {
-            return Err("sync_tokens must contain only non-empty strings".to_string());
+            return Err(recovery_config_error(
+                "sync_tokens must contain only non-empty strings",
+            ));
         }
     }
     Ok(tokens.to_vec())
 }
 
 /// Validate a sync regex string.
-pub fn normalize_sync_regex(regex: &str) -> Result<String, String> {
+pub fn normalize_sync_regex(regex: &str) -> Result<String, ParseError> {
     if regex.trim().is_empty() {
-        return Err("sync_regex must be a non-empty string".to_string());
+        return Err(recovery_config_error(
+            "sync_regex must be a non-empty string",
+        ));
     }
-    Regex::new(regex).map_err(|e| format!("invalid sync_regex: {e}"))?;
+    Regex::new(regex).map_err(|e| recovery_config_error(format!("invalid sync_regex: {e}")))?;
     Ok(regex.to_string())
 }
 
 /// Validate recovery sync configuration and return normalized values.
 pub fn validate_recovery_config(
     config: &RecoveryConfig,
-) -> Result<(Vec<String>, Option<String>), String> {
+) -> Result<(Vec<String>, Option<String>), ParseError> {
     let sync_tokens = normalize_sync_tokens(&config.sync_tokens)?;
     let sync_regex = match config.sync_regex.as_deref() {
         Some(pattern) => Some(normalize_sync_regex(pattern)?),
@@ -89,13 +106,26 @@ pub fn validate_recovery_config(
     };
 
     if sync_tokens.is_empty() && sync_regex.is_none() {
-        return Err("Recovery requires explicit sync_tokens or sync_regex".to_string());
+        return Err(recovery_config_error(
+            "Recovery requires explicit sync_tokens or sync_regex",
+        ));
     }
     if config.max_errors == 0 {
-        return Err("max_errors must be greater than zero".to_string());
+        return Err(recovery_config_error(
+            "max_errors must be greater than zero",
+        ));
+    }
+    if config.max_recovery_attempts == 0 {
+        return Err(recovery_config_error(
+            "max_recovery_attempts must be greater than zero",
+        ));
     }
 
     Ok((sync_tokens, sync_regex))
+}
+
+fn recovery_config_error(message: impl Into<String>) -> ParseError {
+    ParseError::new(message, 0, 0)
 }
 
 // ── Sync-marker collection ─────────────────────────────────────────────────
@@ -221,7 +251,7 @@ where
 
 /// Fallible batch recovery parse.
 ///
-/// This is the strict API equivalent to Python `recover_parse`: callers must
+/// This is the strict API equivalent to the strict recovery parser: callers must
 /// provide explicit `sync_tokens` or `sync_regex`, and invalid recovery
 /// configuration is reported as an error instead of falling back silently.
 pub fn try_recover_parse<F>(
@@ -233,8 +263,7 @@ pub fn try_recover_parse<F>(
 where
     F: Fn(&str, &Grammar) -> Result<ParseValue, ParseError>,
 {
-    let (sync_tokens, sync_regex) =
-        validate_recovery_config(config).map_err(|message| ParseError::new(message, 0, 0))?;
+    let (sync_tokens, sync_regex) = validate_recovery_config(config)?;
     Ok(recover_parse_impl(
         text,
         grammar,
@@ -262,6 +291,7 @@ where
     let markers = collect_sync_markers(text, sync_tokens, sync_regex);
     let marker_starts: Vec<usize> = markers.iter().map(|(s, _)| *s).collect();
     let line_offsets = compute_line_offsets(text);
+    let mut budget = RecoveryBudget::new(config.max_recovery_attempts);
     let mut cursor = 0usize;
 
     while cursor < text.len() {
@@ -275,6 +305,11 @@ where
 
         let chunk = &text[cursor..segment_end];
 
+        if let Err(error) = budget.consume(cursor, &line_offsets) {
+            errors.push(error);
+            break;
+        }
+
         match parse_segment(chunk, grammar) {
             Ok(v) => {
                 results.push(v);
@@ -283,21 +318,35 @@ where
             }
             Err(error) => {
                 let recovered = if config.local_tolerance {
-                    recover_segment_locally(
+                    let mut local_context = LocalRecoveryContext {
                         chunk,
                         grammar,
+                        parse_segment: &parse_segment,
+                        budget: &mut budget,
+                        absolute_offset: cursor,
+                        line_offsets: &line_offsets,
+                    };
+                    recover_segment_locally(
                         &error,
-                        &parse_segment,
                         config.local_insert_max_length,
+                        &mut local_context,
                     )
                 } else {
-                    None
+                    Ok(None)
+                };
+
+                let recovered = match recovered {
+                    Ok(recovered) => recovered,
+                    Err(error) => {
+                        errors.push(error);
+                        break;
+                    }
                 };
 
                 if let Some((value, local_msg)) = recovered {
                     let abs_pos = cursor.saturating_add(error.span.start).min(text.len());
                     results.push(value);
-                    let (line, col) = line_col(&line_offsets, abs_pos);
+                    let (line, col) = line_col_u32(&line_offsets, abs_pos);
                     errors.push(
                         ParseError::with_context(
                             local_msg,
@@ -317,7 +366,7 @@ where
                 }
 
                 let abs_pos = cursor.saturating_add(error.span.start).min(text.len());
-                let (line, col) = line_col(&line_offsets, abs_pos);
+                let (line, col) = line_col_u32(&line_offsets, abs_pos);
                 errors.push(
                     error
                         .at_absolute_pos(abs_pos, abs_pos)
@@ -341,10 +390,16 @@ where
 // ── DefaultRecoveryStrategy ────────────────────────────────────────────────
 
 /// General-purpose recovery strategy.
+/// General-purpose recovery strategy.
 pub struct DefaultRecoveryStrategy {
+    /// Maximum errors to recover before giving up.
     pub max_errors: usize,
+    /// Whether to attempt local insert/delete recovery.
     pub local_tolerance: bool,
+    /// Cap on locally-inserted recovery text length.
     pub local_insert_max_length: usize,
+    /// Cap on recovery attempts per error site.
+    pub max_recovery_attempts: usize,
 }
 
 impl Default for DefaultRecoveryStrategy {
@@ -353,11 +408,13 @@ impl Default for DefaultRecoveryStrategy {
             max_errors: 5,
             local_tolerance: true,
             local_insert_max_length: DEFAULT_LOCAL_INSERT_MAX_LENGTH,
+            max_recovery_attempts: DEFAULT_MAX_RECOVERY_ATTEMPTS,
         }
     }
 }
 
 impl DefaultRecoveryStrategy {
+    /// Recover-parse `text`, splitting at the given sync tokens/regex.
     pub fn recover<F>(
         &self,
         text: &str,
@@ -375,16 +432,23 @@ impl DefaultRecoveryStrategy {
             max_errors: self.max_errors,
             local_tolerance: self.local_tolerance,
             local_insert_max_length: self.local_insert_max_length,
+            max_recovery_attempts: self.max_recovery_attempts,
         };
         recover_parse(text, grammar, parse_segment, &config)
     }
 }
 
 /// Recovery strategy for streaming/top-level forms (uses `)` as default sync).
+/// Recovery strategy for streaming/top-level forms (uses `)` as default sync).
 pub struct StreamingFormRecoveryStrategy {
+    /// Maximum errors to recover before giving up.
     pub max_errors: usize,
+    /// Whether to attempt local insert/delete recovery.
     pub local_tolerance: bool,
+    /// Cap on locally-inserted recovery text length.
     pub local_insert_max_length: usize,
+    /// Cap on recovery attempts per error site.
+    pub max_recovery_attempts: usize,
 }
 
 impl Default for StreamingFormRecoveryStrategy {
@@ -393,11 +457,13 @@ impl Default for StreamingFormRecoveryStrategy {
             max_errors: 20,
             local_tolerance: true,
             local_insert_max_length: DEFAULT_LOCAL_INSERT_MAX_LENGTH,
+            max_recovery_attempts: DEFAULT_MAX_RECOVERY_ATTEMPTS,
         }
     }
 }
 
 impl StreamingFormRecoveryStrategy {
+    /// Recover-parse `text` for streaming forms, defaulting sync to `)`.
     pub fn recover<F>(
         &self,
         text: &str,
@@ -420,6 +486,7 @@ impl StreamingFormRecoveryStrategy {
             max_errors: self.max_errors,
             local_tolerance: self.local_tolerance,
             local_insert_max_length: self.local_insert_max_length,
+            max_recovery_attempts: self.max_recovery_attempts,
         };
         recover_parse(text, grammar, parse_segment, &config)
     }
@@ -427,17 +494,24 @@ impl StreamingFormRecoveryStrategy {
 
 // ── Internal helpers ───────────────────────────────────────────────────────
 
+struct LocalRecoveryContext<'a, F> {
+    chunk: &'a str,
+    grammar: &'a Grammar,
+    parse_segment: &'a F,
+    budget: &'a mut RecoveryBudget,
+    absolute_offset: usize,
+    line_offsets: &'a [usize],
+}
+
 fn recover_segment_locally<F>(
-    chunk: &str,
-    grammar: &Grammar,
     error: &ParseError,
-    parse_segment: &F,
     insert_max_length: usize,
-) -> Option<(ParseValue, String)>
+    context: &mut LocalRecoveryContext<'_, F>,
+) -> Result<Option<(ParseValue, String)>, ParseError>
 where
     F: Fn(&str, &Grammar) -> Result<ParseValue, ParseError>,
 {
-    let rel_pos = error.span.start.min(chunk.len());
+    let rel_pos = error.span.start.min(context.chunk.len());
 
     let insert_candidates = collect_insert_candidates(
         &error.expected,
@@ -445,53 +519,92 @@ where
         DEFAULT_LOCAL_INSERT_MAX_CANDIDATES,
     );
 
-    if let Some(result) = try_insertions(chunk, grammar, rel_pos, &insert_candidates, parse_segment)
-    {
-        return Some(result);
+    if let Some(result) = try_insertions(context, rel_pos, &insert_candidates)? {
+        return Ok(Some(result));
     }
 
-    let deletion = collect_delete_candidate(chunk, rel_pos)?;
-    try_deletion(chunk, grammar, &deletion, parse_segment)
+    let Some(deletion) = collect_delete_candidate(context.chunk, rel_pos) else {
+        return Ok(None);
+    };
+    try_deletion(context, &deletion)
 }
 
 fn try_insertions<F>(
-    chunk: &str,
-    grammar: &Grammar,
+    context: &mut LocalRecoveryContext<'_, F>,
     pos: usize,
     candidates: &[RecoveryInsertCandidate],
-    parse_segment: &F,
-) -> Option<(ParseValue, String)>
+) -> Result<Option<(ParseValue, String)>, ParseError>
 where
     F: Fn(&str, &Grammar) -> Result<ParseValue, ParseError>,
 {
     for candidate in candidates {
-        let corrected = format!("{}{}{}", &chunk[..pos], candidate.text, &chunk[pos..]);
-        if let Ok(value) = parse_segment(&corrected, grammar) {
+        context
+            .budget
+            .consume(context.absolute_offset + pos, context.line_offsets)?;
+        let corrected = format!(
+            "{}{}{}",
+            &context.chunk[..pos],
+            candidate.text,
+            &context.chunk[pos..]
+        );
+        if let Ok(value) = (context.parse_segment)(&corrected, context.grammar) {
             let msg = format!("Recovered by inserting missing {}", candidate.label);
-            return Some((value, msg));
+            return Ok(Some((value, msg)));
         }
     }
-    None
+    Ok(None)
 }
 
 fn try_deletion<F>(
-    chunk: &str,
-    grammar: &Grammar,
+    context: &mut LocalRecoveryContext<'_, F>,
     candidate: &RecoveryDeleteCandidate,
-    parse_segment: &F,
-) -> Option<(ParseValue, String)>
+) -> Result<Option<(ParseValue, String)>, ParseError>
 where
     F: Fn(&str, &Grammar) -> Result<ParseValue, ParseError>,
 {
-    let corrected = format!("{}{}", &chunk[..candidate.start], &chunk[candidate.end..]);
-    if let Ok(value) = parse_segment(&corrected, grammar) {
+    context.budget.consume(
+        context.absolute_offset + candidate.start,
+        context.line_offsets,
+    )?;
+    let corrected = format!(
+        "{}{}",
+        &context.chunk[..candidate.start],
+        &context.chunk[candidate.end..]
+    );
+    if let Ok(value) = (context.parse_segment)(&corrected, context.grammar) {
         let msg = format!(
             "Recovered by deleting unexpected token {:?}",
             candidate.text
         );
-        return Some((value, msg));
+        return Ok(Some((value, msg)));
     }
-    None
+    Ok(None)
+}
+
+struct RecoveryBudget {
+    used: usize,
+    max: usize,
+}
+
+impl RecoveryBudget {
+    fn new(max: usize) -> Self {
+        Self { used: 0, max }
+    }
+
+    fn consume(&mut self, abs_pos: usize, line_offsets: &[usize]) -> Result<(), ParseError> {
+        if self.used >= self.max {
+            let (line, col) = line_col_u32(line_offsets, abs_pos);
+            return Err(ParseError::new(
+                format!("Recovery aborted after {} parse attempts", self.max),
+                abs_pos,
+                abs_pos,
+            )
+            .with_code("recovery_budget_exhausted")
+            .with_location(line, col));
+        }
+        self.used += 1;
+        Ok(())
+    }
 }
 
 /// `(segment_end, cursor_after_success)` — the next segment to parse and
@@ -621,7 +734,7 @@ mod tests {
     fn validate_recovery_config_requires_explicit_sync() {
         let err = validate_recovery_config(&RecoveryConfig::default())
             .expect_err("missing sync config should fail");
-        assert!(err.contains("sync_tokens or sync_regex"));
+        assert!(err.message.contains("sync_tokens or sync_regex"));
     }
 
     #[test]
@@ -632,7 +745,18 @@ mod tests {
             ..Default::default()
         };
         let err = validate_recovery_config(&config).expect_err("zero max_errors should fail");
-        assert!(err.contains("max_errors"));
+        assert!(err.message.contains("max_errors"));
+    }
+
+    #[test]
+    fn validate_recovery_config_rejects_zero_recovery_attempts() {
+        let config = RecoveryConfig {
+            sync_tokens: vec![";".to_string()],
+            max_recovery_attempts: 0,
+            ..Default::default()
+        };
+        let err = validate_recovery_config(&config).expect_err("zero recovery budget should fail");
+        assert!(err.message.contains("max_recovery_attempts"));
     }
 
     // ── collect_sync_markers ─────────────────────────────────────────────
@@ -768,11 +892,11 @@ mod tests {
     // ── recover_parse ────────────────────────────────────────────────────
 
     fn ok_grammar() -> Grammar {
-        Grammar::new("word <- /[a-z]+/").with_start_rule("word")
+        Grammar::trusted_new("word <- /[a-z]+/").with_start_rule("word")
     }
 
     fn always_ok(_text: &str, _grammar: &Grammar) -> Result<ParseValue, ParseError> {
-        Ok(ParseValue::Text("ok".to_string()))
+        Ok(ParseValue::Text("ok".into()))
     }
 
     fn always_err(_text: &str, _grammar: &Grammar) -> Result<ParseValue, ParseError> {
@@ -846,6 +970,24 @@ mod tests {
         };
         let (_values, errors) = recover_parse("a;b;c", &ok_grammar(), always_err, &config);
         assert_eq!(errors.len(), 2);
+    }
+
+    #[test]
+    fn recover_parse_stops_at_recovery_attempt_budget() {
+        let config = RecoveryConfig {
+            sync_tokens: vec![";".to_string()],
+            local_tolerance: false,
+            max_errors: 10,
+            max_recovery_attempts: 2,
+            ..Default::default()
+        };
+        let (_values, errors) = recover_parse("a;b;c", &ok_grammar(), always_err, &config);
+
+        assert_eq!(errors.len(), 3);
+        assert_eq!(
+            errors.last().and_then(|error| error.code.as_deref()),
+            Some("recovery_budget_exhausted")
+        );
     }
 
     #[test]

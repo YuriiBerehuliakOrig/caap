@@ -1,0 +1,131 @@
+; stdlib/lib/tests/test_toml.caap — in-language tests for lib/text/toml.
+
+;; @area: text
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.text.toml toml_parse toml_emit)
+(use stdlib.lib.core.equal deep_eq)
+
+(do
+  ; ── the canonical multi-table document ────────────────────────────────────
+  (bind ((doc (string_concat_many
+                "[pkg]\n"
+                "name=\"x\"\n"
+                "ver=1\n"
+                "tags=[\"a\",\"b\"]\n"
+                "[deps]\n"
+                "foo=\"1.0\"\n"))
+         (r (toml_parse doc))
+         (v (get r "value")))
+    (do
+      (assert_true (get r "ok" false) "doc parses")
+      (assert_eq (get (get v "pkg") "name" "") "x" "pkg.name == x")
+      (assert_eq (get (get v "pkg") "ver" 0) 1 "pkg.ver == 1")
+      (assert_eq (size (get (get v "pkg") "tags")) 2 "pkg.tags size 2")
+      (assert_eq (get (get (get v "pkg") "tags") 0) "a" "pkg.tags[0] == a")
+      (assert_eq (get (get v "deps") "foo" "") "1.0" "deps.foo == 1.0")))
+
+  ; ── scalars: bool / float / literal string / negative int ─────────────────
+  (bind ((r (toml_parse (string_concat_many
+              "b=true\n"
+              "f=2.5\n"
+              "g=-1.0e2\n"
+              "n=-7\n"
+              "lit='no\\escape'\n")))
+         (v (get r "value")))
+    (do
+      (assert_eq (get v "b" false) true "bool true")
+      (assert_eq (get v "f" 0.0) 2.5 "float 2.5")
+      (assert_eq (get v "g" 0.0) -100.0 "float -1.0e2")
+      (assert_eq (get v "n" 0) -7 "negative int")
+      ; a literal string keeps its backslash verbatim
+      (assert_eq (get v "lit" "") "no\\escape" "literal string, no escapes")))
+
+  ; ── nested dotted table header [a.b.c] ────────────────────────────────────
+  (bind ((r (toml_parse (string_concat_many
+              "[a.b.c]\n" "x=1\n")))
+         (v (get r "value")))
+    (assert_eq (get (get (get (get v "a") "b") "c") "x" 0) 1 "nested [a.b.c]"))
+
+  ; ── inline table ──────────────────────────────────────────────────────────
+  (bind ((r (toml_parse "pt = {x = 1, y = 2}\n"))
+         (v (get r "value")))
+    (do
+      (assert_eq (get (get v "pt") "x" 0) 1 "inline table x")
+      (assert_eq (get (get v "pt") "y" 0) 2 "inline table y")))
+
+  ; ── arrays of strings and ints, plus comments & blank lines ───────────────
+  (bind ((r (toml_parse (string_concat_many
+              "# a comment\n"
+              "\n"
+              "ns = [1, 2, 3]   # trailing comment\n"
+              "ws = [\"a\", \"b\"]\n")))
+         (v (get r "value")))
+    (do
+      (assert_true (deep_eq (get v "ns") (list_of 1 2 3)) "int array")
+      (assert_true (deep_eq (get v "ws") (list_of "a" "b")) "string array")))
+
+  ; ── datetimes parse as strings (documented subset behaviour) ──────────────
+  (bind ((r (toml_parse "d = 1979-05-27\n"))
+         (v (get r "value")))
+    (assert_eq (get v "d" "") "1979-05-27" "datetime kept as string"))
+
+  ; ── emit + full round-trip ────────────────────────────────────────────────
+  (bind ((m (assoc (map_of)
+              "pkg" (assoc (map_of) "name" "x" "ver" 1 "tags" (list_of "a" "b"))
+              "deps" (assoc (map_of) "foo" "1.0")))
+         (text (toml_emit m))
+         (back (get (toml_parse text) "value")))
+    (do
+      (assert_true (string_contains text "[pkg]") "emit has [pkg] header")
+      (assert_true (string_contains text "name = \"x\"") "emit key = value")
+      (assert_true (deep_eq back m) "emit -> parse round-trip")))
+
+  ; emit of an inline-tabled list value round-trips too
+  (bind ((m (assoc (map_of) "pt" (assoc (map_of) "x" 1 "y" 2) "flag" true))
+         (back (get (toml_parse (toml_emit m)) "value")))
+    (assert_true (deep_eq back m) "inline-table value round-trip"))
+
+  ; ── whole-valued float round-trips as a float, not an int ─────────────────
+  (bind ((m (assoc (map_of) "ratio" 2.0 "big" 1000.0))
+         (text (toml_emit m))
+         (back (get (toml_parse text) "value")))
+    (do
+      (assert_true (string_contains text "ratio = 2.0") "whole float emits with .0")
+      (assert_eq (value_type (get back "ratio")) "float" "2.0 round-trips as float")
+      (assert_eq (get back "ratio" 0.0) 2.0 "2.0 value preserved")
+      (assert_eq (value_type (get back "big")) "float" "1000.0 round-trips as float")))
+
+  ; ── integer past i64 range is DATA (kept as string), never a raised error ──
+  (bind ((r (toml_parse "n = 100000000000000000000\n")))
+    (do
+      (assert_true (get r "ok" false) "huge int does not crash the parser")
+      ; the over-range literal is preserved verbatim as a string
+      (assert_eq (get (get r "value") "n" 0) "100000000000000000000" "huge int kept as string")))
+
+  ; ── a table header colliding with a scalar key is a located error, not crash
+  (bind ((r (toml_parse "a = 1\n[a]\nb = 2\n")))
+    (do
+      (assert_eq (get r "ok" true) false "header over scalar -> error not crash")
+      (assert_true (string_contains (get r "error" "") "collides") "collision message")))
+  (bind ((r (toml_parse "a = 1\n[a.b]\nc = 2\n")))
+    (assert_eq (get r "ok" true) false "dotted header through scalar -> error"))
+  ; a legitimately nested header through an EXISTING table still works
+  (bind ((r (toml_parse "[a]\nx = 1\n[a.b]\ny = 2\n")) (v (get r "value")))
+    (do
+      (assert_eq (get (get v "a") "x" 0) 1 "a.x kept across re-entered table")
+      (assert_eq (get (get (get v "a") "b") "y" 0) 2 "a.b.y after re-entry")))
+
+  ; ── malformed inputs are located DATA, not a crash ────────────────────────
+  (assert_eq (get (toml_parse "x = [1, 2") "ok" true) false "unterminated array")
+  (assert_eq (get (toml_parse "x = \"abc") "ok" true) false "unterminated string")
+  (assert_eq (get (toml_parse "x 1\n") "ok" true) false "missing `=`")
+  (assert_eq (get (toml_parse "[a.b\n") "ok" true) false "unterminated header")
+  (assert_true
+    (string_contains (get (toml_parse "x 1\n") "error" "") "expected `=`")
+    "missing-eq message")
+  (assert_true
+    (string_contains (get (toml_parse "\n\nx 1") "error" "") "toml: 3:")
+    "errors carry line:col")
+  true)

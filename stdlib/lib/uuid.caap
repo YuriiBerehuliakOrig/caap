@@ -1,0 +1,220 @@
+; stdlib/lib/uuid.caap — UUID v4 / v7 generation, parse, and format
+; (module stdlib.lib.uuid).
+;
+; A UUID is 128 bits = 16 bytes. This module holds one in two shapes:
+;   - the canonical 36-char STRING:  8-4-4-4-12 lowercase hex with dashes,
+;     e.g. "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+;   - a 16-byte LIST of ints (0..255), big-endian (byte 0 is most significant).
+;
+; SECURITY — generation here is PURE / deterministic: it draws from
+; stdlib.lib.random, a seedable LCG PRNG (functional state-threading), NOT a
+; CSPRNG. The same seed always replays the same UUID, which is exactly what you
+; want for reproducible tests, simulations and fixtures — and exactly what you
+; must NOT use for tokens, keys, or anything an adversary could predict. A
+; secure variant belongs over `sys.rand` (the host CSPRNG), which lives at a
+; higher tier and cannot be imported from `lib`; the byte-building / formatting
+; helpers here are reusable from such a variant.
+;
+; THREADING — like everything in stdlib.lib.random, the generators are
+; functional: each returns {"value" <canonical string>, "rng" <next state>};
+; thread the "rng" field into the next call to advance the stream.
+;
+; RFC 4122 / RFC 9562 bit-setting (the parts that are NOT random):
+;   v4: byte[6] high nibble = 4 (version), byte[8] high two bits = 10 (variant)
+;   v7: bytes[0..6) = a 48-bit big-endian millisecond timestamp, then the same
+;       version-nibble (=7) on byte[6] and variant bits on byte[8]; the rest is
+;       random. Because the timestamp is the high bits, v7 UUIDs sort by time.
+;
+; sys.time is rank 5 and cannot be imported from this tier, so v7 takes the
+; millisecond timestamp `ms` as an explicit argument — the caller reads the
+; clock (over a sys facade) and passes it in.
+(module stdlib.lib.uuid)
+
+(use stdlib.lib.random next_int)
+
+; ── hex / byte helpers ───────────────────────────────────────────────────────
+
+; uuid_hex_digits — the 16 lowercase hex glyphs, indexed by nibble value 0..15.
+(bind uuid_hex_digits "0123456789abcdef")
+
+; uuid_byte_hex — a byte int (0..255) → its two lowercase hex chars.
+; The high nibble (b >> 4) then the low nibble (b AND 15), each sliced out of
+; the glyph table — so a leading zero is preserved (byte 5 → "05").
+(bind uuid_byte_hex
+  (lambda (b)
+    (bind ((hi (int_shr b 4))
+           (lo (int_and b 15)))
+      (string_concat_many
+        (string_slice uuid_hex_digits hi (int_add hi 1))
+        (string_slice uuid_hex_digits lo (int_add lo 1))))))
+
+; uuid_hex_value — value 0..15 of one lowercase/uppercase hex char, or -1 when
+; the char is not a hex digit (used by the parser to reject malformed input).
+(bind uuid_hex_value
+  (lambda (c)
+    (if (not (eq (size c) 1)) -1
+      (cond
+        ((string_contains "0123456789" c) (string_find "0123456789" c))
+        ((string_contains "abcdef" c) (int_add 10 (string_find "abcdef" c)))
+        ((string_contains "ABCDEF" c) (int_add 10 (string_find "ABCDEF" c)))
+        (else -1)))))
+
+; ── byte construction (random + fixed bits) ──────────────────────────────────
+
+; uuid_random_bytes — draw `n` random bytes (each in 0..255) by threading the
+; rng through `n` `next_int … 256` draws. Returns {"value" <byte list>, "rng"}.
+;   rng / n : the state and how many bytes to draw
+;   ->      : {"value" a list of n ints (0..255), "rng" next state}
+(bind uuid_random_bytes
+  (lambda (rng n)
+    (bind ((out (list_of)) (state (ref rng)) (i (ref 0)))
+      (do
+        (while (lt (deref i) n)
+          (bind ((r (next_int (deref state) 256)))
+            (do
+              (append out (get r "value"))
+              (set_ref state (get r "rng"))
+              (set_ref i (int_add (deref i) 1)))))
+        (assoc (map_of) "value" out "rng" (deref state))))))
+
+; uuid_set_version — stamp the 4-bit version into byte[6]: keep the low nibble
+; of the existing (random) byte, replace the high nibble with `ver`.
+;   byte / ver : the original byte[6] and the version number (4 or 7)
+;   ->         : the byte with its high nibble set to `ver`
+(bind uuid_set_version
+  (lambda (byte ver)
+    (int_or (int_shl ver 4) (int_and byte 15))))
+
+; uuid_set_variant — stamp the RFC 4122 variant into byte[8]: force the top two
+; bits to 10 (so the high nibble lands in {8,9,a,b}) while keeping the low six
+; bits of the existing (random) byte. byte AND 0x3F clears bits 7..6, then OR
+; 0x80 sets bit 7 (bit 6 stays 0) → pattern 10xx_xxxx.
+;   byte : the original byte[8]
+;   ->   : the byte with its variant bits set to 10
+(bind uuid_set_variant
+  (lambda (byte)
+    (int_or (int_and byte 63) 128)))
+
+; ── formatting / parsing ─────────────────────────────────────────────────────
+
+; uuid_format — a 16-byte list → the canonical 8-4-4-4-12 lowercase-hex string.
+; A list that is not exactly 16 long yields null.
+;   bytes16 : a list of 16 ints (0..255)
+;   ->      : the canonical 36-char string, or null when the input is malformed
+(bind uuid_format
+  (lambda (bytes16)
+    (if (not (eq (size bytes16) 16)) null
+      (bind ((parts (list_of)) (i (ref 0)))
+        (do
+          (while (lt (deref i) 16)
+            (do
+              (append parts (uuid_byte_hex (get bytes16 (deref i))))
+              ; insert a group separator AFTER bytes 3, 5, 7 and 9 (so the dash
+              ; sits between the 4/2/2/2/6-byte groups → 8-4-4-4-12 hex chars)
+              (bind ((k (deref i)))
+                (if (or (eq k 3) (or (eq k 5) (or (eq k 7) (eq k 9))))
+                  (append parts "-")
+                  null))
+              (set_ref i (int_add (deref i) 1))))
+          (sequence_join parts ""))))))
+
+; uuid_parse — a canonical 36-char (8-4-4-4-12) string → the 16-byte list, or
+; null when malformed (wrong length, dashes in the wrong places, or a non-hex
+; digit). Lower- and upper-case hex are both accepted.
+;   s  : a candidate UUID string
+;   -> : a list of 16 ints (0..255), or null
+(bind uuid_parse
+  (lambda (s)
+    (if (not (eq (size s) 36)) null
+      (bind ((cs (string_chars s))
+             (bytes (list_of))
+             (ok (ref true))
+             (i (ref 0)))
+        (do
+          (while (and (deref ok) (lt (deref i) 36))
+            (bind ((k (deref i)))
+              (if (or (eq k 8) (or (eq k 13) (or (eq k 18) (eq k 23))))
+                ; dash positions: index 8, 13, 18, 23 must each be "-"
+                (do
+                  (if (not (eq (get cs k "") "-")) (set_ref ok false) null)
+                  (set_ref i (int_add k 1)))
+                ; otherwise two hex digits form one byte
+                (bind ((hi (uuid_hex_value (get cs k "")))
+                       (lo (uuid_hex_value (get cs (int_add k 1) ""))))
+                  (if (or (lt hi 0) (lt lo 0))
+                    (do (set_ref ok false) (set_ref i (int_add k 2)))
+                    (do
+                      (append bytes (int_or (int_shl hi 4) lo))
+                      (set_ref i (int_add k 2))))))))
+          (if (and (deref ok) (eq (size bytes) 16)) bytes null))))))
+
+; uuid_version — the version int of a canonical UUID string: the high nibble of
+; byte[6]. Returns -1 when the string does not parse.
+;   s  : a canonical UUID string
+;   -> : the version int (e.g. 4 or 7), or -1 on malformed input
+(bind uuid_version
+  (lambda (s)
+    (bind ((bytes (uuid_parse s)))
+      (if (eq bytes null) -1
+        (int_shr (get bytes 6) 4)))))
+
+; uuid_valid? — does `s` parse as a canonical UUID string?
+;   s  : a candidate string
+;   -> : true when uuid_parse succeeds, else false
+(bind uuid_valid?
+  (lambda (s) (not (eq (uuid_parse s) null))))
+
+; uuid_nil — the all-zero UUID, "00000000-0000-0000-0000-000000000000".
+(bind uuid_nil (uuid_format (list_of 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)))
+
+; ── generators ───────────────────────────────────────────────────────────────
+
+; uuid_v4 — a (pseudo-)random UUID, version 4. Draws 16 random bytes, then
+; overwrites byte[6]'s high nibble with 4 (version) and byte[8]'s top two bits
+; with 10 (variant) — leaving 122 random bits. NOT cryptographically secure
+; (see the module header).
+;   rng : the current rng state
+;   ->  : {"value" the canonical v4 string, "rng" next state}
+(bind uuid_v4
+  (lambda (rng)
+    (bind ((r (uuid_random_bytes rng 16))
+           (bytes (get r "value")))
+      (do
+        (set bytes 6 (uuid_set_version (get bytes 6) 4))
+        (set bytes 8 (uuid_set_variant (get bytes 8)))
+        (assoc (map_of) "value" (uuid_format bytes) "rng" (get r "rng"))))))
+
+; uuid_v7 — a time-ordered UUID, version 7. The first 48 bits are the
+; millisecond timestamp `ms` written big-endian into bytes[0..6); the remaining
+; 80 bits are random, with byte[6]'s version nibble set to 7 and byte[8]'s
+; variant bits set to 10. Because the timestamp occupies the high bits, two v7
+; UUIDs minted in timestamp order compare/sort in that same order.
+; `ms` is supplied by the caller (sys.time is out of tier — see the header).
+;   rng / ms : the state and a 48-bit-or-less millisecond Unix timestamp
+;   ->       : {"value" the canonical v7 string, "rng" next state}
+(bind uuid_v7
+  (lambda (rng ms)
+    (bind ((r (uuid_random_bytes rng 10))
+           (rnd (get r "value"))
+           (bytes (list_of)))
+      (do
+        ; bytes[0..6) — the 48-bit timestamp, most-significant byte first.
+        ; byte i (0..5) holds bits [(5-i)*8 .. (5-i)*8 + 8); shift the timestamp
+        ; right by that amount and mask to 8 bits.
+        (bind ((i (ref 0)))
+          (while (lt (deref i) 6)
+            (bind ((shift (int_mul (int_sub 5 (deref i)) 8)))
+              (do
+                (append bytes (int_and (int_shr ms shift) 255))
+                (set_ref i (int_add (deref i) 1))))))
+        ; bytes[6..16) — the 10 random bytes drawn above.
+        (bind ((j (ref 0)))
+          (while (lt (deref j) 10)
+            (do (append bytes (get rnd (deref j))) (set_ref j (int_add (deref j) 1)))))
+        (set bytes 6 (uuid_set_version (get bytes 6) 7))
+        (set bytes 8 (uuid_set_variant (get bytes 8)))
+        (assoc (map_of) "value" (uuid_format bytes) "rng" (get r "rng"))))))
+
+(export uuid_v4 uuid_v7
+        uuid_format uuid_parse uuid_version uuid_valid? uuid_nil
+        uuid_set_version uuid_set_variant)

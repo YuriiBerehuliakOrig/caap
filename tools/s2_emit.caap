@@ -1,0 +1,55 @@
+;; tools/s2_emit.caap — LLVM IR emission on stdlib's OWN backend (no v1).
+;;
+;;   caap stdlib/bootstrap.caap tools/s2_emit.caap FILE [EMITTER] [DEBUG]
+;;
+;; Emits the IR for FILE and returns it — the flagless CLI prints a string
+;; result to stdout (redirect to keep it). EMITTER optionally names a
+;; registered emitter (unit -> {text, diagnostics}); default (null or "") is the
+;; own backend's emit_program. Diagnostics fail the run.
+;;
+;; DEBUG (the optional 3rd positional) opts into DWARF debug info on the DEFAULT
+;; backend — kept OUT of the flagless CLI as a tool argument (no -g): `debug` or
+;; `debug=line-tables` -> line tables; `debug=full` -> + locals/types; absent /
+;; none (byte-identical to a non-debug emit). Unknown DEBUG spellings are usage
+;; errors. A named EMITTER uses its 1-arg registered contract (no debug).
+(bind (
+  (args (ctfe_compiler_lookup_value compiler "cli.args"))
+  ;; load_module auto-loads the native backend BY NAME (declare_root resolves it),
+  ;; so the bare `stdlib/bootstrap.caap` suffices — no native_emit leg needed
+  ;; for the default backend; the compile layer pulls it in on first use.
+  (load_module (get (ctfe_compiler_lookup_value compiler "stdlib.load") "load_module"))
+)
+  (do
+    (if (eq (size args) 0)
+      (runtime_error "usage: caap stdlib/bootstrap.caap tools/s2_emit.caap FILE [EMITTER] [debug[=line-tables|full]]"))
+    (if (gt (size args) 3)
+      (runtime_error "usage: caap stdlib/bootstrap.caap tools/s2_emit.caap FILE [EMITTER] [debug[=line-tables|full]]"))
+    (bind (
+      (input (get args 0 null))
+      (emitter_name (get args 1 null))
+      ;; the DEBUG positional -> a level ("none" | "line-tables" | "full").
+      ;; Plain `if` only — a tool program runs unexpanded, so macros like `cond`
+      ;; are not in scope here.
+      (debug_level
+        (bind ((a (get args 2 null)))
+          (if (eq a null) "none"
+            (if (or (eq a "debug") (eq a "debug=line-tables")) "line-tables"
+              (if (eq a "debug=full") "full"
+                (runtime_error "usage: caap stdlib/bootstrap.caap tools/s2_emit.caap FILE [EMITTER] [debug[=line-tables|full]]"))))))
+      ;; null OR "" -> the DEFAULT own backend (emit_program_debug, debug-aware);
+      ;; otherwise a custom EMITTER name is a REGISTERED value (e.g.
+      ;; stdlib.wasm.emit) called via its 1-arg contract.
+      (use_default (or (eq emitter_name null) (eq emitter_name "")))
+    )
+      (if (and (not use_default) (not (eq (get args 2 null) null)))
+        (runtime_error "s2_emit debug level is only supported by the default LLVM emitter"))
+      (bind ((res
+                (if use_default
+                  ((get (load_module "stdlib.backend.emit.llvm") "emit_program_debug" null)
+                    (ctfe_compiler_load_surface_file_template compiler input)
+                    debug_level)
+                  ((ctfe_compiler_lookup_value compiler emitter_name)
+                    (ctfe_compiler_load_surface_file_template compiler input)))))
+        (if (gt (size (get res "diagnostics" (list_of))) 0)
+          (runtime_error (value_to_string (get res "diagnostics" null)))
+          (get res "text" ""))))))

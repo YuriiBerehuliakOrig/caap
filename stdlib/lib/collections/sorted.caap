@@ -1,0 +1,296 @@
+; stdlib/lib/collections/sorted.caap — ordered / priority structures over plain lists.
+;
+; A binary MIN-heap (priority queue), a FIFO queue, a LIFO stack, and a
+; double-ended queue (deque). Each structure IS a plain list (its backing
+; array); the operations are PURE FUNCTIONAL — they return a NEW list and never
+; mutate the argument. Removal operations return a record {value, <kind>}: the
+; element taken out plus the resulting structure; on an empty structure the
+; value is `null` and the structure is returned unchanged.
+;
+; ORDER is supplied by a COMPARATOR `cmp : (a b) -> int`, C-style: negative when
+; a < b, zero when a == b, positive when a > b. Nothing here uses a kernel
+; total-order builtin — every order-sensitive op takes a `cmp`. The default
+; `int_cmp` orders ints via lt/gt.
+;
+; The heap is an array heap: for a node at index i the parent is (i-1)/2 and the
+; children are 2i+1 and 2i+2 (int division truncates toward zero, so for i>0
+; (i-1)/2 is the correct parent).
+(module stdlib.lib.collections.sorted)
+
+(use stdlib.lib.collections.sequence each take)
+
+; ── internal: pure helpers over a list ───────────────────────────────────────
+
+; copy_list — a fresh, independent list with the same elements. `take` (the
+; sequence facade over sequence_take) always allocates a new list, so the result
+; can be freely mutated (set / append / list_remove_at) without touching `xs`.
+(bind copy_list
+  (lambda (xs) (take xs (size xs))))
+
+; swap! — swap indices i and j IN PLACE on `xs`. Private: only ever called on a
+; fresh copy this module owns, so it never mutates a caller's structure.
+(bind swap!
+  (lambda (xs i j)
+    (bind ((tmp (get xs i)))
+      (do (set xs i (get xs j)) (set xs j tmp) xs))))
+
+; ── comparator ───────────────────────────────────────────────────────────────
+
+; int_cmp — the default integer comparator: negative / zero / positive.
+;   a / b : ints
+;   ->    : -1 when a < b, 1 when a > b, else 0
+(bind int_cmp
+  (lambda (a b)
+    (cond
+      ((lt a b) -1)
+      ((gt a b) 1)
+      (else 0))))
+
+; ── binary MIN-heap (priority queue) ─────────────────────────────────────────
+
+; heap_new — an empty heap.
+(bind heap_new
+  (lambda () (list_of)))
+
+; heap_size — the number of elements.
+(bind heap_size
+  (lambda (h) (size h)))
+
+; heap_is_empty? — true when the heap holds no elements.
+(bind heap_is_empty?
+  (lambda (h) (eq (size h) 0)))
+
+; heap_peek — the minimum (root), or null when empty. Does not modify the heap.
+(bind heap_peek
+  (lambda (h) (if (eq (size h) 0) null (get h 0))))
+
+; sift_up! — restore the heap property upward from index `i` on the owned list
+; `xs`. Mutates `xs` (a fresh copy) and returns it.
+(bind sift_up!
+  (lambda (xs i cmp)
+    (bind ((idx (ref i)))
+      (do
+        (while (and (gt (deref idx) 0)
+                    (lt (cmp (get xs (deref idx))
+                             (get xs (int_div (int_sub (deref idx) 1) 2)))
+                        0))
+          (bind ((parent (int_div (int_sub (deref idx) 1) 2)))
+            (do (swap! xs (deref idx) parent)
+                (set_ref idx parent))))
+        xs))))
+
+; sift_down! — restore the heap property downward from index `i` on the owned
+; list `xs`. Each step moves to the smaller child while it is below the node.
+(bind sift_down!
+  (lambda (xs i cmp)
+    (bind ((idx (ref i)) (n (size xs)) (go (ref true)))
+      (do
+        (while (deref go)
+          (bind (
+            (l (int_add (int_mul (deref idx) 2) 1))
+            (r (int_add (int_mul (deref idx) 2) 2))
+            (small (ref (deref idx)))
+          )
+            (do
+              (when (and (lt l n) (lt (cmp (get xs l) (get xs (deref small))) 0))
+                (set_ref small l))
+              (when (and (lt r n) (lt (cmp (get xs r) (get xs (deref small))) 0))
+                (set_ref small r))
+              (if (eq (deref small) (deref idx))
+                (set_ref go false)
+                (do (swap! xs (deref idx) (deref small))
+                    (set_ref idx (deref small)))))))
+        xs))))
+
+; heap_push — a new heap with `x` inserted (sift up). The argument heap is
+; untouched.
+;   h / x / cmp : the heap, the element, the comparator
+;   ->          : the new heap
+(bind heap_push
+  (lambda (h x cmp)
+    (bind ((out (copy_list h)))
+      (do (append out x)
+          (sift_up! out (int_sub (size out) 1) cmp)))))
+
+; heap_pop — remove and return the minimum.
+;   h / cmp : the heap and comparator
+;   ->      : {value, heap} — value is the min and heap the rest; on an empty
+;             heap value is null and heap is `h` unchanged.
+(bind heap_pop
+  (lambda (h cmp)
+    (if (eq (size h) 0)
+      (assoc (map_of) "value" null "heap" h)
+      (bind ((top (get h 0)) (out (copy_list h)) (last_i (int_sub (size h) 1)))
+        (do
+          (set out 0 (get out last_i))     ; move last element to the root
+          (list_remove_at out last_i)      ; drop the now-duplicated tail
+          (when (gt (size out) 0) (sift_down! out 0 cmp))
+          (assoc (map_of) "value" top "heap" out))))))
+
+; heap_from_list — build a heap from a list of elements (repeated pushes).
+;   xs / cmp : the elements and comparator
+;   ->       : a heap holding every element of `xs`
+(bind heap_from_list
+  (lambda (xs cmp)
+    (bind ((h (ref (list_of))))
+      (do
+        (for x xs (set_ref h (heap_push (deref h) x cmp)))
+        (deref h)))))
+
+; heapify — build a heap from a list in O(n) by bottom-up sift-down: copy `xs`,
+; then sift each internal node down, from the last internal node (n/2)-1 up to
+; the root. This is Floyd's construction — asymptotically cheaper than the
+; (n log n) of heap_from_list's repeated pushes; both yield a valid min-heap.
+; The argument list is untouched (the work runs on a fresh copy).
+;   xs / cmp : the elements and comparator
+;   ->       : a heap holding every element of `xs`
+(bind heapify
+  (lambda (xs cmp)
+    (bind ((out (copy_list xs)) (n (size xs)) (i (ref (int_sub (int_div n 2) 1))))
+      (do
+        (while (gt (deref i) -1)
+          (do
+            (sift_down! out (deref i) cmp)
+            (set_ref i (int_sub (deref i) 1))))
+        out))))
+
+; heap_replace — pop the current minimum and push `x` in one settle (a single
+; sift_down instead of pop's + push's two). Returns {value, heap}: value is the
+; old min, heap is the new heap holding `x` plus the rest. On an EMPTY heap there
+; is no min to return, so value is null and heap is the singleton heap of `x`
+; (push-only). The heap never grows or shrinks except for that empty case.
+;   h / x / cmp : the heap, the element to insert, the comparator
+;   ->          : {value, heap}
+(bind heap_replace
+  (lambda (h x cmp)
+    (if (eq (size h) 0)
+      (assoc (map_of) "value" null "heap" (heap_push h x cmp))
+      (bind ((top (get h 0)) (out (copy_list h)))
+        (do
+          (set out 0 x)                  ; overwrite the root with x
+          (sift_down! out 0 cmp)         ; settle x into place
+          (assoc (map_of) "value" top "heap" out))))))
+
+; heap_to_sorted_list — drain `h` into an ASCENDING list (by `cmp`): repeated
+; heap_pop until empty. This IS heapsort. The argument heap is untouched (the
+; draining runs on the {value,heap} chain, never on `h`).
+;   h / cmp : the heap and comparator
+;   ->      : a fresh list of every element, smallest first
+(bind heap_to_sorted_list
+  (lambda (h cmp)
+    (bind ((out (list_of)) (cur (ref h)))
+      (do
+        (while (gt (size (deref cur)) 0)
+          (bind ((p (heap_pop (deref cur) cmp)))
+            (do (append out (get p "value")) (set_ref cur (get p "heap")))))
+        out))))
+
+; invert_cmp — a comparator with the opposite order (a max-heap is a min-heap
+; under the inverted comparator). Used by the max_heap_* convenience wrappers.
+;   cmp : a comparator (a b) -> int
+;   ->  : the comparator (a b) -> -cmp(a,b)
+(bind invert_cmp
+  (lambda (cmp) (lambda (a b) (int_sub 0 (cmp a b)))))
+
+; max_heap_push / max_heap_pop — MAX-heap convenience over the same heap: they
+; are heap_push / heap_pop run under the INVERTED comparator, so the "min" of the
+; inverted order is the max of the original. NOTE: a heap built with these must
+; be queried/drained with these (or with the inverted cmp); they do not change a
+; heap's representation, only the order imposed on it.
+;   h / x / cmp : the heap, the element, the (original) comparator
+;   ->          : push -> the new heap; pop -> {value, heap} with value the MAX
+(bind max_heap_push
+  (lambda (h x cmp) (heap_push h x (invert_cmp cmp))))
+(bind max_heap_pop
+  (lambda (h cmp) (heap_pop h (invert_cmp cmp))))
+
+; ── FIFO queue ───────────────────────────────────────────────────────────────
+; The list is front-to-back: index 0 is the head (next out), the tail is the
+; back (last in).
+
+(bind queue_new       (lambda () (list_of)))
+(bind queue_size      (lambda (q) (size q)))
+(bind queue_is_empty? (lambda (q) (eq (size q) 0)))
+(bind queue_peek      (lambda (q) (if (eq (size q) 0) null (get q 0))))
+
+; enqueue — a new queue with `x` added at the back.
+(bind enqueue
+  (lambda (q x)
+    (bind ((out (copy_list q))) (do (append out x) out))))
+
+; dequeue — remove and return the front element.
+;   ->  : {value, queue}; on empty, value null and queue unchanged.
+(bind dequeue
+  (lambda (q)
+    (if (eq (size q) 0)
+      (assoc (map_of) "value" null "queue" q)
+      (bind ((head (get q 0)) (out (copy_list q)))
+        (do (list_remove_at out 0)
+            (assoc (map_of) "value" head "queue" out))))))
+
+; ── LIFO stack ───────────────────────────────────────────────────────────────
+; The top of the stack is the END of the list (cheap append / remove-last).
+
+(bind stack_new       (lambda () (list_of)))
+(bind stack_size      (lambda (s) (size s)))
+(bind stack_is_empty? (lambda (s) (eq (size s) 0)))
+(bind stack_peek
+  (lambda (s) (if (eq (size s) 0) null (get s (int_sub (size s) 1)))))
+
+; push — a new stack with `x` on top (the list's end).
+(bind push
+  (lambda (s x)
+    (bind ((out (copy_list s))) (do (append out x) out))))
+
+; pop — remove and return the top element.
+;   ->  : {value, stack}; on empty, value null and stack unchanged.
+(bind pop
+  (lambda (s)
+    (if (eq (size s) 0)
+      (assoc (map_of) "value" null "stack" s)
+      (bind ((last_i (int_sub (size s) 1)) (top (get s last_i)) (out (copy_list s)))
+        (do (list_remove_at out last_i)
+            (assoc (map_of) "value" top "stack" out))))))
+
+; ── deque (double-ended queue) ───────────────────────────────────────────────
+; Front is index 0, back is the last index.
+
+(bind deque_new  (lambda () (list_of)))
+(bind deque_size (lambda (d) (size d)))
+
+; push_front / push_back — a new deque with `x` at the named end.
+(bind push_front
+  (lambda (d x)
+    (bind ((out (list_of x)))
+      (do (each d (lambda (e) (append out e))) out))))
+(bind push_back
+  (lambda (d x)
+    (bind ((out (copy_list d))) (do (append out x) out))))
+
+; pop_front — remove and return the front element.
+;   ->  : {value, deque}; on empty, value null and deque unchanged.
+(bind pop_front
+  (lambda (d)
+    (if (eq (size d) 0)
+      (assoc (map_of) "value" null "deque" d)
+      (bind ((head (get d 0)) (out (copy_list d)))
+        (do (list_remove_at out 0)
+            (assoc (map_of) "value" head "deque" out))))))
+
+; pop_back — remove and return the back element.
+;   ->  : {value, deque}; on empty, value null and deque unchanged.
+(bind pop_back
+  (lambda (d)
+    (if (eq (size d) 0)
+      (assoc (map_of) "value" null "deque" d)
+      (bind ((last_i (int_sub (size d) 1)) (tail (get d last_i)) (out (copy_list d)))
+        (do (list_remove_at out last_i)
+            (assoc (map_of) "value" tail "deque" out))))))
+
+(export int_cmp invert_cmp
+        heap_new heap_push heap_pop heap_peek heap_size heap_from_list heapify
+        heap_is_empty? heap_replace heap_to_sorted_list
+        max_heap_push max_heap_pop
+        queue_new enqueue dequeue queue_peek queue_size queue_is_empty?
+        stack_new push pop stack_peek stack_size stack_is_empty?
+        deque_new push_front push_back pop_front pop_back deque_size)

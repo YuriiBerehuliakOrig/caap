@@ -3,38 +3,100 @@ use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
 
 use crate::eval::{eval_args, Evaluator};
-use crate::values::{eval_err, require_int_strict, require_str, BuiltinInfo, MapKey, RuntimeValue};
+use crate::values::{eval_err, require_int_strict, require_str, MapKey, RuntimeValue};
 
 fn to_str(v: &RuntimeValue, ctx: &str) -> Result<String, crate::values::EvalSignal> {
     require_str(v, ctx).map(|s| s.to_string())
 }
 
+fn require_char_start_index(
+    value: &RuntimeValue,
+    context: &str,
+) -> Result<usize, crate::values::EvalSignal> {
+    let index = require_int_strict(value, context)?;
+    if index < 0 {
+        return Err(eval_err(format!(
+            "{context} start index must be non-negative"
+        )));
+    }
+    usize::try_from(index).map_err(|_| eval_err(format!("{context} start index is too large")))
+}
+
+fn require_non_negative_usize(
+    value: &RuntimeValue,
+    context: &str,
+    name: &str,
+) -> Result<usize, crate::values::EvalSignal> {
+    let value = require_int_strict(value, context)?;
+    if value < 0 {
+        return Err(eval_err(format!("{context} expects a non-negative {name}")));
+    }
+    usize::try_from(value).map_err(|_| eval_err(format!("{context} {name} is too large")))
+}
+
+use super::args::{ensure_string_char_limit, normalize_slice_index, optional_slice_end};
+
+fn checked_string(
+    context: &str,
+    text: String,
+    ev: &Evaluator,
+) -> Result<RuntimeValue, crate::values::EvalSignal> {
+    ensure_string_char_limit(context, text.chars().count(), ev)?;
+    Ok(RuntimeValue::Str(text.into()))
+}
+
+fn ensure_list_len(
+    context: &str,
+    len: usize,
+    ev: &Evaluator,
+) -> Result<(), crate::values::EvalSignal> {
+    let limit = ev.runtime_collection_limit();
+    if len > limit {
+        return Err(eval_err(format!(
+            "{context}: list size limit {limit} exceeded"
+        )));
+    }
+    ev.charge_allocation(len)
+}
+
+fn byte_offset_for_char_index(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map(|(byte_index, _)| byte_index)
+        .unwrap_or(text.len())
+}
+
+fn find_from_char_index(haystack: &str, needle: &str, start: usize) -> Option<usize> {
+    let byte_start = byte_offset_for_char_index(haystack, start);
+    let search = &haystack[byte_start..];
+    let found = search.find(needle)?;
+    Some(start + search[..found].chars().count())
+}
+
 pub fn register(ev: &mut Evaluator) {
     // ── string-concat-many ────────────────────────────────────────────────────
-    ev.register_builtin(BuiltinInfo {
-        name: "string-concat-many".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 0,
-        max_arity: None,
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "string_concat_many",
+        0,
+        None,
+        crate::values::BuiltinMetadata::eager_runtime().with_signature(&["*string"], "string"),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
             let mut result = String::new();
             for v in &args {
-                result.push_str(&to_str(v, "string-concat-many")?);
+                result.push_str(&to_str(v, "string_concat_many")?);
             }
-            Ok(RuntimeValue::Str(result.into()))
-        }),
-    });
+            checked_string("string_concat_many", result, ev)
+        },
+    );
 
     // ── stable-hash ──────────────────────────────────────────────────────────
-    ev.register_builtin(BuiltinInfo {
-        name: "stable-hash".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 1,
-        max_arity: Some(1),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "stable_hash",
+        1,
+        Some(1),
+        crate::values::BuiltinMetadata::eager_runtime().with_signature(&["any"], "string"),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
             let token = stable_hash_token(&args[0])?;
             let mut digest = [0u8; 16];
@@ -45,43 +107,65 @@ pub fn register(ev: &mut Evaluator) {
                 .finalize_variable(&mut digest)
                 .map_err(|error| eval_err(format!("stable-hash failed: {error}")))?;
             Ok(RuntimeValue::Str(hex_lower(&digest).into()))
-        }),
-    });
+        },
+    );
 
     // ── string-slice ─────────────────────────────────────────────────────────
-    ev.register_builtin(BuiltinInfo {
-        name: "string-slice".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 2,
-        max_arity: Some(3),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "string_slice",
+        2,
+        Some(3),
+        crate::values::BuiltinMetadata::eager_runtime()
+            .with_signature(&["string", "int", "int"], "string"),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
-            let s = to_str(&args[0], "string-slice")?;
+            let s = to_str(&args[0], "string_slice")?;
             let chars: Vec<char> = s.chars().collect();
             let start =
-                normalize_slice_index(require_int_strict(&args[1], "string-slice")?, chars.len());
-            let end = optional_slice_end(args.get(2), chars.len(), "string-slice")?;
+                normalize_slice_index(require_int_strict(&args[1], "string_slice")?, chars.len());
+            let end = optional_slice_end(args.get(2), chars.len(), "string_slice")?;
             let sliced: String = if end <= start {
                 String::new()
             } else {
                 chars[start..end].iter().collect()
             };
             Ok(RuntimeValue::Str(sliced.into()))
-        }),
-    });
+        },
+    );
+
+    // ── string-chars ──────────────────────────────────────────────────────────
+    // One-call O(n) character iteration: the per-index `string_slice` loop the
+    // stdlib used before is O(n²) (each slice re-collects the chars).
+    ev.register_special(
+        "string_chars",
+        1,
+        Some(1),
+        crate::values::BuiltinMetadata::eager_runtime().with_signature(&["string"], "list"),
+        |ev, call, env| {
+            let args = eval_args(ev, call, env)?;
+            let s = to_str(&args[0], "string_chars")?;
+            let chars: Vec<RuntimeValue> = s
+                .chars()
+                .map(|c| RuntimeValue::Str(String::from(c).into()))
+                .collect();
+            ensure_list_len("string_chars", chars.len(), ev)?;
+            Ok(RuntimeValue::List(std::rc::Rc::new(
+                std::cell::RefCell::new(chars),
+            )))
+        },
+    );
 
     // ── string-split ──────────────────────────────────────────────────────────
-    ev.register_builtin(BuiltinInfo {
-        name: "string-split".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 2,
-        max_arity: Some(2),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "string_split",
+        2,
+        Some(2),
+        crate::values::BuiltinMetadata::eager_runtime()
+            .with_signature(&["string", "string"], "list"),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
-            let s = to_str(&args[0], "string-split")?;
-            let sep = to_str(&args[1], "string-split")?;
+            let s = to_str(&args[0], "string_split")?;
+            let sep = to_str(&args[1], "string_split")?;
             if sep.is_empty() {
                 return Err(eval_err("string-split expects a non-empty separator"));
             }
@@ -89,315 +173,258 @@ pub fn register(ev: &mut Evaluator) {
                 .split(&sep as &str)
                 .map(|p| RuntimeValue::Str(p.into()))
                 .collect();
+            ensure_list_len("string_split", parts.len(), ev)?;
             Ok(RuntimeValue::List(std::rc::Rc::new(
                 std::cell::RefCell::new(parts),
             )))
-        }),
-    });
+        },
+    );
 
     // ── string-find ───────────────────────────────────────────────────────────
-    ev.register_builtin(BuiltinInfo {
-        name: "string-find".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 2,
-        max_arity: Some(3),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "string_find",
+        2,
+        Some(3),
+        crate::values::BuiltinMetadata::eager_runtime()
+            .with_signature(&["string", "string", "int"], "int"),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
-            let haystack = to_str(&args[0], "string-find")?;
-            let needle = to_str(&args[1], "string-find")?;
+            let haystack = to_str(&args[0], "string_find")?;
+            let needle = to_str(&args[1], "string_find")?;
             if needle.is_empty() {
                 return Err(eval_err("string-find expects a non-empty needle"));
             }
             let start = if args.len() == 3 {
-                require_int_strict(&args[2], "string-find")? as usize
+                require_char_start_index(&args[2], "string_find")?
             } else {
                 0
             };
-            let search = if start < haystack.len() {
-                &haystack[start..]
-            } else {
-                ""
-            };
-            match search.find(&needle as &str) {
-                Some(idx) => Ok(RuntimeValue::Int((start + idx) as i64)),
+            match find_from_char_index(&haystack, &needle, start) {
+                Some(idx) => Ok(RuntimeValue::Int(idx as i64)),
                 None => Ok(RuntimeValue::Null),
             }
-        }),
-    });
-
-    // ── string-index-of ───────────────────────────────────────────────────────
-    ev.register_builtin(BuiltinInfo {
-        name: "string-index-of".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 2,
-        max_arity: Some(3),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
-            let args = eval_args(ev, call, env)?;
-            let haystack = to_str(&args[0], "string-index-of")?;
-            let needle = to_str(&args[1], "string-index-of")?;
-            if needle.is_empty() {
-                return Err(eval_err("string-index-of expects a non-empty needle"));
-            }
-            let start = if args.len() == 3 {
-                require_int_strict(&args[2], "string-index-of")? as usize
-            } else {
-                0
-            };
-            let search = if start < haystack.len() {
-                &haystack[start..]
-            } else {
-                ""
-            };
-            Ok(RuntimeValue::Int(match search.find(&needle as &str) {
-                Some(idx) => (start + idx) as i64,
-                None => -1,
-            }))
-        }),
-    });
+        },
+    );
 
     // ── string-repeat ─────────────────────────────────────────────────────────
-    ev.register_builtin(BuiltinInfo {
-        name: "string-repeat".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 2,
-        max_arity: Some(2),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "string_repeat",
+        2,
+        Some(2),
+        crate::values::BuiltinMetadata::eager_runtime()
+            .with_signature(&["string", "int"], "string"),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
-            let s = to_str(&args[0], "string-repeat")?;
-            let n = require_int_strict(&args[1], "string-repeat")?;
-            if n < 0 {
-                return Err(eval_err("string-repeat expects a non-negative count"));
-            }
-            Ok(RuntimeValue::Str(s.repeat(n as usize).into()))
-        }),
-    });
+            let s = to_str(&args[0], "string_repeat")?;
+            let n = require_non_negative_usize(&args[1], "string_repeat", "count")?;
+            let char_count = s
+                .chars()
+                .count()
+                .checked_mul(n)
+                .ok_or_else(|| eval_err("string_repeat: string size overflow"))?;
+            ensure_string_char_limit("string_repeat", char_count, ev)?;
+            Ok(RuntimeValue::Str(s.repeat(n).into()))
+        },
+    );
 
     // ── string-format ────────────────────────────────────────────────────────
-    ev.register_builtin(BuiltinInfo {
-        name: "string-format".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 1,
-        max_arity: None,
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
-            let args = eval_args(ev, call, env)?;
-            let template = to_str(&args[0], "string-format")?;
-            format_template(&template, &args[1..]).map(|text| RuntimeValue::Str(text.into()))
-        }),
-    });
 
     // ── string-trim ───────────────────────────────────────────────────────────
-    ev.register_builtin(BuiltinInfo {
-        name: "string-trim".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 1,
-        max_arity: Some(1),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "string_trim",
+        1,
+        Some(1),
+        crate::values::BuiltinMetadata::eager_runtime().with_signature(&["string"], "string"),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
-            Ok(RuntimeValue::Str(
-                to_str(&args[0], "string-trim")?.trim().into(),
-            ))
-        }),
-    });
+            let text = to_str(&args[0], "string_trim")?.trim().to_string();
+            checked_string("string_trim", text, ev)
+        },
+    );
 
     // ── string-starts-with ────────────────────────────────────────────────────
-    ev.register_builtin(BuiltinInfo {
-        name: "string-starts-with".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 2,
-        max_arity: Some(2),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "string_starts_with",
+        2,
+        Some(2),
+        crate::values::BuiltinMetadata::eager_runtime()
+            .with_signature(&["string", "string"], "bool"),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
-            let s = to_str(&args[0], "string-starts-with")?;
-            let prefix = to_str(&args[1], "string-starts-with")?;
+            let s = to_str(&args[0], "string_starts_with")?;
+            let prefix = to_str(&args[1], "string_starts_with")?;
             Ok(RuntimeValue::Bool(s.starts_with(&prefix as &str)))
-        }),
-    });
+        },
+    );
 
     // ── string-ends-with ──────────────────────────────────────────────────────
-    ev.register_builtin(BuiltinInfo {
-        name: "string-ends-with".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 2,
-        max_arity: Some(2),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "string_ends_with",
+        2,
+        Some(2),
+        crate::values::BuiltinMetadata::eager_runtime()
+            .with_signature(&["string", "string"], "bool"),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
-            let s = to_str(&args[0], "string-ends-with")?;
-            let suffix = to_str(&args[1], "string-ends-with")?;
+            let s = to_str(&args[0], "string_ends_with")?;
+            let suffix = to_str(&args[1], "string_ends_with")?;
             Ok(RuntimeValue::Bool(s.ends_with(&suffix as &str)))
-        }),
-    });
+        },
+    );
 
     // ── string-contains ───────────────────────────────────────────────────────
-    ev.register_builtin(BuiltinInfo {
-        name: "string-contains".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 2,
-        max_arity: Some(2),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "string_contains",
+        2,
+        Some(2),
+        crate::values::BuiltinMetadata::eager_runtime()
+            .with_signature(&["string", "string"], "bool"),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
-            let s = to_str(&args[0], "string-contains")?;
-            let sub = to_str(&args[1], "string-contains")?;
+            let s = to_str(&args[0], "string_contains")?;
+            let sub = to_str(&args[1], "string_contains")?;
             Ok(RuntimeValue::Bool(s.contains(&sub as &str)))
-        }),
-    });
+        },
+    );
 
     // ── string-upcase ─────────────────────────────────────────────────────────
-    ev.register_builtin(BuiltinInfo {
-        name: "string-upcase".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 1,
-        max_arity: Some(1),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "string_upcase",
+        1,
+        Some(1),
+        crate::values::BuiltinMetadata::eager_runtime().with_signature(&["string"], "string"),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
-            Ok(RuntimeValue::Str(
-                to_str(&args[0], "string-upcase")?.to_uppercase().into(),
-            ))
-        }),
-    });
+            let text = to_str(&args[0], "string_upcase")?.to_uppercase();
+            checked_string("string_upcase", text, ev)
+        },
+    );
 
     // ── string-downcase ───────────────────────────────────────────────────────
-    ev.register_builtin(BuiltinInfo {
-        name: "string-downcase".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 1,
-        max_arity: Some(1),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "string_downcase",
+        1,
+        Some(1),
+        crate::values::BuiltinMetadata::eager_runtime().with_signature(&["string"], "string"),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
-            Ok(RuntimeValue::Str(
-                to_str(&args[0], "string-downcase")?.to_lowercase().into(),
-            ))
-        }),
-    });
+            let text = to_str(&args[0], "string_downcase")?.to_lowercase();
+            checked_string("string_downcase", text, ev)
+        },
+    );
 
     // ── string-replace ────────────────────────────────────────────────────────
-    ev.register_builtin(BuiltinInfo {
-        name: "string-replace".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 3,
-        max_arity: Some(3),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "string_replace",
+        3,
+        Some(3),
+        crate::values::BuiltinMetadata::eager_runtime()
+            .with_signature(&["string", "string", "string"], "string"),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
-            let s = to_str(&args[0], "string-replace")?;
-            let old = to_str(&args[1], "string-replace")?;
-            let new = to_str(&args[2], "string-replace")?;
-            Ok(RuntimeValue::Str(
-                s.replace(&old as &str, &new as &str).into(),
-            ))
-        }),
-    });
+            let s = to_str(&args[0], "string_replace")?;
+            let old = to_str(&args[1], "string_replace")?;
+            let new = to_str(&args[2], "string_replace")?;
+            let text = s.replace(&old as &str, &new as &str);
+            checked_string("string_replace", text, ev)
+        },
+    );
 
     // ── string-lines ─────────────────────────────────────────────────────────
-    ev.register_builtin(BuiltinInfo {
-        name: "string-lines".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 1,
-        max_arity: Some(1),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "string_lines",
+        1,
+        Some(1),
+        crate::values::BuiltinMetadata::eager_runtime().with_signature(&["string"], "list"),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
-            let s = to_str(&args[0], "string-lines")?;
+            let s = to_str(&args[0], "string_lines")?;
             let lines: Vec<RuntimeValue> = s.lines().map(|l| RuntimeValue::Str(l.into())).collect();
+            ensure_list_len("string_lines", lines.len(), ev)?;
             Ok(RuntimeValue::List(std::rc::Rc::new(
                 std::cell::RefCell::new(lines),
             )))
-        }),
-    });
+        },
+    );
 
     // ── string-to-int ─────────────────────────────────────────────────────────
-    ev.register_builtin(BuiltinInfo {
-        name: "string-to-int".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 1,
-        max_arity: Some(1),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "string_to_int",
+        1,
+        Some(1),
+        crate::values::BuiltinMetadata::eager_runtime().with_signature(&["string"], "int"),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
-            let s = to_str(&args[0], "string-to-int")?;
+            let s = to_str(&args[0], "string_to_int")?;
             s.trim()
                 .parse::<i64>()
                 .map(RuntimeValue::Int)
                 .map_err(|_| eval_err("string-to-int expects a base-10 integer string"))
-        }),
-    });
+        },
+    );
+
+    // ── string-to-float ───────────────────────────────────────────────────────
+    ev.register_special(
+        "string_to_float",
+        1,
+        Some(1),
+        crate::values::BuiltinMetadata::eager_runtime().with_signature(&["string"], "float"),
+        |ev, call, env| {
+            let args = eval_args(ev, call, env)?;
+            let s = to_str(&args[0], "string_to_float")?;
+            s.trim()
+                .parse::<f64>()
+                .map(RuntimeValue::Float)
+                .map_err(|_| eval_err("string-to-float expects a decimal float string"))
+        },
+    );
 
     // ── int-to-string ─────────────────────────────────────────────────────────
-    ev.register_builtin(BuiltinInfo {
-        name: "int-to-string".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 1,
-        max_arity: Some(1),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "int_to_string",
+        1,
+        Some(1),
+        crate::values::BuiltinMetadata::eager_runtime().with_signature(&["int"], "string"),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
             let i = match &args[0] {
                 RuntimeValue::Int(i) => *i,
                 other => {
                     return Err(eval_err(format!(
-                        "int-to-string: expected int, got {other}"
+                        "int_to_string: expected int, got {other}"
                     )))
                 }
             };
             Ok(RuntimeValue::Str(i.to_string().into()))
-        }),
-    });
+        },
+    );
 
     // ── string-byte-length ────────────────────────────────────────────────────
-    ev.register_builtin(BuiltinInfo {
-        name: "string-byte-length".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 1,
-        max_arity: Some(1),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "string_byte_length",
+        1,
+        Some(1),
+        crate::values::BuiltinMetadata::eager_runtime().with_signature(&["string"], "int"),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
-            let s = to_str(&args[0], "string-byte-length")?;
+            let s = to_str(&args[0], "string_byte_length")?;
             Ok(RuntimeValue::Int(s.len() as i64))
-        }),
-    });
+        },
+    );
 
     // ── string-byte-at ────────────────────────────────────────────────────────
-    ev.register_builtin(BuiltinInfo {
-        name: "string-byte-at".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 2,
-        max_arity: Some(2),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
-            let args = eval_args(ev, call, env)?;
-            let s = to_str(&args[0], "string-byte-at")?;
-            let index = require_int_strict(&args[1], "string-byte-at")?;
-            if index < 0 {
-                return Err(eval_err("string-byte-at index is out of range"));
-            }
-            let Some(byte) = s.as_bytes().get(index as usize) else {
-                return Err(eval_err("string-byte-at index is out of range"));
-            };
-            Ok(RuntimeValue::Int(*byte as i64))
-        }),
-    });
 
     // ── string-last-segment ───────────────────────────────────────────────────
-    ev.register_builtin(BuiltinInfo {
-        name: "string-last-segment".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 2,
-        max_arity: Some(2),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "string_last_segment",
+        2,
+        Some(2),
+        crate::values::BuiltinMetadata::eager_runtime()
+            .with_signature(&["string", "string"], "string"),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
-            let s = to_str(&args[0], "string-last-segment")?;
-            let sep = to_str(&args[1], "string-last-segment")?;
+            let s = to_str(&args[0], "string_last_segment")?;
+            let sep = to_str(&args[1], "string_last_segment")?;
             if sep.is_empty() {
                 return Err(eval_err(
                     "string-last-segment expects a non-empty separator",
@@ -409,154 +436,9 @@ pub fn register(ev: &mut Evaluator) {
             } else {
                 parts[parts.len() - 1]
             };
-            Ok(RuntimeValue::Str(result.into()))
-        }),
-    });
-
-    // ── string-pad-left ───────────────────────────────────────────────────────
-    ev.register_builtin(BuiltinInfo {
-        name: "string-pad-left".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 2,
-        max_arity: Some(3),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
-            let args = eval_args(ev, call, env)?;
-            let s = to_str(&args[0], "string-pad-left")?;
-            let width = require_int_strict(&args[1], "string-pad-left")?;
-            if width < 0 {
-                return Err(eval_err("string-pad-left expects a non-negative width"));
-            }
-            let fill = if args.len() == 3 {
-                to_str(&args[2], "string-pad-left")?
-            } else {
-                " ".to_string()
-            };
-            if fill.len() != 1 {
-                return Err(eval_err(
-                    "string-pad-left expects a one-character fill string",
-                ));
-            }
-            let chars: Vec<char> = s.chars().collect();
-            let pad = width as usize;
-            if chars.len() >= pad {
-                return Ok(RuntimeValue::Str(s.into()));
-            }
-            let padding: String = fill
-                .chars()
-                .next()
-                .unwrap()
-                .to_string()
-                .repeat(pad - chars.len());
-            Ok(RuntimeValue::Str(format!("{padding}{s}").into()))
-        }),
-    });
-
-    // ── string-pad-right ──────────────────────────────────────────────────────
-    ev.register_builtin(BuiltinInfo {
-        name: "string-pad-right".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 2,
-        max_arity: Some(3),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
-            let args = eval_args(ev, call, env)?;
-            let s = to_str(&args[0], "string-pad-right")?;
-            let width = require_int_strict(&args[1], "string-pad-right")?;
-            if width < 0 {
-                return Err(eval_err("string-pad-right expects a non-negative width"));
-            }
-            let fill = if args.len() == 3 {
-                to_str(&args[2], "string-pad-right")?
-            } else {
-                " ".to_string()
-            };
-            if fill.len() != 1 {
-                return Err(eval_err(
-                    "string-pad-right expects a one-character fill string",
-                ));
-            }
-            let chars: Vec<char> = s.chars().collect();
-            let pad = width as usize;
-            if chars.len() >= pad {
-                return Ok(RuntimeValue::Str(s.into()));
-            }
-            let padding: String = fill
-                .chars()
-                .next()
-                .unwrap()
-                .to_string()
-                .repeat(pad - chars.len());
-            Ok(RuntimeValue::Str(format!("{s}{padding}").into()))
-        }),
-    });
-}
-
-fn format_template(
-    template: &str,
-    args: &[RuntimeValue],
-) -> Result<String, crate::values::EvalSignal> {
-    let mut output = String::new();
-    let mut next_auto_index = 0usize;
-    let mut chars = template.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        match ch {
-            '{' => {
-                if chars.peek() == Some(&'{') {
-                    chars.next();
-                    output.push('{');
-                    continue;
-                }
-                let mut field = String::new();
-                let mut closed = false;
-                for field_ch in chars.by_ref() {
-                    if field_ch == '}' {
-                        closed = true;
-                        break;
-                    }
-                    field.push(field_ch);
-                }
-                if !closed {
-                    return Err(eval_err(
-                        "string-format failed: expected '}' before end of string",
-                    ));
-                }
-                let index = if field.is_empty() {
-                    let index = next_auto_index;
-                    next_auto_index += 1;
-                    index
-                } else if field.chars().all(|item| item.is_ascii_digit()) {
-                    field
-                        .parse::<usize>()
-                        .map_err(|_| eval_err("string-format failed: invalid replacement field"))?
-                } else {
-                    return Err(eval_err(format!(
-                        "string-format failed: unsupported replacement field {{{field}}}"
-                    )));
-                };
-                let Some(value) = args.get(index) else {
-                    return Err(eval_err(format!(
-                        "string-format failed: replacement index {index} out of range"
-                    )));
-                };
-                output.push_str(&value.to_string());
-            }
-            '}' => {
-                if chars.peek() == Some(&'}') {
-                    chars.next();
-                    output.push('}');
-                } else {
-                    return Err(eval_err(
-                        "string-format failed: single '}' encountered in format string",
-                    ));
-                }
-            }
-            _ => output.push(ch),
-        }
-    }
-
-    Ok(output)
+            checked_string("string_last_segment", result.to_string(), ev)
+        },
+    );
 }
 
 fn stable_hash_token(value: &RuntimeValue) -> Result<String, crate::values::EvalSignal> {
@@ -566,6 +448,13 @@ fn stable_hash_token(value: &RuntimeValue) -> Result<String, crate::values::Eval
         RuntimeValue::Int(value) => Ok(format!("i:{value}")),
         RuntimeValue::Float(value) => Ok(format!("f:{}", stable_float_token(*value))),
         RuntimeValue::Str(value) => Ok(format!("s:{}:{value}", value.chars().count())),
+        RuntimeValue::Bytes(value) => {
+            let mut token = format!("y:{}:", value.len());
+            for byte in value.iter() {
+                token.push_str(&format!("{byte:02x}"));
+            }
+            Ok(token)
+        }
         RuntimeValue::HostObject(object) if object.type_name() == "node" => {
             if let Some(node) = object
                 .as_any()
@@ -651,37 +540,21 @@ fn stable_float_token(value: f64) -> String {
 fn stable_hash_type_name(value: &RuntimeValue) -> &'static str {
     match value {
         RuntimeValue::Closure(_) => "closure",
+        RuntimeValue::Macro(_) => "macro",
         RuntimeValue::Builtin(_) => "builtin",
-        RuntimeValue::HostFunction(_) => "host-function",
-        RuntimeValue::HostObject(_) => "host-object",
-        RuntimeValue::UninitializedTopLevel => "uninitialized-top-level",
+        RuntimeValue::HostFunction(_) => "host_function",
+        RuntimeValue::HostObject(_) => "host_object",
+        RuntimeValue::Ref(_) => "ref",
+        RuntimeValue::UninitializedTopLevel => "uninitialized_top_level",
         RuntimeValue::Null
         | RuntimeValue::Bool(_)
         | RuntimeValue::Int(_)
         | RuntimeValue::Float(_)
         | RuntimeValue::Str(_)
+        | RuntimeValue::Bytes(_)
         | RuntimeValue::Tuple(_)
         | RuntimeValue::List(_)
         | RuntimeValue::Map(_) => "value",
-    }
-}
-
-fn optional_slice_end(
-    value: Option<&RuntimeValue>,
-    len: usize,
-    ctx: &str,
-) -> Result<usize, crate::values::EvalSignal> {
-    match value {
-        None | Some(RuntimeValue::Null) => Ok(len),
-        Some(value) => Ok(normalize_slice_index(require_int_strict(value, ctx)?, len)),
-    }
-}
-
-fn normalize_slice_index(index: i64, len: usize) -> usize {
-    if index < 0 {
-        len.saturating_sub(index.unsigned_abs() as usize)
-    } else {
-        (index as usize).min(len)
     }
 }
 

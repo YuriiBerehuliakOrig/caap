@@ -1,0 +1,179 @@
+; stdlib/lib/collections/set.caap — sets over maps (module stdlib.lib.collections.set).
+;
+; A set is a map whose keys are the elements (values are `true`). Elements
+; are therefore STRINGS (map keys); every operation is PURE — derived sets
+; are fresh maps, inputs never mutate (the `out`/`s` accumulators are the
+; function's own fresh state, so mutating them stays effect-free).
+(module stdlib.lib.collections.set)
+
+(use stdlib.lib.collections.sequence all? fold any?)
+
+; ── construction & queries ──────────────────────────────────────────────────
+
+; set_of — a set from a list of elements (duplicates collapse).
+;   xs : a list of string elements
+;   -> : a fresh set
+(bind set_of
+  (lambda (xs)
+    (bind ((s (map_of)))
+      (do (for x xs (assoc s x true)) s))))
+
+; set_has? — is `x` a member of `s`?
+;   s / x : a set and a candidate element
+;   ->    : bool
+(bind set_has?  (lambda (s x) (eq (get s x false) true)))
+
+; set_size — the number of elements.
+;   s  : a set
+;   -> : int
+(bind set_size  (lambda (s) (size s)))
+
+; set_empty? — has `s` no elements?
+;   s  : a set
+;   -> : bool
+(bind set_empty? (lambda (s) (eq (size s) 0)))
+
+; set_items — the elements as a list (order unspecified).
+;   s  : a set
+;   -> : a list of elements
+(bind set_items (lambda (s) (map_keys s)))
+
+; ── single-element edits (pure) ─────────────────────────────────────────────
+
+; set_add / set_remove — pure: a fresh set with / without `x`.
+;   s / x : a set and the element to add / drop
+;   ->    : a fresh set (s untouched)
+(bind set_add
+  (lambda (s x)
+    (bind ((out (map_of)))
+      (do (for k (map_keys s) (assoc out k true)) (assoc out x true) out))))
+(bind set_remove
+  (lambda (s x)
+    (bind ((out (map_of)))
+      (do
+        (for k (map_keys s) (unless (eq k x) (assoc out k true)))
+        out))))
+
+; ── algebra (pure; each yields a fresh set) ─────────────────────────────────
+
+; set_union — every element of `a` or `b`.
+;   a / b : two sets
+;   ->    : a fresh set
+(bind set_union
+  (lambda (a b)
+    (bind ((out (map_of)))
+      (do
+        (for k (map_keys a) (assoc out k true))
+        (for k (map_keys b) (assoc out k true))
+        out))))
+
+; set_intersection — the elements in BOTH `a` and `b`.
+;   a / b : two sets
+;   ->    : a fresh set
+(bind set_intersection
+  (lambda (a b)
+    (bind ((out (map_of)))
+      (do
+        (for k (map_keys a) (when (set_has? b k) (assoc out k true)))
+        out))))
+
+; set_difference — the elements of `a` that are NOT in `b`.
+;   a / b : two sets
+;   ->    : a fresh set
+(bind set_difference
+  (lambda (a b)
+    (bind ((out (map_of)))
+      (do
+        (for k (map_keys a) (unless (set_has? b k) (assoc out k true)))
+        out))))
+
+; set_symmetric_difference — the elements in exactly ONE of `a`, `b`.
+;   a / b : two sets
+;   ->    : a fresh set (a ∪ b minus a ∩ b)
+(bind set_symmetric_difference
+  (lambda (a b)
+    (set_union (set_difference a b) (set_difference b a))))
+
+; set_filter — the subset whose elements satisfy `pred`.
+;   s / pred : a set and (element) -> bool
+;   ->       : a fresh set
+(bind set_filter
+  (lambda (s pred)
+    (bind ((out (map_of)))
+      (do
+        (for k (map_keys s) (when (pred k) (assoc out k true)))
+        out))))
+
+; ── higher-order (pure) ─────────────────────────────────────────────────────
+
+; set_map — the image of `s` under `f` (apply `f` to every element).
+;   s / f : a set and (element) -> element' (a string)
+;   ->    : a fresh set of the mapped elements
+; NOTE: may SHRINK when distinct elements map to the same image (collisions
+; collapse — the result is a set, not a multiset).
+(bind set_map
+  (lambda (s f)
+    (bind ((out (map_of)))
+      (do
+        (for k (map_keys s) (assoc out (f k) true))
+        out))))
+
+; set_fold — fold `f` over the elements (order unspecified).
+;   s / init / f : a set, a seed, and (acc element) -> acc
+;   ->           : the final accumulator
+(bind set_fold
+  (lambda (s init f) (fold (map_keys s) init f)))
+
+; set_any? — does ANY element satisfy `pred`?
+;   s / pred : a set and (element) -> bool
+;   ->       : bool (false when `s` is empty)
+(bind set_any?
+  (lambda (s pred) (any? (map_keys s) pred)))
+
+; set_all? — do ALL elements satisfy `pred`?
+;   s / pred : a set and (element) -> bool
+;   ->       : bool (true when `s` is empty)
+(bind set_all?
+  (lambda (s pred) (all? (map_keys s) pred)))
+
+; set_partition — split `s` by `pred` into a map {yes, no}.
+;   s / pred : a set and (element) -> bool
+;   ->       : a fresh map {"yes": set-of-passing, "no": set-of-failing}
+(bind set_partition
+  (lambda (s pred)
+    (bind ((yes (map_of)) (no (map_of)))
+      (do
+        (for k (map_keys s)
+          (if (pred k) (assoc yes k true) (assoc no k true)))
+        (assoc (assoc (map_of) "yes" yes) "no" no)))))
+
+; ── relations ───────────────────────────────────────────────────────────────
+
+; set_subset? — is every element of `a` also in `b`?
+;   a / b : two sets
+;   ->    : bool (true when `a` is empty)
+(bind set_subset?
+  (lambda (a b) (all? (map_keys a) (lambda (k) (set_has? b k)))))
+
+; set_superset? — does `a` contain every element of `b`? (subset, flipped)
+;   a / b : two sets
+;   ->    : bool
+(bind set_superset?
+  (lambda (a b) (set_subset? b a)))
+
+; set_equal? — do `a` and `b` have exactly the same elements?
+;   a / b : two sets
+;   ->    : bool (same size AND a ⊆ b — order-independent)
+(bind set_equal?
+  (lambda (a b) (and (eq (size a) (size b)) (set_subset? a b))))
+
+; set_disjoint? — do `a` and `b` share NO element?
+;   a / b : two sets
+;   ->    : bool
+(bind set_disjoint?
+  (lambda (a b) (all? (map_keys a) (lambda (k) (not (set_has? b k))))))
+
+(export set_of set_has? set_size set_empty? set_items set_add set_remove
+        set_union set_intersection set_difference set_symmetric_difference
+        set_filter set_map set_fold set_any? set_all? set_partition
+        set_subset? set_superset? set_equal? set_disjoint?)

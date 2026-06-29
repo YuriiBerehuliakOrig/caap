@@ -1,0 +1,126 @@
+; stdlib/lib/tests/test_format.caap — in-language tests for lib/text/format.
+
+;; @area: text
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq)
+(use stdlib.lib.text.format
+     format pad_left pad_right center format_int hex oct bin align_columns)
+
+; ── format: positional {} ────────────────────────────────────────────────────
+(assert_eq (format "{} + {} = {}" (list_of 1 2 3)) "1 + 2 = 3" "format positional")
+(assert_eq (format "hi {}" (list_of "bob")) "hi bob" "format string arg")
+(assert_eq (format "none here" (list_of)) "none here" "format no placeholders")
+
+; ── format: indexed {N} ──────────────────────────────────────────────────────
+(assert_eq (format "{0} {1} {0}" (list_of "a" "b")) "a b a" "format indexed reuse")
+(assert_eq (format "{1}-{0}" (list_of "x" "y")) "y-x" "format indexed reorder")
+
+; ── format: named {name} from a map ──────────────────────────────────────────
+(assert_eq (format "{greet}, {who}!" (map_of "greet" "Hello" "who" "World"))
+           "Hello, World!" "format named map")
+
+; ── format: {{ }} brace escapes ──────────────────────────────────────────────
+(assert_eq (format "{{}}" (list_of)) "{}" "format escaped empty braces")
+(assert_eq (format "{{{}}}" (list_of "x")) "{x}" "format escaped around placeholder")
+(assert_eq (format "100{{%}}" (list_of)) "100{%}" "format escaped percent")
+
+; ── format: graceful out-of-range / missing ──────────────────────────────────
+(assert_eq (format "{0} {5}" (list_of "a")) "a {5}" "format index out of range")
+(assert_eq (format "{x}" (map_of "y" 1)) "{x}" "format missing key")
+
+; ── padding ──────────────────────────────────────────────────────────────────
+(assert_eq (pad_left "7" 3 "0") "007" "pad_left zeros")
+(assert_eq (pad_left "abc" 2 " ") "abc" "pad_left already wide")
+(assert_eq (pad_right "7" 3 "0") "700" "pad_right zeros")
+(assert_eq (pad_right "x" 4 " ") "x   " "pad_right spaces")
+(assert_eq (center "x" 5 "-") "--x--" "center even pad")
+(assert_eq (center "x" 4 "-") "-x--" "center odd pad right-heavy")
+(assert_eq (center "abc" 2 " ") "abc" "center already wide")
+
+; ── format_int / hex / oct / bin ─────────────────────────────────────────────
+(assert_eq (format_int 0 16) "0" "format_int zero")
+(assert_eq (format_int 255 16) "ff" "format_int hex 255")
+(assert_eq (format_int 10 10) "10" "format_int decimal")
+(assert_eq (format_int 5 2) "101" "format_int binary 5")
+(assert_eq (format_int 8 8) "10" "format_int octal 8")
+(assert_eq (format_int -10 16) "-a" "format_int negative hex")
+(assert_eq (hex 255) "ff" "hex 255")
+(assert_eq (oct 64) "100" "oct 64")
+(assert_eq (bin 5) "101" "bin 5")
+(assert_eq (hex -255) "-ff" "hex negative")
+; out-of-range radix surfaces a throw rather than hanging / dropping digits
+(assert_eq (try (do (format_int 5 1) "no-throw") (catch e "threw")) "threw"
+           "format_int radix too small throws")
+(assert_eq (try (do (format_int 5 17) "no-throw") (catch e "threw")) "threw"
+           "format_int radix too large throws")
+
+; ── align_columns ────────────────────────────────────────────────────────────
+(assert_eq (align_columns
+             (list_of (list_of "a" "bb") (list_of "ccc" "d"))
+             (list_of 3 3))
+           "a   bb \nccc d  " "align_columns 2x2 grid")
+; one cell, two columns: "x" -> "x " | "" -> "  ", joined with a space => "x    "
+(assert_eq (align_columns
+             (list_of (list_of "x"))
+             (list_of 2 2))
+           "x    " "align_columns missing cell padded")
+
+; ── format SPEC (the `:spec` after a placeholder) ─────────────────────────────
+; alignment + width (default fill is a space; default align is left)
+(assert_eq (format "{:>8}" (list_of "hi")) "      hi" "spec right-align width")
+(assert_eq (format "{:<8}" (list_of "hi")) "hi      " "spec left-align width")
+(assert_eq (format "{:^6}" (list_of "hi")) "  hi  " "spec center width")
+(assert_eq (format "{:8}" (list_of "hi")) "hi      " "spec width defaults to left")
+; an explicit fill character precedes the alignment marker
+(assert_eq (format "{:*>5}" (list_of "x")) "****x" "spec fill char right")
+(assert_eq (format "{:-^7}" (list_of "ab")) "--ab---" "spec fill char center")
+; already at/over width — no padding
+(assert_eq (format "{:>2}" (list_of "abc")) "abc" "spec no-op when wide")
+; zero-pad (right-aligned, keeps a leading sign ahead of the zeros)
+(assert_eq (format "{:08}" (list_of 42)) "00000042" "spec zero pad")
+(assert_eq (format "{:08}" (list_of -42)) "-0000042" "spec zero pad keeps sign")
+; float precision (half-away-from-zero rounding; precision 0 drops the point)
+(assert_eq (format "{:.2}" (list_of 3.14159)) "3.14" "spec float precision")
+(assert_eq (format "{:.0}" (list_of 3.7)) "4" "spec precision 0 rounds")
+(assert_eq (format "{:.3}" (list_of 1.5)) "1.500" "spec precision pads zeros")
+(assert_eq (format "{:.1}" (list_of -2.56)) "-2.6" "spec precision negative")
+; radix types
+(assert_eq (format "{:x}" (list_of 255)) "ff" "spec hex lowercase")
+(assert_eq (format "{:X}" (list_of 255)) "FF" "spec hex uppercase")
+(assert_eq (format "{:b}" (list_of 5)) "101" "spec binary")
+(assert_eq (format "{:o}" (list_of 8)) "10" "spec octal")
+(assert_eq (format "{:d}" (list_of 42)) "42" "spec decimal type")
+; radix combined with width / zero-pad
+(assert_eq (format "{:>6x}" (list_of 255)) "    ff" "spec hex right-aligned")
+(assert_eq (format "{:04x}" (list_of 255)) "00ff" "spec hex zero-padded")
+; indexed and named placeholders carry specs too
+(assert_eq (format "{0:>4}" (list_of 7)) "   7" "spec on indexed placeholder")
+(assert_eq (format "{n:.1}" (map_of "n" 2.567)) "2.6" "spec on named placeholder")
+; a missing placeholder with a spec still degrades to the literal body
+(assert_eq (format "{5:>4}" (list_of "a")) "{5:>4}" "spec on a missing index is literal")
+(assert_eq (format "{x:x}" (map_of "y" 1)) "{x:x}" "spec on a missing key is literal")
+
+; ── GOLDEN: list-accumulator (buffer-ized) format == old string-concat output ─
+; The char-walk loop now accumulates fragments in a list joined once at the end
+; instead of growing a string per fragment. These pin the exact output so the
+; refactor stays byte-identical: long literal runs, many placeholders, and the
+; lone "}" / escaped-brace branches all flow through the new accumulator.
+(assert_eq (format "" (list_of)) "" "format empty template")
+(assert_eq (format "abcdefghij" (list_of)) "abcdefghij" "format long literal run")
+(assert_eq (format "{}{}{}{}{}" (list_of "a" "b" "c" "d" "e")) "abcde"
+           "format many adjacent placeholders")
+(assert_eq (format "[{}|{}|{}]" (list_of 1 2 3)) "[1|2|3]" "format mixed literals+args")
+(assert_eq (format "a}b" (list_of)) "a}b" "format lone close brace literal")
+(assert_eq (format "{{x}} {}" (list_of "v")) "{x} v" "format escaped braces then arg")
+; an unterminated "{…" reads to end-of-string as the body; a non-numeric name
+; misses the list args and degrades to the literal "{body}" (closing brace added)
+(assert_eq (format "{unterminated" (list_of "z")) "{unterminated}" "format unterminated placeholder")
+(assert_eq (format "ok {" (list_of)) "ok {}" "format trailing lone open brace")
+
+; ── GOLDEN: re-exported pad_left/pad_right (now sourced from lib/text/string) ──
+; Dedup keeps a single definition in string.caap; format re-exports it, so these
+; must behave exactly as the deleted in-file lambdas did.
+(assert_eq (pad_left "7" 3 "0") "007" "re-exported pad_left zeros")
+(assert_eq (pad_right "x" 4 " ") "x   " "re-exported pad_right spaces")
+(assert_eq (pad_left "wide" 2 " ") "wide" "re-exported pad_left no-op when wide")

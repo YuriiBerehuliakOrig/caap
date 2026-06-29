@@ -1,0 +1,315 @@
+; stdlib/semantics/passes/ssa_ccp.caap — SSA-based sparse conditional constant
+; propagation (SCCP) as a whole-module TRANSFORM (module
+; stdlib.semantics.passes.ssa_ccp).
+;
+; ── Phase-2 unification: THIS module provides the `ccp` transform at -O3 ──────
+; `ccp_unified_node` composes the SSA across-merge fold (ssa_ccp_node, below) with
+; the conservative scope-aware ccp (ccp.caap's ccp_node), and `register!` installs
+; it under the name "ccp". opt.caap's O3 loads THIS module for "ccp" — so there is no
+; longer a separate "ssa_ccp" transform; the SSA precision is folded into ccp itself.
+; ccp.caap stays the conservative core (this module wraps it); the import direction
+; ssa_ccp -> ccp is the existing one, so no dependency cycle is introduced.
+;
+; ── what this buys over ccp ───────────────────────────────────────────────────
+; The conservative `ccp` pass (ccp.caap) is flow-sensitive but NOT SSA: it walks
+; the surface IR threading a const env, and at a control-flow JOIN it strips every
+; name touched by either arm (its env does not survive an `if` merge). So a ref
+; that is written the SAME constant on BOTH arms — `(if c (set_ref r 5) (set_ref r
+; 5))` — is BOTTOM to ccp the moment it sees a set_ref of r anywhere: it BAILS, the
+; trailing `(deref r)` is left intact. That is a real, provable constant ccp misses.
+;
+; ssa_ccp recovers the precision by working on the SSA FORM (stdlib.semantics.ssa):
+; there each ref version has a SINGLE definition, and a control-flow merge of two
+; versions is an EXPLICIT φ `(__phi__ v1 v2 …)`. A φ-version whose incoming versions
+; are ALL the same scalar constant is THAT constant — the ACROSS-MERGE fold ccp
+; cannot make. We compute a constant lattice over versions to a fixpoint, replace
+; every USE of a const version with its literal, constfold, and `from_ssa` back to
+; executable IR (no φ survives — the round-trip is the executability guarantee).
+;
+; ── the lattice (Wegman–Zadeck over SSA versions) ────────────────────────────
+; Each SSA VERSION (`r__k`, recorded by the view's `ssa_versions`) has exactly one
+; def, so a per-version state is sound:
+;   * a version whose def is a scalar literal `(lit c)`        -> CONST c
+;   * a COPY version whose def is `(sym vj)` (a bare use of vj) -> CONST = state(vj)
+;   * a φ-version (one whose binder's body holds `(__phi__ a b …)`) -> CONST c iff
+;     EVERY incoming version a,b,… is CONST and they share the SAME scalar value
+;     (the across-merge meet); otherwise NOT-CONST (the arms diverge — keep it).
+;   * anything else (def is an `if`/arithmetic/call/deref/…) -> NOT-CONST.
+; Iterated to a fixpoint over the version graph (a φ const can unlock a later φ).
+; CRUCIALLY the lattice ranges ONLY over genuine SSA VERSIONS — the names the SSA
+; transform minted (`ssa_versions w`), never the body's own user bindings. Folding a
+; surface user binding is the scope-blindness trap (a shadowed `(bind "x" …)` would
+; collapse to one value and mis-substitute an out-of-scope use); we leave every
+; user-level binding to the scope-aware `ccp` and only fold single-assignment
+; versions. A version whose NAME collides with a user identifier in the original
+; body (so the SSA-form node has the user name and the minted version under one key)
+; is excluded — we cannot tell the two apart structurally, so we refuse to fold it.
+;
+; ── conservative, behavior-preserving (the cardinal invariant) ───────────────
+; We only ever replace a USE `(sym v)` when v is a genuine SSA version PROVABLY a
+; single scalar constant on EVERY path (a literal def, a copy chain to a literal, or
+; a φ all of whose incomings are that SAME literal). When unsure we leave the use
+; alone. The replacement is a `(lit c)` for a scalar c only (constfold's restriction
+; — never bake a shared mutable object into the IR). `from_ssa` then materialises
+; φ-free executable IR.
+;
+; ── the from_ssa round-trip hazard guard ─────────────────────────────────────
+; from_ssa is only behavior-faithful when every promoted ref's value is consumed
+; through statement-position reads (a `(deref r)` tail, an `if`-STATEMENT that is a
+; non-final `do` element). When an `if` that touches a promoted ref sits in a VALUE
+; position (its own result is consumed — e.g. `(int_add (if … (deref r) …) 1)` or a
+; tail `if`), the SSA substrate rewrites the arms to yield the ref version instead of
+; the if's natural value, so from_ssa(to_ssa(body)) already changes meaning BEFORE we
+; fold. Since our output is exactly that round-trip with const-version uses swapped
+; for literals, we must not run on such a body: `hazardous?` detects it and we BAIL
+; to the verbatim body (a missed fold, never a wrong one). UNSUPPORTED bodies (to_ssa
+; itself bails) are likewise returned verbatim.
+(module stdlib.semantics.passes.ssa_ccp)
+
+(use stdlib.syntax.ast
+  call? name? literal? string_lit? head_of head_is? args_of arg callee
+  name_of literal_of bind_pairs sym lit call calln mkbind walk)
+(use stdlib.semantics.ssa
+  to_ssa from_ssa supported? ssa_node ssa_view ssa_versions ssa_version_def
+  is_phi? promotable_refs hazardous?)
+(use stdlib.semantics.passes.ccp scalar_const? ccp_node)
+(use stdlib.semantics.passes.constfold fold_node)
+(use stdlib.semantics.passes.registry install_transform!)
+
+; ── version set + collision guard ────────────────────────────────────────────
+; user_names — every identifier that appears in the ORIGINAL body, as either a NAME
+; node (a use) or a bind TARGET (canonical string-lit pair name, or a flat name-node
+; binder). A genuine SSA VERSION whose name also lives here is a COLLISION with a
+; user identifier (the SSA-form node then carries both under one key, structurally
+; indistinguishable) — we refuse to fold it.
+(bind user_names
+  (lambda (body)
+    (bind ((s (map_of)))
+      (do
+        (walk body
+          (lambda (n)
+            (cond
+              ((name? n) (assoc s (name_of n) true))
+              ((and (call? n) (head_is? n "bind") (string_lit? (arg n 0)))
+                (bind ((bp (bind_pairs n)))
+                  (when (not (eq bp null))
+                    (for p (get bp "pairs") (assoc s (get p "name") true)))))
+              ((and (call? n) (head_is? n "bind") (name? (arg n 0)))
+                (assoc s (name_of (arg n 0)) true))
+              (else null))))
+        s))))
+
+; foldable_versions — the SET of genuine SSA versions (from the view) we MAY fold:
+; every recorded version that does NOT collide with a user identifier in the body.
+; This is the ONLY namespace the lattice and substitution ever touch.
+(bind foldable_versions
+  (lambda (w body)
+    (bind ((users (user_names body)) (out (map_of)))
+      (do
+        (for v (ssa_versions w)
+          (when (not (eq (get users v false) true)) (assoc out v true)))
+        out))))
+
+; version_collision? — does ANY minted SSA version NAME coincide with a user
+; identifier in the original body? When it does, to_ssa itself mis-renames (the
+; minted binder shadows the user name of the same spelling, so a later user use
+; reads the wrong cell) — the SSA-form node is already wrong BEFORE we fold. We must
+; not even ship that round-trip, so this forces a verbatim bail. (A genuine SSA
+; version is `base__N`; the checker forbids `__`-prefixed source identifiers, but a
+; `base__N` user name is not `__`-PREFIXED — the `__` is mid-name — so the collision
+; is reachable on synthesized/lowered IR. Refusing it is sound: a missed fold.)
+(bind version_collision?
+  (lambda (w body)
+    (bind ((users (user_names body)) (hit (ref false)))
+      (do
+        (for v (ssa_versions w)
+          (when (eq (get users v false) true) (set_ref hit true)))
+        (deref hit)))))
+
+; ── version-def + φ-incoming collection (over the foldable set only) ──────────
+; collect_phi_incomings — the φ-version map: for each `(bind "v" <if> S0 S1 …)`
+; whose binder BODY contains a `(__phi__ a b …)` STATEMENT, record v -> [a b …]
+; (the incoming version NAMES the φ merges). This is exactly the shape to_ssa
+; emits for an if-merge: the merged version is the LAST pair's name (the binder the
+; φ statement immediately follows), the φ's arguments are the two arm-tail versions
+; (each a `(sym vN)`). Only φ-versions in `foldable` are recorded.
+(bind collect_phi_incomings
+  (lambda (node foldable)
+    (bind ((phis (map_of)))
+      (do
+        (walk node
+          (lambda (n)
+            (when (and (call? n) (head_is? n "bind") (string_lit? (arg n 0)))
+              (bind ((bp (bind_pairs n)))
+                (when (not (eq bp null))
+                  (bind ((pairs (get bp "pairs")) (body (get bp "body")))
+                    (when (gt (size pairs) 0)
+                      (bind ((vn (get (get pairs (int_sub (size pairs) 1)) "name")))
+                        (when (eq (get foldable vn false) true)
+                          (for s body
+                            (when (and (call? s) (is_phi? s))
+                              (bind ((incoming (list_of)))
+                                (do
+                                  (for a (args_of s)
+                                    (when (name? a) (append incoming (name_of a))))
+                                  (assoc phis vn incoming))))))))))))))
+        phis))))
+
+; ── the constant lattice over versions ───────────────────────────────────────
+; State per version: ABSENT from the map = NOT-CONST (TOP/varies). PRESENT = a
+; scalar constant VALUE. We never store a sentinel — a missing key IS not-const.
+
+; lit_const_of — the scalar constant of a def value node, when it is a bare scalar
+; literal `(lit c)`; else null. (A literal whose value is a non-scalar — list/map —
+; is not propagatable, exactly as scalar_const? guards.)
+(bind lit_const_of
+  (lambda (valnode)
+    (if (and (literal? valnode) (scalar_const? (literal_of valnode)))
+      (literal_of valnode)
+      null)))
+
+; copy_src_of — the source version NAME when a def value is a bare copy `(sym vj)`;
+; else null. A copy version takes its source's constant (only when vj is itself a
+; foldable version — checked by the caller against the const map).
+(bind copy_src_of
+  (lambda (valnode) (if (name? valnode) (name_of valnode) null)))
+
+; all_same_const — given the current const map and a list of incoming version
+; names, the shared scalar constant when EVERY incoming is const AND they all hold
+; the SAME value; else null (the meet is not-const). An empty incoming list yields
+; null (nothing to merge — conservative).
+(bind all_same_const
+  (lambda (consts incoming)
+    (if (eq (size incoming) 0)
+      null
+      (bind ((first (get consts (get incoming 0) null)) (ok (ref true)))
+        (do
+          (when (eq first null) (set_ref ok false))
+          (for v incoming
+            (bind ((cv (get consts v null)))
+              (when (or (eq cv null) (not (eq cv first))) (set_ref ok false))))
+          (if (deref ok) first null))))))
+
+; compute_consts — the fixpoint over the FOLDABLE versions only. Seed every foldable
+; version whose def is a scalar literal as that constant; then iterate, learning a
+; copy version (def `(sym vj)`) from its source and a φ-version from its incomings,
+; until no version's state changes. Monotone (a version only ever moves not-const ->
+; const), so the fixpoint is reached in at most #versions rounds — we loop until a
+; round adds nothing.
+;   w        : the to_ssa wrapper (its view supplies each version's def)
+;   foldable : the version set we may fold (foldable_versions)
+;   phis     : φ-version -> [incoming version names] (collect_phi_incomings)
+;   ->       : version -> scalar constant VALUE (only the CONST versions)
+(bind compute_consts
+  (lambda (w foldable phis)
+    (bind ((consts (map_of)) (vers (map_keys foldable)))
+      (do
+        ; seed: literal defs.
+        (for v vers
+          (bind ((c (lit_const_of (ssa_version_def w v))))
+            (when (not (eq c null)) (assoc consts v c))))
+        ; iterate to a fixpoint.
+        (bind ((changed (ref true)))
+          (while (deref changed)
+            (do
+              (set_ref changed false)
+              (for v vers
+                (when (not (contains consts v))
+                  (bind (
+                    (phi_in (get phis v null))
+                    (newc
+                      (if (not (eq phi_in null))
+                        ; a φ-version: meet of its incomings.
+                        (all_same_const consts phi_in)
+                        ; a copy version `(sym vj)`: inherit vj's constant (only if
+                        ; vj is itself foldable — a non-foldable source has no const
+                        ; key, so this naturally yields null).
+                        (bind ((src (copy_src_of (ssa_version_def w v))))
+                          (if (eq src null) null (get consts src null)))))
+                  )
+                    (when (and (not (eq newc null)) (scalar_const? newc))
+                      (do (assoc consts v newc) (set_ref changed true)))))))))
+        consts))))
+
+; ── substitution: replace const-version USES with their literal ───────────────
+; subst_const_uses — rewrite `node`, replacing every USE of a const version (a bare
+; `(sym v)` where v is in `consts`) with `(lit c)`. `consts` keys are FOLDABLE
+; versions only — never a user identifier — so a user name use is never touched. A
+; version NAME also appears as a bind TARGET (a string literal `"v"`) — those are NOT
+; name nodes, so they are never folded; only genuine name-node USES are. A φ
+; statement `(__phi__ …)` may mention const versions; from_ssa drops every φ, so a
+; rewrite inside it is harmless. Pure structural recursion (callee + args).
+(bind subst_const_uses
+  (lambda (self node consts)
+    (cond
+      ((name? node)
+        (bind ((nm (name_of node)))
+          (if (contains consts nm) (lit (get consts nm)) node)))
+      ((not (call? node)) node)
+      (else
+        (call (self self (callee node) consts)
+          (bind ((out (list_of)))
+            (do
+              (for a (args_of node) (append out (self self a consts)))
+              out)))))))
+
+; ── the public core: ssa_ccp over one form ───────────────────────────────────
+; ssa_ccp_node — SSA-based SCCP over one IR node.
+;   1. UNSUPPORTED (to_ssa bails) OR HAZARDOUS (a value-position if over a promoted
+;      ref — the from_ssa round-trip would already mis-rebuild) -> return the ORIGINAL
+;      node verbatim (never the broken round-trip).
+;   2. build the SSA form; if a minted version NAME collides with a user identifier
+;      (to_ssa then mis-renamed) -> return the ORIGINAL node verbatim.
+;   3. else over the SSA-form node: pick the FOLDABLE versions (genuine, non-colliding
+;      SSA versions), collect φ incomings, compute the const lattice to a fixpoint,
+;      substitute const-version uses with literals.
+;   4. constfold the substituted SSA node (folds e.g. an `(int_add (lit 5) (lit 100))`
+;      newly exposed by the substitution), then from_ssa to executable IR.
+; The hazard + collision guards (each bailing to the ORIGINAL, never a broken round-
+; trip) + the foldable-only namespace are the soundness guarantees; the lattice is
+; the precision (only a provable single scalar const is ever folded).
+(bind ssa_ccp_node
+  (lambda (node)
+    (if (or (not (supported? node)) (hazardous? node))
+      node
+      (bind ((w (to_ssa node)))
+        (if (version_collision? w node)
+          node
+          (bind (
+            (snode (ssa_node w))
+            (foldable (foldable_versions w node))
+            (phis (collect_phi_incomings snode foldable))
+            (consts (compute_consts w foldable phis))
+            (substituted (subst_const_uses subst_const_uses snode consts))
+            (folded (fold_node substituted))
+          )
+            (from_ssa folded)))))))
+
+; ── the UNIFIED ccp node: SSA across-merge fold, then the conservative pass ─────
+; ccp_unified_node — the SSA-backed `ccp`. It is the COMPOSITION of the two folds,
+; each behaviour-preserving, so the whole is behaviour-preserving:
+;   1. ssa_ccp_node — the ACROSS-MERGE fold (a const rebound on both arms), bailing
+;      to identity on any unsupported/hazardous body;
+;   2. ccp_node — the conservative scope-aware straight-line propagation, which still
+;      catches everything SSA does not (it is flow-sensitive over user bindings, not
+;      just promoted ref versions).
+; This is the Phase-2 unification: ONE `ccp` transform that tries SSA first and falls
+; back to the conservative path, so the default -O3 pipeline gets the SSA precision
+; without a second pass. (The dependency direction ssa_ccp -> ccp already exists — for
+; scalar_const? — so composing here needs no new edge and no change to ccp.caap.)
+(bind ccp_unified_node
+  (lambda (node) (ccp_node (ssa_ccp_node node))))
+
+; ── transform entry + registration ───────────────────────────────────────────
+; run — rewrite every located form IN PLACE (the same located protocol as ccp.run).
+(bind run
+  (lambda (located)
+    (for f located (assoc f "node" (ccp_unified_node (get f "node"))))))
+
+; register! — install the UNIFIED constant propagation under the name "ccp" (it
+; SUPERSEDES the conservative ccp's registration: install_transform! replaces any
+; same-named entry, so whichever is registered last wins; opt.caap's O3 loads THIS
+; module for "ccp"). Idempotent.
+(bind register! (lambda () (install_transform! "ccp" run)))
+
+(export ssa_ccp_node ccp_unified_node run register!)

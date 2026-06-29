@@ -1,5 +1,12 @@
+//! Core runtime data types: the [`ParseValue`] result tree, the [`ParserConfig`]
+//! that tunes a run, lexer [`LexToken`]s, and the incremental-parse cache and
+//! edit types.
+
+use crate::error::ParseError;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+const EXACT_PARSE_CACHE_ENTRY_LIMIT: usize = 32;
 
 // ── Parse value ────────────────────────────────────────────────────────────
 
@@ -9,15 +16,28 @@ use std::sync::Arc;
 /// an annotated node with children, a named binding, and a span-decorated value.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ParseValue {
+    /// No value — a position-only match (lookahead, trivia, empty sequence).
     Nil,
-    Text(String),
+    /// Matched source text.
+    Text(Arc<str>),
+    /// An integer value. The grammar engine never produces this directly (all
+    /// terminals yield `Text`); it exists for host semantic actions that
+    /// transform matched text into a number.
     Number(i64),
-    Node(String, Vec<ParseValue>),
+    /// A tagged node: a rule/construct name plus its child values.
+    Node(Arc<str>, Arc<Vec<ParseValue>>),
     /// A named sub-value produced by a `name:expr` binding in a grammar rule.
-    Named(String, Box<ParseValue>),
+    ///
+    /// The inner value is `Arc`-wrapped (not `Box`) so cloning a `Named` — e.g.
+    /// on a packrat memo hit — is an O(1) refcount bump rather than a deep copy.
+    Named(Arc<str>, Arc<ParseValue>),
+    /// A value decorated with the byte span `[start, end)` it covered.
     SpannedValue {
-        value: Box<ParseValue>,
+        /// `Arc`-wrapped for O(1) clones (see [`ParseValue::Named`]).
+        value: Arc<ParseValue>,
+        /// Inclusive start byte offset.
         start: usize,
+        /// Exclusive end byte offset.
         end: usize,
     },
 }
@@ -26,16 +46,24 @@ impl ParseValue {
     /// Wrap `self` in a `SpannedValue` covering `[start, end)`.
     pub fn spanned(self, start: usize, end: usize) -> Self {
         Self::SpannedValue {
-            value: Box::new(self),
+            value: Arc::new(self),
             start,
             end,
         }
     }
 
+    /// Move a value out of an `Arc<ParseValue>` without copying when uniquely
+    /// owned (the common case for fresh parse output), cloning only if shared.
+    pub fn unwrap_arc(value: Arc<ParseValue>) -> ParseValue {
+        Arc::try_unwrap(value).unwrap_or_else(|shared| (*shared).clone())
+    }
+
+    /// Whether this is the [`Nil`](ParseValue::Nil) value.
     pub fn is_nil(&self) -> bool {
         matches!(self, Self::Nil)
     }
 
+    /// Whether this is a [`SpannedValue`](ParseValue::SpannedValue).
     pub fn is_spanned(&self) -> bool {
         matches!(self, Self::SpannedValue { .. })
     }
@@ -51,7 +79,7 @@ impl ParseValue {
     /// Return the name and inner value if this is a `Named` variant.
     pub fn as_named(&self) -> Option<(&str, &Self)> {
         match self {
-            Self::Named(name, value) => Some((name.as_str(), value)),
+            Self::Named(name, value) => Some((name.as_ref(), value)),
             _ => None,
         }
     }
@@ -61,12 +89,12 @@ impl ParseValue {
         let mut map = std::collections::HashMap::new();
         match self {
             Self::Named(name, value) => {
-                map.insert(name.clone(), value.as_ref());
+                map.insert(name.to_string(), value.as_ref());
             }
             Self::Node(_, children) => {
-                for child in children {
+                for child in children.iter() {
                     if let Self::Named(name, value) = child {
-                        map.insert(name.clone(), value.as_ref());
+                        map.insert(name.to_string(), value.as_ref());
                     }
                 }
             }
@@ -83,26 +111,47 @@ impl ParseValue {
 /// whether the match reached EOF, and any diagnostic messages.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CompletedPrefixParse {
+    /// The matched value, or `None` if the prefix did not parse.
     pub value: Option<ParseValue>,
+    /// Bytes consumed from the start position.
     pub consumed: usize,
+    /// Whether the match reached end-of-input.
     pub eof: bool,
+    /// Diagnostic messages (empty on success).
     pub errors: Vec<String>,
 }
 
 impl CompletedPrefixParse {
+    /// Whether a value was produced with no errors.
     pub fn ok(&self) -> bool {
         self.value.is_some() && self.errors.is_empty()
+    }
+
+    /// A failed prefix parse carrying a single diagnostic message.
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self {
+            value: None,
+            consumed: 0,
+            eof: false,
+            errors: vec![message.into()],
+        }
     }
 }
 
 // ── Parse cache ────────────────────────────────────────────────────────────
 
+/// A whole-input parse result cached for exact-text reuse, keyed by the text,
+/// grammar, and runtime signatures.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CachedResult {
+    /// Hash of the input text.
     pub text_hash: u64,
+    /// Signature of the grammar that produced the result.
     pub grammar_signature: u64,
+    /// Signature of the runtime config that produced the result.
     pub runtime_signature: u64,
-    pub output: ParseValue,
+    /// The cached root value.
+    pub output: Arc<ParseValue>,
 }
 
 /// A successful rule parse result persisted across incremental parse runs.
@@ -110,7 +159,37 @@ pub struct CachedResult {
 pub struct PositionMemoEntry {
     /// End position (exclusive) of the matched span.
     pub end: usize,
-    pub value: ParseValue,
+    /// The cached rule value.
+    pub value: Arc<ParseValue>,
+    /// Whether the original parse committed via `cut` at or below this rule.
+    /// `#[serde(default)]` keeps deserialisation backward-compatible with
+    /// caches written before this field existed (legacy entries default to
+    /// `false`, matching the previous always-false replay behaviour).
+    #[serde(default)]
+    pub cut: bool,
+    /// Lowest byte index the parse *examined* to produce this result. Lookbehind
+    /// can push it below the match start; otherwise it equals the start. `None`
+    /// in legacy caches → callers fall back to the match start. This is the
+    /// soundness datum for incremental reuse: an edit overlapping the examined
+    /// interval (not merely the matched span) must invalidate the entry.
+    #[serde(default)]
+    pub read_lo: Option<usize>,
+    /// One past the highest byte index the parse examined. Lookahead/trivia can
+    /// push it past `end`; otherwise it equals `end`. `None` in legacy caches →
+    /// callers fall back to `end`.
+    #[serde(default)]
+    pub read_hi: Option<usize>,
+}
+
+impl PositionMemoEntry {
+    /// The examined byte interval `[lo, hi)`, always a superset of the matched
+    /// span `[start, end)`. Falls back to the matched span for legacy entries
+    /// that predate read-extent tracking.
+    pub fn examined(&self, start: usize) -> (usize, usize) {
+        let lo = self.read_lo.unwrap_or(start).min(start.min(self.end));
+        let hi = self.read_hi.unwrap_or(self.end).max(start.max(self.end));
+        (lo, hi)
+    }
 }
 
 /// Position-level incremental memo for a single (grammar, runtime) context.
@@ -123,7 +202,9 @@ pub struct PositionMemoEntry {
 pub struct PositionCache {
     /// The text used to build this cache (needed to compute edit shifts).
     pub text: String,
+    /// Signature of the grammar this cache was built against.
     pub grammar_hash: u64,
+    /// Signature of the runtime config this cache was built against.
     pub runtime_signature: u64,
     /// Outer key: rule name.  Inner key: start position.
     pub memo:
@@ -131,6 +212,7 @@ pub struct PositionCache {
 }
 
 impl PositionCache {
+    /// An empty position cache bound to the given text and signatures.
     pub fn new(text: impl Into<String>, grammar_hash: u64, runtime_signature: u64) -> Self {
         Self {
             text: text.into(),
@@ -141,16 +223,29 @@ impl PositionCache {
     }
 
     /// Merge a batch of exported rule-memo entries into this cache.
-    pub fn absorb(
+    pub fn absorb(&mut self, exported: impl IntoIterator<Item = ExportedMemoEntry>) {
+        self.absorb_with_limit(exported, None);
+    }
+
+    /// Merge exported rule-memo entries and enforce a deterministic global cap.
+    pub fn absorb_with_limit(
         &mut self,
-        exported: impl IntoIterator<Item = (String, usize, usize, ParseValue)>,
+        exported: impl IntoIterator<Item = ExportedMemoEntry>,
+        global_limit: Option<usize>,
     ) {
-        for (rule, start, end, value) in exported {
-            self.memo
-                .entry(rule)
-                .or_default()
-                .insert(start, PositionMemoEntry { end, value });
+        for entry in exported {
+            self.memo.entry(entry.rule).or_default().insert(
+                entry.start,
+                PositionMemoEntry {
+                    end: entry.end,
+                    value: Arc::new(entry.value),
+                    cut: entry.cut,
+                    read_lo: Some(entry.read_lo),
+                    read_hi: Some(entry.read_hi),
+                },
+            );
         }
+        self.enforce_global_limit(global_limit);
     }
 
     /// Look up a rule result at `pos`.
@@ -160,12 +255,20 @@ impl PositionCache {
 
     /// Apply a sequential list of incremental edits to shift/invalidate entries.
     ///
-    /// Each edit is `(edit_start, old_end, new_len)`.  Entries whose `[start, end)`
-    /// overlaps `[edit_start, old_end)` are discarded.  Entries that start at or
-    /// after `old_end` are shifted by `delta`.
+    /// Each edit is `(edit_start, old_end, new_len)`. Reuse is decided on the
+    /// **examined** interval `[read_lo, read_hi)` (a superset of the matched
+    /// span): an entry whose examined interval overlaps `[edit_start, old_end)`
+    /// is discarded, because the edit could change what that subtree saw —
+    /// including bytes a lookahead/lookbehind read but did not consume. Entries
+    /// whose examined interval is entirely after the edit are shifted by `delta`
+    /// (both the matched span and the examined interval).
     pub fn apply_edits(&mut self, edits: &[(usize, usize, usize)]) {
         for &(edit_start, old_end, new_len) in edits {
-            let delta = new_len as isize - (old_end - edit_start) as isize;
+            let Some(removed_len) = old_end.checked_sub(edit_start) else {
+                self.memo.clear();
+                return;
+            };
+            let delta = new_len as isize - removed_len as isize;
             let mut next_memo: std::collections::HashMap<
                 String,
                 std::collections::HashMap<usize, PositionMemoEntry>,
@@ -175,24 +278,26 @@ impl PositionCache {
                 let mut shifted: std::collections::HashMap<usize, PositionMemoEntry> =
                     std::collections::HashMap::new();
                 for (&start, entry) in by_pos {
-                    let end = entry.end;
-                    // Invalidate if the entry's span overlaps the edit region.
-                    if start < old_end && end > edit_start {
+                    let (read_lo, read_hi) = entry.examined(start);
+                    // Invalidate if the *examined* interval overlaps the edit.
+                    if read_lo < old_end && read_hi > edit_start {
                         continue;
                     }
-                    if start >= old_end {
-                        // Entry is entirely after the edit — shift.
-                        let new_start = (start as isize + delta) as usize;
-                        let new_end = (end as isize + delta) as usize;
-                        shifted.insert(
-                            new_start,
-                            PositionMemoEntry {
-                                end: new_end,
-                                value: entry.value.clone(),
-                            },
-                        );
+                    if read_lo >= old_end {
+                        // Entirely after the edit — shift span + examined interval.
+                        let Some(new_start) =
+                            shift_position_after_edit(start, removed_len, new_len)
+                        else {
+                            continue;
+                        };
+                        let Some(new_end) =
+                            shift_position_after_edit(entry.end, removed_len, new_len)
+                        else {
+                            continue;
+                        };
+                        shifted.insert(new_start, entry.shifted_to(new_end, delta));
                     } else {
-                        // Entry is entirely before the edit — keep as-is.
+                        // Entirely before the edit — keep as-is.
                         shifted.insert(start, entry.clone());
                     }
                 }
@@ -208,29 +313,149 @@ impl PositionCache {
     pub fn entry_count(&self) -> usize {
         self.memo.values().map(|m| m.len()).sum()
     }
+
+    fn enforce_global_limit(&mut self, global_limit: Option<usize>) {
+        let Some(limit) = global_limit else {
+            return;
+        };
+        let count = self.entry_count();
+        if count <= limit {
+            return;
+        }
+        if limit == 0 {
+            self.memo.clear();
+            return;
+        }
+        // Drop `to_drop` entries without sorting — any eviction order is correct
+        // because evicted entries are simply recomputed on the next parse pass.
+        // Walking the HashMap directly is O(n) vs. the previous O(n log n) sort.
+        let mut to_drop = count - limit;
+        self.memo.retain(|_, by_pos| {
+            if to_drop == 0 {
+                return true;
+            }
+            let available = by_pos.len();
+            if available <= to_drop {
+                to_drop -= available;
+                false
+            } else {
+                let keys: Vec<usize> = by_pos.keys().copied().take(to_drop).collect();
+                for k in keys {
+                    by_pos.remove(&k);
+                }
+                to_drop = 0;
+                true
+            }
+        });
+    }
+}
+
+fn shift_position_after_edit(position: usize, removed_len: usize, new_len: usize) -> Option<usize> {
+    position.checked_sub(removed_len)?.checked_add(new_len)
+}
+
+impl PositionMemoEntry {
+    fn shifted_to(&self, end: usize, delta: isize) -> Self {
+        Self {
+            end,
+            value: Arc::clone(&self.value),
+            cut: self.cut,
+            read_lo: self.read_lo.and_then(|lo| shift_offset_signed(lo, delta)),
+            read_hi: self.read_hi.and_then(|hi| shift_offset_signed(hi, delta)),
+        }
+    }
+}
+
+fn shift_offset_signed(offset: usize, delta: isize) -> Option<usize> {
+    if delta >= 0 {
+        offset.checked_add(delta as usize)
+    } else {
+        offset.checked_sub(delta.unsigned_abs())
+    }
+}
+
+/// One successful rule outcome exported from a parse run into a [`PositionCache`].
+///
+/// Carries both the matched span `[start, end)` and the examined byte interval
+/// `[read_lo, read_hi)` (a superset of the matched span) so the cache can decide
+/// reuse soundly: an edit overlapping the examined interval invalidates the entry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExportedMemoEntry {
+    /// Rule that produced the outcome.
+    pub rule: String,
+    /// Inclusive start byte offset of the matched span.
+    pub start: usize,
+    /// Exclusive end byte offset of the matched span.
+    pub end: usize,
+    /// Whether the parse committed via `cut` at or below this rule.
+    pub cut: bool,
+    /// Lowest byte index examined (≤ `start`).
+    pub read_lo: usize,
+    /// One past the highest byte index examined (≥ `end`).
+    pub read_hi: usize,
+    /// The matched value.
+    pub value: ParseValue,
+}
+
+impl ExportedMemoEntry {
+    /// Build an entry whose examined interval equals its matched span — for
+    /// callers (and tests) that have no lookahead/lookbehind extent to record.
+    pub fn span(
+        rule: impl Into<String>,
+        start: usize,
+        end: usize,
+        cut: bool,
+        value: ParseValue,
+    ) -> Self {
+        Self {
+            rule: rule.into(),
+            start,
+            end,
+            cut,
+            read_lo: start,
+            read_hi: end,
+            value,
+        }
+    }
 }
 
 /// Parse cache used by `parse_incremental_many`.
 ///
-/// `entries` provides fast exact-text-match reuse (backward compatible).
+/// `entries` provides bounded whole-input exact-text-match reuse.
 /// `pos_cache` provides position-level incremental reuse that survives edits.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ParseCache {
+    /// Bounded whole-input exact-text-match results.
     pub entries: Vec<CachedResult>,
+    /// Position-level incremental memo that survives edits.
     pub pos_cache: Option<PositionCache>,
 }
 
 impl ParseCache {
+    /// An empty cache.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Number of whole-input exact-match entries held.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// Whether no whole-input entries are held.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    pub(crate) fn insert_exact_result(&mut self, entry: CachedResult) {
+        self.entries.push(entry);
+        let excess = self
+            .entries
+            .len()
+            .saturating_sub(EXACT_PARSE_CACHE_ENTRY_LIMIT);
+        if excess > 0 {
+            self.entries.drain(0..excess);
+        }
     }
 
     /// Number of position-level memo entries currently in the cache.
@@ -258,6 +483,7 @@ pub struct LexToken {
 }
 
 impl LexToken {
+    /// Build a token of `kind` covering `text` over the byte span `[start, end)`.
     pub fn new(kind: impl Into<String>, text: impl Into<String>, start: usize, end: usize) -> Self {
         Self {
             kind: kind.into(),
@@ -268,90 +494,54 @@ impl LexToken {
     }
 }
 
-// ── Parse trace events ────────────────────────────────────────────────────
-
-/// A single parser trace event emitted when a named rule is entered, exited, or fails.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ParseEvent {
-    /// `"enter"`, `"exit"`, or `"fail"`.
-    pub kind: &'static str,
-    pub rule: String,
-    pub pos: usize,
-}
-
-/// Optional per-rule trace callback. Called on every rule entry, successful exit, and failure.
-pub type TraceCallback = Arc<dyn Fn(&ParseEvent) + Send + Sync>;
-
-/// Newtype wrapper so `TraceCallback` can live in a `#[derive(Clone)]` struct.
-#[derive(Clone)]
-pub struct TraceCallbackHolder(pub TraceCallback);
-
-impl std::fmt::Debug for TraceCallbackHolder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("TraceCallback")
-    }
-}
-
-impl PartialEq for TraceCallbackHolder {
-    fn eq(&self, _other: &Self) -> bool {
-        false
-    }
-}
-
-impl Eq for TraceCallbackHolder {}
-
 // ── Parser configuration ───────────────────────────────────────────────────
 
-/// Configuration for a single parse invocation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Fine-grained memoisation budget for a parse run.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct MemoPolicy {
     /// Cap on total memo entries across the whole parse run.
-    pub global_budget: Option<usize>,
-    /// Cap on per-session (node-level) memo entries.
-    pub session_budget: Option<usize>,
-    /// Sliding-window size for node-memo lookups (in bytes).
-    pub region_window: Option<usize>,
-    /// How often to prune stale memo entries (every N rule calls).
-    pub prune_cadence: Option<usize>,
+    global_budget: Option<usize>,
 }
 
 impl MemoPolicy {
-    pub fn new(
-        global_budget: Option<usize>,
-        session_budget: Option<usize>,
-        region_window: Option<usize>,
-        prune_cadence: Option<usize>,
-    ) -> Result<Self, String> {
-        for (name, val) in [
-            ("global_budget", global_budget),
-            ("session_budget", session_budget),
-            ("region_window", region_window),
-        ] {
-            if val == Some(0) && name == "prune_cadence" {
-                return Err(format!(
-                    "MemoPolicy.{name} must be a positive integer when provided"
-                ));
-            }
-        }
-        if prune_cadence == Some(0) {
-            return Err("MemoPolicy.prune_cadence must be a positive integer when provided".into());
-        }
-        Ok(Self {
-            global_budget,
-            session_budget,
-            region_window,
-            prune_cadence,
-        })
+    /// Build a policy with an optional cap on total memo entries.
+    pub fn new(global_budget: Option<usize>) -> Result<Self, ParseError> {
+        Ok(Self { global_budget })
+    }
+
+    /// The cap on total memo entries, if any.
+    pub fn global_budget(&self) -> Option<usize> {
+        self.global_budget
     }
 }
 
+impl<'de> Deserialize<'de> for MemoPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct MemoPolicyData {
+            global_budget: Option<usize>,
+        }
+
+        let data = MemoPolicyData::deserialize(deserializer)?;
+        Self::new(data.global_budget).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Preferred result shape for entry points that can return more than a value.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub enum ParserOutputMode {
+    /// Produce a [`ParseValue`] (default).
     #[default]
     Value,
+    /// Produce an [`AstNode`](crate::ast::AstNode) tree.
     Ast,
 }
 
+/// Configuration for a single parse invocation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ParserConfig {
     /// When `true`, wrap the root result in a `SpannedValue`.
@@ -367,12 +557,21 @@ pub struct ParserConfig {
     pub invalid_rule_prefixes: Option<Vec<String>>,
     /// Fine-grained memo budget/window configuration.
     pub memo_policy: Option<MemoPolicy>,
-    /// Optional per-rule trace callback. Not serialized.
-    #[serde(skip)]
-    pub trace: Option<TraceCallbackHolder>,
     /// Preferred output shape for APIs that can return more than `ParseValue`.
     #[serde(default)]
     pub output_mode: ParserOutputMode,
+    /// Maximum expression-evaluation nesting depth before the parse fails with a
+    /// `recursion_limit` error instead of overflowing the stack. Bounds recursive
+    /// descent on deeply-nested input (a denial-of-service guard).
+    #[serde(default = "default_max_depth")]
+    pub max_depth: usize,
+}
+
+/// Default expression-nesting depth limit (`ParserConfig::max_depth`). Generous
+/// for real grammars (cf. serde_json's default of 128) yet safely below the
+/// stack-overflow threshold on common thread-stack sizes.
+fn default_max_depth() -> usize {
+    1024
 }
 
 impl Default for ParserConfig {
@@ -384,53 +583,38 @@ impl Default for ParserConfig {
             include_invalid_rules: false,
             invalid_rule_prefixes: None,
             memo_policy: None,
-            trace: None,
             output_mode: ParserOutputMode::Value,
+            max_depth: default_max_depth(),
         }
     }
 }
 
 impl ParserConfig {
-    /// Return a new config with selected fields overridden.
-    pub fn with_updates(
-        &self,
-        return_spans: bool,
-        include_invalid_rules: Option<bool>,
-        invalid_rule_prefixes: Option<Vec<String>>,
-    ) -> Self {
-        Self {
-            return_spans,
-            memo: self.memo,
-            max_steps: self.max_steps,
-            include_invalid_rules: include_invalid_rules.unwrap_or(self.include_invalid_rules),
-            invalid_rule_prefixes: invalid_rule_prefixes
-                .or_else(|| self.invalid_rule_prefixes.clone()),
-            memo_policy: None,
-            trace: self.trace.clone(),
-            output_mode: self.output_mode.clone(),
-        }
-    }
-
-    pub fn with_trace(mut self, callback: impl Fn(&ParseEvent) + Send + Sync + 'static) -> Self {
-        self.trace = Some(TraceCallbackHolder(Arc::new(callback)));
-        self
-    }
-
+    /// Enable span-wrapping of the root result.
     pub fn with_spans(mut self) -> Self {
         self.return_spans = true;
         self
     }
 
+    /// Toggle packrat memoisation.
     pub fn with_memo(mut self, memo: bool) -> Self {
         self.memo = memo;
         self
     }
 
+    /// Set the maximum input size / step budget.
     pub fn with_max_steps(mut self, max_steps: usize) -> Self {
         self.max_steps = max_steps;
         self
     }
 
+    /// Set the maximum expression-nesting depth (recursion guard).
+    pub fn with_max_depth(mut self, max_depth: usize) -> Self {
+        self.max_depth = max_depth;
+        self
+    }
+
+    /// Set the preferred output mode (value vs AST).
     pub fn with_output_mode(mut self, output_mode: ParserOutputMode) -> Self {
         self.output_mode = output_mode;
         self
@@ -442,11 +626,11 @@ impl ParserConfig {
 /// A single text edit described as a half-open byte range to replace.
 ///
 /// Invariants enforced at construction: `start ≤ old_end`, both non-negative.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct IncrementalEdit {
-    pub start: usize,
-    pub old_end: usize,
-    pub replacement: String,
+    start: usize,
+    old_end: usize,
+    replacement: String,
 }
 
 impl IncrementalEdit {
@@ -462,14 +646,24 @@ impl IncrementalEdit {
         })
     }
 
-    /// Panics if the invariant is violated; use in tests / trusted contexts only.
-    pub fn new_unchecked(start: usize, old_end: usize, replacement: impl Into<String>) -> Self {
-        assert!(start <= old_end, "IncrementalEdit: start > old_end");
-        Self {
-            start,
-            old_end,
-            replacement: replacement.into(),
-        }
+    /// Inclusive start byte offset of the replaced range.
+    pub fn start(&self) -> usize {
+        self.start
+    }
+
+    /// Exclusive end byte offset of the replaced range.
+    pub fn old_end(&self) -> usize {
+        self.old_end
+    }
+
+    /// The replacement text.
+    pub fn replacement(&self) -> &str {
+        &self.replacement
+    }
+
+    /// Consume the edit, returning its replacement text.
+    pub fn into_replacement(self) -> String {
+        self.replacement
     }
 
     /// The number of bytes removed by this edit.
@@ -483,15 +677,46 @@ impl IncrementalEdit {
     }
 
     /// Net byte-length change: positive = text grew, negative = text shrank.
-    pub fn delta(&self) -> isize {
-        self.inserted_len() as isize - self.removed_len() as isize
+    ///
+    /// Returns `None` when the byte-length difference cannot be represented as
+    /// an `isize`; callers that shift `usize` offsets must handle that case
+    /// explicitly instead of relying on wrapping casts.
+    pub fn delta(&self) -> Option<isize> {
+        if self.inserted_len() >= self.removed_len() {
+            isize::try_from(self.inserted_len() - self.removed_len()).ok()
+        } else {
+            isize::try_from(self.removed_len() - self.inserted_len())
+                .ok()
+                .and_then(isize::checked_neg)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for IncrementalEdit {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct IncrementalEditData {
+            start: usize,
+            old_end: usize,
+            replacement: String,
+        }
+
+        let data = IncrementalEditData::deserialize(deserializer)?;
+        Self::new(data.start, data.old_end, data.replacement).ok_or_else(|| {
+            serde::de::Error::custom("incremental edit start must be less than or equal to old_end")
+        })
     }
 }
 
 /// A sequential edit produced by `snapshot_edits_to_sequential`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CompletedEdit {
+    /// Replacement text inserted at `span`.
     pub text: String,
+    /// The `(start, end)` byte range replaced, in original-text coordinates.
     pub span: (usize, usize),
 }
 
@@ -532,18 +757,160 @@ mod tests {
     }
 
     #[test]
+    fn memo_policy_deserialize_rejects_inactive_fields() {
+        let err =
+            serde_json::from_str::<MemoPolicy>(r#"{"global_budget":null,"session_budget":64}"#)
+                .unwrap_err();
+        assert!(err.to_string().contains("session_budget"));
+    }
+
+    #[test]
+    fn position_cache_absorb_enforces_global_limit() {
+        let mut cache = PositionCache::new("abc", 1, 1);
+        cache.absorb_with_limit(
+            [
+                ExportedMemoEntry::span("b", 0, 1, false, ParseValue::Text("b0".into())),
+                ExportedMemoEntry::span("a", 0, 1, false, ParseValue::Text("a0".into())),
+                ExportedMemoEntry::span("a", 1, 2, false, ParseValue::Text("a1".into())),
+            ],
+            Some(2),
+        );
+
+        // The limit is enforced: exactly 2 entries survive. Which entries are
+        // evicted is unspecified (retain uses HashMap order, not insertion order).
+        assert_eq!(cache.entry_count(), 2);
+    }
+
+    #[test]
+    fn position_cache_zero_global_limit_disables_storage() {
+        let mut cache = PositionCache::new("abc", 1, 1);
+        cache.absorb_with_limit(
+            [ExportedMemoEntry::span(
+                "a",
+                0,
+                1,
+                false,
+                ParseValue::Text("a".into()),
+            )],
+            Some(0),
+        );
+
+        assert_eq!(cache.entry_count(), 0);
+    }
+
+    #[test]
+    fn position_cache_edit_shift_drops_entries_that_overflow() {
+        let mut cache = PositionCache::new("abc", 1, 1);
+        cache.absorb([ExportedMemoEntry::span(
+            "a",
+            usize::MAX - 1,
+            usize::MAX,
+            false,
+            ParseValue::Text("a".into()),
+        )]);
+
+        cache.apply_edits(&[(0, 0, 2)]);
+
+        assert_eq!(cache.entry_count(), 0);
+    }
+
+    #[test]
+    fn apply_edits_invalidates_edit_in_examined_but_unmatched_region() {
+        // Entry matched [0,1) but examined [0,5) (e.g. a `&"…"` lookahead read 4
+        // bytes it did not consume). An edit at byte 3 — inside the examined
+        // region but outside the matched span — must invalidate it.
+        let mut cache = PositionCache::new("xZZZZ", 1, 1);
+        cache.memo.entry("a".to_string()).or_default().insert(
+            0,
+            PositionMemoEntry {
+                end: 1,
+                value: Arc::new(ParseValue::Nil),
+                cut: false,
+                read_lo: Some(0),
+                read_hi: Some(5),
+            },
+        );
+        // Replace bytes [3,4) (1 byte → 1 byte, delta 0).
+        cache.apply_edits(&[(3, 4, 1)]);
+        assert_eq!(
+            cache.entry_count(),
+            0,
+            "entry whose lookahead read the edited byte must be dropped"
+        );
+    }
+
+    #[test]
+    fn apply_edits_keeps_entry_when_edit_is_outside_examined_region() {
+        // Entry matched [0,1), examined [0,3); an edit at byte 6 is disjoint from
+        // the examined interval, so the entry survives unchanged.
+        let mut cache = PositionCache::new("ab    cd", 1, 1);
+        cache.memo.entry("a".to_string()).or_default().insert(
+            0,
+            PositionMemoEntry {
+                end: 1,
+                value: Arc::new(ParseValue::Nil),
+                cut: false,
+                read_lo: Some(0),
+                read_hi: Some(3),
+            },
+        );
+        cache.apply_edits(&[(6, 7, 1)]);
+        assert_eq!(cache.entry_count(), 1, "disjoint edit must keep the entry");
+        let entry = cache.get("a", 0).expect("entry survives");
+        assert_eq!((entry.read_lo, entry.read_hi), (Some(0), Some(3)));
+    }
+
+    #[test]
+    fn apply_edits_shifts_examined_interval_for_suffix_entry() {
+        // An insertion before a suffix entry shifts both its matched span and its
+        // examined interval by the same delta.
+        let mut cache = PositionCache::new("0123456789", 1, 1);
+        cache.memo.entry("a".to_string()).or_default().insert(
+            5,
+            PositionMemoEntry {
+                end: 7,
+                value: Arc::new(ParseValue::Nil),
+                cut: false,
+                read_lo: Some(5),
+                read_hi: Some(9),
+            },
+        );
+        // Insert 2 bytes at position 0: [0,0) → 2 bytes, delta +2.
+        cache.apply_edits(&[(0, 0, 2)]);
+        let entry = cache.get("a", 7).expect("suffix entry shifted to +2");
+        assert_eq!(entry.end, 9);
+        assert_eq!((entry.read_lo, entry.read_hi), (Some(7), Some(11)));
+    }
+
+    #[test]
+    fn position_cache_malformed_edit_clears_cache() {
+        let mut cache = PositionCache::new("abc", 1, 1);
+        cache.absorb([ExportedMemoEntry::span(
+            "a",
+            1,
+            2,
+            false,
+            ParseValue::Text("a".into()),
+        )]);
+
+        cache.apply_edits(&[(3, 1, 0)]);
+
+        assert_eq!(cache.entry_count(), 0);
+    }
+
+    #[test]
     fn incremental_edit_delta_insert() {
-        let e = IncrementalEdit::new_unchecked(3, 3, "hello");
+        let e = IncrementalEdit::new(3, 3, "hello").unwrap();
         assert_eq!(e.removed_len(), 0);
         assert_eq!(e.inserted_len(), 5);
-        assert_eq!(e.delta(), 5);
+        assert_eq!(e.delta(), Some(5));
     }
 
     #[test]
     fn incremental_edit_delta_delete() {
-        let e = IncrementalEdit::new_unchecked(1, 4, "");
+        let e = IncrementalEdit::new(1, 4, "").unwrap();
         assert_eq!(e.removed_len(), 3);
-        assert_eq!(e.delta(), -3);
+        assert_eq!(e.delta(), Some(-3));
     }
 
     #[test]
@@ -554,7 +921,20 @@ mod tests {
     #[test]
     fn incremental_edit_new_accepts_empty_range() {
         let e = IncrementalEdit::new(3, 3, "").unwrap();
-        assert_eq!(e.delta(), 0);
+        assert_eq!(e.start(), 3);
+        assert_eq!(e.old_end(), 3);
+        assert_eq!(e.replacement(), "");
+        assert_eq!(e.delta(), Some(0));
+    }
+
+    #[test]
+    fn incremental_edit_deserialize_rejects_invalid_range() {
+        let err =
+            serde_json::from_str::<IncrementalEdit>(r#"{"start":5,"old_end":3,"replacement":"x"}"#)
+                .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("start must be less than or equal to old_end"));
     }
 
     #[test]
@@ -562,6 +942,26 @@ mod tests {
         let c = ParseCache::new();
         assert!(c.is_empty());
         assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn parse_cache_exact_results_are_bounded() {
+        let mut cache = ParseCache::new();
+        for index in 0..(EXACT_PARSE_CACHE_ENTRY_LIMIT + 3) {
+            cache.insert_exact_result(CachedResult {
+                text_hash: index as u64,
+                grammar_signature: 1,
+                runtime_signature: 1,
+                output: Arc::new(ParseValue::Number(index as i64)),
+            });
+        }
+
+        assert_eq!(cache.len(), EXACT_PARSE_CACHE_ENTRY_LIMIT);
+        assert_eq!(cache.entries.first().map(|entry| entry.text_hash), Some(3));
+        assert_eq!(
+            cache.entries.last().map(|entry| entry.text_hash),
+            Some((EXACT_PARSE_CACHE_ENTRY_LIMIT + 2) as u64)
+        );
     }
 
     #[test]

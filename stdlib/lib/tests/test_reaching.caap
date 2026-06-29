@@ -1,0 +1,150 @@
+; stdlib/lib/tests/test_reaching.caap — REACHING DEFINITIONS, the second
+; dataflow client (the forward sibling of the backward liveness test). A def
+; `(bind "x" v)` / `(set_ref x v)` reaches a point if a path to it does not
+; redefine x. Driven over hand-built AST like test_dataflow / test_alias.
+;
+; What each assertion proves:
+;   - a straight-line def reaches a later use (the basic forward fact);
+;   - a re-definition KILLS the earlier one (only the LATEST def reaches);
+;   - the two arms of an `if` UNION at the merge (a def on EITHER path reaches).
+; The result is read by NAME via `name_reaches?` (resolving site ids through the
+; result's `sites` table) and by SITE count via `reaching_names`.
+
+;; @area: passes
+;; @kind: regression
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.dataflow cfg_entry cfg_exit)
+(use stdlib.semantics.passes.reaching
+  reaching reaching_in reaching_names name_reaches?)
+(use stdlib.syntax.ast sym lit calln)
+(use stdlib.lib.collections.set set_size set_items)
+
+(do
+  (bind (
+    ; (bind "n" v) — a let* binding def site (build_cfg emits one def marker
+    ; per binding; a literal-headed bind is the canonical merged shape)
+    (bindn (lambda (n v) (calln "bind" (list_of (lit n) v))))
+    ; (set_ref r v) — a write to r (a def of r)
+    (setr (lambda (r v) (calln "set_ref" (list_of (sym r) v))))
+    ; a use of a name (e.g. as a call arg): (use x) is a call mentioning x
+    (use1 (lambda (x) (calln "use" (list_of (sym x)))))
+    ; the defset reaching the EXIT block of a reaching result
+    (reach_exit (lambda (res) (reaching_in res (cfg_exit (get res "cfg")))))
+  )
+    (do
+      ; ════════════════════════════════════════════════════════════════════
+      ; 1. STRAIGHT-LINE — a def reaches a later use
+      ;    (do (bind "x" (lit 1)) (bind "y" (sym "x")) (use y))
+      ;    x's def reaches the read of x in y's value; both defs reach the end.
+      ; ════════════════════════════════════════════════════════════════════
+      (bind ((res (reaching
+                    (calln "do"
+                      (list_of
+                        (bindn "x" (lit 1))
+                        (bindn "y" (sym "x"))
+                        (use1 "y"))))))
+        (do
+          ; at the EXIT point, a def of x AND a def of y both reach
+          (assert_true (name_reaches? res (reach_exit res) "x")
+            "straight-line: x's definition reaches the end")
+          (assert_true (name_reaches? res (reach_exit res) "y")
+            "straight-line: y's definition reaches the end")
+          ; exactly two names are defined-and-reaching (x, y) — nothing spurious
+          (assert_eq (set_size (reaching_names res (reach_exit res))) 2
+            "straight-line: exactly x and y reach the end")
+          ; a name never defined does NOT reach
+          (assert_true (not (name_reaches? res (reach_exit res) "z"))
+            "straight-line: an undefined name does not reach")))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 2. RE-DEFINITION KILLS — only the LATEST def reaches
+      ;    (do (set_ref x 1) (set_ref x 2) (use x))
+      ;    The second store kills the first; the read sees ONE reaching def of x
+      ;    (the latest), and that one def is site `x#…:1` (index 1), not :0.
+      ; ════════════════════════════════════════════════════════════════════
+      (bind ((res (reaching
+                    (calln "do"
+                      (list_of
+                        (setr "x" (lit 1))
+                        (setr "x" (lit 2))
+                        (use1 "x"))))))
+        (bind ((reaching_x (reach_exit res)))
+          (do
+            ; x is reaching (by name)
+            (assert_true (name_reaches? res reaching_x "x")
+              "redef: x reaches after two stores")
+            ; but only ONE site of x reaches — the earlier store was killed
+            (bind ((x_sites (list_of)))
+              (do
+                (for id (set_items reaching_x)
+                  (when (eq (get (get res "sites") id) "x")
+                    (append x_sites id)))
+                (assert_eq (size x_sites) 1
+                  "redef: exactly ONE definition of x reaches (the latest)")
+                ; the surviving site is the SECOND store (index 1 in its block),
+                ; never the first (index 0) — the killed one does not reach
+                (assert_true
+                  (string_contains (get x_sites 0) ":1")
+                  "redef: the LATEST store (index 1) is the one that reaches")
+                (assert_true
+                  (not (string_contains (get x_sites 0) ":0"))
+                  "redef: the killed earlier store (index 0) does not reach"))))))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 3. IF-MERGE UNIONS — a def on EITHER arm reaches the merge
+      ;    (do (if c (set_ref x 1) (set_ref x 2)) (use x))
+      ;    Both arms define x; at the read after the if BOTH defs reach (set
+      ;    union at the confluence). Two distinct sites of x reach.
+      ; ════════════════════════════════════════════════════════════════════
+      (bind ((res (reaching
+                    (calln "do"
+                      (list_of
+                        (calln "if"
+                          (list_of (sym "c")
+                            (setr "x" (lit 1))
+                            (setr "x" (lit 2))))
+                        (use1 "x"))))))
+        (bind ((reaching_x (reach_exit res)))
+          (do
+            ; x reaches the merge
+            (assert_true (name_reaches? res reaching_x "x")
+              "if-merge: x reaches after the branch")
+            ; BOTH arm-definitions of x reach — the join is a UNION, so the
+            ; two sites (one per arm) are both present (>= 2 sites of x)
+            (bind ((x_sites (list_of)))
+              (do
+                (for id (set_items reaching_x)
+                  (when (eq (get (get res "sites") id) "x")
+                    (append x_sites id)))
+                (assert_eq (size x_sites) 2
+                  "if-merge: BOTH arm definitions of x reach (set union)"))))))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 4. ENTRY IS BOTTOM — nothing reaches the ENTRY of a body (no preds)
+      ; ════════════════════════════════════════════════════════════════════
+      (bind ((res (reaching
+                    (calln "do" (list_of (bindn "x" (lit 1)) (use1 "x"))))))
+        (assert_eq (set_size (reaching_in res (cfg_entry (get res "cfg")))) 0
+          "ENTRY has no predecessors: its in-fact is the empty defset"))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 5. KILL ACROSS A SET — a redefinition after a use still kills the prior
+      ;    def for code AFTER it.
+      ;    (do (set_ref x 1) (use x) (set_ref x 9) (use x))
+      ;    At the END only the second store reaches (one site of x).
+      ; ════════════════════════════════════════════════════════════════════
+      (bind ((res (reaching
+                    (calln "do"
+                      (list_of
+                        (setr "x" (lit 1))
+                        (use1 "x")
+                        (setr "x" (lit 9))
+                        (use1 "x"))))))
+        (bind ((x_sites (list_of)))
+          (do
+            (for id (set_items (reach_exit res))
+              (when (eq (get (get res "sites") id) "x")
+                (append x_sites id)))
+            (assert_eq (size x_sites) 1
+              "kill-after-use: only the latest store of x reaches the end")))))))

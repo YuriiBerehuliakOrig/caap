@@ -1,6 +1,6 @@
 /// Internal host-service capability builtins.
+use indexmap::IndexMap;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::bridges::HostCapabilityBridgeValue;
@@ -8,83 +8,60 @@ use crate::builtins::compiler_registry::{require_compiler_bridge, require_named_
 use crate::compiler::CompilerBridgeValue;
 use crate::eval::{eval_args, Evaluator};
 use crate::host::HostServiceExport;
-use crate::semantic::PhasePolicy;
-use crate::values::{
-    eval_err, BuiltinInfo, EnvRef, EvalSignal, HostFunction, MapKey, RuntimeValue,
-};
+use crate::semantic::{CapabilityName, PhasePolicy};
+use crate::values::{eval_err, EnvRef, EvalSignal, HostFunction, MapKey, RuntimeValue};
 
 pub fn register(ev: &mut Evaluator) {
-    ev.register_builtin(BuiltinInfo {
-        name: "host-service-export".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 2,
-        max_arity: Some(3),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "host_service_export",
+        2,
+        Some(3),
+        crate::values::BuiltinMetadata::compile_time_compiler_registry(),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
             let library = require_named_string(&args[0], "host-service-export expects a library")?;
             let export = require_named_string(&args[1], "host-service-export expects an export")?;
             let phase = optional_phase(args.get(2), PhasePolicy::CompileTime)?;
             with_compiler(env, |compiler| {
                 compiler
+                    .require_host_service_capability(&library, &export, phase)
+                    .map_err(|error| eval_err(error.to_string()))?;
+                compiler
                     .host_service_export(&library, &export, phase)
                     .map_err(eval_err)
             })?
-        }),
-    });
+        },
+    );
 
-    ev.register_builtin(BuiltinInfo {
-        name: "host-runtime-service-export".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 3,
-        max_arity: Some(3),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
-            let args = eval_args(ev, call, env)?;
-            let capability = require_host_capability(
-                &args[0],
-                "host-runtime-service-export requires a host_services projection capability",
-            )?;
-            if capability.capability_kind() != "host_services" {
-                return Err(eval_err(
-                    "host-runtime-service-export requires a host_services projection capability",
-                ));
-            }
-            let library =
-                require_named_string(&args[1], "host-runtime-service-export expects a library")?;
-            let export =
-                require_named_string(&args[2], "host-runtime-service-export expects an export")?;
-            with_compiler(env, |compiler| {
-                compiler
-                    .host_service_export(&library, &export, PhasePolicy::Runtime)
-                    .map_err(eval_err)
-            })?
-        }),
-    });
-
-    ev.register_builtin(BuiltinInfo {
-        name: "host-service-capability".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 1,
-        max_arity: Some(1),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "host_service_capability",
+        1,
+        Some(1),
+        crate::values::BuiltinMetadata::compile_time_compiler_registry(),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
             let kind =
                 require_named_string(&args[0], "host-service-capability expects a capability")?;
+            // Minting a capability projection requires holding the capability it
+            // projects: a `sys.io` projection needs `sys.io`, while the root
+            // `sys` projection requires explicit coarse authority.
+            with_compiler(env, |compiler| {
+                compiler
+                    .require_current_bootstrap_capability(&kind)
+                    .map_err(|error| eval_err(error.to_string()))
+            })??;
             Ok(RuntimeValue::HostObject(Rc::new(
                 HostCapabilityBridgeValue::new(kind).map_err(eval_err)?,
             )))
-        }),
-    });
+        },
+    );
 
-    ev.register_builtin(BuiltinInfo {
-        name: "host-service-capability-export".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 3,
-        max_arity: Some(4),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "host_service_capability_export",
+        3,
+        Some(4),
+        crate::values::BuiltinMetadata::compile_time_compiler_registry(),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
             let capability = require_host_capability(
                 &args[0],
@@ -96,21 +73,27 @@ pub fn register(ev: &mut Evaluator) {
                 require_named_string(&args[2], "host-service-capability-export expects an export")?;
             let phase = optional_phase(args.get(3), PhasePolicy::CompileTime)?;
             let exported = with_compiler(env, |compiler| {
+                require_capability_export_authority(
+                    compiler,
+                    capability.capability_kind(),
+                    &library,
+                    &export,
+                    phase,
+                )?;
                 compiler
                     .host_service_export(&library, &export, phase)
                     .map_err(eval_err)
             })??;
             wrap_capability_export(capability.capability_kind(), exported)
-        }),
-    });
+        },
+    );
 
-    ev.register_builtin(BuiltinInfo {
-        name: "host-service-libraries".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 0,
-        max_arity: Some(1),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "host_service_libraries",
+        0,
+        Some(1),
+        crate::values::BuiltinMetadata::compile_time_pure(),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
             let phase = optional_phase(args.first(), PhasePolicy::CompileTime)?;
             with_compiler(env, |compiler| {
@@ -122,16 +105,15 @@ pub fn register(ev: &mut Evaluator) {
                         .collect(),
                 ))
             })?
-        }),
-    });
+        },
+    );
 
-    ev.register_builtin(BuiltinInfo {
-        name: "host-service-library-catalog".to_string(),
-        metadata: crate::values::BuiltinMetadata::eager_runtime(),
-        min_arity: 1,
-        max_arity: Some(2),
-        eager_handler: None,
-        handler: Box::new(|ev, call, env| {
+    ev.register_special(
+        "host_service_library_catalog",
+        1,
+        Some(2),
+        crate::values::BuiltinMetadata::compile_time_pure(),
+        |ev, call, env| {
             let args = eval_args(ev, call, env)?;
             let library =
                 require_named_string(&args[0], "host-service-library-catalog expects a library")?;
@@ -144,8 +126,8 @@ pub fn register(ev: &mut Evaluator) {
                     catalog.iter().map(host_service_catalog_entry).collect(),
                 ))
             })?
-        }),
-    });
+        },
+    );
 }
 
 fn with_compiler<R>(
@@ -157,6 +139,36 @@ fn with_compiler<R>(
     let compiler =
         require_compiler_bridge(&compiler, "host service builtin expects compiler binding")?;
     Ok(f(compiler))
+}
+
+fn require_capability_export_authority(
+    compiler: &CompilerBridgeValue,
+    capability_kind: &str,
+    library: &str,
+    export: &str,
+    phase: PhasePolicy,
+) -> Result<(), EvalSignal> {
+    compiler
+        .require_current_bootstrap_capability(capability_kind)
+        .map_err(|error| eval_err(error.to_string()))?;
+    let required = compiler
+        .host_service_required_capability(library, export, phase)
+        .map_err(eval_err)?;
+    let allowed = match required.as_deref() {
+        None => true,
+        Some(required) => {
+            let projection = CapabilityName::new(capability_kind).map_err(eval_err)?;
+            let requested = CapabilityName::new(required).map_err(eval_err)?;
+            projection.covers(&requested)
+        }
+    };
+    if !allowed {
+        return Err(eval_err(format!(
+            "host-service-capability-export cannot project {library}.{export} requiring {:?} through capability {capability_kind:?}",
+            required
+        )));
+    }
+    Ok(())
 }
 
 fn require_host_capability<'a>(
@@ -178,14 +190,9 @@ fn optional_phase(
 ) -> Result<PhasePolicy, EvalSignal> {
     match value {
         None | Some(RuntimeValue::Null) => Ok(default),
-        Some(RuntimeValue::Str(value)) => match value.as_ref() {
-            "runtime" => Ok(PhasePolicy::Runtime),
-            "compile_time" | "compile-time" => Ok(PhasePolicy::CompileTime),
-            "dual" => Ok(PhasePolicy::Dual),
-            _ => Err(eval_err(
-                "host service phase must be runtime, compile_time, or dual",
-            )),
-        },
+        Some(RuntimeValue::Str(value)) => {
+            PhasePolicy::parse_label(value.as_ref()).map_err(eval_err)
+        }
         Some(_) => Err(eval_err("host service phase must be a string")),
     }
 }
@@ -200,6 +207,7 @@ fn wrap_capability_export(
         ));
     };
     let expected_kind = expected_kind.to_string();
+    let phase_policy = function.phase_policy;
     let name = format!("capability:{}", function.name);
     let min_arity = function.min_arity + 1;
     let max_arity = function.max_arity.map(|arity| arity + 1);
@@ -225,6 +233,7 @@ fn wrap_capability_export(
             (function.handler)(args[1..].to_vec())
         }),
     )
+    .map(|function| function.with_phase_policy(phase_policy))
     .map_err(eval_err)?;
     Ok(RuntimeValue::HostFunction(Rc::new(wrapped)))
 }
@@ -241,11 +250,10 @@ fn host_service_catalog_entry(entry: &HostServiceExport) -> RuntimeValue {
                 .map(string)
                 .unwrap_or(RuntimeValue::Null),
         ),
-        ("public", string(metadata.public.as_str())),
+        ("public", string(entry.name.as_str())),
         ("export", string(entry.name.as_str())),
         ("phase", string(entry.phase.as_str())),
         ("effect", string(metadata.effect.as_str())),
-        ("pure", RuntimeValue::Bool(metadata.pure)),
         ("kind", string(metadata.kind.as_str())),
         ("policy", string(metadata.policy.as_str())),
         ("min_arity", RuntimeValue::Int(metadata.min_arity as i64)),
@@ -256,7 +264,7 @@ fn host_service_catalog_entry(entry: &HostServiceExport) -> RuntimeValue {
                 .map(|arity| RuntimeValue::Int(arity as i64))
                 .unwrap_or(RuntimeValue::Null),
         ),
-        ("variadic", RuntimeValue::Bool(metadata.variadic)),
+        ("variadic", RuntimeValue::Bool(metadata.is_variadic())),
         (
             "capability_kind",
             metadata
@@ -304,17 +312,11 @@ fn host_function_signature(entry: &HostServiceExport) -> RuntimeValue {
 }
 
 fn map<const N: usize>(entries: [(&str, RuntimeValue); N]) -> RuntimeValue {
-    let mut map = HashMap::new();
+    let mut map = IndexMap::new();
     for (key, value) in entries {
         map.insert(MapKey::Str(key.into()), value);
     }
     RuntimeValue::Map(Rc::new(RefCell::new(map)))
 }
 
-fn tuple(items: Vec<RuntimeValue>) -> RuntimeValue {
-    RuntimeValue::Tuple(items.into())
-}
-
-fn string(value: impl AsRef<str>) -> RuntimeValue {
-    RuntimeValue::Str(value.as_ref().into())
-}
+use super::args::{string, tuple};

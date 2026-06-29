@@ -1,0 +1,6 @@
+; tests/bad_arity.caap — calls a user lambda with the wrong number of
+; arguments; the load-time checker must reject it.
+(module stdlib.fixtures.bad_arity)
+(bind add2 (lambda (a b) (int_add a b)))
+(bind broken (lambda () (add2 1)))
+(export broken)

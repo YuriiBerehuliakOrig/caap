@@ -1,0 +1,171 @@
+; stdlib/lib/tests/test_cli.caap — in-language tests for lib/cli.
+
+;; @area: core
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.cli
+  spec flag? list? parse route usage option_line with_env_default env_key
+  coerce parse_bool)
+(use stdlib.lib.collections.result ok? err? ok unwrap error_code)
+
+; A small CLI: a --verbose/-v flag, a --name string, an int --count (default 1).
+(bind specs
+  (list_of
+    (spec "verbose" "v" "flag"   false null "be loud")
+    (spec "name"    "n" "string" null  null "the name")
+    (spec "count"   "c" "int"    1     null "how many")))
+
+(do
+  ; ── happy path: short flag, --name=value, a positional ──────────────────────
+  (bind r (parse specs (list_of "-v" "--name=bob" "positional")))
+  (assert_true (ok? r) "parse happy path is ok")
+  (bind vals (get (unwrap r) "values"))
+  (bind pos  (get (unwrap r) "positionals"))
+  (assert_eq (get vals "verbose") true       "flag -v -> true")
+  (assert_eq (get vals "name")    "bob"       "--name=bob captured")
+  (assert_eq (get vals "count")   1           "count default applied")
+  (assert_eq (size pos)           1           "one positional")
+  (assert_eq (get pos 0)          "positional" "positional value")
+
+  ; ── --name value (separate token) and int coercion ─────────────────────────
+  (bind r2 (parse specs (list_of "--name" "ann" "--count" "5")))
+  (assert_true (ok? r2) "separate-token value is ok")
+  (assert_eq (get (get (unwrap r2) "values") "name")  "ann" "--name ann")
+  (assert_eq (get (get (unwrap r2) "values") "count") 5     "--count 5 coerced to int")
+
+  ; ── grouped short flags ────────────────────────────────────────────────────
+  (bind r3 (parse specs (list_of "-vn" "x")))
+  (assert_true (ok? r3) "grouped short with trailing value is ok")
+  (assert_eq (get (get (unwrap r3) "values") "verbose") true "grouped -v set")
+  (assert_eq (get (get (unwrap r3) "values") "name")    "x"  "grouped -n took next token")
+
+  ; ── short with attached value -cVALUE ──────────────────────────────────────
+  (bind r4 (parse specs (list_of "-c3")))
+  (assert_true (ok? r4) "attached short value is ok")
+  (assert_eq (get (get (unwrap r4) "values") "count") 3 "-c3 -> 3")
+
+  ; ── bad int -> err ─────────────────────────────────────────────────────────
+  (bind rbad (parse specs (list_of "--count" "x")))
+  (assert_true (err? rbad) "bad int is err")
+  (assert_eq (error_code rbad) "cli.bad_int" "bad int code")
+
+  ; ── unknown option -> err ──────────────────────────────────────────────────
+  (assert_true (err? (parse specs (list_of "--nope"))) "unknown long is err")
+  (assert_true (err? (parse specs (list_of "-z")))      "unknown short is err")
+
+  ; ── missing value for a valued option -> err ───────────────────────────────
+  (assert_true (err? (parse specs (list_of "--name"))) "trailing valued option is err")
+
+  ; ── required-but-missing -> err ────────────────────────────────────────────
+  (bind reqspecs (list_of (spec "out" "o" "string" null true "output path")))
+  (assert_true (err? (parse reqspecs (list_of))) "required missing is err")
+  (assert_eq (error_code (parse reqspecs (list_of))) "cli.missing_required" "missing-required code")
+  (assert_true (ok? (parse reqspecs (list_of "--out" "f"))) "required satisfied is ok")
+
+  ; ── `--` terminator: everything after is a positional ──────────────────────
+  (bind rdd (parse specs (list_of "-v" "--" "--name" "raw")))
+  (assert_true (ok? rdd) "terminator parse is ok")
+  (assert_eq (get (get (unwrap rdd) "values") "verbose") true "flag before -- set")
+  (assert_eq (size (get (unwrap rdd) "positionals")) 2 "two positionals after --")
+  (assert_eq (get (get (unwrap rdd) "positionals") 0) "--name" "raw token kept verbatim")
+
+  ; ── bare '-' is a positional, not an option ────────────────────────────────
+  (bind rdash (parse specs (list_of "-")))
+  (assert_true (ok? rdash) "bare dash parse is ok")
+  (assert_eq (get (get (unwrap rdash) "positionals") 0) "-" "bare - is positional")
+
+  ; ── usage text mentions the long name ──────────────────────────────────────
+  (assert_true (string_contains (usage specs "prog") "--name") "usage contains --name")
+  (assert_true (string_contains (usage specs "prog") "Usage: prog") "usage has header")
+  (assert_true (string_contains (option_line (get specs 2)) "[default: 1]") "default shown in help")
+
+  ; ── route: dispatch by first token ─────────────────────────────────────────
+  (bind cmds (assoc (map_of) "build" "B" "run" "R"))
+  (bind rr (route cmds (list_of "build" "--fast" "x")))
+  (assert_true (ok? rr) "route to known command is ok")
+  (assert_eq (get (unwrap rr) "command") "build" "chosen command")
+  (assert_eq (get (unwrap rr) "handler") "B" "handler returned")
+  (assert_eq (size (get (unwrap rr) "rest")) 2 "remaining argv")
+  (assert_eq (get (get (unwrap rr) "rest") 0) "--fast" "rest preserves order")
+  (assert_true (err? (route cmds (list_of))) "empty argv -> err")
+  (assert_true (err? (route cmds (list_of "nope"))) "unknown command -> err")
+
+  ; ── with_env_default: fill defaults from an env map ────────────────────────
+  (assert_eq (env_key "log-level") "LOG_LEVEL" "env_key normalizes")
+  (bind envspecs (with_env_default specs (assoc (map_of) "NAME" "fromenv" "COUNT" "7")))
+  (bind renv (parse envspecs (list_of)))
+  (assert_true (ok? renv) "env-defaulted parse is ok")
+  (assert_eq (get (get (unwrap renv) "values") "name")  "fromenv" "name default from env")
+  (assert_eq (get (get (unwrap renv) "values") "count") 7 "count default from env (coerced)")
+  ; an explicit arg still overrides the env default
+  (assert_eq (get (get (unwrap (parse envspecs (list_of "--name" "cli"))) "values") "name")
+             "cli" "cli arg overrides env default")
+
+  ; ── coerce is a usable Result-returning helper ─────────────────────────────
+  (assert_eq (unwrap (coerce (spec "n" null "int" 0 null "") "42")) 42 "coerce int ok")
+  (assert_true (err? (coerce (spec "n" null "int" 0 null "") "nope")) "coerce bad int err")
+  (assert_true (flag? (spec "v" "v" "flag" false null "")) "flag? true for flag kind")
+
+  ; ── float kind ─────────────────────────────────────────────────────────────
+  (bind near (lambda (a b) (lt (float_abs (float_sub a b)) 0.0001)))
+  (assert_true (near (unwrap (coerce (spec "f" null "float" 0.0 null "") "3.14")) 3.14)
+    "coerce float ok")
+  (assert_true (err? (coerce (spec "f" null "float" 0.0 null "") "nope")) "coerce bad float err")
+  (assert_eq (error_code (coerce (spec "f" null "float" 0.0 null "") "nope")) "cli.bad_float"
+    "bad float code")
+  (bind fspecs (list_of (spec "rate" "r" "float" 1.0 null "the rate")))
+  (assert_true (near (get (get (unwrap (parse fspecs (list_of "--rate=2.5"))) "values") "rate") 2.5)
+    "parse --rate=2.5 -> 2.5")
+  (assert_true (near (get (get (unwrap (parse fspecs (list_of "-r" "0.5"))) "values") "rate") 0.5)
+    "parse -r 0.5 -> 0.5")
+
+  ; ── bool kind (--flag=true / =false and the spellings) ─────────────────────
+  (bind bspecs (list_of (spec "debug" "d" "bool" false null "debug mode")))
+  (assert_eq (get (get (unwrap (parse bspecs (list_of "--debug=true"))) "values") "debug")
+    true "--debug=true -> true")
+  (assert_eq (get (get (unwrap (parse bspecs (list_of "--debug=false"))) "values") "debug")
+    false "--debug=false -> false")
+  (assert_eq (get (get (unwrap (parse bspecs (list_of "--debug" "on"))) "values") "debug")
+    true "--debug on (separate token) -> true")
+  (assert_eq (get (get (unwrap (parse bspecs (list_of "-d" "off"))) "values") "debug")
+    false "-d off -> false")
+  (assert_eq (unwrap (coerce (spec "b" null "bool" false null "") "1")) true "coerce bool 1 -> true")
+  (assert_eq (unwrap (coerce (spec "b" null "bool" false null "") "no")) false "coerce bool no -> false")
+  (assert_true (err? (parse bspecs (list_of "--debug=maybe"))) "an unrecognised bool word is err")
+  (assert_eq (error_code (parse bspecs (list_of "--debug=maybe"))) "cli.bad_bool" "bad bool code")
+  (assert_eq (unwrap (parse_bool (spec "b" null "bool" false null "") "YES")) true
+    "parse_bool is case-insensitive")
+
+  ; ── list kind (repeatable, accumulates in order) ───────────────────────────
+  (bind lspecs (list_of (spec "tag" "t" "list" null null "a repeatable tag")))
+  (assert_true (list? (get lspecs 0)) "list? true for list kind")
+  (bind rl (parse lspecs (list_of "--tag" "a" "--tag=b" "-t" "c")))
+  (assert_true (ok? rl) "repeatable list parse is ok")
+  (bind tags (get (get (unwrap rl) "values") "tag"))
+  (assert_eq (size tags) 3 "three tags accumulated")
+  (assert_eq (get tags 0) "a" "first tag")
+  (assert_eq (get tags 1) "b" "second tag (=value form)")
+  (assert_eq (get tags 2) "c" "third tag (short form)")
+  ; an absent list defaults to the empty list
+  (assert_eq (size (get (get (unwrap (parse lspecs (list_of))) "values") "tag")) 0
+    "absent list defaults to []")
+
+  ; ── with_env_default coerces the new kinds (not just int) ──────────────────
+  ; a bool env default of "false" must read back as the BOOL false, not the
+  ; truthy string "false"
+  (bind benv (with_env_default bspecs (assoc (map_of) "DEBUG" "false")))
+  (assert_eq (get (get (unwrap (parse benv (list_of))) "values") "debug") false
+    "bool env default 'false' coerces to bool false")
+  (bind benv2 (with_env_default bspecs (assoc (map_of) "DEBUG" "on")))
+  (assert_eq (get (get (unwrap (parse benv2 (list_of))) "values") "debug") true
+    "bool env default 'on' coerces to bool true")
+  ; a float env default coerces to a number
+  (bind fenv (with_env_default fspecs (assoc (map_of) "RATE" "2.5")))
+  (assert_true (near (get (get (unwrap (parse fenv (list_of))) "values") "rate") 2.5)
+    "float env default coerces to a number")
+  ; a list env default becomes a one-element list
+  (bind lenv (with_env_default lspecs (assoc (map_of) "TAG" "fromenv")))
+  (assert_eq (get (get (get (unwrap (parse lenv (list_of))) "values") "tag") 0) "fromenv"
+    "list env default becomes a one-element list")
+  true)

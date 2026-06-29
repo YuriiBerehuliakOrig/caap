@@ -1,0 +1,103 @@
+; stdlib/frontend/clike/sem_tokens.caap - semantic-token helpers for clike.
+;
+; This leaf owns the sink ref and the parser-owned classification helpers used by
+; lowerer leaves while analyze_program has the sink armed.
+(module stdlib.frontend.clike.sem_tokens)
+
+(use stdlib.lib.collections.map clone)
+(use stdlib.semantics.types.registry known_type?)
+(use stdlib.frontend.clike.tokens tval split_dots)
+(use stdlib.frontend.clike.state local_types local_consts local_enum_variants)
+
+; ── LSP semantic tokens: the REAL parser emits them ─────────────────────────
+; Highlighting is produced by INSTRUMENTING the real recursive-descent parser:
+; as parse_primary/parse_postfix/lower_block/read_type/param_spec/classify_named/
+; lower_struct/lower_enum recognize a construct, they call `st_emit!` with the
+; SOURCE TOKEN and its semantic ROLE. There is NO second walk and NO re-derivation
+; of grammar — the role IS the parser's own decision at that point, and a name's
+; param/local/type/enum-member status comes from the parser's own scope (env +
+; sem_params) and registries (local_types/local_consts/local_enum_variants).
+;
+; `sem_token_sink` is armed (a list) only by analyze_program around a real lower,
+; and is null during ordinary codegen — so st_emit! is a strict no-op for builds.
+(bind sem_token_sink (ref null))
+; sem_params — the CURRENT function's parameter names (set by lower_fndef before
+; its body lowers), so a name USE in the body classifies as `parameter` vs local.
+(bind sem_params (ref (map_of)))
+
+; st_emit! — record a {span, type, mods} token for the source token `t` (no-op
+; unless the sink is armed; skips a token with no span).
+(bind st_emit!
+  (lambda (t type mods)
+    (when (and (not (eq (deref sem_token_sink) null)) (not (eq t null)))
+      (bind ((sp (get t "span")))
+        (when (not (eq sp null))
+          (append (deref sem_token_sink)
+            (assoc (map_of)
+              "span" (assoc (map_of)
+                "start" (get sp "start" 0) "end" (get sp "end" 0)
+                "start_line" (get sp "start_line" 0) "start_col" (get sp "start_col" 0)
+                "end_line" (get sp "end_line" 0) "end_col" (get sp "end_col" 0))
+              "type" type "mods" mods
+              ; carry the source text so the LSP definition index can be derived
+              ; from the SAME [declaration]-marked tokens the highlighter produces
+              ; (one classification, no parallel pattern-matching).
+              "text" (tval t))))))))
+
+; st_sub_span — a single-line span shifted to the sub-slice [off, off+len) of a
+; token's span (a dotted `a.b.c` lexes as ONE token; each part needs its own span).
+(bind st_sub_span
+  (lambda (sp off len)
+    (if (eq sp null) null
+      (assoc (clone sp)
+        "start_col" (int_add (get sp "start_col" 0) off)
+        "end_col"   (int_add (int_add (get sp "start_col" 0) off) len)))))
+
+; st_emit_span! — like st_emit! but for an already-built (sub-)span map.
+(bind st_emit_span!
+  (lambda (sp type mods)
+    (when (and (not (eq (deref sem_token_sink) null)) (not (eq sp null)))
+      (append (deref sem_token_sink)
+        (assoc (map_of) "span" sp "type" type "mods" mods)))))
+
+; (st_name! / name_role — the USE-site name classifier — are defined AFTER the
+; local_* registries they consult, just above the parser; see below.)
+
+; name_role — the semantic category of a bare name at a USE site, decided ONLY
+; from the parser's own scope and the file registries the real lower populates:
+; a parameter (sem_params) > a local (the live env) > an enum member > a type
+; (program struct/enum or a registry primitive) > else a plain variable. (A const
+; falls through to variable and is tagged `readonly` by st_name!.)
+(bind name_role
+  (lambda (nm env)
+    (cond
+      ((contains (deref sem_params) nm) "parameter")
+      ((not (eq (get env nm) null)) "variable")
+      ((contains (local_enum_variants) nm) "enumMember")
+      ; `type` for a real local type (a struct or an enum type — both live in
+      ; local_types) or a registry-known type. `use`-imported names live in
+      ; local_imports, NOT local_types, so an imported VALUE (enum variant / const
+      ; / fn ref) used here falls through to `variable` instead of being
+      ; mis-coloured a type — no field-count heuristic needed. (Imported TYPES
+      ; appear in TYPE position, classified by read_type, never reaching here.)
+      ((or (contains (local_types) nm) (known_type? nm)) "type")
+      (else "variable"))))
+
+; st_name! — emit a (possibly dotted) NAME token at a USE site: the head by
+; name_role (its dotted parts are field accesses -> property). `env` is the live
+; lexical env at the read site, so param-vs-local comes from the real parser.
+(bind st_name!
+  (lambda (t env)
+    (when (and (not (eq (deref sem_token_sink) null)) (not (eq t null)))
+      (bind ((sp (get t "span")) (parts (split_dots (tval t))) (off (ref 0)) (k (ref 0)))
+        (while (lt (deref k) (size parts))
+          (bind ((p (get parts (deref k))) (sub (st_sub_span sp (deref off) (size p))))
+            (do
+              (if (eq (deref k) 0)
+                (st_emit_span! sub (name_role p env)
+                  (if (contains (local_consts) p) (list_of "readonly") (list_of)))
+                (st_emit_span! sub "property" (list_of)))
+              (set_ref off (int_add (deref off) (int_add (size p) 1)))
+              (set_ref k (int_add (deref k) 1)))))))))
+
+(export sem_token_sink sem_params st_emit! st_name!)

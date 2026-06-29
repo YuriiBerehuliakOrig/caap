@@ -1,0 +1,84 @@
+; stdlib/lib/tests/test_alias.caap — CROSS-ALIAS (points-to) analysis: a move
+; through one pointer name taints every aliased name (use-after-move through an
+; alias), while the Copy-type discipline keeps plain value copies independent.
+; Driven over hand-built AST like test_borrow.
+
+;; @area: passes
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.alias check class_map)
+(use stdlib.syntax.ast sym lit calln)
+(use stdlib.lib.collections.sequence any?)
+
+(do
+  (bind (
+    (has (lambda (findings needle)
+           (any? findings (lambda (f) (string_contains f needle)))))
+    ; (bind ((p (int_to_ptr a 0)) (q p)) body) — q aliases the pointer p
+    (with_ptr_copy (lambda (body)
+      (calln "bind"
+        (list_of
+          (lit "p") (calln "int_to_ptr" (list_of (sym "a") (lit 0)))
+          (lit "q") (sym "p")
+          body))))
+  )
+    (do
+      ; ── use-after-move THROUGH a pointer alias: move p, read q (ptr_read) ──
+      (assert_true
+        (has (check (with_ptr_copy
+                      (calln "do"
+                        (list_of (calln "move" (list_of (sym "p")))
+                                 (calln "ptr_read" (list_of (sym "q")))))))
+             "use after move")
+        "use of a pointer alias after the original is moved is flagged")
+
+      ; the finding names the alias actually used (q), not just the moved name
+      (assert_true
+        (has (check (with_ptr_copy
+                      (calln "do"
+                        (list_of (calln "move" (list_of (sym "p")))
+                                 (calln "ptr_read" (list_of (sym "q")))))))
+             "`q`")
+        "the finding names the aliased name read after the move")
+
+      ; ── clean: moved, but the alias is NOT read afterwards ──
+      (assert_eq
+        (size (check (with_ptr_copy (calln "move" (list_of (sym "p"))))))
+        0
+        "moving a pointer with no later alias use is clean")
+
+      ; ── Copy-type discipline: a plain VALUE copy is independent ──
+      ; (bind ((b a)) (do (move a) b)) — a/b are ints, never used as pointers.
+      (assert_eq
+        (size (check (calln "bind"
+                       (list_of (lit "b") (sym "a")
+                         (calln "do"
+                           (list_of (calln "move" (list_of (sym "a"))) (sym "b")))))))
+        0
+        "moving a value does not taint a value copy of it")
+
+      ; ── (ref x) yields a pointer class: a copy of an address, the address
+      ; moved, the copy read THROUGH (deref) is use-after-move ──
+      ; (bind ((p (ref x)) (q p)) (do (move p) (deref q)))
+      (assert_true
+        (has (check (calln "bind"
+                      (list_of
+                        (lit "p") (calln "ref" (list_of (sym "x")))
+                        (lit "q") (sym "p")
+                        (calln "do"
+                          (list_of (calln "move" (list_of (sym "p")))
+                                   (calln "deref" (list_of (sym "q"))))))))
+             "use after move")
+        "an address (ref) copy is a pointer class — use after move flagged")
+
+      ; ── class_map: the cross-alias FACTS borrow consumes ──
+      ; p and q land in ONE pointer class; both names map to the same id.
+      (bind ((cm (class_map (with_ptr_copy (calln "ptr_read" (list_of (sym "q")))))))
+        (do
+          (assert_true (and (not (eq (get cm "p") null))
+                            (eq (get cm "p") (get cm "q")))
+            "p and q share one class id in class_map")
+          ; a non-pointer name never appears in class_map
+          (assert_eq (get cm "a" null) null
+            "a plain value name is absent from the pointer class_map"))))))

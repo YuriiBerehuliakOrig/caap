@@ -1,6 +1,10 @@
+//! Multi-pass parse pipelines: feed one stage's parsed output (via a transform)
+//! into the next stage's input text, statelessly ([`parse_pipeline`]) or with a
+//! reusable incremental cache (`IncrementalPipeline`).
+
 use crate::error::ParseError;
 use crate::grammar::Grammar;
-use crate::parser::PEGParser;
+use crate::parser_engine::PEGParser;
 use crate::types::{IncrementalEdit, ParseCache, ParseValue, ParserConfig};
 
 // ── Pipeline input/output types ────────────────────────────────────────────
@@ -8,11 +12,14 @@ use crate::types::{IncrementalEdit, ParseCache, ParseValue, ParserConfig};
 /// Text (and optional incremental-edit hints) fed into one pipeline stage.
 #[derive(Clone, Debug)]
 pub struct PipelineTextUpdate {
+    /// The full text for this stage.
     pub text: String,
+    /// Optional incremental-edit hints relative to the previous run.
     pub edits: Option<Vec<IncrementalEdit>>,
 }
 
 impl PipelineTextUpdate {
+    /// A whole-text update with no edit hints.
     pub fn new(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
@@ -20,6 +27,7 @@ impl PipelineTextUpdate {
         }
     }
 
+    /// A text update carrying incremental-edit hints.
     pub fn with_edits(text: impl Into<String>, edits: Vec<IncrementalEdit>) -> Self {
         Self {
             text: text.into(),
@@ -33,11 +41,14 @@ pub type PipelineTransform = Box<dyn Fn(ParseValue) -> Result<PipelineTextUpdate
 
 /// A single stage: grammar + optional transform to the next stage.
 pub struct PipelineStage {
+    /// The grammar parsed by this stage.
     pub grammar: Grammar,
+    /// Optional transform producing the next stage's input.
     pub transform: Option<PipelineTransform>,
 }
 
 impl PipelineStage {
+    /// A terminal stage with no onward transform.
     pub fn new(grammar: Grammar) -> Self {
         Self {
             grammar,
@@ -45,6 +56,7 @@ impl PipelineStage {
         }
     }
 
+    /// A stage that transforms its result into the next stage's input.
     pub fn with_transform<F>(grammar: Grammar, transform: F) -> Self
     where
         F: Fn(ParseValue) -> Result<PipelineTextUpdate, ParseError> + 'static,
@@ -58,7 +70,9 @@ impl PipelineStage {
 
 /// Result produced by running one stage.
 pub struct PipelineStageResult {
+    /// The input fed to this stage.
     pub input: PipelineTextUpdate,
+    /// The parsed value.
     pub value: ParseValue,
     /// The derived input for the next stage, or `None` if this is the last stage.
     pub next_input: Option<PipelineTextUpdate>,
@@ -127,6 +141,7 @@ pub struct IncrementalPipeline {
 }
 
 impl IncrementalPipeline {
+    /// Build a stateful incremental pipeline from its stages.
     pub fn new(stages: Vec<PipelineStage>) -> Self {
         Self {
             stages: stages
@@ -188,9 +203,8 @@ fn parse_stage_incremental(
     stage_input: &PipelineTextUpdate,
 ) -> Result<ParseValue, ParseError> {
     // Compute incremental edits when text changed and no explicit edits were
-    // provided; this keeps diff metadata aligned with the reference API even
-    // though incremental parsing in this Rust port still relies on whole-input
-    // cache keys.
+    // provided; this keeps diff metadata aligned with the incremental API even
+    // though parsing still relies on whole-input cache keys.
     let _edits: Option<Vec<IncrementalEdit>> = match &stage_input.edits {
         Some(e) => Some(e.clone()),
         None => {
@@ -207,7 +221,7 @@ fn parse_stage_incremental(
     };
 
     let cache = state.cache.get_or_insert_with(ParseCache::new);
-    let value = state.parser.parse_incremental_many_with_result(
+    let value = state.parser.parse_incremental_many(
         &state.grammar,
         &stage_input.text,
         &ParserConfig::default(),
@@ -217,7 +231,7 @@ fn parse_stage_incremental(
     // Track last input for future incremental-edit computation.
     state.last_input = Some(stage_input.clone());
 
-    Ok(value)
+    Ok(value.as_ref().clone())
 }
 
 // ── compute_snapshot_edits ─────────────────────────────────────────────────
@@ -237,11 +251,9 @@ pub fn compute_snapshot_edits(old_text: &str, new_text: &str) -> Vec<Incremental
     let old_end = old_text.len() - suffix;
     let new_end = new_text.len() - suffix;
 
-    vec![IncrementalEdit {
-        start,
-        old_end,
-        replacement: new_text[start..new_end].to_string(),
-    }]
+    IncrementalEdit::new(start, old_end, new_text[start..new_end].to_string())
+        .into_iter()
+        .collect()
 }
 
 fn compute_equal_length_edits(old_text: &str, new_text: &str) -> Vec<IncrementalEdit> {
@@ -253,22 +265,26 @@ fn compute_equal_length_edits(old_text: &str, new_text: &str) -> Vec<Incremental
     for (i, (oc, nc)) in old.iter().zip(new.iter()).enumerate() {
         if oc == nc {
             if let Some(ms) = mismatch_start.take() {
-                edits.push(IncrementalEdit {
-                    start: ms,
-                    old_end: i,
-                    replacement: new_text.chars().skip(ms).take(i - ms).collect(),
-                });
+                if let Some(edit) = IncrementalEdit::new(
+                    ms,
+                    i,
+                    new_text.chars().skip(ms).take(i - ms).collect::<String>(),
+                ) {
+                    edits.push(edit);
+                }
             }
         } else if mismatch_start.is_none() {
             mismatch_start = Some(i);
         }
     }
     if let Some(ms) = mismatch_start {
-        edits.push(IncrementalEdit {
-            start: ms,
-            old_end: old_text.len(),
-            replacement: new_text.chars().skip(ms).collect(),
-        });
+        if let Some(edit) = IncrementalEdit::new(
+            ms,
+            old_text.len(),
+            new_text.chars().skip(ms).collect::<String>(),
+        ) {
+            edits.push(edit);
+        }
     }
     edits
 }
@@ -308,7 +324,7 @@ fn resolve_next_input(
         return Ok(None);
     }
     match value {
-        ParseValue::Text(s) => Ok(Some(PipelineTextUpdate::new(s.clone()))),
+        ParseValue::Text(s) => Ok(Some(PipelineTextUpdate::new(s.to_string()))),
         _ => Err(ParseError::new(
             "pipeline stage produced a non-text value; a transform is required to proceed",
             0,
@@ -324,7 +340,7 @@ mod tests {
     use super::*;
 
     fn word_grammar() -> Grammar {
-        Grammar::new("word <- /[a-z]+/").with_start_rule("word")
+        Grammar::trusted_new("word <- /[a-z]+/").with_start_rule("word")
     }
 
     // ── compute_snapshot_edits ───────────────────────────────────────────
@@ -338,9 +354,9 @@ mod tests {
     fn snapshot_edits_full_replacement() {
         let edits = compute_snapshot_edits("abc", "xyz");
         assert_eq!(edits.len(), 1);
-        assert_eq!(edits[0].start, 0);
-        assert_eq!(edits[0].old_end, 3);
-        assert_eq!(edits[0].replacement, "xyz");
+        assert_eq!(edits[0].start(), 0);
+        assert_eq!(edits[0].old_end(), 3);
+        assert_eq!(edits[0].replacement(), "xyz");
     }
 
     #[test]
@@ -349,7 +365,7 @@ mod tests {
         assert_eq!(edits.len(), 1);
         let e = &edits[0];
         // 'h','e' match; then old='l','o' new='l','l','o' diverge
-        assert!(e.replacement.contains('l'));
+        assert!(e.replacement().contains('l'));
     }
 
     #[test]
@@ -392,7 +408,7 @@ mod tests {
         let stages = vec![
             PipelineStage::with_transform(g1, |v| {
                 let text = match v {
-                    ParseValue::Text(t) => t,
+                    ParseValue::Text(t) => t.to_string(),
                     _ => String::new(),
                 };
                 Ok(PipelineTextUpdate::new(text))
@@ -405,7 +421,7 @@ mod tests {
 
     #[test]
     fn parse_pipeline_parse_failure_propagates() {
-        let g = Grammar::new("num <- /[0-9]+/").with_start_rule("num");
+        let g = Grammar::trusted_new("num <- /[0-9]+/").with_start_rule("num");
         let stages = vec![PipelineStage::new(g)];
         assert!(parse_pipeline("hello", &stages).is_err());
     }

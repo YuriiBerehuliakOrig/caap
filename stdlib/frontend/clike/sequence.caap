@@ -1,0 +1,12 @@
+; stdlib/frontend/clike/sequence.caap - local sequence helper facade for clike internals.
+;
+; Clike leaves share these collection helpers through this shim so splitting the
+; lowerer does not widen direct fan-in to stdlib.lib.collections.sequence.
+(module stdlib.frontend.clike.sequence)
+
+(use stdlib.lib.collections.sequence map prepend drop join)
+
+(bind sequence_drop drop)
+(bind sequence_join join)
+
+(export map prepend sequence_drop sequence_join)

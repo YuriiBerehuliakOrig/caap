@@ -1,0 +1,7 @@
+(surface stdlib.frontend.no_such_kit stdlib.fixtures.bad_surface_kit)
+// A surface HEADER is present, but it names a kit that does not exist.
+// Loading this file must NOT silently fall back to the default kernel reader
+// (which would try to parse this clike-shaped text as kernel forms and fail
+// cryptically, or worse, succeed with a wrong reading). The loader must emit a
+// LOCATED diagnostic naming the unavailable surface kit.
+int answer = 42;

@@ -1,0 +1,205 @@
+; stdlib/lib/tests/test_tailcall.caap — the syntactic tail-position analysis:
+; tail_calls / self_tail_recursive? / analyze_module + the pass facts, driven
+; over hand-built AST like test_callgraph / test_lint.
+
+;; @area: passes
+;; @kind: regression
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.tailcall
+  tail_calls self_tail_recursive? analyze_module check_module)
+(use stdlib.semantics.passes.registry fact! fact_of)
+(use stdlib.syntax.ast sym lit calln lam head_of loc)
+(use stdlib.lib.collections.sequence any?)
+
+(do
+  (bind (
+    ; a top-level definition form: (bind "name" value)
+    (def (lambda (nm v) (calln "bind" (list_of (lit nm) v))))
+    ; wrap forms as the loader's located list
+    (located (lambda (forms)
+               (bind ((out (list_of)))
+                 (do (for f forms (append out (assoc (map_of) "node" f "loc" "m")))
+                     out))))
+    ; does any tail call have head `name`?
+    (calls? (lambda (tcs name) (any? tcs (lambda (c) (eq (head_of c) name)))))
+  )
+    (do
+      ; ── a tail-recursive loop ──
+      ; (lambda (n acc) (if (eq n 0) acc (self (int_sub n 1) (int_add acc n))))
+      ; the `self` call is the else-arm of the `if`, i.e. in TAIL position.
+      (bind (
+        (self_call (calln "self"
+                     (list_of (calln "int_sub" (list_of (sym "n") (lit 1)))
+                              (calln "int_add" (list_of (sym "acc") (sym "n"))))))
+        (loop_body (calln "if"
+                     (list_of (calln "eq" (list_of (sym "n") (lit 0)))
+                              (sym "acc")
+                              self_call)))
+        (tcs (tail_calls loop_body))
+      )
+        (do
+          (assert_true (calls? tcs "self")
+            "the recursive `self` call (if's else-arm) is in tail position")
+          (assert_true (self_tail_recursive? "self" loop_body)
+            "the loop is self-tail-recursive (TCO-able)")))
+
+      ; ── a NON-tail recursive call ──
+      ; (lambda (n) (int_add 1 (self (int_sub n 1))))
+      ; `self` is an ARGUMENT of int_add, so its result must return to int_add —
+      ; it is NOT in tail position.
+      (bind (
+        (body (calln "int_add"
+                (list_of (lit 1)
+                         (calln "self"
+                           (list_of (calln "int_sub" (list_of (sym "n") (lit 1))))))))
+        (tcs (tail_calls body))
+      )
+        (do
+          (assert_true (not (calls? tcs "self"))
+            "`self` inside an argument of int_add is NOT a tail call")
+          ; the whole body's tail call IS int_add (the value returned)
+          (assert_true (calls? tcs "int_add")
+            "the outer int_add IS the tail call (the value the body returns)")
+          (assert_true (not (self_tail_recursive? "self" body))
+            "non-tail self-recursion is not self-tail-recursive")))
+
+      ; ── tail position through a `do` ──
+      ; (do a b (g x)) — only the LAST form, (g x), is in tail position.
+      (bind (
+        (body (calln "do"
+                (list_of (sym "a") (sym "b")
+                         (calln "g" (list_of (sym "x"))))))
+        (tcs (tail_calls body))
+      )
+        (do
+          (assert_true (calls? tcs "g")
+            "(g x), the last form of the do, is in tail position")
+          (assert_eq (size tcs) 1
+            "only the last form of a do is tail (a, b are not calls anyway)")))
+
+      ; ── tail position through BOTH if arms ──
+      ; (if c (f) (g)) — both (f) and (g) are tail.
+      (bind (
+        (body (calln "if"
+                (list_of (sym "c") (calln "f" (list_of)) (calln "g" (list_of)))))
+        (tcs (tail_calls body))
+      )
+        (do
+          (assert_true (calls? tcs "f") "if then-arm is tail")
+          (assert_true (calls? tcs "g") "if else-arm is tail")))
+
+      ; ── tail position through cond clause results ──
+      ; (cond ((p) (h)) (else (k))) — (h) and (k) are tail; (p) is a test, not.
+      (bind (
+        (body (calln "cond"
+                (list_of
+                  (calln "p" (list_of (calln "h" (list_of))))
+                  (calln "else" (list_of (calln "k" (list_of)))))))
+        (tcs (tail_calls body))
+      )
+        (do
+          (assert_true (calls? tcs "h") "cond clause result (h) is tail")
+          (assert_true (calls? tcs "k") "cond else result (k) is tail")
+          (assert_true (not (calls? tcs "p")) "cond test (p) is NOT tail")))
+
+      ; ── tail position through match arm bodies ──
+      ; (match s (0 (a)) (_ (b))) — (a) and (b) are tail; the subject s is not.
+      (bind (
+        (body (calln "match"
+                (list_of (sym "s")
+                  (calln "0" (list_of (calln "a" (list_of))))
+                  (calln "_" (list_of (calln "b" (list_of)))))))
+        (tcs (tail_calls body))
+      )
+        (do
+          (assert_true (calls? tcs "a") "match arm body (a) is tail")
+          (assert_true (calls? tcs "b") "match arm body (b) is tail")))
+
+      ; ── a bare tail call (the whole body IS the call) ──
+      ; (f x) — the body itself is the tail call.
+      (bind ((tcs (tail_calls (calln "f" (list_of (sym "x"))))))
+        (assert_true (calls? tcs "f") "a bare call body is itself the tail call"))
+
+      ; ── a value/control special form in tail position is NOT a tail call ──
+      ; (try (f) (catch e (g))) — `try` is a control form, not a function call;
+      ; it must NOT be recorded (and its sub-forms are conservatively unmarked).
+      (bind ((tcs (tail_calls
+                    (calln "try"
+                      (list_of (calln "f" (list_of))
+                               (calln "catch"
+                                 (list_of (sym "e") (calln "g" (list_of)))))))))
+        (do
+          (assert_eq (size tcs) 0
+            "a `try` form in tail position is not a tail call (no false marking)")
+          (assert_true (not (calls? tcs "try")) "`try` head is not recorded")))
+
+      ; (lambda () (h)) in tail position is a VALUE (a closure), not a tail call.
+      (bind ((tcs (tail_calls (lam (list_of) (calln "h" (list_of))))))
+        (assert_eq (size tcs) 0
+          "a lambda value in tail position is not a tail call"))
+
+      ; ── analyze_module classifies self-tail-recursive defs ──
+      (bind ((g (analyze_module (located (list_of
+                  ; loop: self-tail-recursive
+                  (def "loop"
+                    (lam (list_of "n" "acc")
+                      (calln "if"
+                        (list_of (calln "eq" (list_of (sym "n") (lit 0)))
+                                 (sym "acc")
+                                 (calln "loop"
+                                   (list_of (calln "int_sub" (list_of (sym "n") (lit 1)))
+                                            (sym "acc")))))))
+                  ; fact_acc: non-tail self-recursion (multiply on the way out)
+                  (def "fact_acc"
+                    (lam (list_of "n")
+                      (calln "int_mul"
+                        (list_of (sym "n")
+                                 (calln "fact_acc"
+                                   (list_of (calln "int_sub" (list_of (sym "n") (lit 1))))))))))))))
+        (do
+          (assert_true (eq (get (get g "self_tco") "loop" false) true)
+            "loop is classified self-tail-recursive (TCO candidate)")
+          (assert_true (not (eq (get (get g "self_tco") "fact_acc" false) true))
+            "fact_acc (multiply-on-return) is NOT a TCO candidate")))
+
+      ; ── the pass publishes a `tailcall` fact per tail-position call site ──
+      ; Give the tail call a REAL span so the published fact is keyed by a
+      ; distinct path:line:col (not the empty synthetic loc), exercising the
+      ; loc-keying contract — the same idiom test_match_check / test_naming use.
+      (bind (
+        (sp (map_of "start" 0 "end" 1 "start_line" 7 "start_col" 3
+                    "end_line" 7 "end_col" 9 "path" "demo.caap"))
+        (g_call (ctfe_spec_with_span (calln "g" (list_of (sym "x"))) sp))
+        (loc_forms (located (list_of
+                     (def "use_g" (lam (list_of) g_call)))))
+        (sink (list_of))
+      )
+        (do
+          (check_module loc_forms sink)
+          (assert_eq (loc g_call) "demo.caap:7:3" "the tail call has a real loc")
+          (assert_eq (fact_of "tailcall" (loc g_call) null) true
+            "pass publishes a tailcall fact for each tail-position call site")
+          ; `use_g` is not self-recursive, so it gets NO advisory TCO finding.
+          (assert_eq (size sink) 0 "a non-recursive def publishes no TCO finding")
+          ; CLEAN UP: null the fact this test published.
+          (fact! "tailcall" (loc g_call) null)))
+
+      ; ── a self-tail-recursive def DOES get an advisory TCO finding ──
+      (bind (
+        (loop_forms (located (list_of
+                      (def "loop"
+                        (lam (list_of "n")
+                          (calln "if"
+                            (list_of (calln "eq" (list_of (sym "n") (lit 0)))
+                                     (lit 0)
+                                     (calln "loop"
+                                       (list_of (calln "int_sub" (list_of (sym "n") (lit 1)))))))))) ))
+        (sink (list_of))
+      )
+        (do
+          (check_module loop_forms sink)
+          (assert_true (any? sink (lambda (f) (string_contains f "TCO candidate")))
+            "self-tail-recursive def gets a TCO-candidate advisory finding")
+          ; CLEAN UP: the loop's tail call has loc "" (synthetic) — null it.
+          (fact! "tailcall" "" null))))))

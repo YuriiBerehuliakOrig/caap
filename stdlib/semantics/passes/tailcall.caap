@@ -1,0 +1,199 @@
+; stdlib/semantics/passes/tailcall.caap — SYNTACTIC tail-position analysis
+; (module stdlib.semantics.passes.tailcall).
+;
+; The TCO advice the callgraph header promises but never produces. callgraph
+; records that a definition is `recursive` (it transitively calls itself); this
+; pass refines that to the OPTIMIZABLE case — a SELF call in TAIL position, the
+; shape a backend can rewrite into a loop with no stack growth.
+;
+; Tail position is purely syntactic: a call is in tail position of a function
+; body iff it is the value the body returns. From the body root, tail position
+; propagates through the control forms — and ONLY through them — to the calls
+; that actually produce the result:
+;
+;   (do  s1 … sn)       only sn (the last form) is tail; s1..s(n-1) are effects
+;   (bind "n" v … body) only the LAST body form is tail; binding VALUES are not
+;   (if c t e)          BOTH arms (t = arg1, e = arg2) are tail; the test c is not
+;   (when t body…)      the body's last form is tail (expands to a one-armed if)
+;   (unless t body…)    likewise
+;   (cond (c r…) …)     each clause's RESULT (its last form) is tail; tests are not
+;   (match s (p b…) …)  each arm's BODY (its last form) is tail; subject/pats not
+;
+; A call that is itself in tail position and is NOT one of those control forms is
+; a genuine tail call (the value flows straight out). Crucially, descending into
+; an ARGUMENT of a call leaves tail position: in `(int_add 1 (f x))` the result
+; is `int_add`'s, so `(f x)` is NOT tail; `(f x)` written as the whole body IS.
+;
+; Precision is the contract: marking a NON-tail call (the failure mode) would
+; tell a backend to TCO a call that must return to its caller. When a form is not
+; a recognised tail-propagating control form, we do NOT descend — we record the
+; tail call (if it is one) and stop, never guessing tail-ness inside arguments.
+(module stdlib.semantics.passes.tailcall)
+
+(use stdlib.syntax.ast
+  call? head_of head_is? args_of arg def_of bind_pairs loc)
+(use stdlib.semantics.passes.registry note! fact! install_pass!)
+
+; last_of — the last element of a list, or null when empty (the form a `do` /
+; clause body / arm body actually returns).
+(bind last_of
+  (lambda (lst)
+    (if (eq (size lst) 0) null (get lst (int_sub (size lst) 1)))))
+
+; bind_body — the BODY forms of a canonical `(bind "n" v … body…)`: the suffix
+; after the trailing string-literal name/value pairs. Delegates to lib/ast
+; `bind_pairs` (the ONE reader of the canonical bind shape — dce/naming consume
+; it the same way); a bind whose first arg is NOT a string literal (the kernel
+; flat 2-arg def) yields null pairs/body here, so the empty list is returned and
+; the caller threads tail position into nothing (never mis-reading a binding
+; VALUE as a tail body form).
+(bind bind_body
+  (lambda (node) (get (bind_pairs node) "body" (list_of))))
+
+; non_call_head? — a head name that is a SPECIAL FORM / value-producing form, not
+; a function call. A node in tail position headed by one of these is NOT a tail
+; CALL: `lambda`/`quote` evaluate to a value (not a call), and `try`/`while`/
+; `case`/`if_let`/`when_let`/`let` are control forms with their own (here
+; unmodeled) tail semantics — conservatively we neither record nor descend into
+; them (under-reporting is safe; falsely marking a non-call is the failure mode).
+; The tail-PROPAGATING control forms (do/bind/if/when/unless/cond/match) never
+; reach this test — they are matched earlier in `visit`.
+(bind non_call_head?
+  (lambda (h)
+    (or (eq h "lambda") (eq h "quote") (eq h "try") (eq h "catch")
+        (eq h "while") (eq h "case") (eq h "if_let") (eq h "when_let")
+        (eq h "let") (eq h "let*"))))
+
+; tail_calls — the call nodes in TAIL position of `fn_body`. Walks ONLY through
+; the tail-propagating control forms; any other call reached in tail position is
+; recorded and not descended (a tail call is a leaf of this walk). A non-call
+; tail value (a name / literal) contributes nothing.
+;   fn_body : the body spec of a function (a lambda's body, or any expression)
+;   ->      : [node…] the call nodes that are in tail position
+(bind tail_calls
+  (lambda (fn_body)
+    (bind (
+      (out (list_of))
+      ; visit — walk `n` as a value in TAIL position, collecting tail calls.
+      (visit
+        (lambda (self n)
+          (when (call? n)
+            (bind ((h (head_of n)))
+              (cond
+                ; (do s1 … sn): only sn is in tail position.
+                ((eq h "do")
+                  (bind ((last (last_of (args_of n))))
+                    (when (not (eq last null)) (self self last))))
+                ; (bind "n" v … body…): only the LAST body form is tail. A bind
+                ; with no body (the flat def form) threads nothing.
+                ((eq h "bind")
+                  (bind ((last (last_of (bind_body n))))
+                    (when (not (eq last null)) (self self last))))
+                ; (if c t e): BOTH arms are tail; the test is not. A 2-arm
+                ; `(if c t)` (no else) threads only the then-arm.
+                ((eq h "if")
+                  (do
+                    (when (not (eq (arg n 1) null)) (self self (arg n 1)))
+                    (when (not (eq (arg n 2) null)) (self self (arg n 2)))))
+                ; (when t body…) / (unless t body…): the body's last form is tail
+                ; (each is a one-armed `if` over the body; the test is not tail).
+                ((or (eq h "when") (eq h "unless"))
+                  (bind ((last (last_of (sequence_drop (args_of n) 1))))
+                    (when (not (eq last null)) (self self last))))
+                ; (cond (test result…) … (else result…)): each clause's RESULT
+                ; (the last form of the clause) is tail; the tests are not.
+                ((eq h "cond")
+                  (for clause (args_of n)
+                    (when (call? clause)
+                      (bind ((last (last_of (args_of clause))))
+                        (when (not (eq last null)) (self self last))))))
+                ; (match subj (pat body…) … ): each arm's BODY (its last form) is
+                ; tail; the subject (arg 0) and the patterns are not.
+                ((eq h "match")
+                  (bind ((arms (args_of n)))
+                    (sequence_each (sequence_range 1 (size arms))
+                      (lambda (i)
+                        (bind ((arm (get arms i)))
+                          (when (call? arm)
+                            (bind ((last (last_of (args_of arm))))
+                              (when (not (eq last null)) (self self last)))))))))
+                ; any OTHER call in tail position is the returned value: a tail
+                ; CALL — record it and STOP (its arguments are NOT in tail
+                ; position, so we never descend into them). But a value/control
+                ; special form (lambda/quote/try/while/case/…) is NOT a function
+                ; call: do not record it (and do not descend — its tail-position
+                ; sub-forms, if any, are conservatively left unmarked). A
+                ; non-name-headed call `((f) x)` has a null head we cannot name;
+                ; it is still a genuine tail call, so we record it.
+                ((non_call_head? h) null)
+                (else (append out n)))))))
+    )
+      (do (visit visit fn_body) out))))
+
+; self_tail_recursive? — does `fn_body` contain a tail call to `name`? This is
+; the TCO-able self-recursion the backend can turn into a loop. (callgraph's
+; `recursive` fact is the broader "calls itself somehow"; this is the strictly
+; tail subset.)
+;   name    : the function's own name
+;   fn_body : its body spec
+;   ->      : bool
+(bind self_tail_recursive?
+  (lambda (name fn_body)
+    (sequence_any (tail_calls fn_body) (lambda (c) (eq (head_of c) name)))))
+
+; analyze_module — for each top-level def `(bind "name" (lambda …))`, find its
+; tail calls and classify whether it is self-tail-recursive (the TCO candidate).
+;   located : [{node, loc}] the module's top-level forms
+;   -> { defs:[name…], tail:{name->[call-node…]}, self_tco:{name->true} }
+(bind analyze_module
+  (lambda (located)
+    (bind (
+      (defs (list_of)) (tail (map_of)) (self_tco (map_of))
+    )
+      (do
+        (for f located
+          (bind ((d (def_of (get f "node"))))
+            (when (and (not (eq d null)) (head_is? (get d "value") "lambda"))
+              (bind (
+                (nm (get d "name"))
+                ; a lambda is (lambda (params) body): the body is arg 1. Compute
+                ; the tail calls ONCE and reuse them for the self-recursion test
+                ; (a tail call to the def's own name) — no second body walk.
+                (tcs (tail_calls (arg (get d "value") 1)))
+              )
+                (do
+                  (append defs nm)
+                  (assoc tail nm tcs)
+                  (when (sequence_any tcs (lambda (c) (eq (head_of c) nm)))
+                    (assoc self_tco nm true)))))))
+        (assoc (map_of) "defs" defs "tail" tail "self_tco" self_tco)))))
+
+; check_module — the pass entry. Publishes a fact for each tail-position call
+; site (loc -> true on the "tailcall" channel) and a located finding noting each
+; self-tail-recursive def (a TCO candidate — advisory, never a failure).
+;   located : [{node, loc}] the module's top-level forms
+;   sink    : the findings list
+(bind check_module
+  (lambda (located sink)
+    (bind ((g (analyze_module located)))
+      (do
+        ; facts: every tail-position call site, keyed by its source loc.
+        (for nm (get g "defs" (list_of))
+          (for c (get (get g "tail" (map_of)) nm (list_of))
+            (fact! "tailcall" (loc c) true)))
+        ; advisory findings: the self-tail-recursive defs (TCO candidates).
+        (for f located
+          (bind ((d (def_of (get f "node"))))
+            (when (and (not (eq d null))
+                       (eq (get (get g "self_tco" (map_of)) (get d "name") false) true))
+              (note! sink "tailcall" (get f "node")
+                (string_concat_many
+                  "self-tail-recursive `" (get d "name")
+                  "` — TCO candidate (rewritable as a loop)")))))))))
+
+; register! — install the tail-call analysis as a load-time pass (idempotent).
+(bind register!
+  (lambda ()
+    (install_pass! "tailcall" (lambda (located sink) (check_module located sink)))))
+
+(export tail_calls self_tail_recursive? analyze_module check_module register!)

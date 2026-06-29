@@ -1,0 +1,15 @@
+;; Surface AST as JSON (with character spans) — the span-based refactoring
+;; surface scripts/caap_refactor.py consumes. Pure kernel parse; also a cheap
+;; parse check (malformed source fails with the parser's diagnostic).
+;;
+;;   caap tools/bare.caap tools/ast_json.caap FILE
+;;
+;; The JSON text is the program's result — the CLI prints it to stdout.
+(bind (
+  (args (ctfe_compiler_lookup_value compiler "cli.args"))
+  (read_text (host_service_export "fs" "read_text" "compile_time"))
+)
+  (do
+    (if (eq (size args) 0)
+      (runtime_error "usage: caap tools/bare.caap tools/ast_json.caap FILE"))
+    (ctfe_source_ast_json (read_text (get args 0 null)))))

@@ -1,0 +1,52 @@
+; stdlib/boot/sys_grants.caap — mint the sys capability + raw callables.
+; MODULE IDENTITY: a RAW bootstrap script (run via ctfe_compiler_execute_bootstrap_file /
+; run_expanded BEFORE the `module` form is a bound name), so it carries NO `(module …)`
+; form — adding one would raise `unknown name: module`. Its registry identity is set
+; explicitly via ctfe_compiler_register_value. Allowlisted in stdlib/CONVENTIONS.md +
+; stdlib_module_identity_check (caap/tests/stdlib_governance_tests.rs).
+;
+; THE TRUST BOUNDARY. Run explicitly, WITH the umbrella capability, by whoever
+; owns the session:
+;
+;   (ctfe_compiler_execute_bootstrap_file compiler ".../boot/sys_grants.caap"
+;     (list_of "sys"))
+;
+; ONE handle of kind "sys" is minted: it prefix-covers every fine-grained sys
+; capability (sys.io.write, sys.fs.read, sys.env, sys.proc, …), which matters
+; because a single library can mix kinds (os spans sys.os/sys.env/sys.path).
+; Projecting a host export demands AMBIENT capability (the kernel checks the
+; current bootstrap frame), so the raw callables are built HERE, inside the
+; granted frame — a handle alone cannot create them later. For each library we
+; project every op the live catalog lists (nothing hand-kept to drift):
+;
+;   stdlib.sys.grant.<lib> = { capability: <sys handle>, raw: { name -> fn } }
+;
+; Sys exports are DUAL-phase; each phase's sandbox policy decides what a call
+; may do (the compile-time sandbox denies stdin/fs-writes/net/process, allows
+; stdout logging and os queries). Raw callables take the handle as their first
+; call argument; sys facades partially apply it via stdlib.sys.wrap.
+; Trusted-bootstrap model: anyone who can read the registry can take the grant;
+; the embedder decides whether this file runs at all.
+; (Bare kernel forms: this runs raw, outside the expander, on purpose.)
+(bind (
+  ; the umbrella sys handle — minted ONCE, prefix-covers every fine-grained
+  ; sys.* capability (so a multi-kind library projects from this one handle).
+  (capability (host_service_capability "sys"))
+)
+  ; for each sys library, project every runtime op the LIVE catalog lists into
+  ; a `raw` map (name -> callable) and register the grant under
+  ; stdlib.sys.grant.<lib> = {capability, raw}. Catalog-driven: nothing
+  ; hand-kept, so the projection never drifts from the host surface.
+  (sequence_each (list_of "io" "fs" "os" "time" "net" "process" "rand" "path")
+    (lambda (lib)
+      (bind ((raw (map_of)))
+        (do
+          (sequence_each (host_service_library_catalog lib "runtime")
+            (lambda (entry)
+              (bind ((name (get entry "public")))
+                (assoc raw name
+                  (host_service_capability_export capability lib name "runtime")))))
+          (ctfe_compiler_register_value
+            compiler
+            (string_concat_many "stdlib.sys.grant." lib)
+            (assoc (map_of) "capability" capability "raw" raw)))))))

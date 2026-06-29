@@ -1,0 +1,41 @@
+; stdlib/semantics/passes/source_read.caap — the shared RAW-form reader for the
+; directive-level static-analysis passes (module stdlib.semantics.passes.source_read).
+;
+; THE PROBLEM: tiers / imports / bare_gate each work on a module's RAW top-level
+; forms (directives INTACT — the loader consumes `use`/`import`/`re_export` into
+; scope before user passes run, so a directive linter cannot use the loader's
+; post-consumption `located` list). All three therefore opened their `check_file`
+; with the IDENTICAL three-line dance:
+;
+;   (ctfe_compiler_load_surface_file_template compiler path)  ; parse the file
+;   -> (ctfe_unit_top_level_forms unit)                       ; the live nodes
+;   -> (ctfe_node_to_spec f) per node                         ; detached specs
+;
+; Three copies of the same privileged loader-bypass read (the surface-template
+; builtin) is three call sites to keep in sync and three entries on the governance
+; allowlist. This module owns the read ONCE; the passes call `read_leading_forms`.
+;
+; Tier: rank 4 (semantics/passes), KERNEL/ctfe builtins only — it imports no other
+; stdlib module, so it loads anywhere a pass does and never inverts the tower.
+(module stdlib.semantics.passes.source_read)
+
+; read_leading_forms — a module file's RAW top-level forms as detached specs, in
+; source order. This is the one sanctioned `ctfe_compiler_load_surface_file_template`
+; read the directive passes share: parse the file into a surface unit, walk its
+; live top-level nodes, and lower each to a construction spec (spans preserved, so
+; the located findings the passes build still carry source positions). The result
+; is exactly what a pass's `check_forms` consumes — directives are still present
+; (nothing is stripped), because the whole point of these passes is to inspect the
+; `use`/`import`/`re_export`/`module` directives the loader would otherwise swallow.
+;   path : the module file's path
+;   ->   : [spec…] the raw top-level form specs, in source order
+(bind read_leading_forms
+  (lambda (path)
+    (bind ((unit (ctfe_compiler_load_surface_file_template compiler path))
+           (forms (list_of)))
+      (do
+        (for f (ctfe_unit_top_level_forms unit)
+          (append forms (ctfe_node_to_spec f)))
+        forms))))
+
+(export read_leading_forms)

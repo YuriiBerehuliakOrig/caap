@@ -1,0 +1,132 @@
+; stdlib/lib/test_derive.caap — the derive registry generates per-type
+; code ONCE: a field-lister derive built through the IR layer.
+
+;; @area: types
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.derive register_derive! derive_for derived? derives reset_derives! register_battery!)
+(use stdlib.semantics.types.registry define_struct! field)
+(use stdlib.syntax.ast sym lit calln lam eval_ir)
+(use stdlib.lib.diag.error error_code)
+(use stdlib.lib.collections.sequence any?)
+
+(do
+  (define_struct! "TPair"
+    (list_of (field "a" "int") (field "b" "string")))
+
+  (bind ((gens (ref 0)))
+    (do
+      (register_derive! "fields_of"
+        (lambda (tname d)
+          (do
+            (set_ref gens (int_add (deref gens) 1))
+            ; generated: (lambda (s) (string_concat_many "a=" … " b=" …))
+            (bind ((args (list_of)))
+              (do
+                (for f (get d "fields" (list_of))
+                  (do
+                    (append args (lit (string_concat_many
+                                        (get f "name") "=")))
+                    (append args (calln "value_to_string"
+                      (list_of (calln "get"
+                        (list_of (sym "s") (lit (get f "name"))
+                                 (lit null))))))
+                    (append args (lit " "))))
+                (eval_ir (lam (list_of "s")
+                           (calln "string_concat_many" args))))))))
+
+      (assert_eq (derived? "fields_of" "TPair") false "nothing generated yet")
+      (bind ((shower (derive_for "fields_of" "TPair")))
+        (assert_eq (shower (assoc (map_of) "a" 7 "b" "x"))
+          "a=7 b=x " "generated instance works"))
+      (assert_true (derived? "fields_of" "TPair") "instance cached")
+      (bind ((again (derive_for "fields_of" "TPair")))
+        (assert_eq (again (assoc (map_of) "a" 1 "b" "y")) "a=1 b=y " "reuse"))
+      (assert_eq (deref gens) 1 "two derive_for calls, ONE generation")))
+
+  ; failure channel: protocol errors with codes
+  (assert_eq
+    (error_code (try (derive_for "nope" "TPair") (catch e e)))
+    "stdlib.derive.unknown" "unknown derive")
+  (assert_eq
+    (error_code (try (derive_for "fields_of" "Bogus") (catch e e)))
+    "stdlib.derive.unknown_type" "unknown type")
+
+  ; observability: `derives` lists the registered generator names
+  (assert_true
+    (any? (derives) (lambda (n) (eq n "fields_of")))
+    "derives lists the registered derive")
+
+  ; duplicate registration is a certain protocol error
+  (assert_eq
+    (error_code (try (register_derive! "fields_of" (lambda (t d) null)) (catch e e)))
+    "stdlib.derive.duplicate" "re-registering a derive is rejected")
+
+  ; reset_derives! clears generators AND the memo cache (back to empty)
+  (do
+    (reset_derives!)
+    (assert_eq (size (derives)) 0 "reset drops every generator")
+    (assert_eq (derived? "fields_of" "TPair") false "reset drops the memo cache")
+    (assert_eq
+      (error_code (try (derive_for "fields_of" "TPair") (catch e e)))
+      "stdlib.derive.unknown" "the reset generator is gone"))
+  true)
+
+; ── the standard derive battery over the TPair struct descriptor ──────────────
+; reset_derives! above left the registry empty; register_battery! installs the
+; five standard derives, then derive_for generates each instance for TPair.
+(do
+  (register_battery!)
+
+  ; Show — TypeName{field=value, …} with value_to_string-rendered fields.
+  (bind ((show (derive_for "show" "TPair")))
+    (do
+      (assert_eq (show (assoc (map_of) "a" 7 "b" "x")) "TPair{a=7, b=x}"
+        "Show renders the struct field by field")
+      (assert_eq (show (assoc (map_of) "a" -1 "b" "")) "TPair{a=-1, b=}"
+        "Show handles an empty-string field")))
+
+  ; Eq — structural equality (two distinct maps with equal entries ARE eq).
+  (bind ((eqd (derive_for "eq" "TPair"))
+         (p1 (assoc (map_of) "a" 1 "b" "z"))
+         (p2 (assoc (map_of) "a" 1 "b" "z"))
+         (p3 (assoc (map_of) "a" 2 "b" "z")))
+    (do
+      (assert_true (eqd p1 p2) "Eq: structurally-equal structs are equal")
+      (assert_true (not (eqd p1 p3)) "Eq: differing field => not equal")))
+
+  ; Compare — total order: -1 / 0 / +1, consistent with Eq (0 exactly when eq).
+  (bind ((cmp (derive_for "compare" "TPair"))
+         (p1 (assoc (map_of) "a" 1 "b" "z"))
+         (p1b (assoc (map_of) "a" 1 "b" "z"))
+         (p2 (assoc (map_of) "a" 2 "b" "z")))
+    (do
+      (assert_eq (cmp p1 p1b) 0 "Compare: equal structs compare 0")
+      (assert_eq (cmp p1 p2) -1 "Compare: smaller field => -1")
+      (assert_eq (cmp p2 p1) 1 "Compare: larger field => +1")))
+
+  ; Hash — value_eq-equal structs hash equal.
+  (bind ((hsh (derive_for "hash" "TPair"))
+         (p1 (assoc (map_of) "a" 5 "b" "k"))
+         (p1b (assoc (map_of) "a" 5 "b" "k")))
+    (do
+      (assert_eq (hsh p1) (hsh p1b) "Hash: equal structs hash equal")
+      (assert_true (eq (value_hash 0) (value_hash 0)) "Hash: deterministic")))
+
+  ; Clone — a fresh field-by-field copy, structurally equal but a DISTINCT map
+  ; (mutating the clone does not alter the original's top level).
+  (bind ((cln (derive_for "clone" "TPair"))
+         (orig (assoc (map_of) "a" 9 "b" "w")))
+    (bind ((copy (cln orig)))
+      (do
+        (assert_true (value_eq orig copy) "Clone: copy is structurally equal")
+        (assert_true (not (eq orig copy)) "Clone: copy is a DISTINCT map")
+        (assoc copy "a" 100)
+        (assert_eq (get orig "a" null) 9 "Clone: mutating the copy spares the original"))))
+
+  ; register_battery! is idempotent / additive: a second call is a no-op and a
+  ; pre-existing same-named derive is preserved (not a duplicate error).
+  (register_battery!)
+  (assert_true (any? (derives) (lambda (n) (eq n "show"))) "battery installed `show`")
+  true)

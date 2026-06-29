@@ -10,8 +10,11 @@ use thiserror::Error;
 /// A single applied edit: the byte range it affected and the net byte-length delta.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IncrementalEditStep {
+    /// Inclusive start byte offset of the affected range.
     pub start: usize,
+    /// Exclusive end byte offset of the affected range.
     pub old_end: usize,
+    /// Net byte-length change (inserted − removed).
     pub delta: isize,
 }
 
@@ -20,7 +23,9 @@ pub struct IncrementalEditStep {
 /// Records a point in the text after which all offsets shift by `delta` bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SpanShift {
+    /// Offset at/after which the shift applies.
     pub shift_from: usize,
+    /// Bytes to add to offsets at/after `shift_from`.
     pub delta: isize,
 }
 
@@ -29,32 +34,70 @@ pub struct SpanShift {
 /// A simpler transplant plan built from old/new text boundaries.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoundaryTransplant {
+    /// Length of the unchanged prefix shared by old and new text.
     pub prefix: usize,
+    /// End of the edited region in the old text.
     pub old_edit_end: usize,
+    /// Net byte-length change across the edit.
     pub delta: isize,
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error, Clone, PartialEq)]
+/// Why edit normalization/sequencing failed.
 pub enum IncrementalEditError {
     #[error("invalid edit range at edit[{index}]: start={start} old_end={old_end} len={len}")]
+    /// An edit's byte range was invalid for the text.
     InvalidRange {
+        /// Index of the offending edit.
         index: usize,
+        /// Edit start offset.
         start: usize,
+        /// Edit old-end offset.
         old_end: usize,
+        /// Text length.
         len: usize,
+    },
+    #[error(
+        "edit[{index}] length delta is too large: inserted={inserted_len} removed={removed_len}"
+    )]
+    /// An edit's length delta overflowed.
+    DeltaOverflow {
+        /// Index of the offending edit.
+        index: usize,
+        /// Inserted byte count.
+        inserted_len: usize,
+        /// Removed byte count.
+        removed_len: usize,
+    },
+    #[error("edit[{index}] shifted offset overflows: offset={offset} delta={delta}")]
+    /// A shifted offset overflowed.
+    OffsetOverflow {
+        /// Index of the offending edit.
+        index: usize,
+        /// The offset being shifted.
+        offset: usize,
+        /// The shift delta.
+        delta: isize,
     },
     #[error(
         "overlapping snapshot edits: edit[{cur_index}] [{cur_start},{cur_end}) overlaps \
          edit[{prev_index}] [{prev_start},{prev_end})"
     )]
+    /// Two snapshot edits overlapped.
     OverlappingEdits {
+        /// Index of the current edit.
         cur_index: usize,
+        /// Current edit start.
         cur_start: usize,
+        /// Current edit end.
         cur_end: usize,
+        /// Index of the previous edit.
         prev_index: usize,
+        /// Previous edit start.
         prev_start: usize,
+        /// Previous edit end.
         prev_end: usize,
     },
 }
@@ -78,23 +121,28 @@ pub fn compile_incremental_edit_steps(
     let mut current = old_text.to_string();
     for (idx, edit) in edits.iter().enumerate() {
         let len = current.len();
-        if edit.start > len || edit.old_end > len || edit.start > edit.old_end {
+        if edit.start() > len || edit.old_end() > len || edit.start() > edit.old_end() {
             return Err(IncrementalEditError::InvalidRange {
                 index: idx,
-                start: edit.start,
-                old_end: edit.old_end,
+                start: edit.start(),
+                old_end: edit.old_end(),
                 len,
             });
         }
-        let delta = edit.replacement.len() as isize - (edit.old_end - edit.start) as isize;
+        let delta = checked_len_delta(edit.replacement().len(), edit.old_end() - edit.start())
+            .ok_or(IncrementalEditError::DeltaOverflow {
+                index: idx,
+                inserted_len: edit.replacement().len(),
+                removed_len: edit.old_end() - edit.start(),
+            })?;
         steps.push(IncrementalEditStep {
-            start: edit.start,
-            old_end: edit.old_end,
+            start: edit.start(),
+            old_end: edit.old_end(),
             delta,
         });
-        let mut new_text = current[..edit.start].to_string();
-        new_text.push_str(&edit.replacement);
-        new_text.push_str(&current[edit.old_end..]);
+        let mut new_text = current[..edit.start()].to_string();
+        new_text.push_str(edit.replacement());
+        new_text.push_str(&current[edit.old_end()..]);
         current = new_text;
     }
     Ok((steps, current))
@@ -118,22 +166,69 @@ pub fn snapshot_edits_to_sequential(
 
     let mut sequential = Vec::with_capacity(sorted.len());
     let mut delta: isize = 0;
-    for (_, edit) in &sorted {
-        let seq_start = (edit.start as isize + delta) as usize;
-        let seq_old_end = (edit.old_end as isize + delta) as usize;
-        sequential.push(IncrementalEdit::new_unchecked(
-            seq_start,
-            seq_old_end,
-            edit.replacement.clone(),
-        ));
-        delta += edit.replacement.len() as isize - (edit.old_end - edit.start) as isize;
+    for (index, edit) in &sorted {
+        let seq_start = shift_offset_by_delta(edit.start(), delta).ok_or(
+            IncrementalEditError::OffsetOverflow {
+                index: *index,
+                offset: edit.start(),
+                delta,
+            },
+        )?;
+        let seq_old_end = shift_offset_by_delta(edit.old_end(), delta).ok_or(
+            IncrementalEditError::OffsetOverflow {
+                index: *index,
+                offset: edit.old_end(),
+                delta,
+            },
+        )?;
+        sequential.push(
+            IncrementalEdit::new(seq_start, seq_old_end, edit.replacement().to_string()).ok_or(
+                IncrementalEditError::InvalidRange {
+                    index: *index,
+                    start: seq_start,
+                    old_end: seq_old_end,
+                    len: base_text.len(),
+                },
+            )?,
+        );
+        let edit_delta = checked_len_delta(edit.replacement().len(), edit.old_end() - edit.start())
+            .ok_or(IncrementalEditError::DeltaOverflow {
+                index: *index,
+                inserted_len: edit.replacement().len(),
+                removed_len: edit.old_end() - edit.start(),
+            })?;
+        delta = delta
+            .checked_add(edit_delta)
+            .ok_or(IncrementalEditError::DeltaOverflow {
+                index: *index,
+                inserted_len: edit.replacement().len(),
+                removed_len: edit.old_end() - edit.start(),
+            })?;
     }
     Ok(sequential)
 }
 
+fn checked_len_delta(inserted_len: usize, removed_len: usize) -> Option<isize> {
+    if inserted_len >= removed_len {
+        isize::try_from(inserted_len - removed_len).ok()
+    } else {
+        isize::try_from(removed_len - inserted_len)
+            .ok()
+            .and_then(isize::checked_neg)
+    }
+}
+
+pub(crate) fn shift_offset_by_delta(offset: usize, delta: isize) -> Option<usize> {
+    if delta >= 0 {
+        offset.checked_add(delta as usize)
+    } else {
+        offset.checked_sub(delta.unsigned_abs())
+    }
+}
+
 fn _sort_snapshot_edits(edits: &[IncrementalEdit]) -> Vec<(usize, &IncrementalEdit)> {
     let mut indexed: Vec<(usize, &IncrementalEdit)> = edits.iter().enumerate().collect();
-    indexed.sort_by_key(|(i, e)| (e.start, e.old_end, *i));
+    indexed.sort_by_key(|(i, e)| (e.start(), e.old_end(), *i));
     indexed
 }
 
@@ -145,28 +240,28 @@ fn _validate_snapshot_edit_ranges(
     let mut prev_end = 0usize;
     let mut prev_index: Option<usize> = None;
     for &(index, edit) in sorted {
-        if edit.start > base_len || edit.old_end > base_len || edit.start > edit.old_end {
+        if edit.start() > base_len || edit.old_end() > base_len || edit.start() > edit.old_end() {
             return Err(IncrementalEditError::InvalidRange {
                 index,
-                start: edit.start,
-                old_end: edit.old_end,
+                start: edit.start(),
+                old_end: edit.old_end(),
                 len: base_len,
             });
         }
         if let Some(pi) = prev_index {
-            if edit.start < prev_end {
+            if edit.start() < prev_end {
                 return Err(IncrementalEditError::OverlappingEdits {
                     cur_index: index,
-                    cur_start: edit.start,
-                    cur_end: edit.old_end,
+                    cur_start: edit.start(),
+                    cur_end: edit.old_end(),
                     prev_index: pi,
                     prev_start,
                     prev_end,
                 });
             }
         }
-        prev_start = edit.start;
-        prev_end = edit.old_end;
+        prev_start = edit.start();
+        prev_end = edit.old_end();
         prev_index = Some(index);
     }
     Ok(())
@@ -176,7 +271,7 @@ fn _validate_snapshot_edit_ranges(
 
 /// Classify interval `[start, end)` relative to edit region `[prefix, old_edit_end)`.
 ///
-/// - `"prefix"` — interval is entirely before the edit region (`hi < prefix`)
+/// - `"prefix"` — interval is entirely before the edit region (`hi <= prefix`)
 /// - `"suffix"` — interval is entirely after the edit region (`lo >= old_edit_end`)
 /// - `None` — interval overlaps the edit region; entry cannot be transplanted
 pub fn cache_interval_zone(
@@ -187,7 +282,7 @@ pub fn cache_interval_zone(
 ) -> Option<&'static str> {
     let lo = start.min(end);
     let hi = start.max(end);
-    if hi < prefix {
+    if hi <= prefix {
         Some("prefix")
     } else if lo >= old_edit_end {
         Some("suffix")
@@ -207,16 +302,11 @@ pub fn apply_incremental_steps_to_entry(
     end: usize,
     steps: &[IncrementalEditStep],
 ) -> Option<(usize, usize, Vec<SpanShift>)> {
-    let mut cur_start = start as isize;
-    let mut cur_end = end as isize;
+    let mut cur_start = start;
+    let mut cur_end = end;
     let mut span_shifts: Vec<SpanShift> = Vec::new();
     for step in steps {
-        let zone = cache_interval_zone(
-            cur_start as usize,
-            cur_end as usize,
-            step.start,
-            step.old_end,
-        )?;
+        let zone = cache_interval_zone(cur_start, cur_end, step.start, step.old_end)?;
         if zone == "suffix" {
             if step.delta != 0 {
                 span_shifts.push(SpanShift {
@@ -224,11 +314,11 @@ pub fn apply_incremental_steps_to_entry(
                     delta: step.delta,
                 });
             }
-            cur_start += step.delta;
-            cur_end += step.delta;
+            cur_start = shift_offset_by_delta(cur_start, step.delta)?;
+            cur_end = shift_offset_by_delta(cur_end, step.delta)?;
         }
     }
-    Some((cur_start as usize, cur_end as usize, span_shifts))
+    Some((cur_start, cur_end, span_shifts))
 }
 
 /// Apply edit steps to `[start, end)`, returning the shifted interval only.
@@ -239,21 +329,16 @@ pub fn apply_incremental_steps_to_interval(
     end: usize,
     steps: &[IncrementalEditStep],
 ) -> Option<(usize, usize)> {
-    let mut cur_start = start as isize;
-    let mut cur_end = end as isize;
+    let mut cur_start = start;
+    let mut cur_end = end;
     for step in steps {
-        let zone = cache_interval_zone(
-            cur_start as usize,
-            cur_end as usize,
-            step.start,
-            step.old_end,
-        )?;
+        let zone = cache_interval_zone(cur_start, cur_end, step.start, step.old_end)?;
         if zone == "suffix" {
-            cur_start += step.delta;
-            cur_end += step.delta;
+            cur_start = shift_offset_by_delta(cur_start, step.delta)?;
+            cur_end = shift_offset_by_delta(cur_end, step.delta)?;
         }
     }
-    Some((cur_start as usize, cur_end as usize))
+    Some((cur_start, cur_end))
 }
 
 // ── Boundary transplant helpers ───────────────────────────────────────────────
@@ -264,12 +349,12 @@ pub fn boundary_transplant_plan(
     new_len: usize,
     prefix: usize,
     old_edit_end: usize,
-) -> BoundaryTransplant {
-    BoundaryTransplant {
+) -> Option<BoundaryTransplant> {
+    Some(BoundaryTransplant {
         prefix,
         old_edit_end,
-        delta: new_len as isize - old_len as isize,
-    }
+        delta: checked_len_delta(new_len, old_len)?,
+    })
 }
 
 /// Transplant a cached entry `[start, end)` using a boundary plan.
@@ -284,9 +369,11 @@ pub fn transplant_cached_entry_with_boundary(
     if zone == "prefix" || boundary.delta == 0 {
         return Some((start, end, vec![]));
     }
+    let new_start = shift_offset_by_delta(start, boundary.delta)?;
+    let new_end = shift_offset_by_delta(end, boundary.delta)?;
     Some((
-        (start as isize + boundary.delta) as usize,
-        (end as isize + boundary.delta) as usize,
+        new_start,
+        new_end,
         vec![SpanShift {
             shift_from: boundary.old_edit_end,
             delta: boundary.delta,
@@ -305,8 +392,8 @@ pub fn transplant_interval_with_boundary(
         return Some((start, end));
     }
     Some((
-        (start as isize + boundary.delta) as usize,
-        (end as isize + boundary.delta) as usize,
+        shift_offset_by_delta(start, boundary.delta)?,
+        shift_offset_by_delta(end, boundary.delta)?,
     ))
 }
 
@@ -317,11 +404,15 @@ mod tests {
     use super::*;
     use crate::types::IncrementalEdit;
 
+    fn edit(start: usize, old_end: usize, replacement: impl Into<String>) -> IncrementalEdit {
+        IncrementalEdit::new(start, old_end, replacement).expect("test edit must be valid")
+    }
+
     // ── compile_incremental_edit_steps ────────────────────────────────────────
 
     #[test]
     fn compile_steps_single_insert() {
-        let edits = vec![IncrementalEdit::new_unchecked(3, 3, "XY")];
+        let edits = vec![edit(3, 3, "XY")];
         let (steps, text) = compile_incremental_edit_steps("hello", &edits).unwrap();
         assert_eq!(text, "helXYlo");
         assert_eq!(steps.len(), 1);
@@ -330,7 +421,7 @@ mod tests {
 
     #[test]
     fn compile_steps_single_delete() {
-        let edits = vec![IncrementalEdit::new_unchecked(1, 4, "")];
+        let edits = vec![edit(1, 4, "")];
         let (steps, text) = compile_incremental_edit_steps("hello", &edits).unwrap();
         assert_eq!(text, "ho");
         assert_eq!(steps[0].delta, -3);
@@ -338,7 +429,7 @@ mod tests {
 
     #[test]
     fn compile_steps_replace() {
-        let edits = vec![IncrementalEdit::new_unchecked(0, 2, "AB")];
+        let edits = vec![edit(0, 2, "AB")];
         let (steps, text) = compile_incremental_edit_steps("hello", &edits).unwrap();
         assert_eq!(text, "ABllo");
         assert_eq!(steps[0].delta, 0);
@@ -347,10 +438,7 @@ mod tests {
     #[test]
     fn compile_steps_sequential_multiple() {
         // "abcde" → delete 'b' → "acde" → insert 'X' at 2 → "acXde"
-        let edits = vec![
-            IncrementalEdit::new_unchecked(1, 2, ""),
-            IncrementalEdit::new_unchecked(2, 2, "X"),
-        ];
+        let edits = vec![edit(1, 2, ""), edit(2, 2, "X")];
         let (steps, text) = compile_incremental_edit_steps("abcde", &edits).unwrap();
         assert_eq!(text, "acXde");
         assert_eq!(steps[0].delta, -1);
@@ -359,7 +447,7 @@ mod tests {
 
     #[test]
     fn compile_steps_invalid_range_returns_error() {
-        let edits = vec![IncrementalEdit::new_unchecked(3, 10, "x")];
+        let edits = vec![edit(3, 10, "x")];
         let err = compile_incremental_edit_steps("hi", &edits).unwrap_err();
         assert!(matches!(err, IncrementalEditError::InvalidRange { .. }));
     }
@@ -368,11 +456,11 @@ mod tests {
 
     #[test]
     fn snapshot_sequential_single() {
-        let edits = vec![IncrementalEdit::new_unchecked(1, 3, "XY")];
+        let edits = vec![edit(1, 3, "XY")];
         let seq = snapshot_edits_to_sequential("hello", &edits).unwrap();
         assert_eq!(seq.len(), 1);
-        assert_eq!(seq[0].start, 1);
-        assert_eq!(seq[0].old_end, 3);
+        assert_eq!(seq[0].start(), 1);
+        assert_eq!(seq[0].old_end(), 3);
     }
 
     #[test]
@@ -383,17 +471,14 @@ mod tests {
         // sequential:
         //   (0,1,"AB") → delta=+1
         //   (3+1,4+1,"Z") = (4,5,"Z") → delta=0
-        let edits = vec![
-            IncrementalEdit::new_unchecked(3, 4, "Z"),
-            IncrementalEdit::new_unchecked(0, 1, "AB"),
-        ];
+        let edits = vec![edit(3, 4, "Z"), edit(0, 1, "AB")];
         let seq = snapshot_edits_to_sequential("hello", &edits).unwrap();
         assert_eq!(seq.len(), 2);
-        assert_eq!(seq[0].start, 0);
-        assert_eq!(seq[0].old_end, 1);
-        assert_eq!(seq[0].replacement, "AB");
-        assert_eq!(seq[1].start, 4); // shifted by +1
-        assert_eq!(seq[1].old_end, 5);
+        assert_eq!(seq[0].start(), 0);
+        assert_eq!(seq[0].old_end(), 1);
+        assert_eq!(seq[0].replacement(), "AB");
+        assert_eq!(seq[1].start(), 4); // shifted by +1
+        assert_eq!(seq[1].old_end(), 5);
     }
 
     #[test]
@@ -404,10 +489,7 @@ mod tests {
 
     #[test]
     fn snapshot_sequential_overlapping_returns_error() {
-        let edits = vec![
-            IncrementalEdit::new_unchecked(0, 3, "X"),
-            IncrementalEdit::new_unchecked(2, 4, "Y"),
-        ];
+        let edits = vec![edit(0, 3, "X"), edit(2, 4, "Y")];
         let err = snapshot_edits_to_sequential("hello", &edits).unwrap_err();
         assert!(matches!(err, IncrementalEditError::OverlappingEdits { .. }));
     }
@@ -416,7 +498,7 @@ mod tests {
 
     #[test]
     fn zone_prefix() {
-        // interval [0,3), prefix=5, old_edit_end=8 → hi=3 < prefix=5 → "prefix"
+        // interval [0,3), prefix=5, old_edit_end=8 -> hi=3 <= prefix=5 -> "prefix"
         assert_eq!(cache_interval_zone(0, 3, 5, 8), Some("prefix"));
     }
 
@@ -434,9 +516,9 @@ mod tests {
 
     #[test]
     fn zone_touching_boundary() {
-        // interval [0,5) — hi=5 is NOT < prefix=5, lo=0 < 8 → overlap → None
-        assert_eq!(cache_interval_zone(0, 5, 5, 8), None);
-        // interval [8,10) — lo=8 >= old_edit_end=8 → "suffix"
+        // interval [0,5) ends exactly where the edit starts, so it is still prefix.
+        assert_eq!(cache_interval_zone(0, 5, 5, 8), Some("prefix"));
+        // interval [8,10) starts exactly where the edit ends, so it is suffix.
         assert_eq!(cache_interval_zone(8, 10, 5, 8), Some("suffix"));
     }
 
@@ -481,6 +563,16 @@ mod tests {
         assert_eq!(apply_incremental_steps_to_interval(4, 9, &steps), None);
     }
 
+    #[test]
+    fn steps_to_interval_drops_underflowed_shift() {
+        let steps = vec![IncrementalEditStep {
+            start: 0,
+            old_end: 10,
+            delta: -3,
+        }];
+        assert_eq!(apply_incremental_steps_to_interval(1, 2, &steps), None);
+    }
+
     // ── apply_incremental_steps_to_entry ──────────────────────────────────────
 
     #[test]
@@ -515,7 +607,7 @@ mod tests {
 
     #[test]
     fn boundary_plan_computes_delta() {
-        let bp = boundary_transplant_plan(10, 14, 3, 8);
+        let bp = boundary_transplant_plan(10, 14, 3, 8).unwrap();
         assert_eq!(bp.delta, 4);
         assert_eq!(bp.prefix, 3);
         assert_eq!(bp.old_edit_end, 8);
@@ -523,21 +615,21 @@ mod tests {
 
     #[test]
     fn transplant_interval_prefix_unchanged() {
-        let bp = boundary_transplant_plan(5, 7, 10, 15);
+        let bp = boundary_transplant_plan(5, 7, 10, 15).unwrap();
         // interval [0,8) — hi=8 < prefix=10 → "prefix", no shift
         assert_eq!(transplant_interval_with_boundary(0, 8, &bp), Some((0, 8)));
     }
 
     #[test]
     fn transplant_interval_suffix_shifted() {
-        let bp = boundary_transplant_plan(5, 7, 3, 6);
+        let bp = boundary_transplant_plan(5, 7, 3, 6).unwrap();
         // interval [7,10) — lo=7 >= old_edit_end=6 → "suffix", delta=+2
         assert_eq!(transplant_interval_with_boundary(7, 10, &bp), Some((9, 12)));
     }
 
     #[test]
     fn transplant_entry_suffix_with_span_shift() {
-        let bp = boundary_transplant_plan(5, 7, 3, 6);
+        let bp = boundary_transplant_plan(5, 7, 3, 6).unwrap();
         let (ns, ne, shifts) = transplant_cached_entry_with_boundary(7, 10, &bp).unwrap();
         assert_eq!((ns, ne), (9, 12));
         assert_eq!(shifts.len(), 1);
@@ -548,7 +640,7 @@ mod tests {
     #[test]
     fn transplant_entry_no_delta_no_shift() {
         // delta=0 means no span shifts even if suffix
-        let bp = boundary_transplant_plan(5, 5, 3, 6);
+        let bp = boundary_transplant_plan(5, 5, 3, 6).unwrap();
         let (ns, ne, shifts) = transplant_cached_entry_with_boundary(7, 10, &bp).unwrap();
         assert_eq!((ns, ne), (7, 10));
         assert!(shifts.is_empty());
@@ -556,8 +648,13 @@ mod tests {
 
     #[test]
     fn transplant_overlap_returns_none() {
-        let bp = boundary_transplant_plan(5, 7, 3, 6);
+        let bp = boundary_transplant_plan(5, 7, 3, 6).unwrap();
         // interval [4, 7) overlaps edit [3,6)
         assert_eq!(transplant_interval_with_boundary(4, 7, &bp), None);
+    }
+
+    #[test]
+    fn boundary_plan_rejects_unrepresentable_delta() {
+        assert!(boundary_transplant_plan(0, usize::MAX, 0, 0).is_none());
     }
 }

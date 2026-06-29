@@ -1,0 +1,244 @@
+; stdlib/lib/tests/test_time.caap — in-language tests for lib/time.
+;
+; NOTE: assertions compare SCALARS only (ints/strings/bools). Datetime and
+; calendar results are maps, so each field is pulled out with `get` and checked
+; individually rather than comparing whole maps — the same idiom test_map /
+; test_result use (kernel `eq` on aggregates is not relied upon here).
+
+;; @area: core
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.time
+     is_leap?
+     days_from_civil civil_from_days day_of_week
+     datetime_from_unix unix_from_datetime
+     floor_div floor_mod
+     duration to_seconds to_minutes to_hours to_days
+     from_seconds from_minutes from_hours from_days
+     duration_add duration_sub duration_compare
+     format_iso8601 parse_iso8601
+     offset_suffix format_iso8601_offset parse_offset_minutes
+     pad2 pad4
+     frac3 format_iso8601_millis parse_fraction_millis fraction_end
+     parse_iso8601_millis)
+
+; assert_ymd — check a calendar map's year/month/day fields.
+(bind assert_ymd
+  (lambda (m y mo d label)
+    (do
+      (assert_eq (get m "year")  y  (string_concat_many label " .year"))
+      (assert_eq (get m "month") mo (string_concat_many label " .month"))
+      (assert_eq (get m "day")   d  (string_concat_many label " .day")))))
+
+; assert_dt — check a datetime map's six fields.
+(bind assert_dt
+  (lambda (m y mo d h mi s label)
+    (do
+      (assert_ymd m y mo d label)
+      (assert_eq (get m "hour")   h  (string_concat_many label " .hour"))
+      (assert_eq (get m "minute") mi (string_concat_many label " .minute"))
+      (assert_eq (get m "second") s  (string_concat_many label " .second")))))
+
+(do
+  ; ── leap years ─────────────────────────────────────────────────────────────
+  (assert_eq (is_leap? 2000) true  "is_leap 2000 (div 400)")
+  (assert_eq (is_leap? 1900) false "is_leap 1900 (div 100 not 400)")
+  (assert_eq (is_leap? 2004) true  "is_leap 2004 (div 4)")
+  (assert_eq (is_leap? 2001) false "is_leap 2001 (odd)")
+  (assert_eq (is_leap? 1970) false "is_leap 1970")
+
+  ; ── days_from_civil — known anchors ──────────────────────────────────────────
+  (assert_eq (days_from_civil 1970 1 1) 0      "days epoch")
+  (assert_eq (days_from_civil 2000 1 1) 10957  "days 2000-01-01")
+  (assert_eq (days_from_civil 1970 1 2) 1      "days epoch + 1")
+  (assert_eq (days_from_civil 1969 12 31) -1   "days epoch - 1 (pre-epoch)")
+  (assert_eq (days_from_civil 1972 3 1) 790    "days after a leap day")
+
+  ; ── civil_from_days — known dates + round-trips ─────────────────────────────
+  (assert_ymd (civil_from_days 0)     1970 1  1  "civil_from_days epoch")
+  (assert_ymd (civil_from_days 10957) 2000 1  1  "civil_from_days 2000")
+  (assert_ymd (civil_from_days -1)    1969 12 31 "civil_from_days pre-epoch")
+  ; days_from_civil ∘ civil_from_days = identity across a spread of days
+  (assert_eq (days_from_civil
+               (get (civil_from_days 12345) "year")
+               (get (civil_from_days 12345) "month")
+               (get (civil_from_days 12345) "day")) 12345 "round-trip 12345")
+  (assert_eq (days_from_civil
+               (get (civil_from_days 20000) "year")
+               (get (civil_from_days 20000) "month")
+               (get (civil_from_days 20000) "day")) 20000 "round-trip 20000")
+  (assert_eq (days_from_civil
+               (get (civil_from_days -5000) "year")
+               (get (civil_from_days -5000) "month")
+               (get (civil_from_days -5000) "day")) -5000 "round-trip -5000")
+  (assert_ymd (civil_from_days (days_from_civil 2024 2 29)) 2024 2 29
+    "round-trip leap day 2024-02-29")
+
+  ; ── day_of_week (0 = Sunday) ─────────────────────────────────────────────────
+  (assert_eq (day_of_week 0) 4 "1970-01-01 is Thursday")
+  (assert_eq (day_of_week (days_from_civil 1970 1 4)) 0 "1970-01-04 is Sunday")
+  (assert_eq (day_of_week (days_from_civil 2000 1 1)) 6 "2000-01-01 is Saturday")
+  (assert_eq (day_of_week -1) 3 "1969-12-31 is Wednesday")
+
+  ; ── floor_div / floor_mod (negative-safe) ────────────────────────────────────
+  (assert_eq (floor_div 7 3) 2   "floor_div pos")
+  (assert_eq (floor_div -7 3) -3 "floor_div neg toward -inf")
+  (assert_eq (floor_mod -7 3) 2  "floor_mod neg in range")
+  (assert_eq (floor_mod 7 3) 1   "floor_mod pos")
+
+  ; ── unix <-> datetime ────────────────────────────────────────────────────────
+  (assert_dt (datetime_from_unix 0)         1970 1 1  0  0  0  "datetime epoch")
+  (assert_dt (datetime_from_unix 946684800) 2000 1 1  0  0  0  "datetime 2000-01-01")
+  ; 2009-02-13T23:31:30Z — the famous 1234567890 timestamp
+  (assert_dt (datetime_from_unix 1234567890) 2009 2 13 23 31 30 "datetime 1234567890")
+  (assert_eq (unix_from_datetime (datetime_from_unix 0)) 0 "unix round-trip epoch")
+  (assert_eq (unix_from_datetime (datetime_from_unix 1234567890)) 1234567890
+    "unix round-trip 1234567890")
+  (assert_eq (unix_from_datetime (datetime_from_unix 946702800)) 946702800
+    "unix round-trip with time-of-day")
+  ; pre-epoch negative seconds: 1969-12-31T23:59:59Z = -1
+  (assert_dt (datetime_from_unix -1) 1969 12 31 23 59 59 "datetime pre-epoch -1")
+  (assert_eq (unix_from_datetime (datetime_from_unix -100000)) -100000
+    "unix round-trip pre-epoch")
+
+  ; ── ISO-8601 formatting / parsing ────────────────────────────────────────────
+  (assert_eq (format_iso8601 (datetime_from_unix 0)) "1970-01-01T00:00:00Z"
+    "format epoch")
+  (assert_eq (format_iso8601 (datetime_from_unix 1234567890)) "2009-02-13T23:31:30Z"
+    "format 1234567890")
+  (assert_dt (parse_iso8601 "1970-01-01T00:00:00Z") 1970 1 1 0 0 0 "parse epoch")
+  (assert_dt (parse_iso8601 "2009-02-13T23:31:30Z") 2009 2 13 23 31 30 "parse 1234567890")
+  ; format ∘ parse = identity on a well-formed timestamp
+  (assert_eq (format_iso8601 (parse_iso8601 "2024-02-29T12:34:56Z"))
+    "2024-02-29T12:34:56Z" "iso round-trip leap day")
+  ; parse ∘ format = identity through unix
+  (assert_eq (unix_from_datetime (parse_iso8601 (format_iso8601 (datetime_from_unix 1717200000))))
+    1717200000 "iso full round-trip via unix")
+
+  ; ── durations ────────────────────────────────────────────────────────────────
+  (assert_eq (duration 1500) 1500 "duration ms constructor")
+  (assert_eq (to_seconds 1500) 1   "to_seconds truncates")
+  (assert_eq (to_seconds 2000) 2   "to_seconds exact")
+  (assert_eq (to_minutes 120000) 2 "to_minutes")
+  (assert_eq (to_hours 7200000) 2  "to_hours")
+  (assert_eq (to_days 172800000) 2 "to_days")
+  (assert_eq (from_seconds 2) 2000     "from_seconds")
+  (assert_eq (from_minutes 2) 120000   "from_minutes")
+  (assert_eq (from_hours 2) 7200000    "from_hours")
+  (assert_eq (from_days 2) 172800000   "from_days")
+  ; from_* and to_* are inverse on whole units
+  (assert_eq (to_hours (from_hours 5)) 5 "to_hours ∘ from_hours")
+  (assert_eq (duration_add 1000 500) 1500 "duration_add")
+  (assert_eq (duration_sub 1000 500) 500  "duration_sub")
+  (assert_eq (duration_compare 1000 2000) -1 "duration_compare shorter")
+  (assert_eq (duration_compare 2000 2000) 0  "duration_compare equal")
+  (assert_eq (duration_compare 3000 2000) 1  "duration_compare longer")
+
+  ; ── fixed-offset ISO-8601 ────────────────────────────────────────────────────
+  ; parse_offset_minutes reads the zone suffix into signed minutes east of UTC
+  (assert_eq (parse_offset_minutes "1970-01-01T00:00:00Z") 0    "Z offset is 0")
+  (assert_eq (parse_offset_minutes "1970-01-01T00:00:00")  0    "no zone is UTC (0)")
+  (assert_eq (parse_offset_minutes "1970-01-01T00:00:00+02:00") 120  "+02:00 = +120 min")
+  (assert_eq (parse_offset_minutes "1970-01-01T00:00:00-05:00") -300 "-05:00 = -300 min")
+  (assert_eq (parse_offset_minutes "1970-01-01T00:00:00+05:30") 330  "+05:30 = +330 min")
+  ; a malformed/truncated zone is TOTAL: treated as UTC (0), never raises
+  (assert_eq (parse_offset_minutes "1970-01-01T00:00:00+")     0 "bare '+' zone -> 0 (no throw)")
+  (assert_eq (parse_offset_minutes "1970-01-01T00:00:00+02")   0 "truncated '+02' zone -> 0")
+  (assert_eq (parse_offset_minutes "1970-01-01T00:00:00+0500") 0 "missing-colon zone -> 0")
+
+  ; offset_suffix renders signed minutes back to a zone string (Z for 0)
+  (assert_eq (offset_suffix 0)    "Z"      "offset_suffix 0 is Z")
+  (assert_eq (offset_suffix 120)  "+02:00" "offset_suffix +120")
+  (assert_eq (offset_suffix -300) "-05:00" "offset_suffix -300")
+  (assert_eq (offset_suffix 330)  "+05:30" "offset_suffix +330")
+
+  ; parse_iso8601 APPLIES the offset: a local wall-clock is shifted to UTC.
+  ; 2009-02-13T18:31:30-05:00 is the same instant as 2009-02-13T23:31:30Z.
+  (assert_dt (parse_iso8601 "2009-02-13T18:31:30-05:00") 2009 2 13 23 31 30
+    "parse applies a -05:00 offset to UTC")
+  ; 2009-02-14T01:31:30+02:00 is also 2009-02-13T23:31:30Z (offset crosses midnight)
+  (assert_dt (parse_iso8601 "2009-02-14T01:31:30+02:00") 2009 2 13 23 31 30
+    "parse applies a +02:00 offset (and rolls the date back)")
+  ; a Z / no-suffix timestamp is UTC and passes through unchanged (preserved)
+  (assert_dt (parse_iso8601 "2009-02-13T23:31:30Z") 2009 2 13 23 31 30
+    "Z timestamp is unchanged (UTC default)")
+  ; an offset'd parse equals the equivalent UTC unix instant
+  (assert_eq
+    (unix_from_datetime (parse_iso8601 "2009-02-13T18:31:30-05:00"))
+    (unix_from_datetime (parse_iso8601 "2009-02-13T23:31:30Z"))
+    "offset and Z spellings of one instant parse to the same unix time")
+
+  ; format_iso8601_offset renders a local wall-clock with its zone suffix
+  (assert_eq
+    (format_iso8601_offset (assoc (map_of) "year" 2009 "month" 2 "day" 13
+                             "hour" 18 "minute" 31 "second" 30) -300)
+    "2009-02-13T18:31:30-05:00" "format with a -05:00 offset")
+  ; a zero offset formats with the trailing Z (matching format_iso8601)
+  (assert_eq
+    (format_iso8601_offset (datetime_from_unix 0) 0)
+    "1970-01-01T00:00:00Z" "format_iso8601_offset 0 matches format_iso8601 (Z)")
+
+  ; ── pad2 / pad4 (now delegating to text.format pad_left; same behaviour) ──────
+  (assert_eq (pad2 0) "00"   "pad2 0")
+  (assert_eq (pad2 7) "07"   "pad2 single digit")
+  (assert_eq (pad2 42) "42"  "pad2 already 2 wide")
+  (assert_eq (pad2 123) "123" "pad2 wider than 2 is unchanged")
+  (assert_eq (pad4 0) "0000" "pad4 0")
+  (assert_eq (pad4 7) "0007" "pad4 single digit")
+  (assert_eq (pad4 2024) "2024" "pad4 already 4 wide")
+  (assert_eq (pad4 12345) "12345" "pad4 wider than 4 is unchanged")
+
+  ; ── fractional-second (millis) formatting ────────────────────────────────────
+  ; frac3 renders only a NON-ZERO fraction, zero-padded to three digits
+  (assert_eq (frac3 0)   ""     "frac3 0 -> empty (no fraction printed)")
+  (assert_eq (frac3 7)   ".007" "frac3 7 -> .007")
+  (assert_eq (frac3 50)  ".050" "frac3 50 -> .050")
+  (assert_eq (frac3 250) ".250" "frac3 250 -> .250")
+  (assert_eq (frac3 999) ".999" "frac3 999 -> .999")
+  ; format_iso8601_millis: with millis present appends .fff; with 0/absent it is
+  ; byte-identical to format_iso8601 (a strict superset)
+  (assert_eq
+    (format_iso8601_millis (assoc (datetime_from_unix 0) "millis" 123))
+    "1970-01-01T00:00:00.123Z" "format millis 123")
+  (assert_eq
+    (format_iso8601_millis (assoc (datetime_from_unix 1234567890) "millis" 5))
+    "2009-02-13T23:31:30.005Z" "format millis 5 (zero-padded)")
+  (assert_eq
+    (format_iso8601_millis (datetime_from_unix 0))
+    "1970-01-01T00:00:00Z" "format millis absent == format_iso8601 (no .fff)")
+  (assert_eq
+    (format_iso8601_millis (assoc (datetime_from_unix 0) "millis" 0))
+    "1970-01-01T00:00:00Z" "format millis 0 == format_iso8601 (no .fff)")
+
+  ; ── fractional-second parsing ────────────────────────────────────────────────
+  ; parse_fraction_millis reads the optional .fff, scaling short fractions to ms
+  (assert_eq (parse_fraction_millis "1970-01-01T00:00:00.123Z") 123 "parse .123 -> 123")
+  (assert_eq (parse_fraction_millis "1970-01-01T00:00:00.5Z")   500 "parse .5 -> 500 (scaled)")
+  (assert_eq (parse_fraction_millis "1970-01-01T00:00:00.05Z")  50  "parse .05 -> 50 (scaled)")
+  (assert_eq (parse_fraction_millis "1970-01-01T00:00:00.123456Z") 123
+    "parse .123456 -> 123 (millisecond resolution; extra digits dropped)")
+  (assert_eq (parse_fraction_millis "1970-01-01T00:00:00Z") 0 "parse no fraction -> 0")
+  (assert_eq (parse_fraction_millis "1970-01-01T00:00:00") 0 "parse bare (no zone) -> 0")
+  ; fraction_end finds where the zone begins (19 when there is no fraction)
+  (assert_eq (fraction_end "1970-01-01T00:00:00.123Z") 23 "fraction_end after .123")
+  (assert_eq (fraction_end "1970-01-01T00:00:00Z") 19 "fraction_end no fraction -> 19")
+  (assert_eq (fraction_end "1970-01-01T00:00:00.5+02:00") 21 "fraction_end .5 then offset")
+
+  ; parse_iso8601_millis returns the datetime plus a "millis" field, and applies
+  ; a zone offset that follows the fraction
+  (assert_dt (parse_iso8601_millis "2009-02-13T23:31:30.250Z") 2009 2 13 23 31 30
+    "parse millis: whole-second fields")
+  (assert_eq (get (parse_iso8601_millis "2009-02-13T23:31:30.250Z") "millis") 250
+    "parse millis: .250 captured")
+  (assert_eq (get (parse_iso8601_millis "2009-02-13T23:31:30Z") "millis") 0
+    "parse millis: a whole-second timestamp is millis 0")
+  ; offset + fraction: the wall-clock shifts to UTC, the millis ride along
+  (assert_dt (parse_iso8601_millis "2009-02-13T18:31:30.250-05:00") 2009 2 13 23 31 30
+    "parse millis applies -05:00 offset to UTC")
+  (assert_eq (get (parse_iso8601_millis "2009-02-13T18:31:30.250-05:00") "millis") 250
+    "parse millis: fraction preserved across an offset")
+  ; format ∘ parse millis = identity on a fractional timestamp
+  (assert_eq
+    (format_iso8601_millis (parse_iso8601_millis "2024-02-29T12:34:56.789Z"))
+    "2024-02-29T12:34:56.789Z" "millis round-trip (format ∘ parse)"))

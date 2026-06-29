@@ -1,0 +1,30 @@
+; stdlib/semantics/types/infer/result.caap - type-walk result helpers.
+;
+; Internal leaf behind stdlib.semantics.types.infer.
+(module stdlib.semantics.types.infer.result)
+
+(use stdlib.semantics.types.registry int_family? float_family?)
+
+(bind diverge-result? (lambda (r) (eq (value_type r) "map")))
+
+(bind tc_t
+  (lambda (r) (if (diverge-result? r) (get r "type" "never") r)))
+
+(bind tc_div?
+  (lambda (r) (and (diverge-result? r) (eq (get r "diverges" false) true))))
+
+(bind diverge
+  (lambda (t) (assoc (map_of) "type" t "diverges" true)))
+
+(bind join
+  (lambda (a b)
+    (cond
+      ((eq a b) a)
+      ((eq a "never") b)
+      ((eq b "never") a)
+      ((or (eq a null) (eq b null)) null)
+      ((and (int_family? a) (int_family? b)) "int")
+      ((and (float_family? a) (float_family? b)) "float")
+      (else null))))
+
+(export tc_t tc_div? diverge join)

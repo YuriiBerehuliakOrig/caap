@@ -1,0 +1,5 @@
+; tests/bad_range.caap — literal 300 cannot fit a declared u8.
+(module stdlib.fixtures.bad_range)
+(defn f8 ((x u8)) u8 x)
+(bind broken (lambda () (f8 300)))
+(export broken)

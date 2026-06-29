@@ -1,0 +1,253 @@
+; stdlib/lib/random.caap — pure, seedable PRNG (module stdlib.lib.random).
+;
+; A deterministic, host-free pseudo-random generator with FUNCTIONAL
+; state-threading: every draw returns both a value and the *next* rng state, so
+; nothing is mutated in place and the same seed always replays the same
+; sequence. This is the reproducible counterpart to sys.rand's CSPRNG — use it
+; for tests, simulations and property generators, NOT for anything security
+; sensitive.
+;
+; ALGORITHM — a 32-bit linear congruential generator (LCG), Numerical Recipes
+; constants:
+;
+;     state' = (A * state + C) AND MASK
+;     A = 1664525   C = 1013904223   MASK = 0xFFFFFFFF (32 bits)
+;
+; The kernel's int_* are CHECKED (overflow raises), so the state is kept inside
+; 32 bits by masking after every step. The widest intermediate is
+; A*MASK + C = 1664525*4294967295 + 1013904223 ~ 7.15e15, far below i64's
+; 9.22e18 ceiling — so the multiply/add never overflow. A 31-bit non-negative
+; value is read from the HIGH bits of the state (state >> 1), which mix far
+; better than the low bits of an LCG.
+;
+; State is just the raw 32-bit int. make_rng scrambles the seed once so that
+; small/adjacent seeds (0, 1, 2...) don't start with near-identical streams.
+;
+; Every draw returns a map {"value" <result>, "rng" <next state>}; thread the
+; "rng" field into the next call to advance the stream.
+(module stdlib.lib.random)
+
+; ── core LCG step ────────────────────────────────────────────────────────────
+
+(bind LCG_A 1664525)
+(bind LCG_C 1013904223)
+(bind LCG_MASK 4294967295)     ; 0xFFFFFFFF — 32-bit state mask
+(bind VALUE_MASK 2147483647)   ; 0x7FFFFFFF — 31-bit non-negative result mask
+
+; step — advance the raw 32-bit LCG state once.
+;   s  : the current 32-bit state int
+;   -> : the next 32-bit state, masked to 32 bits (never overflows)
+(defn step ((s int)) int
+  (int_and (int_add (int_mul LCG_A s) LCG_C) LCG_MASK))
+
+; raw_value — a 31-bit non-negative int read from the high bits of a state.
+;   s  : a 32-bit state int
+;   -> : (s >> 1) AND 0x7FFFFFFF — a value in [0, 2^31)
+(defn raw_value ((s int)) int
+  (int_and (int_shr s 1) VALUE_MASK))
+
+; result — pack a draw into {"value", "rng"}.
+; `rng` is `any` (not `int`): every call site reads it back out of a result map
+; via `get`, whose static type is unknown — so a bare `map` return keeps the
+; threaded state flowing without a spurious `expected int, got any` at each
+; re-extraction. The state is still a 32-bit int at runtime.
+;   value : the drawn value
+;   rng   : the next rng state to thread forward
+;   ->    : a fresh result map {"value", "rng"}
+(defn result ((value any) (rng any)) map
+  (assoc (map_of) "value" value "rng" rng))
+
+; ── constructor ──────────────────────────────────────────────────────────────
+
+; make_rng — build an rng state from a seed.
+; The seed is folded through one extra step so that nearby seeds (0,1,2...)
+; yield well-separated streams instead of trivially related ones.
+;   seed : any int
+;   ->   : a 32-bit rng state
+(defn make_rng ((seed int)) int
+  (step (int_and seed LCG_MASK)))
+
+; ── primitive draws ──────────────────────────────────────────────────────────
+
+; next — the next non-negative value in [0, 2^31) and the advanced rng.
+;   rng : the current rng state
+;   ->  : {"value" in [0, 2^31), "rng" next state}
+(defn next ((rng int)) map
+  (bind ((s2 (step rng)))
+    (result (raw_value s2) s2)))
+
+; next_int — a value uniformly in [0, n) and the advanced rng.
+; n must be positive; n <= 1 collapses the range to {0}. The modulo bias is
+; negligible for the small bounds these helpers are used with.
+;   rng / n : the state and an exclusive upper bound
+;   ->      : {"value" in [0, n), "rng" next state}
+(defn next_int ((rng int) (n int)) map
+  (bind ((r (next rng)))
+    (if (le n 1)
+      (result 0 (get r "rng"))
+      (result (int_mod (get r "value") n) (get r "rng")))))
+
+; next_range — a value uniformly in [lo, hi) and the advanced rng.
+; Empty/degenerate ranges (hi <= lo) yield lo.
+;   rng / lo / hi : the state and the inclusive-lo / exclusive-hi bounds
+;   ->            : {"value" in [lo, hi), "rng" next state}
+(defn next_range ((rng int) (lo int) (hi int)) map
+  (bind ((span (int_sub hi lo)))
+    (if (le span 0)
+      (result lo (step rng))
+      (bind ((r (next_int rng span)))
+        (result (int_add lo (get r "value")) (get r "rng"))))))
+
+; next_bool — a fair coin flip and the advanced rng.
+;   rng : the current rng state
+;   ->  : {"value" bool, "rng" next state}
+(defn next_bool ((rng int)) map
+  (bind ((r (next_int rng 2)))
+    (result (eq (get r "value") 1) (get r "rng"))))
+
+; ── float / Gaussian draws ───────────────────────────────────────────────────
+
+; TWO_POW_31 — 2^31 as a float, the divisor mapping a 31-bit draw into [0,1).
+(bind TWO_POW_31 2147483648.0)
+; PI — circle constant, for the Box-Muller transform's 2*pi*u term.
+(bind PI 3.141592653589793)
+
+; unit_float — the [0,1) float drawn from STATE `s` (already a state to read,
+; not advanced here). A typed int->float bridge: `raw_value` yields a typed int
+; in [0, 2^31), divided by 2^31. Kept separate from `next_float` so the float
+; draws below can thread typed `int` states without round-tripping through the
+; `any`-typed result map (the kernel's int_to_float / float_* are strictly typed).
+;   s  : a 32-bit rng state to read a uniform from
+;   -> : a float in [0, 1)
+(defn unit_float ((s int)) float
+  (float_div (int_to_float (raw_value s)) TWO_POW_31))
+
+; next_float — a float uniformly in [0, 1) and the advanced rng. The 31-bit
+; integer draw (in [0, 2^31)) is divided by 2^31, so the maximum is strictly
+; below 1.0 (and 0.0 is attainable).
+;   rng : the current rng state
+;   ->  : {"value" float in [0,1), "rng" next state}
+(defn next_float ((rng int)) map
+  (bind ((s2 (step rng)))
+    (result (unit_float s2) s2)))
+
+; next_gaussian — a standard-normal draw (mean 0, stddev 1) via the Box-Muller
+; transform, and the advanced rng. Two independent uniforms u1, u2 in [0,1) are
+; drawn from two successive states; u1 is nudged off 0 (so ln u1 is finite) by
+; mapping a 0 draw to a tiny positive value, then z = sqrt(-2 ln u1) *
+; cos(2*pi*u2). Only the first of the pair of normals Box-Muller produces is
+; returned (the rng advances twice).
+;   rng : the current rng state
+;   ->  : {"value" float (standard normal), "rng" next state (advanced twice)}
+(defn next_gaussian ((rng int)) map
+  (bind ((s1 (step rng))
+         (s2 (step s1))
+         (u1raw (unit_float s1))
+         ; avoid ln(0): a 0 draw becomes 2^-31 (the smallest non-zero this PRNG
+         ; could otherwise yield), keeping the transform finite.
+         (u1 (if (eq u1raw 0.0) (float_div 1.0 TWO_POW_31) u1raw))
+         (u2 (unit_float s2))
+         (mag (sqrt (float_mul -2.0 (log u1))))
+         (z (float_mul mag (cos (float_mul (float_mul 2.0 PI) u2)))))
+    (result z s2)))
+
+; ── sequence draws ───────────────────────────────────────────────────────────
+
+; copy_list — a fresh shallow copy of a list (so callers never mutate the input).
+(defn copy_list ((xs (list T))) (list T)
+  (bind ((out (list_of)))
+    (do (sequence_each xs (lambda (e) (append out e))) out)))
+
+; choice — pick a uniformly random element of a non-empty list.
+; An empty list yields null (and only advances the rng).
+;   rng / xs : the state and the list to draw from
+;   ->       : {"value" an element (or null), "rng" next state}
+(defn choice ((rng int) (xs (list T))) map
+  (if (eq (size xs) 0)
+    (result null (step rng))
+    (bind ((r (next_int rng (size xs))))
+      (result (get xs (get r "value")) (get r "rng")))))
+
+; weighted_choice — pick an element of `xs` with probability proportional to the
+; matching entry of `weights` (same length; non-negative FLOAT weights — pass
+; (int_to_float n) for integer weights). A uniform draw in [0, total) walks the
+; cumulative weights and returns the first element whose running total exceeds
+; it. An empty list, mismatched lengths, or a non-positive total all yield null
+; (and only advance the rng once) — degenerate inputs never throw.
+;   rng / xs / weights : the state, the elements, their relative FLOAT weights
+;   ->                 : {"value" a chosen element (or null), "rng" next state}
+(defn weighted_choice ((rng int) (xs (list T)) (weights (list float))) map
+  (if (or (eq (size xs) 0) (ne (size xs) (size weights)))
+    (result null (step rng))
+    (bind ((total (ref 0.0)))
+      (do
+        (sequence_each weights (lambda (w) (set_ref total (float_add (deref total) w))))
+        (if (le (deref total) 0.0)
+          (result null (step rng))
+          ; a typed [0,1) float from the advanced state; `s2` is the next rng.
+          (bind ((s2 (step rng))
+                 (target (float_mul (unit_float s2) (deref total)))
+                 (acc (ref 0.0))
+                 (chosen (ref null))
+                 (idx (ref 0)))
+            (do
+              (while (and (eq (deref chosen) null) (lt (deref idx) (size xs)))
+                (do
+                  (set_ref acc (float_add (deref acc) (get weights (deref idx))))
+                  (if (lt target (deref acc))
+                    (set_ref chosen (get xs (deref idx)))
+                    (set_ref idx (int_add (deref idx) 1)))))
+              ; float rounding could leave `chosen` null at target≈total: fall
+              ; back to the last element (its cumulative weight is the total).
+              (result
+                (if (eq (deref chosen) null) (get xs (int_sub (size xs) 1)) (deref chosen))
+                s2))))))))
+
+; shuffle — a uniformly random permutation of `xs` (Fisher-Yates), functional.
+; The input list is left untouched; a fresh shuffled list is returned.
+;   rng / xs : the state and the list to permute
+;   ->       : {"value" the shuffled list, "rng" next state}
+(defn shuffle ((rng int) (xs (list T))) map
+  (bind ((out (copy_list xs)) (state (ref rng)) (i (ref (int_sub (size xs) 1))))
+    (do
+      (while (gt (deref i) 0)
+        (bind ((r (next_int (deref state) (int_add (deref i) 1)))
+               (j (get r "value")))
+          (do
+            (set_ref state (get r "rng"))
+            (bind ((tmp (get out (deref i))))
+              (do
+                (set out (deref i) (get out j))
+                (set out j tmp)))
+            (set_ref i (int_sub (deref i) 1)))))
+      (result out (deref state)))))
+
+; sample — k DISTINCT elements drawn uniformly without replacement.
+; Implemented as a partial Fisher-Yates over a copy, then taking the first k.
+; If k >= (size xs) the whole list (shuffled) is returned; k <= 0 yields [].
+;   rng / xs / k : the state, the pool, and how many distinct elements to draw
+;   ->           : {"value" a list of up to k distinct elements, "rng" next state}
+(defn sample ((rng int) (xs (list T)) (k int)) map
+  (bind ((n (size xs))
+         (take_n (if (gt k n) n k)))
+    (if (le take_n 0)
+      (result (list_of) (step rng))
+      (bind ((pool (copy_list xs)) (state (ref rng)) (out (list_of)) (i (ref 0)))
+        (do
+          (while (lt (deref i) take_n)
+            ; pick an index in [i, n) and swap it to position i, then emit it.
+            (bind ((r (next_int (deref state) (int_sub n (deref i))))
+                   (j (int_add (deref i) (get r "value"))))
+              (do
+                (set_ref state (get r "rng"))
+                (bind ((tmp (get pool (deref i))))
+                  (do
+                    (set pool (deref i) (get pool j))
+                    (set pool j tmp)))
+                (append out (get pool (deref i)))
+                (set_ref i (int_add (deref i) 1)))))
+          (result out (deref state)))))))
+
+(export make_rng next next_int next_range next_bool
+        next_float next_gaussian
+        choice weighted_choice shuffle sample)

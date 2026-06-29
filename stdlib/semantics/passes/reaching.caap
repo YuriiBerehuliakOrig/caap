@@ -1,0 +1,183 @@
+; stdlib/semantics/passes/reaching.caap — REACHING DEFINITIONS, the second
+; dataflow client (module stdlib.semantics.passes.reaching).
+;
+; The sibling of liveness, and the proof that the `dataflow` substrate
+; generalizes: liveness is BACKWARD over sets of live NAMES; reaching is FORWARD
+; over sets of DEFINITION SITES. Same CFG, same monotone worklist — only the
+; lattice differs. A definition `(bind "x" v)` / `(set_ref x v)` REACHES a
+; program point if there is a path from the def to that point along which `x` is
+; not redefined. The textbook gen/kill transfer, forward:
+;   reach_out(b) = gen(b) ∪ (reach_in(b) − kill(b))
+; where a later def of a name KILLS every earlier def of the same name.
+;
+; ── the fact ─────────────────────────────────────────────────────────────────
+; A fact is a SET of definition-SITE ids (strings). A site uniquely identifies
+; one def textually: `name#blockid:index`. The set elements are opaque ids; the
+; NAME a site defines is resolved through a side table `sites` (id -> name) the
+; transfer fills in as it walks (deterministic ids ⇒ idempotent). Keeping the
+; lattice fact a flat set of strings is what makes `set_union` (join) and
+; `value_eq` (the fixpoint's order-insensitive "no change" test) just work, the
+; same way liveness's namesets do.
+;
+; ── boundaries ───────────────────────────────────────────────────────────────
+; "Definition site" mirrors dataflow's `stmt_def`: a `(bind "x" v)` def marker
+; (one per binding, emitted by build_cfg) and a `(set_ref x v)` write. The kill
+; is per-NAME within a block walked forward, so two defs of the same name in one
+; straight-line block leave only the LAST reaching — exactly SSA-free gen/kill.
+; A `match`/pattern binding is not a def site (the substrate does not model arm
+; bindings); a call is one statement (its callee a black box).
+(module stdlib.semantics.passes.reaching)
+
+(use stdlib.semantics.dataflow
+  build_cfg cfg_block cfg_block_ids
+  block_stmts block_id stmt_def stmt_uses
+  solve_forward)
+(use stdlib.lib.collections.set
+  set_has? set_items set_union set_filter set_add)
+(use stdlib.semantics.passes.registry
+  install_pass! note! ignored?)
+
+; ── definition sites ─────────────────────────────────────────────────────────
+
+; site_id — the textual identity of a def: `name#blockid:index`. Deterministic
+; in (block, index), so re-deriving it across worklist iterations is stable and
+; the side table `sites` can be filled idempotently.
+(bind site_id
+  (lambda (name bid idx)
+    (string_concat_many name "#" (int_to_string bid) ":" (int_to_string idx))))
+
+; kill_then_gen — apply one def site's gen/kill to a reach SET (pure): drop every
+; reaching site that defines the SAME name (kill), then add this site (gen).
+;   sites : id -> name side table (this id is recorded as defining `name`)
+;   reach : the incoming defset; name/bid/idx identify the def
+;   ->    : a fresh defset
+(bind kill_then_gen
+  (lambda (sites reach name bid idx)
+    (bind ((id (site_id name bid idx)))
+      (do
+        (assoc sites id name)
+        (set_add
+          (set_filter reach (lambda (e) (not (eq (get sites e) name))))
+          id)))))
+
+; step_reach! — advance the (reach, idx) refs of a forward walk by ONE statement
+; `s` of block `bid`: if `s` is a def, apply kill_then_gen; then bump the index.
+; The single per-statement step BOTH forward walkers share — the lattice transfer
+; (block_transfer_reach) and the pass walk (run) — so site numbering stays
+; identical between the fixpoint and the use-before-def check.
+;   sites : id -> name side table (threaded through, mutated by kill_then_gen)
+;   reach : ref to the running defset    idx : ref to the running statement index
+;   bid   : the enclosing block id       s   : the statement node
+(bind step_reach!
+  (lambda (sites reach idx bid s)
+    (bind ((d (stmt_def s)))
+      (do
+        (when (not (eq d null))
+          (set_ref reach (kill_then_gen sites (deref reach) d bid (deref idx))))
+        (set_ref idx (int_add (deref idx) 1))))))
+
+; ── the lattice (a forward gen/kill fixpoint) ────────────────────────────────
+; reaching_lattice builds the lattice over ONE body. It closes over a fresh
+; `sites` table (site id -> defined name) so the per-block transfer can resolve
+; which earlier sites a redefinition kills.
+(bind reaching_lattice
+  (lambda (sites)
+    (assoc (map_of)
+      "bottom" (map_of)                 ; bottom = the empty defset
+      "join"   set_union                ; a def reaches a merge via ANY pred
+      "transfer"
+        ; block_transfer_reach — fold a block's statements FORWARD: from the
+        ; defs reaching block entry, apply each def statement's gen/kill in
+        ; flow order. Pure set algebra over the running fact.
+        (lambda (b reach_in)
+          (bind ((reach (ref reach_in)) (bid (block_id b)) (idx (ref 0)))
+            (do
+              (for s (block_stmts b) (step_reach! sites reach idx bid s))
+              (deref reach)))))))
+
+; ── the analysis ─────────────────────────────────────────────────────────────
+
+; reaching — run forward reaching-definitions over a body.
+;   node : the IR body
+;   ->   : { in:{id->defset}, out:{id->defset}, cfg, sites }  where a defset is
+;          a SET of site ids (strings) and `sites` maps each id -> the name it
+;          defines. reach_in[b] / reach_out[b] are the defs reaching block b's
+;          entry / exit.
+(bind reaching
+  (lambda (node)
+    (bind (
+      (cfg (build_cfg node))
+      (sites (map_of))
+      (sol (solve_forward cfg (reaching_lattice sites)))
+    )
+      (assoc (map_of)
+        "in" (get sol "in") "out" (get sol "out")
+        "cfg" cfg "sites" sites))))
+
+; reaching_in / reaching_out — the defset reaching the entry to / exit from a
+; block id (a set of site ids; query with set_has?, list with set_items). An
+; absent block yields the empty set.
+(bind reaching_in
+  (lambda (result id) (get (get result "in") (int_to_string id) (map_of))))
+(bind reaching_out
+  (lambda (result id) (get (get result "out") (int_to_string id) (map_of))))
+
+; ── reach-resolution helpers (read the result by NAME) ───────────────────────
+
+; reaching_names — the SET of names with at least one def reaching point `defset`
+; (resolved through `sites`). Lets a caller ask "is x defined here at all?".
+(bind reaching_names
+  (lambda (result defset)
+    (bind ((sites (get result "sites")) (out (map_of)))
+      (do
+        (for id (set_items defset)
+          (bind ((nm (get sites id)))
+            (when (not (eq nm null)) (assoc out nm true))))
+        out))))
+
+; name_reaches? — does SOME def of `name` reach point `defset`?
+(bind name_reaches?
+  (lambda (result defset name) (set_has? (reaching_names result defset) name)))
+
+; ── the analysis pass (conservative use-before-def) ──────────────────────────
+; A NAME read in a block where NO def of it reaches the read — neither from the
+; block entry nor an earlier statement in the same block — is flagged as a
+; possible use-before-def via the pass `note!` sink. `_`-prefixed names opt out.
+; This is DELIBERATELY a demonstrator, NOT auto-installed: free names (function
+; params, module globals, builtins) have no def SITE inside the analyzed body,
+; so the conservative check over-reports on a real module. `register!` is opt-in
+; tooling — the point is to prove a dataflow result routes through the standard
+; analysis-pass protocol, mirroring the built-in analyses.
+(bind run
+  (lambda (located sink)
+    (for f located
+      (bind ((res (reaching (get f "node"))) (sites (get res "sites")))
+        (for id (cfg_block_ids (get res "cfg"))
+          (bind (
+            (b (cfg_block (get res "cfg") id))
+            (reach (ref (reaching_in res id)))    ; defs reaching this point
+            (idx (ref 0))
+          )
+            (for s (block_stmts b)
+              (do
+                ; a read of a name with NO reaching def (and not yet defined in
+                ; this block) is a conservative use-before-def
+                (for u (set_items (stmt_uses s))
+                  (when (and (not (ignored? u))
+                             (not (name_reaches? res (deref reach) u)))
+                    (note! sink "reaching" s
+                      (string_concat_many
+                        "no definition of `" u "` reaches this use"))))
+                ; then advance the running reach by this statement's def (the
+                ; SAME per-statement step the lattice transfer takes)
+                (step_reach! sites reach idx id s)))))))))
+
+; register! — install reaching-definitions as an opt-in load-time analysis pass.
+; NOT auto-registered (see `run`): a demonstrator of routing a dataflow result
+; through the pass `note!` sink, not a check meant for the default pipeline.
+(bind register! (lambda () (install_pass! "reaching" run)))
+
+(export
+  reaching reaching_in reaching_out
+  reaching_names name_reaches? site_id kill_then_gen step_reach!
+  run register!)

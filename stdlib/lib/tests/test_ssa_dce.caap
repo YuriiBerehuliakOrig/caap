@@ -1,0 +1,395 @@
+; stdlib/lib/tests/test_ssa_dce.caap — the SSA-based dead-store / dead-code pass
+; (stdlib.semantics.passes.ssa_dce). THE win: it removes a dead store ACROSS control
+; flow — the exact case the conservative straight-line `dead_store` BAILS on (a body
+; with an `if` is not flat straight-line, so dead_store removes nothing). Every case
+; asserts BEHAVIOUR PRESERVATION first: eval the body before AND after the rewrite and
+; value_eq the two — a wrong drop is a miscompile — THEN the structural change.
+
+;; @area: passes
+;; @kind: regression
+;; @slow: true
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.ssa_dce ssa_dce_node)
+(use stdlib.semantics.passes.dead_store dead_store_node)
+(use stdlib.semantics.ssa to_ssa from_ssa)
+(use stdlib.syntax.ast sym lit calln call eval_ir walk head_is? call? string_lit? literal_of)
+
+(do
+  (bind (
+    ; ── IR builders (closed bodies under test) ──
+    (setr (lambda (r v) (calln "set_ref" (list_of (sym r) v))))   ; (set_ref r v)
+    (drf  (lambda (r)   (calln "deref" (list_of (sym r)))))        ; (deref r)
+    (mkref (lambda (v)  (calln "ref" (list_of v))))                ; (ref v)
+
+    ; eval a body to its observable value.
+    (run_body (lambda (b) (eval_ir b)))
+
+    ; count_set_ref — how many (set_ref …) statements appear anywhere in `node`.
+    (count_set_ref
+      (lambda (node)
+        (bind ((c (ref 0)))
+          (do
+            (walk node (lambda (n) (when (and (call? n) (head_is? n "set_ref"))
+                                     (set_ref c (int_add (deref c) 1)))))
+            (deref c)))))
+
+    ; count_version_binds — how many SSA version binders `(bind "r__N" …)` of the ref
+    ; named `r` appear in `node`. After to_ssa each store of r is a versioned bind
+    ; `(bind "r__N" value …)` (the promoted form has NO set_ref), so the number of
+    ; version binders of r is the SSA store count. Dropping a dead arm-store removes
+    ; one such binder, so this is the structural witness of the win.
+    (version_pfx? (lambda (nm base)
+      (bind ((pfx (string_concat_many base "__")) (plen (size pfx)))
+        (and (gt (size nm) plen) (eq (string_slice nm 0 plen) pfx)))))
+    ; count_version_binds — how many SSA version binders `(bind "<base>__N" …)` appear.
+    (count_version_binds
+      (lambda (node base)
+        (bind ((c (ref 0)))
+          (do
+            (walk node
+              (lambda (n)
+                (when (and (call? n) (head_is? n "bind"))
+                  (bind ((as (syntax_call_args n)) (i (ref 0)))
+                    (while (lt (int_add (deref i) 1) (size as))
+                      (do
+                        (bind ((a0 (get as (deref i))))
+                          (when (and (string_lit? a0) (version_pfx? (literal_of a0) base))
+                            (set_ref c (int_add (deref c) 1))))
+                        (set_ref i (int_add (deref i) 2))))))))
+            (deref c)))))
+    ; has_version_bind? — does an exact version binder `(bind "<ver>" …)` appear in node?
+    (has_version_bind?
+      (lambda (node ver)
+        (bind ((found (ref false)))
+          (do
+            (walk node
+              (lambda (n)
+                (when (and (call? n) (head_is? n "bind"))
+                  (bind ((as (syntax_call_args n)) (i (ref 0)))
+                    (while (lt (int_add (deref i) 1) (size as))
+                      (do
+                        (bind ((a0 (get as (deref i))))
+                          (when (and (string_lit? a0) (eq (literal_of a0) ver))
+                            (set_ref found true)))
+                        (set_ref i (int_add (deref i) 2))))))))
+            (deref found)))))
+  )
+    (do
+      ; ════════════════════════════════════════════════════════════════════
+      ; 1. THE WIN — a DEAD STORE ACROSS CONTROL FLOW.
+      ;    (bind "r" (ref 0)
+      ;      (do (if c (set_ref r 9) (set_ref r 8))   ; arm-stores r:=9 / r:=8
+      ;          (set_ref r 2)                          ; unconditional overwrite
+      ;          (deref r)))                            ; the only read sees r=2
+      ;    The if-arm stores are DEAD: r is unconditionally overwritten by (set_ref r 2)
+      ;    before the only read. But the body is NOT straight-line (it has an `if`), so
+      ;    dead_store BAILS. ssa_dce works in SSA form where the merge is an explicit φ:
+      ;    the arm versions r__1/r__2 are used only by a φ whose merged version is dead,
+      ;    so they are transitively dead and dropped — removing the dead arm-stores.
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (body (calln "bind"
+                (list_of (lit "c") (lit true)
+                  (calln "bind"
+                    (list_of (lit "r") (mkref (lit 0))
+                      (calln "do"
+                        (list_of
+                          (calln "if" (list_of (sym "c") (setr "r" (lit 9)) (setr "r" (lit 8))))
+                          (setr "r" (lit 2))
+                          (drf "r"))))))))
+        (before (run_body body))
+        (rw (ssa_dce_node body))
+        (after (run_body rw))
+      )
+        (do
+          (assert_eq before 2 "the win: original body (c=true) evaluates to 2")
+          (assert_true (value_eq after before)
+            "the win: behaviour preserved — ssa_dce result still evaluates to 2")
+          ; STRUCTURAL: the dead arm-store version binders r__1 (=9) / r__2 (=8) are
+          ; removed. After to_ssa each store of r is a versioned bind `(bind "r__N" …)`
+          ; (the promoted form has NO set_ref). The plain SSA round-trip (from_ssa∘to_ssa,
+          ; no DCE) keeps EVERY version binder; ssa_dce drops the two dead arm versions,
+          ; so it has STRICTLY FEWER r-version binders than the round-trip baseline.
+          (bind (
+            (baseline (from_ssa (to_ssa body)))          ; SSA round-trip, no DCE
+            (base_vbinds (count_version_binds baseline "r"))
+            (dce_vbinds (count_version_binds rw "r"))    ; surviving r__N version binders
+          )
+            (do
+              (assert_true (gt base_vbinds dce_vbinds)
+                "the win: ssa_dce removed dead arm-store versions (fewer r-version binders than the SSA round-trip)")
+              ; the dead ARM-STORE versions (r__1 = the then-arm r:=9, r__2 = the else-arm
+              ; r:=8) appear as binders in the plain SSA round-trip but are REMOVED by
+              ; ssa_dce — the exact cross-control dead stores the win is about.
+              (assert_true (has_version_bind? baseline "r__1")
+                "the win: the round-trip has the then-arm store version r__1 (=9)")
+              (assert_true (has_version_bind? baseline "r__2")
+                "the win: the round-trip has the else-arm store version r__2 (=8)")
+              (assert_true (not (has_version_bind? rw "r__1"))
+                "the win: ssa_dce removed the dead then-arm store version r__1 (across control flow)")
+              (assert_true (not (has_version_bind? rw "r__2"))
+                "the win: ssa_dce removed the dead else-arm store version r__2 (across control flow)")
+              ; the LIVE store survives as a version binder (r__4 = r:=2).
+              (assert_true (has_version_bind? rw "r__4")
+                "the win: the live store r:=2 (version r__4) is kept")))))
+
+      ; Also exercise c=false (the OTHER path) — same dead arm-stores, same result 2.
+      (bind (
+        (body (calln "bind"
+                (list_of (lit "c") (lit false)
+                  (calln "bind"
+                    (list_of (lit "r") (mkref (lit 0))
+                      (calln "do"
+                        (list_of
+                          (calln "if" (list_of (sym "c") (setr "r" (lit 9)) (setr "r" (lit 8))))
+                          (setr "r" (lit 2))
+                          (drf "r"))))))))
+        (before (run_body body))
+        (rw (ssa_dce_node body))
+        (after (run_body rw))
+      )
+        (do
+          (assert_eq before 2 "the win (c=false): original body evaluates to 2")
+          (assert_true (value_eq after before)
+            "the win (c=false): behaviour preserved — still 2")))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 2. THE CONTRAST — the conservative dead_store BAILS on the SAME input.
+      ;    The body contains an `if`, so it is not a flat straight-line `(do …)`;
+      ;    dead_store removes NOTHING (it keeps all three set_ref). ssa_dce removes
+      ;    the dead arm-stores. Asserting BOTH on the same body proves ssa_dce wins
+      ;    exactly where dead_store gives up.
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (body (calln "bind"
+                (list_of (lit "c") (lit true)
+                  (calln "bind"
+                    (list_of (lit "r") (mkref (lit 0))
+                      (calln "do"
+                        (list_of
+                          (calln "if" (list_of (sym "c") (setr "r" (lit 9)) (setr "r" (lit 8))))
+                          (setr "r" (lit 2))
+                          (drf "r"))))))))
+        (before (run_body body))
+        ; dead_store on the SAME body: it bails (the body has an `if`).
+        (ds (dead_store_node body))
+        (ds_after (run_body ds))
+        ; ssa_dce on the same body: it removes the dead arm-stores.
+        (sd (ssa_dce_node body))
+        (sd_after (run_body sd))
+        ; the SSA round-trip baseline (no DCE) for the version-binder comparison.
+        (baseline (from_ssa (to_ssa body)))
+      )
+        (do
+          (assert_eq before 2 "contrast: original evaluates to 2")
+          ; dead_store leaves the body UNCHANGED (it bailed on the `if`): it removed
+          ; NOTHING, so the dead_store result is node-identical to the input — all three
+          ; set_ref of r survive.
+          (assert_eq (count_set_ref ds) (count_set_ref body)
+            "contrast: dead_store BAILS — every set_ref of r is kept (body has an if)")
+          (assert_eq (count_set_ref ds) 3
+            "contrast: dead_store kept all three (set_ref r …) (it removed nothing)")
+          (assert_true (value_eq ds_after before)
+            "contrast: dead_store is behaviour-preserving by doing nothing (still 2)")
+          ; ssa_dce removed the dead arm-store versions: fewer r-version binders than the
+          ; plain SSA round-trip (which keeps every version).
+          (assert_true (gt (count_version_binds baseline "r") (count_version_binds sd "r"))
+            "contrast: ssa_dce REMOVES the dead arm-stores (fewer r-version binders than the round-trip)")
+          (assert_true (value_eq sd_after before)
+            "contrast: ssa_dce is behaviour-preserving (still 2)")
+          ; the headline: dead_store kept all three stores; ssa_dce dropped the two dead
+          ; arm-store versions, leaving fewer.
+          (assert_true (gt (count_set_ref ds) (count_version_binds sd "r"))
+            "contrast: dead_store leaves the dead stores; ssa_dce removes them")))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 3. BEHAVIOUR PRESERVATION — a LIVE store across control flow is KEPT.
+      ;    (bind "r" (ref 5)
+      ;      (do (if c (deref r) 0)   ; the then-arm READS r=5 (a real use)
+      ;          (set_ref r 7)         ; overwrite AFTER the read
+      ;          (deref r)))           ; final read sees 7
+      ;    The initial r=5 is READ on the then-arm (c=true), so its version is LIVE and
+      ;    must NOT be dropped. Both c=true and c=false must round-trip to 7.
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (mk_live
+          (lambda (cval)
+            (calln "bind"
+              (list_of (lit "c") (lit cval)
+                (calln "bind"
+                  (list_of (lit "r") (mkref (lit 5))
+                    (calln "do"
+                      (list_of
+                        (calln "if" (list_of (sym "c") (drf "r") (lit 0)))
+                        (setr "r" (lit 7))
+                        (drf "r")))))))))
+      )
+        (do
+          ; c=true: the then-arm reads r=5 (live), final result 7.
+          (bind (
+            (body (mk_live true))
+            (before (run_body body))
+            (rw (ssa_dce_node body))
+            (after (run_body rw))
+          )
+            (do
+              (assert_eq before 7 "live store (c=true): original evaluates to 7")
+              (assert_true (value_eq after before)
+                "live store (c=true): behaviour preserved — the read of r=5 still happens, result 7")))
+          ; c=false: the then-arm read does not run, but the version is still kept; 7.
+          (bind (
+            (body (mk_live false))
+            (before (run_body body))
+            (rw (ssa_dce_node body))
+            (after (run_body rw))
+          )
+            (do
+              (assert_eq before 7 "live store (c=false): original evaluates to 7")
+              (assert_true (value_eq after before)
+                "live store (c=false): behaviour preserved — result 7")))))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 4. BEHAVIOUR PRESERVATION — an IMPURE (THROWING) value is KEPT.
+      ;    The dead ARM-store's VALUE OVERFLOWS i64 and THROWS. The destination version
+      ;    is dead (r is unconditionally overwritten by r:=2 before the only read), but
+      ;    dropping the store would ERASE the throw (THROW → 2) — a miscompile. The
+      ;    purity gate (pure_value? rejects int_add: i64 overflow is partial) KEEPS it.
+      ;    We observe via an outer try/catch yielding the sentinel "THREW": both the
+      ;    original AND the ssa_dce result must THROW.
+      ;    (bind "c" true (bind "r" (ref 0)
+      ;      (do (if c (set_ref r (int_add MAX 1)) (set_ref r 8))
+      ;          (set_ref r 2) (deref r))))   ⇒ THROWS (overflow)
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (maxint 9223372036854775807)
+        ; eval_guard b — eval b, returning its value or "THREW" if it throws.
+        (eval_guard
+          (lambda (b)
+            (eval_ir
+              (calln "try"
+                (list_of b (call (sym "catch") (list_of (sym "e") (lit "THREW"))))))))
+        (ovf (calln "int_add" (list_of (lit maxint) (lit 1))))
+        (body (calln "bind"
+                (list_of (lit "c") (lit true)
+                  (calln "bind"
+                    (list_of (lit "r") (mkref (lit 0))
+                      (calln "do"
+                        (list_of
+                          (calln "if" (list_of (sym "c") (setr "r" ovf) (setr "r" (lit 8))))
+                          (setr "r" (lit 2))
+                          (drf "r"))))))))
+        (before (eval_guard body))
+        (rw (ssa_dce_node body))
+        (after (eval_guard rw))
+      )
+        (do
+          (assert_eq before "THREW" "impure value: the dead arm-store overflows and THROWS (before)")
+          (assert_eq after before
+            "impure value: behaviour preserved — the overflowing arm-store still throws (store KEPT)")))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 5. BEHAVIOUR PRESERVATION — a WHILE-LOOP body BAILS (no-op).
+      ;    A loop-carried ref is NOT promotable, so the body is unsupported and ssa_dce
+      ;    returns it verbatim. eval before == eval after, and nothing is changed.
+      ;    (bind "r" (ref 0)
+      ;      (do (while (lt (deref r) 3) (set_ref r (int_add (deref r) 1))) (deref r)))  ⇒ 3
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (body (calln "bind"
+                (list_of (lit "r") (mkref (lit 0))
+                  (calln "do"
+                    (list_of
+                      (calln "while"
+                        (list_of
+                          (calln "lt" (list_of (drf "r") (lit 3)))
+                          (setr "r" (calln "int_add" (list_of (drf "r") (lit 1))))))
+                      (drf "r"))))))
+        (before (run_body body))
+        (rw (ssa_dce_node body))
+        (after (run_body rw))
+      )
+        (do
+          (assert_eq before 3 "while-loop: original evaluates to 3")
+          (assert_true (value_eq after before)
+            "while-loop: behaviour preserved — loop-carried ref bails, result 3")
+          ; bail = no-op: the while body's set_ref is untouched (still present).
+          (assert_eq (count_set_ref rw) 1
+            "while-loop: bail leaves the loop store intact (no-op on an unsupported body)")))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 6. STRAIGHT-LINE OVERLAP — ssa_dce also handles the plain straight-line dead
+      ;    store (the case dead_store removes), behaviour-preserved.
+      ;    (bind "r" (ref 0) (do (set_ref r 1) (set_ref r 2) (deref r)))  ⇒ 2
+      ;    r__1 (=1) is overwritten by r__2 (=2) before the read, so r__1 is dead+pure
+      ;    and dropped; result still 2.
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        (body (calln "bind"
+                (list_of (lit "r") (mkref (lit 0))
+                  (calln "do"
+                    (list_of (setr "r" (lit 1)) (setr "r" (lit 2)) (drf "r"))))))
+        (before (run_body body))
+        (rw (ssa_dce_node body))
+        (after (run_body rw))
+        (baseline (from_ssa (to_ssa body)))
+      )
+        (do
+          (assert_eq before 2 "straight-line: original evaluates to 2")
+          (assert_true (value_eq after before)
+            "straight-line: behaviour preserved — dead r__1 dropped, result 2")
+          (assert_true (gt (count_version_binds baseline "r") (count_version_binds rw "r"))
+            "straight-line: the dead leading store version is removed (fewer than the round-trip)")))
+
+      ; ════════════════════════════════════════════════════════════════════
+      ; 7. REGRESSION — CONSERVATIVE BAIL on bodies where the SSA round-trip is not
+      ;    behaviour-faithful. Adversarial review found two SUPPORTED shapes on which
+      ;    to_ssa itself does not round-trip (eval(from_ssa(to_ssa(b))) != eval(b)): a
+      ;    MULTI-REF co-promotion (each ref's renamer threads over the others' merge),
+      ;    and an if-merge in a BIND-PAIR-VALUE position (the merged version escapes its
+      ;    binder's scope). ssa_dce must NOT emit corrupted code on these — it guards
+      ;    with (a) a single-promoted-ref restriction and (b) a round-trip version-well-
+      ;    scopedness check, BAILING to the original body. Each case asserts BEHAVIOUR
+      ;    PRESERVATION (eval before == eval after) — the soundness floor.
+      ; ════════════════════════════════════════════════════════════════════
+      (bind (
+        ; 7A — TWO co-promoted refs, both if-merged. The single-ref guard bails.
+        ;   (bind "c" true (bind "r" (ref 0) (bind "s" (ref 0)
+        ;     (do (if c (set_ref r 9) (set_ref r 8))
+        ;         (if c (set_ref s 1) (set_ref s 2))
+        ;         (int_add (deref r) (deref s))))))  ⇒ 10 (c=true: r=9, s=1)
+        (bug_multiref
+          (calln "bind"
+            (list_of (lit "c") (lit true)
+              (calln "bind"
+                (list_of (lit "r") (mkref (lit 0))
+                  (calln "bind"
+                    (list_of (lit "s") (mkref (lit 0))
+                      (calln "do"
+                        (list_of
+                          (calln "if" (list_of (sym "c") (setr "r" (lit 9)) (setr "r" (lit 8))))
+                          (calln "if" (list_of (sym "c") (setr "s" (lit 1)) (setr "s" (lit 2))))
+                          (calln "int_add" (list_of (drf "r") (drf "s"))))))))))))
+        ; 7B — single ref, if-merge in a BIND-PAIR-VALUE position. The well-scoped guard bails.
+        ;   (bind "c" true (bind "r" (ref 0)
+        ;     (bind "m" (if c (set_ref r 9) (set_ref r 8)) (deref r))))  ⇒ 9
+        (bug_pairvalue
+          (calln "bind"
+            (list_of (lit "c") (lit true)
+              (calln "bind"
+                (list_of (lit "r") (mkref (lit 0))
+                  (calln "bind"
+                    (list_of (lit "m")
+                             (calln "if" (list_of (sym "c") (setr "r" (lit 9)) (setr "r" (lit 8))))
+                      (drf "r"))))))))
+      )
+        (do
+          (bind ((before (run_body bug_multiref)) (after (run_body (ssa_dce_node bug_multiref))))
+            (do
+              (assert_eq before 10 "bail(multi-ref): original evaluates to 10")
+              (assert_true (value_eq after before)
+                "bail(multi-ref): behaviour preserved — co-promotion bails (still 10)")))
+          (bind ((before (run_body bug_pairvalue)) (after (run_body (ssa_dce_node bug_pairvalue))))
+            (do
+              (assert_eq before 9 "bail(pair-value): original evaluates to 9")
+              (assert_true (value_eq after before)
+                "bail(pair-value): behaviour preserved — escaped-version round-trip bails (still 9)"))))))))

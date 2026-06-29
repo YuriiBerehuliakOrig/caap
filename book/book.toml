@@ -1,0 +1,20 @@
+[book]
+title = "The CAAP Programming Language"
+authors = ["The CAAP Project"]
+description = "A tutorial introduction to CAAP — a small homoiconic kernel that is programmable at compile time, with an extensible surface syntax and a native backend."
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/YuriiBerehuliakOrig/caap"
+edit-url-template = "https://github.com/YuriiBerehuliakOrig/caap/edit/main/book/{path}"
+no-section-label = false
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.playground]
+runnable = false

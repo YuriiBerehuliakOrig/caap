@@ -1,0 +1,119 @@
+; stdlib/lib/tests/test_uuid.caap — in-language tests for lib/uuid.
+;
+; The generators are deterministic (seedable LCG PRNG), so a fixed seed replays
+; the exact same UUID — we assert that determinism plus the structural RFC
+; invariants (canonical 8-4-4-4-12 shape, version nibble, 10xx variant) and the
+; parse/format round-trip. No magic golden string is hardcoded; instead the
+; shape is checked field by field so the test documents the format.
+
+;; @area: crypto
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.random make_rng)
+(use stdlib.lib.uuid
+     uuid_v4 uuid_v7 uuid_format uuid_parse uuid_version uuid_valid? uuid_nil)
+
+; ── shape helper: is `s` a canonical lowercase 8-4-4-4-12 hex UUID string? ────
+; 36 chars; dashes exactly at 8/13/18/23; every other char a lowercase hex digit.
+(bind lower_hex? (lambda (c) (string_contains "0123456789abcdef" c)))
+(bind canonical_shape?
+  (lambda (s)
+    (if (not (eq (size s) 36)) false
+      (bind ((cs (string_chars s)) (ok (ref true)) (i (ref 0)))
+        (do
+          (while (and (deref ok) (lt (deref i) 36))
+            (bind ((k (deref i)) (c (get cs (deref i) "")))
+              (do
+                (if (or (eq k 8) (or (eq k 13) (or (eq k 18) (eq k 23))))
+                  (if (not (eq c "-")) (set_ref ok false) null)
+                  (if (not (lower_hex? c)) (set_ref ok false) null))
+                (set_ref i (int_add k 1)))))
+          (deref ok))))))
+
+; ── uuid_nil ─────────────────────────────────────────────────────────────────
+(assert_eq uuid_nil "00000000-0000-0000-0000-000000000000" "nil uuid")
+(assert_eq (uuid_version uuid_nil) 0 "nil version is 0")
+(assert_true (uuid_valid? uuid_nil) "nil is valid")
+(assert_true (canonical_shape? uuid_nil) "nil has canonical shape")
+
+; ── uuid_v4: shape, version, variant ─────────────────────────────────────────
+(bind v4a (uuid_v4 (make_rng 42)))
+(bind v4a_str (get v4a "value"))
+(assert_eq (size v4a_str) 36 "v4 is 36 chars")
+(assert_true (canonical_shape? v4a_str) "v4 has canonical 8-4-4-4-12 shape")
+(assert_eq (uuid_version v4a_str) 4 "v4 version nibble is 4")
+; the version nibble is the hex char at index 14
+(assert_eq (get (string_chars v4a_str) 14 "") "4" "v4 char[14] = '4'")
+; the variant high nibble is the hex char at index 19, must be in {8,9,a,b}
+(bind v4a_variant (get (string_chars v4a_str) 19 ""))
+(assert_true
+  (or (eq v4a_variant "8") (or (eq v4a_variant "9")
+      (or (eq v4a_variant "a") (eq v4a_variant "b"))))
+  "v4 variant nibble in {8,9,a,b}")
+(assert_true (uuid_valid? v4a_str) "v4 is valid")
+
+; ── determinism: same seed → same uuid ───────────────────────────────────────
+(bind v4b (uuid_v4 (make_rng 42)))
+(assert_eq (get v4b "value") v4a_str "v4 determinism: same seed → same uuid")
+; a different seed → a different uuid (overwhelmingly likely, distinct stream)
+(bind v4c (uuid_v4 (make_rng 7)))
+(assert_eq (eq (get v4c "value") v4a_str) false "v4: different seed → different uuid")
+; the rng is threaded: drawing twice from one stream yields two distinct uuids
+(bind v4d (uuid_v4 (get v4a "rng")))
+(assert_eq (eq (get v4d "value") v4a_str) false "v4: threaded rng advances the stream")
+
+; ── parse ∘ format round-trip ────────────────────────────────────────────────
+; uuid_parse of a freshly-formatted v4 gives 16 bytes; re-formatting reproduces it.
+(bind v4_bytes (uuid_parse v4a_str))
+(assert_eq (size v4_bytes) 16 "uuid_parse yields 16 bytes")
+(assert_eq (uuid_format v4_bytes) v4a_str "format ∘ parse round-trip")
+; parse is case-insensitive on hex; format is canonical lowercase
+(assert_eq
+  (uuid_format (uuid_parse "F47AC10B-58CC-4372-A567-0E02B2C3D479"))
+  "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+  "parse accepts uppercase, format lowercases")
+
+; ── uuid_v7: shape, version, time ordering, timestamp bytes ──────────────────
+(bind ms1 1717000000000)            ; an example millisecond Unix timestamp
+(bind v7a (uuid_v7 (make_rng 99) ms1))
+(bind v7a_str (get v7a "value"))
+(assert_true (canonical_shape? v7a_str) "v7 has canonical shape")
+(assert_eq (uuid_version v7a_str) 7 "v7 version nibble is 7")
+(assert_true (uuid_valid? v7a_str) "v7 is valid")
+; v7 determinism
+(assert_eq (get (uuid_v7 (make_rng 99) ms1) "value") v7a_str
+  "v7 determinism: same seed+ms → same uuid")
+
+; the first 48 bits = ms (big-endian) → the first 6 bytes encode the timestamp.
+; reconstruct ms from bytes[0..6) and compare.
+(bind v7_bytes (uuid_parse v7a_str))
+(bind ts_from_bytes
+  (bind ((acc (ref 0)) (i (ref 0)))
+    (do
+      (while (lt (deref i) 6)
+        (do
+          (set_ref acc (int_add (int_shl (deref acc) 8) (get v7_bytes (deref i))))
+          (set_ref i (int_add (deref i) 1))))
+      (deref acc))))
+(assert_eq ts_from_bytes ms1 "v7 first 48 bits reflect the ms timestamp")
+
+; time ordering: a later timestamp (same seed) sorts after an earlier one as a
+; plain string compare, because the timestamp occupies the leading hex chars.
+(bind v7_early (get (uuid_v7 (make_rng 1) 1000000000000) "value"))
+(bind v7_late  (get (uuid_v7 (make_rng 1) 2000000000000) "value"))
+(assert_eq (lt (value_compare v7_early v7_late) 0) true
+  "v7 is time-ordered: earlier ms sorts before later ms")
+
+; ── uuid_valid? / malformed inputs ───────────────────────────────────────────
+(assert_eq (uuid_valid? "not-a-uuid") false "valid? rejects short garbage")
+(assert_eq (uuid_valid? "f47ac10b-58cc-4372-a567-0e02b2c3d47") false
+  "valid? rejects a 35-char string")
+(assert_eq (uuid_valid? "f47ac10bX58cc-4372-a567-0e02b2c3d479") false
+  "valid? rejects a wrong-position dash")
+(assert_eq (uuid_valid? "g47ac10b-58cc-4372-a567-0e02b2c3d479") false
+  "valid? rejects a non-hex digit")
+(assert_eq (uuid_parse "not a valid uuid string of len.....!!") null
+  "parse returns null on malformed input")
+(assert_eq (uuid_version "not-a-uuid") -1 "version of malformed = -1")
+(assert_eq (uuid_format (list_of 1 2 3)) null "format of wrong-length list = null")

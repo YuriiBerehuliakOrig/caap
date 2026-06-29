@@ -1,0 +1,156 @@
+; stdlib/lib/core/bits.caap — integer bit-manipulation helpers
+; (module stdlib.lib.core.bits).
+;
+; All of these run over the kernel int, which is a 64-bit two's-complement i64.
+; The kernel's bitwise set is `int_and`/`int_or`/`int_xor`/`int_not` plus the
+; shifts `int_shl` / `int_shr`, and TWO facts about it drive every routine here:
+;
+;   1. `int_shr` is an ARITHMETIC (sign-extending) right shift — shifting a
+;      negative value in fills 1s from the top, NOT 0s. To get a LOGICAL right
+;      shift (the unsigned view, 0-fill) we shift once and then clear the sign
+;      bit with `(int_and … mask63)` where mask63 = 0x7FFF_FFFF_FFFF_FFFF.
+;   2. Integer arithmetic is CHECKED: `int_add`/`int_sub` THROW on overflow, so
+;      Kernighan's `n & (n-1)` trick is unusable at i64::MIN (n-1 underflows).
+;      Every routine therefore counts/walks bits by masked shifts, never by
+;      arithmetic on the value itself.
+;
+; Where a function treats `n` as an unsigned 64-bit pattern (popcount,
+; trailing_zeros) that is stated in its doc; the single-bit and rotate helpers
+; restrict the bit index / width away from the sign bit so results stay
+; non-negative and predictable.
+(module stdlib.lib.core.bits)
+
+; mask63 — 0x7FFF_FFFF_FFFF_FFFF (i64::MAX): clears the sign bit, turning one
+; arithmetic `int_shr … 1` into a LOGICAL (0-fill) right shift by one.
+(bind mask63 9223372036854775807)
+
+; lshr1 — logical right shift of `x` by ONE bit (0-fill across all 64 bits),
+; correct for negative x where the raw `int_shr` would sign-extend.
+(bind lshr1 (lambda (x) (int_and (int_shr x 1) mask63)))
+
+; popcount — number of set bits in the 64-bit pattern of `n`.
+;   n  : any int (interpreted as its unsigned 64-bit two's-complement pattern)
+;   -> : the count 0..64 (popcount 0 = 0, popcount -1 = 64, popcount i64::MIN = 1)
+; A fixed 64-iteration loop: add the low bit, logical-shift right. No `n-1`, so
+; i64::MIN is safe.
+(defn popcount ((n int)) int
+  (bind ((x (ref n)) (c (ref 0)) (i (ref 0)))
+    (do
+      (while (lt (deref i) 64)
+        (do
+          (set_ref c (int_add (deref c) (int_and (deref x) 1)))
+          (set_ref x (lshr1 (deref x)))
+          (set_ref i (int_add (deref i) 1))))
+      (deref c))))
+
+; trailing_zeros — count of consecutive 0 bits from the least-significant end.
+;   n  : any int (unsigned 64-bit pattern)
+;   -> : the count 0..64; trailing_zeros 0 = 64 (no set bit), trailing_zeros 1
+;        = 0, trailing_zeros 8 = 3, trailing_zeros i64::MIN = 63.
+(defn trailing_zeros ((n int)) int
+  (if (eq n 0) 64
+    (bind ((x (ref n)) (c (ref 0)))
+      (do
+        (while (eq (int_and (deref x) 1) 0)
+          (do
+            (set_ref c (int_add (deref c) 1))
+            (set_ref x (lshr1 (deref x)))))
+        (deref c)))))
+
+; ilog2 — floor of log base 2: the position (0-based) of the highest set bit.
+;   n  : an int n > 0 (REQUIRED — log2 is undefined for n <= 0)
+;   -> : floor(log2 n); ilog2 1 = 0, ilog2 8 = 3, ilog2 255 = 7.
+; Throws on n <= 0 rather than inventing a value (no silent fallback). For n > 0
+; the sign bit is clear, so the plain `int_shr` is already a logical shift.
+(defn ilog2 ((n int)) int
+  (if (le n 0)
+    (throw (string_concat_many "ilog2: argument must be positive, got "
+                               (value_to_string n)))
+    (bind ((x (ref n)) (r (ref 0)))
+      (do
+        (while (gt (deref x) 1)
+          (do
+            (set_ref x (int_shr (deref x) 1))
+            (set_ref r (int_add (deref r) 1))))
+        (deref r)))))
+
+; leading_zeros — count of consecutive 0 bits from the most-significant end of
+; the 64-bit pattern.
+;   n  : any int (unsigned 64-bit pattern)
+;   -> : the count 0..64; leading_zeros 0 = 64, leading_zeros 1 = 63,
+;        leading_zeros 255 = 56, and leading_zeros of any negative = 0 (bit 63
+;        is set). For n > 0 this is 63 - ilog2(n).
+(defn leading_zeros ((n int)) int
+  (cond
+    ((eq n 0) 64)
+    ((lt n 0) 0)
+    (else (int_sub 63 (ilog2 n)))))
+
+; is_pow2? — true when `n` is a power of two (exactly one set bit).
+;   n  : any int
+;   -> : true iff n > 0 and n has a single set bit (1,2,4,8,…); false for n <= 0.
+(defn is_pow2? ((n int)) bool
+  (and (gt n 0) (eq (popcount n) 1)))
+
+; bit_set? — is bit `i` of `n` set?
+;   n : any int
+;   i : a bit index in 0..62 (avoids the sign bit 63; see header)
+;   -> : true iff bit i of n is 1.
+(defn bit_set? ((n int) (i int)) bool
+  (ne (int_and (int_shr n i) 1) 0))
+
+; set_bit — `n` with bit `i` forced to 1.
+;   n : any int
+;   i : a bit index in 0..62
+;   -> : n | (1 << i)
+(defn set_bit ((n int) (i int)) int
+  (int_or n (int_shl 1 i)))
+
+; clear_bit — `n` with bit `i` forced to 0.
+;   n : any int
+;   i : a bit index in 0..62
+;   -> : n & ~(1 << i)
+(defn clear_bit ((n int) (i int)) int
+  (int_and n (int_not (int_shl 1 i))))
+
+; toggle_bit — `n` with bit `i` flipped.
+;   n : any int
+;   i : a bit index in 0..62
+;   -> : n ^ (1 << i)
+(defn toggle_bit ((n int) (i int)) int
+  (int_xor n (int_shl 1 i)))
+
+; width_mask — the low `width` bits all set: (1 << width) - 1, valid for
+; width in 1..62 (so the result stays a positive i64).
+(bind width_mask (lambda (width) (int_sub (int_shl 1 width) 1)))
+
+; rotate_left — rotate the low `width` bits of `n` left by `k` positions.
+;   n     : any int (only its low `width` bits participate)
+;   k     : a non-negative rotate amount (reduced mod width)
+;   width : the field width in 1..62 (e.g. 32)
+;   -> : the rotated field as a value in 0 .. 2^width - 1.
+; Bits shifted out of the top re-enter at the bottom. `k mod width` keeps the
+; two shift amounts in 0..width (and both well under 63, so int_shl is legal).
+(defn rotate_left ((n int) (k int) (width int)) int
+  (bind ((m (width_mask width))
+         (x (int_and n (width_mask width)))
+         (r (int_mod k width)))
+    (if (eq r 0) x
+      (int_and
+        (int_or (int_shl x r) (int_shr x (int_sub width r)))
+        m))))
+
+; rotate_right — rotate the low `width` bits of `n` right by `k` positions.
+;   n     : any int (only its low `width` bits participate)
+;   k     : a non-negative rotate amount (reduced mod width)
+;   width : the field width in 1..62 (e.g. 32)
+;   -> : the rotated field as a value in 0 .. 2^width - 1.
+; Defined as a left rotate by width - (k mod width), so it shares rotate_left's
+; masking and stays within the legal shift range.
+(defn rotate_right ((n int) (k int) (width int)) int
+  (bind ((r (int_mod k width)))
+    (if (eq r 0) (int_and n (width_mask width))
+      (rotate_left n (int_sub width r) width))))
+
+(export popcount trailing_zeros leading_zeros ilog2 is_pow2?
+        bit_set? set_bit clear_bit toggle_bit rotate_left rotate_right)

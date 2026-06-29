@@ -1,0 +1,161 @@
+; stdlib/storage/binary/validate.caap — the seven compile-time checks
+; (module stdlib.storage.binary.validate).
+;
+; Reads a parsed spec map and returns a list of located findings (strings); an
+; empty list means the spec lowers cleanly. The checks: (1) duplicate field,
+; (2) duplicate record version, (3) unsupported field type + (3b) (bytes N)
+; length, (4) enum base/value size, (5) CRC region (u32 + last), (6) missing
+; migration between consecutive versions, (7) unknown endian. `record_names` is
+; also consumed by the generate driver (the distinct record names), so it is
+; exported alongside `validate`.
+(module stdlib.storage.binary.validate)
+
+(use stdlib.syntax.ast loc)
+(use stdlib.lib.collections.sequence each any? range map unique last)
+(use stdlib.storage.binary.runtime uint_type? pow256)
+(use stdlib.storage.binary.parse endian_known?)
+
+(bind note
+  (lambda (findings node msg)
+    (append findings
+      (string_concat_many "storage: " (loc node) ": " msg))))
+
+; helpers for the checks. record_names — the DISTINCT record names in declaration
+; order (first occurrence kept). `unique` over the projected names is the same
+; first-occurrence, order-preserving dedup the hand-rolled seen-map loop did; the
+; crc check's `last` is sequence.last over a non-empty field list (a crc field
+; always implies at least one field) — identical to (get xs (size-1)).
+(bind record_names
+  (lambda (records)
+    (unique (map records (lambda (r) (get r "name"))))))
+; record_versions — the DISTINCT versions of record `rn`, in declaration order
+; (deduped: a reused version is the "duplicate version" check's job, not a phantom
+; v1->v1 migration gap).
+(bind record_versions
+  (lambda (records rn)
+    (bind ((out (list_of)) (seen (map_of)))
+      (do
+        (each records
+          (lambda (r)
+            (if (and (eq (get r "name") rn)
+                     (not (eq (get seen (get r "version") false) true)))
+              (do (assoc seen (get r "version") true) (append out (get r "version")))
+              null)))
+        out))))
+(bind has_migration
+  (lambda (migs rn a b)
+    (any? migs (lambda (m) (and (eq (get m "record") rn)
+                                (and (eq (get m "from") a) (eq (get m "to") b)))))))
+
+(bind validate
+  (lambda (spec node)
+    (bind ((findings (list_of)) (seen_ver (map_of)))
+      (do
+        ; (7) endian: an unrecognized `(endian X)` must be a located diagnostic,
+        ; not a silent fall-through to little-endian — now that endian actually
+        ; changes the emitted byte order, a typo would otherwise yield wrong bytes.
+        (if (not (endian_known? (get spec "endian")))
+          (note findings node
+            (string_concat_many "unknown endian `" (get spec "endian" "?")
+              "` (expected little/le or big/be)"))
+          null)
+        (each (get spec "records" (list_of))
+          (lambda (rec)
+            (bind (
+              (key (string_concat_many (get rec "name") " v" (int_to_string (get rec "version"))))
+              (seen_field (map_of))
+            )
+              (do
+                ; (2) duplicate record version
+                (if (eq (get seen_ver key false) true)
+                  (note findings node (string_concat_many "duplicate record version " key))
+                  (assoc seen_ver key true))
+                (each (get rec "fields" (list_of))
+                  (lambda (f)
+                    (bind ((fn (get f "name")) (ty (get f "type")))
+                      (do
+                        ; (1) duplicate field
+                        (if (eq (get seen_field fn false) true)
+                          (note findings node
+                            (string_concat_many "duplicate field `" fn "` in " key))
+                          (assoc seen_field fn true))
+                        ; (3) unsupported field type
+                        (if (eq (get ty "kind") "unsupported")
+                          (note findings node
+                            (string_concat_many "unsupported field type for `" fn
+                              "`: " (get ty "spelling" "?")))
+                          null)
+                        ; (3b) (bytes N) length: N must be a positive int literal
+                        ; (absent -> null, or <= 0). The on-disk slice width is N
+                        ; bytes, so a missing/non-int/non-positive N is meaningless.
+                        (if (eq (get ty "kind") "bytes")
+                          (if (or (not (eq (value_type (get ty "size")) "int"))
+                                  (le (get ty "size") 0))
+                            (note findings node
+                              (string_concat_many "bytes length must be a positive integer for `"
+                                fn "`"))
+                            null)
+                          null)
+                        ; (4) enum value size
+                        (if (eq (get ty "kind") "enum")
+                          (do
+                            (if (not (uint_type? (get ty "base" "")))
+                              (note findings node
+                                (string_concat_many "enum `" fn
+                                  "` must have an unsigned int base (u8…u64), got `"
+                                  (get ty "base" "?") "`"))
+                              null)
+                            (each (get ty "variants" (list_of))
+                              (lambda (v)
+                                ; a variant value must be an int literal; a non-int
+                                ; (e.g. a name/call: literal_of -> null) is reported
+                                ; here and skips the numeric range checks below, so
+                                ; the polymorphic lt/ge never raise on a null value.
+                                (if (not (eq (value_type (get v "value")) "int"))
+                                  (note findings node
+                                    (string_concat_many "enum value " (get v "name")
+                                      " must be an int literal for `" fn "`"))
+                                  (do
+                                    ; variant values are bit patterns for an unsigned
+                                    ; field, so a negative value is never valid (>= 0)
+                                    (if (lt (get v "value") 0)
+                                      (note findings node
+                                        (string_concat_many "enum value " (get v "name")
+                                          "=" (int_to_string (get v "value"))
+                                          " must be >= 0 for `" fn "`"))
+                                      null)
+                                    (if (ge (get v "value") (pow256 (get ty "size" 1)))
+                                      (note findings node
+                                        (string_concat_many "enum value " (get v "name")
+                                          "=" (int_to_string (get v "value"))
+                                          " does not fit in " (get ty "base") " for `" fn "`"))
+                                      null))))))
+                          null)
+                        ; (5) CRC region: a crc field must be u32 and the LAST field
+                        (if (get f "crc" false)
+                          (do
+                            (if (not (eq (get ty "size" 0) 4))
+                              (note findings node
+                                (string_concat_many "crc field `" fn "` must be u32"))
+                              null)
+                            (if (not (eq fn (get (last (get rec "fields")) "name")))
+                              (note findings node
+                                (string_concat_many "crc field `" fn
+                                  "` must be the last field (its region is everything before it)"))
+                              null))
+                          null)))))))))
+        ; (6) missing migration: consecutive versions of a record need a migrate
+        (each (record_names (get spec "records"))
+          (lambda (rn)
+            (bind ((vers (record_versions (get spec "records") rn)))
+              (each (range 1 (size vers))
+                (lambda (i)
+                  (bind ((a (get vers (int_sub i 1))) (b (get vers i)))
+                    (if (has_migration (get spec "migrations") rn a b)
+                      null
+                      (note findings node
+                        (string_concat_many "missing migration for " rn " v"
+                          (int_to_string a) " -> v" (int_to_string b))))))))))
+        findings))))
+
+(export validate record_names record_versions has_migration note)

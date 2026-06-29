@@ -1,0 +1,6 @@
+; native_typo — a native program with a typo: `squrae` instead of `square`.
+; The prep gate (checker) must reject it with a LOCATED unknown-name error
+; BEFORE codegen, not as a cryptic "codegen: unsupported free name".
+(defn square ((x i32)) i32 (int_mul x x))
+(bind main (lambda () (squrae 6)))
+(main)

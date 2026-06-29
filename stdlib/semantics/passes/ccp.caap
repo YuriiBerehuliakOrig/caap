@@ -1,0 +1,540 @@
+; stdlib/semantics/passes/ccp.caap — sparse conditional constant propagation as a
+; whole-module TRANSFORM (module stdlib.semantics.passes.ccp).
+;
+; The FLOW-SENSITIVE complement to peval's literal-only constprop. Where peval
+; substitutes a binding whose value is ALREADY a literal/name (a syntactic copy),
+; ccp threads a CONSTANT ENVIRONMENT top-down through `(bind …)` and `(if …)` and
+; rewrites a name use to its literal wherever it is PROVABLY a single literal at
+; that point — even when the value had to be evaluated to discover it
+; (`(bind "x" (int_add 2 3) …)` makes x const 5, which peval's prop_value reaches
+; only after a separate fold round; ccp learns it directly while walking the body).
+;
+; ── the lattice ──────────────────────────────────────────────────────────────
+; Per name, three states (Wegman–Zadeck): TOP (unknown — not in the env), a
+; single CONSTANT (a scalar literal VALUE, stored in the env), or BOTTOM (varies —
+; recorded as a poisoned name we must NOT propagate). The env is a map name->value
+; holding only the CONSTANT names; a separate `poison` set holds the BOTTOM names.
+; A name is propagatable iff it is in the env AND not poisoned.
+;
+; ── conservative, behavior-preserving rewrites (the cardinal invariant) ───────
+; A transform may only rewrite when the result is provably equivalent on EVERY
+; path; when unsure it leaves the node alone. Concretely:
+;   * a NAME use that is a single literal in scope  -> that `(lit v)`
+;   * `(if <provably-const-bool> t e)`              -> the live arm (t or e)
+;   * a bind pair value that is a PURE expression of constants-in-scope folds to
+;     a scalar literal -> that name becomes CONSTANT for the rest of the scope.
+; Everything else is left intact. In particular:
+;   * a name written through `(set_ref name …)` ANYWHERE in its scope is BOTTOM
+;     from the start — a `ref` cell is mutable, so even its initial literal may be
+;     overwritten on some path; we never propagate it.
+;   * `(deref …)` / `(ref …)` are never constant (a heap read / a fresh cell).
+;   * a bind value that is NOT a provable scalar literal leaves the name TOP — its
+;     uses are untouched. Two `if` arms that bind a name differently never merge
+;     to a constant: arm-local binds are scoped INSIDE the arm (their env does not
+;     leak past the join), so a post-if use sees only the outer state.
+;
+; SOUND BY CONSTRUCTION, opt-in (registered at -O3 via boot/opt.caap; not in the base
+; pipeline). It hardened over adversarial-verification rounds (flat-name-bind poison +
+; control-flow env stripping for straight-line-only propagation + multiply-bound-name
+; poison for same-name shadows). A final 9-skeptic adversarial pass reproduced ZERO
+; miscompiles. CONSERVATIVE: it propagates a name only where it is unconditionally,
+; straight-line constant and never bound twice — a missed fold, never a wrong one. A
+; fuller CCP (Wegman–Zadeck across joins) wants SSA so each name has a single definition.
+(module stdlib.semantics.passes.ccp)
+
+(use stdlib.syntax.ast
+  call? name? literal? string_lit? head_of head_is? args_of arg items_of
+  name_of literal_of bind_pairs sym lit call if3 walk mkbind)
+(use stdlib.syntax.ir subst_safe)
+(use stdlib.semantics.passes.constfold fold_node)
+(use stdlib.semantics.passes.registry install_transform!)
+
+; ── scalar-constant test ─────────────────────────────────────────────────────
+; A propagatable constant is an IMMUTABLE SCALAR: int / bool / string. A folded
+; value that is a list/map/ref/function is NOT propagatable (folding it would bake
+; one shared mutable object into the IR, exactly as constfold guards). This is the
+; same restriction `pure_heads` enforces — only scalar-yielding heads fold — so a
+; folded value is already scalar; this is the belt-and-suspenders check.
+(bind scalar_const?
+  (lambda (v)
+    (bind ((t (value_type v)))
+      (or (eq t "int") (or (eq t "bool") (eq t "string"))))))
+
+; ── poison set: names that are BOTTOM (varies / mutated) ─────────────────────
+; A name is BOTTOM if it is MUTATED — or REBOUND IN THE CURRENT SCOPE — anywhere
+; in the tree we are about to walk:
+;   * `(set_ref name …)`  — a ref-cell write
+;   * `(set! name …)` / `(assign_lexical name …)` — a LEXICAL rebinding (the
+;     frontend lowers `set!` to `assign_lexical`; the kernel mutates the bound
+;     name in place — so a `(bind "x" 5 (do (set! x 9) x))` is NOT const-5).
+;   * `(bind <name-node> val body…)` — the FLAT name-bind form (arg0 a NAME node,
+;     NOT a string literal). The kernel evaluates this via `Environment::define`
+;     into the CURRENT environment (caap/src/builtins/control_flow.rs:168) — it
+;     does NOT open a child scope (only the canonical string-bind and the
+;     call-bindings shape do). So a flat (re)bind of `x` is a lexical mutation of
+;     the enclosing scope that LEAKS past any `do`/`if`/`while`/`try`/`match`
+;     join, exactly like assign_lexical. We therefore poison the flat-bind target
+;     whole-form: a name ever flat-rebound is never a propagatable constant.
+; We collect every such target ONCE over the whole form and never propagate those
+; names. Whole-scope and by-identifier: this is intentionally conservative — a
+; name mutated in ANY scope suppresses propagation for every same-named binding
+; (never unsound, at worst a missed fold). This is the guard the spec demands: do
+; NOT propagate across a write to that name.
+(bind mutated_targets
+  (lambda (node)
+    (bind ((s (map_of)))
+      (do
+        (walk node
+          (lambda (n)
+            (when (call? n)
+              (cond
+                ((or (head_is? n "set_ref")
+                     (or (head_is? n "set!") (head_is? n "assign_lexical")))
+                  (bind ((a0 (arg n 0)))
+                    (when (name? a0) (assoc s (name_of a0) true))))
+                ; flat name-bind `(bind <name-node> …)` — leaks into current scope
+                ((and (head_is? n "bind") (name? (arg n 0)))
+                  (assoc s (name_of (arg n 0)) true))
+                (else null)))))
+        s))))
+
+; ── evaluate a pair value under the current const env ────────────────────────
+; const_value — reduce a bind-pair value to a scalar-literal VALUE under `env`
+; (name->const value), or null when it is not provably a single constant.
+; Strategy: substitute every in-env constant name for its literal node, then ask
+; constfold to fold the result. If folding yields a scalar literal, that is the
+; constant. A value mentioning a name NOT in env (free / TOP / poisoned) cannot
+; fold to a literal — fold_node leaves it a call — so const_value returns null and
+; the name stays TOP. A value reading a `ref`/`deref` likewise never folds (ref is
+; not a pure head, deref is not, so fold_node never evaluates them).
+;
+; subst_safe is capture-avoiding, fold_node only evaluates PURE all-literal heads
+; in a try (a throwing eval is caught), and we additionally require the folded
+; result be a SCALAR literal — so this is sound: we never invent a constant.
+(bind env_to_litmap
+  (lambda (env)
+    (bind ((m (map_of)))
+      (do (for k (map_keys env) (assoc m k (lit (get env k)))) m))))
+
+(bind const_value
+  (lambda (value env)
+    (bind (
+      (substituted (subst_safe value (env_to_litmap env)))
+      (folded (fold_node substituted))
+    )
+      (if (and (literal? folded) (scalar_const? (literal_of folded)))
+        (literal_of folded)
+        null))))
+
+; ── const-bool test of an `if` condition under env ───────────────────────────
+; const_bool — the boolean VALUE of `cond` if it is provably a constant bool under
+; `env`, else null. Reuses const_value, then checks the constant is a bool. Only a
+; PROVABLY-const bool lets us prune a branch; anything else keeps the full `if`.
+(bind const_bool
+  (lambda (cond env)
+    (bind ((v (const_value cond env)))
+      (if (and (not (eq v null)) (eq (value_type v) "bool")) v null))))
+
+; ── env helpers (functional: never mutate a caller's env) ────────────────────
+; clone_map — a shallow copy (so extending an env for a child scope never leaks
+; back to a sibling).
+(bind clone_map
+  (lambda (m)
+    (bind ((c (map_of))) (do (for k (map_keys m) (assoc c k (get m k))) c))))
+; with_const — env extended with name->value (a fresh map; the caller's env is
+; unchanged so sibling subtrees do not see a leaked binding).
+(bind with_const
+  (lambda (env name value)
+    (bind ((c (clone_map env))) (do (assoc c name value) c))))
+; without_const — env with `name` removed (a rebind to a NON-constant kills any
+; prior constant for that name: shadowing reverts it to TOP for the body).
+(bind without_const
+  (lambda (env name)
+    (bind ((c (map_of)))
+      (do (for k (map_keys env) (when (not (eq k name)) (assoc c k (get env k)))) c))))
+; without_consts — without_const over a LIST of names (drop each shadowing binder).
+(bind without_consts
+  (lambda (env names)
+    (bind ((cur (ref env)))
+      (do (for nm names (set_ref cur (without_const (deref cur) nm))) (deref cur)))))
+
+; ── binder name extraction (shadowing) ───────────────────────────────────────
+; lambda_param_names — a lambda's parameter NAME strings, for BOTH kernel param
+; shapes (the literal tuple `["x" "y"]` AND the call-of-names `(x y)` the frontend
+; actually emits). A param SHADOWS any outer constant of the same name, so these
+; must be stripped from the env before walking the body. (Same logic as ir's
+; binder_params, replicated here to avoid an export change to a tier-2 module.)
+(bind lambda_param_names
+  (lambda (pnode)
+    (bind ((out (list_of)))
+      (do
+        (cond
+          ((literal? pnode)
+            (bind ((v (literal_of pnode)))
+              (when (not (eq v null))
+                (for p v (when (eq (value_type p) "string") (append out p))))))
+          ((call? pnode)
+            ; call-of-names `(x y …)`: every item is a name node
+            (for it (list_of (syntax_call_callee pnode))
+              (bind ((nm (name_of it))) (when (not (eq nm null)) (append out nm))))
+            (for it (args_of pnode)
+              (bind ((nm (name_of it))) (when (not (eq nm null)) (append out nm)))))
+          (else null))
+        out))))
+
+; ── multiply-bound names: same-name shadows are NEVER propagated ──────────────
+; multiply_bound_names — the SET of names that appear as a BIND TARGET more than
+; ONCE anywhere in the tree (across EVERY bind shape + lambda params). This closes
+; the same-name-shadow gap CONSERVATIVELY, without modeling scopes or SSA.
+;
+; WHY: a shadowing inner bind `(bind "x" v …)` re-binds an outer same-name `x`.
+; The kernel's evaluate_bind_pairs is LETREC — it pre-defines every pair name to
+; Null in the new child scope BEFORE evaluating any pair value — so the inner
+; value `v` reads x=Null, not the outer constant. CCP's let*-over-the-outer-env
+; handler would instead substitute the stale outer constant into `v`, mis-folding
+; it (e.g. `(bind "x" 5 (bind "x" (eq x null) (if x 111 222)))` is 111 under the
+; kernel but a naive CCP folds (eq 5 null)=false and yields 222). A name that is a
+; bind TARGET in two different places is exactly such a shadow candidate; we refuse
+; to ever fold it. A name bound only ONCE has no shadow, so it is left fully
+; propagatable. Over-poisoning is SOUND — at worst a missed fold.
+;
+; All bind shapes counted (matching the kernel's binders): (a) flat name-bind
+; `(bind <name-node> v …)` (arg0 a NAME node); (b) the canonical string-bind pairs
+; `(bind "n1" v1 "n2" v2 … body)` (arg0 a string lit — bind_pairs reads each pair
+; name); (c) the multi-binding form `(bind ((n v) …) body)` whose arg0 is a Call of
+; pairs (each pair's callee name is a target); and lambda parameters (a fresh
+; binder of the same name shadows just as a bind does).
+(bind multiply_bound_names
+  (lambda (node)
+    (bind ((counts (map_of)) (out (map_of)))
+      (do
+        ; bump — record one TARGET occurrence of `nm`; on the 2nd it is multiply-
+        ; bound (a shadow candidate) and joins the poison-seed set.
+        (bind (
+          (bump
+            (lambda (nm)
+              (when (not (eq nm null))
+                (bind ((c (get counts nm 0)))
+                  (do
+                    (assoc counts nm (int_add c 1))
+                    (when (eq c 1) (assoc out nm true)))))))
+        )
+          (walk node
+            (lambda (n)
+              (when (call? n)
+                (cond
+                  ; (b) canonical string-bind: every pair name is a target.
+                  ((and (head_is? n "bind") (string_lit? (arg n 0)))
+                    (bind ((bp (bind_pairs n)))
+                      (when (not (eq bp null))
+                        (for p (get bp "pairs") (bump (get p "name"))))))
+                  ; (a) flat name-bind `(bind <name-node> v …)`.
+                  ((and (head_is? n "bind") (name? (arg n 0)))
+                    (bump (name_of (arg n 0))))
+                  ; (c) multi-binding `(bind ((n v) …) body)`: arg0 is a Call of
+                  ; pair nodes; each pair's CALLEE name is the bound target.
+                  ((and (head_is? n "bind") (call? (arg n 0)))
+                    (for pr (items_of (arg n 0))
+                      (when (call? pr) (bump (head_of pr)))))
+                  ; lambda parameters: a fresh binder shadowing the outer name.
+                  ((and (head_is? n "lambda") (gt (size (args_of n)) 0))
+                    (for pn (lambda_param_names (arg n 0)) (bump pn)))
+                  (else null))))))
+        out))))
+
+; bound_names_of — every name a binder/clause form INTRODUCES (so the body sees
+; it as a fresh TOP, shadowing any outer constant). Conservative: for a `match` we
+; take every clause-pattern name + guard-capture name; for `try`/`catch` the
+; handler var; for a flat name-bind the bound name. We then strip ALL of them from
+; the env before recursing — over-stripping is sound (a missed fold), never wrong.
+(bind bound_names_of
+  (lambda (node)
+    (bind ((out (list_of)) (h (head_of node)))
+      (do
+        (cond
+          ; match — clause patterns bind: `(name …)` binds name; `(pred n …)` binds n
+          ((eq h "match")
+            (for i (sequence_range 1 (size (args_of node)))
+              (bind ((clause (arg node i)))
+                (when (call? clause)
+                  (bind ((pat (syntax_call_callee clause)))
+                    (cond
+                      ((name? pat)
+                        (bind ((pn (name_of pat)))
+                          (when (and (not (eq pn "else")) (not (eq pn "_")))
+                            (append out pn))))
+                      ((call? pat)
+                        (bind ((pa (args_of pat)))
+                          (when (and (gt (size pa) 0) (name? (get pa 0)))
+                            (append out (name_of (get pa 0))))))
+                      (else null)))))))
+          ; try — (try expr (catch e handler…)): e binds in the handler
+          ((or (eq h "try") (eq h "catch"))
+            (bind ((clause (arg node 1)))
+              (when (call? clause)
+                (bind ((cv (syntax_call_callee clause)))
+                  ; (catch e …): e is the FIRST arg of the catch clause
+                  (bind ((ev (if (gt (size (args_of clause)) 0) (arg clause 0) cv)))
+                    (when (name? ev) (append out (name_of ev))))))))
+          ; flat name-node bind `(bind <name> v rest…)`: <name> binds over rest
+          ((and (eq h "bind") (name? (arg node 0)))
+            (append out (name_of (arg node 0))))
+          (else null))
+        out))))
+
+; ── touched-names of a subtree (the control-flow boundary set) ───────────────
+; touched_names — every name that is BOUND (canonical/flat) or MUTATED
+; (set_ref/set!/assign_lexical) ANYWHERE inside `node`. This is the set we must
+; refuse to propagate ACROSS a control-flow boundary: a name re-bound or modified
+; on some path inside an `if`/`while`/`try`/`match` is NOT provably the outer
+; constant after the form (nor inside an arm that re-binds it). We strip these
+; from the const env before DESCENDING into a control-flow form (so no stale
+; constant leaks into an arm that might re-bind it, and the condition only sees
+; provably-const-on-entry names). After the form, the whole-form poison set keeps
+; every such name BOTTOM for the straight-line continuation too. Over-collecting
+; is always SOUND — at worst a missed fold, never a wrong constant.
+;   * canonical bind `(bind "n1" v1 … body)` — each pair name n1, n2, …
+;   * flat bind `(bind <name> v body…)` — the bound name
+;   * `(set_ref/set!/assign_lexical name …)` — the target
+;   * lambda parameters — a fresh binder shadowing the outer name
+(bind touched_names
+  (lambda (node)
+    (bind ((s (map_of)))
+      (do
+        (walk node
+          (lambda (n)
+            (when (call? n)
+              (cond
+                ; mutations: set_ref / set! / assign_lexical
+                ((or (head_is? n "set_ref")
+                     (or (head_is? n "set!") (head_is? n "assign_lexical")))
+                  (bind ((a0 (arg n 0)))
+                    (when (name? a0) (assoc s (name_of a0) true))))
+                ; canonical string-bind: every pair name shadows for the body
+                ((and (head_is? n "bind") (string_lit? (arg n 0)))
+                  (bind ((bp (bind_pairs n)))
+                    (when (not (eq bp null))
+                      (for p (get bp "pairs") (assoc s (get p "name") true)))))
+                ; flat name-bind: leaks into the current scope
+                ((and (head_is? n "bind") (name? (arg n 0)))
+                  (assoc s (name_of (arg n 0)) true))
+                ; lambda parameters: fresh binders shadowing the outer name
+                ((and (head_is? n "lambda") (gt (size (args_of n)) 0))
+                  (for pn (lambda_param_names (arg n 0)) (assoc s pn true)))
+                (else null)))))
+        s))))
+
+; without_touched — env with every name in the `touched` set removed (the
+; control-flow boundary strip).
+(bind without_touched
+  (lambda (env touched)
+    (bind ((c (map_of)))
+      (do
+        (for k (map_keys env)
+          (when (not (eq (get touched k false) true)) (assoc c k (get env k))))
+        c))))
+
+; ── the core walk: propagate constants, threading env top-down ───────────────
+; ccp_walk — rewrite `node` under const env `env` and poison set `poison`.
+;   env    : map name -> scalar constant VALUE (the CONSTANT names in scope)
+;   poison : set name -> true (BOTTOM names: set_ref targets — never propagated)
+;   ->     : the rewritten node (input never mutated)
+;
+; Unlike a pure bottom-up `transform`, ccp is a TOP-DOWN walk: a `bind` extends the
+; env for its body, an `if` prunes/recurses with the same env, and a NAME leaf is
+; replaced only when the env proves it constant. Children are rebuilt explicitly so
+; each sees the correct scoped env.
+(bind ccp_walk
+  (lambda (self node env poison)
+    (cond
+      ; ── a name use: replace with its literal iff provably constant here ──
+      ((name? node)
+        (bind ((nm (name_of node)))
+          (if (and (contains env nm) (not (eq (get poison nm false) true)))
+            (lit (get env nm))
+            node)))
+
+      ; ── a literal: nothing to do ──
+      ((literal? node) node)
+
+      ; ── a call: dispatch on the head (control forms get special threading) ──
+      ((call? node)
+        (bind ((h (head_of node)))
+          (cond
+            ; ── (if cond then else): a CONTROL-FLOW BOUNDARY. The condition runs
+            ; STRAIGHT-LINE (before either arm), so we prune on a provably-const
+            ; bool under the FULL env and walk the condition under it. But each ARM
+            ; may re-bind or mutate a name, and a name is only propagatable where it
+            ; is UNCONDITIONALLY straight-line constant — so we DESCEND into each arm
+            ; with the env STRIPPED of every name touched anywhere inside that arm
+            ; (touched_names): no stale outer constant leaks into an arm that might
+            ; re-bind it. After the if, the whole-form poison set keeps every such
+            ; name BOTTOM for the continuation. When the condition is provably const
+            ; we keep ONLY the live arm (the removed test bound nothing new). ──
+            ((and (head_is? node "if") (eq (size (args_of node)) 3))
+              (bind (
+                (c (arg node 0)) (t (arg node 1)) (e (arg node 2))
+                (cv (const_bool c env))
+              )
+                (if (not (eq cv null))
+                  ; provably constant condition -> keep only the live arm, walked
+                  ; under the env stripped of names that arm touches.
+                  (if cv
+                    (self self t (without_touched env (touched_names t)) poison)
+                    (self self e (without_touched env (touched_names e)) poison))
+                  ; condition not provably constant -> rebuild all three children.
+                  ; The condition is STRAIGHT-LINE (current env); each arm descends
+                  ; with the env stripped of every name it touches.
+                  (if3 (self self c env poison)
+                       (self self t (without_touched env (touched_names t)) poison)
+                       (self self e (without_touched env (touched_names e)) poison)))))
+
+            ; ── while / try / catch / match: CONTROL-FLOW BOUNDARIES that do not
+            ; nest through the canonical-bind/if cases. Each may execute (or skip,
+            ; or repeat) a body that re-binds or mutates names; a name is
+            ; propagatable inside only where it is provably constant on entry. We
+            ; DESCEND with the env stripped of every name TOUCHED anywhere inside the
+            ; whole form (touched_names over the node) — a single conservative strip
+            ; that covers the condition, all arms/branches, the loop body, and the
+            ; handler. The continuation past the form is protected by the whole-form
+            ; poison set. bound_names_of additionally strips this form's own binders
+            ; (e.g. a catch handler var, match captures) so they are never confused
+            ; with an outer constant. Over-stripping is sound — only a missed fold. ──
+            ((or (head_is? node "while")
+                 (or (head_is? node "try")
+                     (or (head_is? node "catch") (head_is? node "match"))))
+              (bind (
+                (stripped (without_touched env (touched_names node)))
+                (inner (without_consts stripped (bound_names_of node)))
+              )
+                (call (self self (syntax_call_callee node) inner poison)
+                  (bind ((out (list_of)))
+                    (do
+                      (for a (args_of node)
+                        (append out (self self a inner poison)))
+                      out)))))
+
+            ; ── canonical (bind "n1" v1 … body…): thread a growing env through the
+            ; let* pairs, then the body. Each pair's value is walked under the env
+            ; so far; if it then proves a scalar constant, the name becomes CONSTANT
+            ; for the remaining pairs and the body; otherwise the name reverts to
+            ; TOP (any prior constant of the same name is removed — a shadow). A
+            ; poisoned name (set_ref target) is NEVER recorded as constant. ──
+            ((and (head_is? node "bind") (string_lit? (arg node 0)))
+              (bind (
+                (bp (bind_pairs node))
+                (pairs (get bp "pairs")) (body (get bp "body"))
+                (cur (ref env))
+                (out_pairs (list_of))
+              )
+                (do
+                  (for p pairs
+                    (bind (
+                      (nm (get p "name"))
+                      ; rewrite the value under the env established by EARLIER pairs
+                      (val (self self (get p "value") (deref cur) poison))
+                    )
+                      (do
+                        (append out_pairs (assoc (map_of) "name" nm "value" val))
+                        ; learn whether this name is now a scalar constant. A
+                        ; poisoned name (mutated by set_ref somewhere in scope) is
+                        ; never const; otherwise try to fold the (already-rewritten)
+                        ; value under the current env.
+                        (if (eq (get poison nm false) true)
+                          (set_ref cur (without_const (deref cur) nm))
+                          (bind ((cv (const_value val (deref cur))))
+                            (if (eq cv null)
+                              (set_ref cur (without_const (deref cur) nm))
+                              (set_ref cur (with_const (deref cur) nm cv))))))))
+                  ; the body is walked under the FINAL env (all const pairs in scope)
+                  (bind ((out_body (list_of)))
+                    (do
+                      (for b body
+                        (append out_body (self self b (deref cur) poison)))
+                      (mkbind out_pairs out_body))))))
+
+            ; ── (lambda params body…): a parameter is a fresh binder — its name is
+            ; UNKNOWN inside the body (TOP), so it must SHADOW any outer constant of
+            ; the same name. Strip every parameter (BOTH kernel param shapes, via
+            ; lambda_param_names) from the env before walking the body, then rebuild.
+            ; The params node itself is kept verbatim (never rewritten — its names
+            ; are binders, not uses). A degenerate `(lambda)` with no params arg is
+            ; left intact (no args to rebuild). ──
+            ((head_is? node "lambda")
+              (bind ((as (args_of node)))
+                (if (eq (size as) 0)
+                  node
+                  (bind (
+                    (params (get as 0))
+                    (inner (without_consts env (lambda_param_names params)))
+                    (parts (list_of params))
+                  )
+                    (do
+                      (for k (sequence_range 1 (size as))
+                        (append parts (self self (get as k) inner poison)))
+                      (call (sym "lambda") parts))))))
+
+            ; ── quote / quasiquote: the argument is DATA, not code — propagating a
+            ; constant name INTO it would rewrite the quoted datum (change `'x` to
+            ; `'5`). Leave the whole form EXACTLY intact. ──
+            ((or (head_is? node "quote") (head_is? node "quasiquote"))
+              node)
+
+            ; ── any other call (set_ref / ref / deref, do, a flat name-bind, an
+            ; ordinary application, …): rebuild head + args. The control-flow forms
+            ; (if/while/try/catch/match) are dispatched ABOVE — they never reach
+            ; here. A flat name-bind `(bind <name> v body…)` that lands here defines
+            ; its name into the CURRENT scope, so it shadows for the body; its name
+            ; is also poisoned WHOLE-FORM by mutated_targets (it can leak), so it is
+            ; never propagated anywhere. bound_names_of collects this form's own
+            ; binders (the flat-bind name) and strips them from the env (conservative:
+            ; over-stripping only misses a fold, never miscompiles) before walking the
+            ; args. For every other call the env is unchanged. A constant arg may
+            ; still be propagated, but the RESULT is never treated as constant — the
+            ; poison set keeps every set_ref/set! target out of the env, and ref/deref
+            ; are not pure heads so const_value never folds them. The recursion only
+            ; ever replaces a name the (correctly scoped) env proves constant. ──
+            (else
+              (bind ((inner (without_consts env (bound_names_of node))))
+                (call (self self (syntax_call_callee node) inner poison)
+                  (bind ((out (list_of)))
+                    (do
+                      (for a (args_of node)
+                        (append out (self self a inner poison)))
+                      out))))))))
+
+      ; ── anything else (shouldn't occur for valid IR): unchanged ──
+      (else node))))
+
+; ── public core: ccp over one form ───────────────────────────────────────────
+; ccp_node — sparse conditional constant propagation over one IR node. Computes
+; the whole-form poison set first (so a name written by set_ref/set! LATER in the
+; form is already BOTTOM when we reach its binding — the conservative whole-scope
+; guard), then walks top-down with an empty initial env. The poison seed is the
+; UNION of two whole-tree pre-scans:
+;   * mutated_targets    — names mutated (set_ref/set!/assign_lexical) or flat-
+;     rebound anywhere (a write leaks past joins, so the name is BOTTOM).
+;   * multiply_bound_names — names that are a BIND TARGET more than once anywhere
+;     (a same-name SHADOW). The kernel evaluates a shadowing bind as letrec, so a
+;     CCP that walks pair values under the OUTER env would substitute the stale
+;     outer constant; poisoning every multiply-bound name forbids that fold. A name
+;     bound only ONCE is not poisoned and stays fully propagatable.
+; Over-poisoning is SOUND — at worst a missed fold, never a wrong constant.
+(bind ccp_node
+  (lambda (node)
+    (bind ((poison (mutated_targets node)))
+      (do
+        (for k (map_keys (multiply_bound_names node)) (assoc poison k true))
+        (ccp_walk ccp_walk node (map_of) poison)))))
+
+; ── transform entry + registration ───────────────────────────────────────────
+; run — rewrite every located form IN PLACE.
+(bind run
+  (lambda (located)
+    (for f located (assoc f "node" (ccp_node (get f "node"))))))
+
+; register! — install sparse conditional constant propagation as a load-time
+; TRANSFORM (idempotent).
+(bind register! (lambda () (install_transform! "ccp" run)))
+
+(export ccp_node run register! scalar_const? const_value const_bool)

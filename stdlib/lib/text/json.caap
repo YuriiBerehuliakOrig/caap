@@ -1,0 +1,514 @@
+; stdlib/lib/text/json.caap — JSON in pure CAAP (module stdlib.lib.text.json).
+;
+;   json_parse      TEXT  -> {ok: true, value} | {ok: false, error}
+;   json_stringify  VALUE -> compact JSON text   (throws a protocol error
+;   json_pretty     VALUE -> indented JSON text    for non-JSON values)
+;
+; Values map 1:1 — object<->map, array<->list, string/int/float/bool/null
+; as themselves. A parse failure is DATA with a "line:col:" located message;
+; an encode failure is a stdlib.lib.diag.error protocol error (the caller's try
+; sees code "stdlib.json.encode").
+;
+; Escapes: \" \\ \/ \b \f \n \r \t both ways. \uXXXX is decoded to its
+; UTF-8 character via the kernel `bytes_from_list` + `bytes->string` pair,
+; surrogate pairs included (codepoints above U+FFFF). On encode the mandatory
+; JSON control characters U+0000..U+001F become \b \f \n \r \t or \u00XX,
+; so stringify output is always valid JSON.
+(module stdlib.lib.text.json)
+
+(use stdlib.lib.diag.error raise!)
+; digit?/hex_digit reuse the canonical char predicates (same ASCII classes and
+; the same (size c)=1 guard, so the behaviour is identical to the old private
+; copies). is_digit? = the old `digit?`; hex_digit_value = the old `hex_digit`.
+(use stdlib.lib.text.char is_digit? hex_digit_value)
+
+; ── cursor helpers ──────────────────────────────────────────────────────────
+; the parser walks a PRE-SPLIT char list (kernel string_chars, O(n) once) —
+; `text` everywhere below is that list; indexing is O(1)
+(bind ch
+  (lambda (text i) (get text i "")))
+
+(bind ws?
+  (lambda (c) (or (eq c " ") (or (eq c "\n") (or (eq c "\t") (eq c "\r"))))))
+
+(bind skip_ws
+  (lambda (text i)
+    (bind ((j (ref i)))
+      (do
+        (while (and (lt (deref j) (size text)) (ws? (ch text (deref j))))
+          (set_ref j (int_add (deref j) 1)))
+        (deref j)))))
+
+; lexeme — the chars [i0, i1) joined back into a string. Collected into a LOCAL
+; list and joined once (O(n)) instead of concatenated onto a growing accumulator
+; per char (O(n^2)); the joined characters are identical, so is the lexeme.
+(bind lexeme
+  (lambda (text i0 i1)
+    (bind ((parts (list_of)) (k (ref i0)))
+      (do
+        (while (lt (deref k) i1)
+          (do
+            (append parts (ch text (deref k)))
+            (set_ref k (int_add (deref k) 1))))
+        (sequence_join parts "")))))
+
+; pos — "line:col" of byte offset `i` (error paths only).
+(bind pos
+  (lambda (text i)
+    (bind ((line (ref 1)) (col (ref 1)) (k (ref 0)))
+      (do
+        (while (lt (deref k) i)
+          (do
+            (if (eq (ch text (deref k)) "\n")
+              (do (set_ref line (int_add (deref line) 1)) (set_ref col 1))
+              (set_ref col (int_add (deref col) 1)))
+            (set_ref k (int_add (deref k) 1))))
+        (string_concat_many
+          (int_to_string (deref line)) ":" (int_to_string (deref col)))))))
+
+(bind fail
+  (lambda (text i message)
+    (assoc (map_of) "ok" false
+      "error" (string_concat_many
+                "json: " (pos text i) ": " message))))
+
+(bind good
+  (lambda (value i)
+    (assoc (map_of) "ok" true "value" value "i" i)))
+
+; the mutually recursive parsers share one dispatch record
+(bind J (map_of))
+
+; ── codepoint -> string ─────────────────────────────────────────────────────
+; CAAP has no char type and no direct codepoint->string builtin, but the kernel
+; bytes pair gives a total path: hand-encode the scalar value to UTF-8 bytes,
+; then `bytes->string` (which validates the UTF-8). Used for \uXXXX and to mint
+; the \b / \f control characters by value (no invisible control bytes in source).
+;   cp : a Unicode scalar value (0 .. 0x10FFFF, surrogates excluded)
+;   -> : the 1-character string for `cp`
+(bind codepoint_to_string
+  (lambda (cp)
+    (bytes->string
+      (bytes_from_list
+        (cond
+          ; U+0000..U+007F — one byte, the codepoint itself
+          ((lt cp 128) (list_of cp))
+          ; U+0080..U+07FF — 110xxxxx 10xxxxxx
+          ((lt cp 2048)
+            (list_of
+              (int_add 192 (int_div cp 64))
+              (int_add 128 (int_mod cp 64))))
+          ; U+0800..U+FFFF — 1110xxxx 10xxxxxx 10xxxxxx
+          ((lt cp 65536)
+            (list_of
+              (int_add 224 (int_div cp 4096))
+              (int_add 128 (int_mod (int_div cp 64) 64))
+              (int_add 128 (int_mod cp 64))))
+          ; U+10000..U+10FFFF — 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+          (else
+            (list_of
+              (int_add 240 (int_div cp 262144))
+              (int_add 128 (int_mod (int_div cp 4096) 64))
+              (int_add 128 (int_mod (int_div cp 64) 64))
+              (int_add 128 (int_mod cp 64)))))))))
+
+; hex_digit — value of one hex digit "0".."9"/"a".."f"/"A".."F", else -1. The
+; canonical char.hex_digit_value (imported above): same classes, same (size c)=1
+; guard (which matters here — string_contains/string_find treat the empty string,
+; what `ch` yields past end-of-input, as a match at index 0, so an unguarded ""
+; would read as hex 0 and run off the end of the text).
+(bind hex_digit hex_digit_value)
+
+; read_hex4 — the 4 hex digits of a \uXXXX starting at `j` (just past "u") as
+; an int, or -1 when any of the four is missing or not a hex digit.
+(bind read_hex4
+  (lambda (text j)
+    (bind ((acc (ref 0)) (k (ref 0)) (bad (ref false)))
+      (do
+        (while (and (not (deref bad)) (lt (deref k) 4))
+          (bind ((d (hex_digit (ch text (int_add j (deref k))))))
+            (if (lt d 0)
+              (set_ref bad true)
+              (do
+                (set_ref acc (int_add (int_mul (deref acc) 16) d))
+                (set_ref k (int_add (deref k) 1))))))
+        (if (deref bad) -1 (deref acc))))))
+
+; UTF-16 surrogate halves. A codepoint above U+FFFF is written in JSON as a
+; high+low pair; either half alone is not a scalar value (bytes->string would
+; reject it), so a lone or mismatched surrogate is a parse error.
+(bind high_surrogate?
+  (lambda (cp) (and (ge cp 55296) (le cp 56319))))   ; 0xD800..0xDBFF
+(bind low_surrogate?
+  (lambda (cp) (and (ge cp 56320) (le cp 57343))))   ; 0xDC00..0xDFFF
+(bind combine_surrogates
+  (lambda (hi lo)
+    (int_add 65536
+      (int_add (int_mul (int_sub hi 55296) 1024) (int_sub lo 56320)))))
+
+; ── strings ─────────────────────────────────────────────────────────────────
+; control_char? — a single-character string whose codepoint is < 0x20 (U+0000..
+; U+001F). JSON forbids these raw inside a string literal; they must appear as a
+; short escape (\n \t …) or \u00XX. The test is a lexicographic string compare
+; against codepoint 0x20: for ASCII (single-byte) chars byte order is codepoint
+; order, and every multi-byte UTF-8 char begins with a byte >= 0xC2 (> 0x1F), so
+; it always sorts after the 0x20 sentinel — no false positive on non-ASCII text.
+; The (size c) guard rejects "" (end-of-input), which sorts before the sentinel.
+(bind space_char (codepoint_to_string 32))
+(bind control_char?
+  (lambda (c) (and (eq (size c) 1) (lt c space_char))))
+; \b (backspace, U+0008) and \f (form feed, U+000C) decode to their real
+; control characters, minted by value so the source carries no raw control
+; bytes (the previous map embedded literal 0x08 / 0x0C in the file).
+(bind unescape
+  (assoc (map_of) "\"" "\"" "\\" "\\" "/" "/" "n" "\n" "t" "\t" "r" "\r"
+                  "b" (codepoint_to_string 8) "f" (codepoint_to_string 12)))
+; `out` accumulates the decoded chunks in a LOCAL list, joined once on success
+; (O(n)); the old per-chunk string_concat_many onto a growing string was O(n^2).
+; The decoded pieces are unchanged, so the parsed string value is identical.
+(bind parse_string
+  (lambda (text i0)
+    (bind ((out (list_of)) (i (ref (int_add i0 1))) (res (ref null)))
+      (do
+        (while (and (eq (deref res) null) (lt (deref i) (size text)))
+          (bind ((c (ch text (deref i))))
+            (cond
+              ((eq c "\"")
+                (set_ref res (good (sequence_join out "") (int_add (deref i) 1))))
+              ((eq c "\\")
+                (bind ((e (ch text (int_add (deref i) 1))))
+                  (cond
+                    ((eq e "u")
+                      ; \uXXXX: read 4 hex; a high surrogate must be followed by
+                      ; a low-surrogate \uXXXX (the two combine into one codepoint).
+                      (bind ((cp (read_hex4 text (int_add (deref i) 2))))
+                        (cond
+                          ((lt cp 0)
+                            (set_ref res
+                              (fail text (deref i) "bad \\u escape (need 4 hex digits)")))
+                          ((low_surrogate? cp)
+                            (set_ref res
+                              (fail text (deref i) "unexpected low surrogate")))
+                          ((high_surrogate? cp)
+                            (if (not (and (eq (ch text (int_add (deref i) 6)) "\\")
+                                          (eq (ch text (int_add (deref i) 7)) "u")))
+                              (set_ref res
+                                (fail text (deref i) "high surrogate needs a following \\u"))
+                              (bind ((lo (read_hex4 text (int_add (deref i) 8))))
+                                (if (not (low_surrogate? lo))
+                                  (set_ref res
+                                    (fail text (deref i) "high surrogate needs a low surrogate"))
+                                  (do
+                                    (append out
+                                      (codepoint_to_string (combine_surrogates cp lo)))
+                                    (set_ref i (int_add (deref i) 12)))))))
+                          (else
+                            (do
+                              (append out (codepoint_to_string cp))
+                              (set_ref i (int_add (deref i) 6)))))))
+                    ((not (eq (get unescape e) null))
+                      (do
+                        (append out (get unescape e ""))
+                        (set_ref i (int_add (deref i) 2))))
+                    (else
+                      (set_ref res
+                        (fail text (deref i)
+                          (string_concat_many "bad escape \\" e)))))))
+              ; a raw C0 control char (< 0x20) must be escaped, never literal
+              ((control_char? c)
+                (set_ref res
+                  (fail text (deref i) "unescaped control character in JSON string")))
+              (else
+                (do
+                  (append out c)
+                  (set_ref i (int_add (deref i) 1)))))))
+        (if (eq (deref res) null)
+          (fail text i0 "unterminated string")
+          (deref res))))))
+
+; ── numbers ─────────────────────────────────────────────────────────────────
+(bind num_char?
+  (lambda (c)
+    (or (string_contains "0123456789" c)
+        (or (eq c "-") (or (eq c "+")
+            (or (eq c ".") (or (eq c "e") (eq c "E"))))))))
+; digit? = the canonical char.is_digit? (imported above); same class + guard.
+(bind digit? is_digit?)
+
+; json_number? — validate a collected lexeme against the JSON number grammar
+; (RFC 8259) BEFORE delegating to string_to_int / string_to_float, which are
+; lenient and would otherwise accept malformed shapes (1.2.3, --1, 1e, +1, 01).
+;   number = [ "-" ] int [ frac ] [ exp ]
+;   int    = "0" / ( digit1-9 *digit )      ; no leading zero unless the int is 0
+;   frac   = "." 1*digit
+;   exp    = ("e"/"E") [ "+"/"-" ] 1*digit
+; Walks the pre-split char list with a single cursor; returns true only on an
+; exactly-matching lexeme (cursor lands on the end). cs is (string_chars lex).
+(bind json_number?
+  (lambda (cs)
+    (bind ((n (size cs)) (k (ref 0)) (ok (ref true)))
+      (do
+        ; optional leading minus
+        (if (eq (get cs (deref k) "") "-") (set_ref k (int_add (deref k) 1)) null)
+        ; int part: "0" alone, or a 1-9 digit followed by any digits
+        (if (not (digit? (get cs (deref k) "")))
+          (set_ref ok false)
+          (if (eq (get cs (deref k) "") "0")
+            (set_ref k (int_add (deref k) 1))   ; a leading 0 ends the int part
+            (while (digit? (get cs (deref k) ""))
+              (set_ref k (int_add (deref k) 1)))))
+        ; optional fraction: "." then 1+ digits
+        (if (and (deref ok) (eq (get cs (deref k) "") "."))
+          (do
+            (set_ref k (int_add (deref k) 1))
+            (if (not (digit? (get cs (deref k) "")))
+              (set_ref ok false)
+              (while (digit? (get cs (deref k) ""))
+                (set_ref k (int_add (deref k) 1)))))
+          null)
+        ; optional exponent: e/E, optional sign, then 1+ digits
+        (if (and (deref ok)
+                 (or (eq (get cs (deref k) "") "e") (eq (get cs (deref k) "") "E")))
+          (do
+            (set_ref k (int_add (deref k) 1))
+            (if (or (eq (get cs (deref k) "") "+") (eq (get cs (deref k) "") "-"))
+              (set_ref k (int_add (deref k) 1)) null)
+            (if (not (digit? (get cs (deref k) "")))
+              (set_ref ok false)
+              (while (digit? (get cs (deref k) ""))
+                (set_ref k (int_add (deref k) 1)))))
+          null)
+        ; the lexeme is a JSON number only if the whole thing was consumed
+        (and (deref ok) (eq (deref k) n))))))
+
+; float_or_fail — a parsed float is JSON only when it is finite. JSON has no
+; Infinity/NaN, but string_to_float returns inf (not an error) when a value
+; overflows f64 (e.g. 1e400), so the json_number? grammar gate is not enough —
+; an over-magnitude literal must still be rejected here as a bad number.
+(bind float_or_fail
+  (lambda (text i0 lex i f)
+    (if (or (float_inf? f) (float_nan? f))
+      (fail text i0 (string_concat_many "bad number `" lex "`"))
+      (good f i))))
+
+(bind parse_number
+  (lambda (text i0)
+    (bind ((i (ref i0)))
+      (do
+        (while (and (lt (deref i) (size text)) (num_char? (ch text (deref i))))
+          (set_ref i (int_add (deref i) 1)))
+        (bind ((lex (lexeme text i0 (deref i))))
+          (if (not (json_number? (string_chars lex)))
+            (fail text i0 (string_concat_many "bad number `" lex "`"))
+            (if (or (string_contains lex ".")
+                    (or (string_contains lex "e") (string_contains lex "E")))
+              ; fractional/exponent form -> float (reject inf/nan overflow)
+              (float_or_fail text i0 lex (deref i) (string_to_float lex))
+              ; integer form -> int, but a magnitude past i64 is still a valid
+              ; JSON number; fall back to a (lossy) float so huge ints parse the
+              ; same way their float-shaped equivalents already do
+              (try
+                (good (string_to_int lex) (deref i))
+                (catch e
+                  (float_or_fail text i0 lex (deref i) (string_to_float lex)))))))))))
+
+; ── arrays / objects ────────────────────────────────────────────────────────
+(bind parse_array
+  (lambda (text i0)
+    (bind ((items (list_of)) (i (ref (skip_ws text (int_add i0 1))))
+           (res (ref null)) (first (ref true)))
+      (do
+        (while (eq (deref res) null)
+          (bind ((c (ch text (deref i))))
+            (cond
+              ((eq c "]")
+                (set_ref res (good items (int_add (deref i) 1))))
+              ((eq c "")
+                (set_ref res (fail text i0 "unterminated array")))
+              (else
+                (bind ((sep (if (deref first)
+                              (deref i)
+                              (if (eq c ",")
+                                (skip_ws text (int_add (deref i) 1))
+                                -1))))
+                  (if (lt sep 0)
+                    (set_ref res (fail text (deref i) "expected `,` or `]`"))
+                    (bind ((r ((get J "value") text sep)))
+                      (if (not (get r "ok" false))
+                        (set_ref res r)
+                        (do
+                          (set_ref first false)
+                          (append items (get r "value"))
+                          (set_ref i (skip_ws text (get r "i" 0))))))))))))
+        (deref res)))))
+
+(bind parse_object
+  (lambda (text i0)
+    (bind ((m (map_of)) (i (ref (skip_ws text (int_add i0 1))))
+           (res (ref null)) (first (ref true)))
+      (do
+        (while (eq (deref res) null)
+          (bind ((c (ch text (deref i))))
+            (cond
+              ((eq c "}")
+                (set_ref res (good m (int_add (deref i) 1))))
+              ((eq c "")
+                (set_ref res (fail text i0 "unterminated object")))
+              (else
+                (bind ((sep (if (deref first)
+                              (deref i)
+                              (if (eq c ",")
+                                (skip_ws text (int_add (deref i) 1))
+                                -1))))
+                  (if (lt sep 0)
+                    (set_ref res (fail text (deref i) "expected `,` or `}`"))
+                    (if (not (eq (ch text sep) "\""))
+                      (set_ref res (fail text sep "expected a string key"))
+                      (bind ((k (parse_string text sep)))
+                        (if (not (get k "ok" false))
+                          (set_ref res k)
+                          (bind ((colon (skip_ws text (get k "i" 0))))
+                            (if (not (eq (ch text colon) ":"))
+                              (set_ref res (fail text colon "expected `:`"))
+                              (bind ((v ((get J "value") text
+                                         (skip_ws text (int_add colon 1)))))
+                                (if (not (get v "ok" false))
+                                  (set_ref res v)
+                                  (do
+                                    (set_ref first false)
+                                    (assoc m (get k "value")
+                                             (get v "value"))
+                                    (set_ref i (skip_ws text
+                                                 (get v "i" 0)))))))))))))))))
+        (deref res)))))
+
+; ── values ──────────────────────────────────────────────────────────────────
+(bind lit?
+  (lambda (text i word)
+    (eq (lexeme text i (int_add i (size word))) word)))
+(bind parse_value
+  (lambda (text i0)
+    (bind ((i (skip_ws text i0)))
+      (bind ((c (ch text i)))
+        (cond
+          ((eq c "\"") (parse_string text i))
+          ((eq c "[") (parse_array text i))
+          ((eq c "{") (parse_object text i))
+          ((lit? text i "true") (good true (int_add i 4)))
+          ((lit? text i "false") (good false (int_add i 5)))
+          ((lit? text i "null") (good null (int_add i 4)))
+          ((or (string_contains "0123456789" c) (eq c "-"))
+            (parse_number text i))
+          ((eq c "") (fail text i "unexpected end of input"))
+          (else (fail text i (string_concat_many "unexpected `" c "`"))))))))
+(assoc J "value" parse_value)
+
+; json_parse — TEXT -> {ok: true, value} | {ok: false, error}.
+; Trailing non-whitespace is an error (the whole text must be ONE value).
+(bind json_parse
+  (lambda (raw)
+    (bind ((text (string_chars raw)))
+      (bind ((r (parse_value text 0)))
+      (if (not (get r "ok" false))
+        r
+        (bind ((rest (skip_ws text (get r "i" 0))))
+          (if (lt rest (size text))
+            (fail text rest "trailing content after the value")
+            (assoc (map_of) "ok" true "value" (get r "value")))))))))
+
+; ── stringify ───────────────────────────────────────────────────────────────
+(bind hex_chars "0123456789abcdef")
+; u_escape — "\u00XX" for a control codepoint 0..255 (no short form).
+(bind u_escape
+  (lambda (cp)
+    (string_concat_many "\\u00"
+      (string_slice hex_chars (int_div cp 16) (int_add (int_div cp 16) 1))
+      (string_slice hex_chars (int_mod cp 16) (int_add (int_mod cp 16) 1)))))
+
+; control_escapes — char (U+0000..U+001F) -> its mandatory JSON escape, built
+; once at load time. The five named ones get short forms, the rest \u00XX. esc
+; then does ONE O(1) lookup per character instead of an allocation-per-char
+; codepoint probe, and every C0 control is covered in one place.
+(bind control_escapes
+  (bind ((m (map_of)) (cp (ref 0)))
+    (do
+      (while (lt (deref cp) 32)
+        (bind ((c (codepoint_to_string (deref cp))))
+          (do
+            (assoc m c
+              (cond
+                ((eq (deref cp) 8) "\\b")
+                ((eq (deref cp) 9) "\\t")
+                ((eq (deref cp) 10) "\\n")
+                ((eq (deref cp) 12) "\\f")
+                ((eq (deref cp) 13) "\\r")
+                (else (u_escape (deref cp)))))
+            (set_ref cp (int_add (deref cp) 1)))))
+      m)))
+
+; Each char's rendering is appended to a LOCAL list and joined once at the end
+; (O(n)); the old per-char string_concat_many onto a growing `out` was O(n^2).
+; Each emitted piece is unchanged, so the escaped string is byte-identical.
+(bind esc
+  (lambda (s)
+    (bind ((parts (list_of)) (i (ref 0)) (cs (string_chars s)))
+      (do
+        (while (lt (deref i) (size cs))
+          (bind ((c (get cs (deref i) "")) (ctl (get control_escapes c null)))
+            (do
+              (append parts
+                (cond
+                  ((eq c "\"") "\\\"")
+                  ((eq c "\\") "\\\\")
+                  ; any JSON-mandatory control char (incl. \n \t \r \b \f)
+                  ((not (eq ctl null)) ctl)
+                  (else c)))
+              (set_ref i (int_add (deref i) 1)))))
+        (string_concat_many "\"" (sequence_join parts "") "\"")))))
+
+; write — the one serializer; `indent` null = compact, "" or spaces = pretty
+; (current depth's prefix in `pad`).
+(bind write
+  (lambda (self v indent pad)
+    (bind (
+      (t (value_type v))
+      (nl (if (eq indent null) "" "\n"))
+      (pad2 (if (eq indent null) "" (string_concat_many pad indent)))
+      (col (if (eq indent null) ":" ": "))
+    )
+      (cond
+        ((eq v null) "null")
+        ((eq t "bool") (if v "true" "false"))
+        ((eq t "int") (int_to_string v))
+        ((eq t "float") (value_to_string v))
+        ((eq t "string") (esc v))
+        ((eq t "list")
+          (if (eq (size v) 0) "[]"
+            (bind ((parts (list_of)))
+              (do
+                (for x v
+                  (append parts
+                    (string_concat_many pad2 (self self x indent pad2))))
+                (string_concat_many
+                  "[" nl (sequence_join parts (string_concat_many "," nl))
+                  nl pad "]")))))
+        ((eq t "map")
+          (if (eq (size v) 0) "{}"
+            (bind ((parts (list_of)))
+              (do
+                (for k (map_keys v)
+                  (append parts
+                    (string_concat_many
+                      pad2 (esc k) col (self self (get v k) indent pad2))))
+                (string_concat_many
+                  "{" nl (sequence_join parts (string_concat_many "," nl))
+                  nl pad "}")))))
+        (else
+          (raise! "stdlib.json.encode"
+            (string_concat_many "value of type `" t "` is not JSON")
+            (assoc (map_of) "type" t)))))))
+
+(bind json_stringify (lambda (v) (write write v null "")))
+(bind json_pretty    (lambda (v) (write write v "  " "")))
+
+(export json_parse json_stringify json_pretty)

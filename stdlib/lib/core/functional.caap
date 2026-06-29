@@ -1,0 +1,181 @@
+; stdlib/lib/core/functional.caap — higher-order combinators
+; (module stdlib.lib.core.functional).
+;
+; Plain function values composed and adapted: pure builders that return new
+; functions (the one stateful exception is `memoize`, whose cache lives in the
+; returned closure). `compose`/`compose_all` run right-to-left (math order);
+; `pipe`/`pipe_all` are their left-to-right mirror (data-flow order).
+(module stdlib.lib.core.functional)
+
+; ── composition ─────────────────────────────────────────────────────────────
+
+; compose — (compose f g) = x -> f(g(x)) (apply g, then f).
+;   f / g : two 1-arg functions
+;   ->    : their right-to-left composition
+(bind compose
+  (lambda (f g) (lambda (x) (f (g x)))))
+
+; compose_all — fold a LIST of 1-arg functions into one, applied right-to-left
+; (math order: the last function in the list runs first).
+;   fs : a list of 1-arg functions (empty list -> identity)
+;   -> : their composition
+(bind compose_all
+  (lambda (fs)
+    (lambda (x)
+      (bind ((acc (ref x)) (i (ref (int_sub (size fs) 1))))
+        (do
+          (while (ge (deref i) 0)
+            (do
+              (set_ref acc ((get fs (deref i)) (deref acc)))
+              (set_ref i (int_sub (deref i) 1))))
+          (deref acc))))))
+
+; pipe — (pipe f g) = x -> g(f(x)) (apply f, then g): compose, flipped.
+;   f / g : two 1-arg functions
+;   ->    : their left-to-right composition (data-flow order)
+(bind pipe
+  (lambda (f g) (lambda (x) (g (f x)))))
+
+; pipe_all — thread `x` through a LIST of 1-arg functions left-to-right (the
+; first function in the list runs first). The value-level twin of the `->>`
+; form, as a reusable function.
+;   fs : a list of 1-arg functions (empty list -> identity)
+;   -> : their left-to-right composition
+(bind pipe_all
+  (lambda (fs)
+    (lambda (x)
+      (bind ((acc (ref x)) (i (ref 0)))
+        (do
+          (while (lt (deref i) (size fs))
+            (do
+              (set_ref acc ((get fs (deref i)) (deref acc)))
+              (set_ref i (int_add (deref i) 1))))
+          (deref acc))))))
+
+; ── adapters ────────────────────────────────────────────────────────────────
+
+; partial1 / partial2 — fix the first argument(s) of a 2-/3-arg function.
+;   partial1 : (f a)   -> b -> (f a b)
+;   partial2 : (f a b) -> c -> (f a b c)
+(bind partial1 (lambda (f a) (lambda (b) (f a b))))
+(bind partial2 (lambda (f a b) (lambda (c) (f a b c))))
+
+; curry2 / curry3 — turn a fixed-arity function into a chain of 1-arg functions
+; (a fixed-arity language cannot express a single N-ary `curry`, so the common
+; arities are spelled out). `uncurry2` is the inverse of `curry2`.
+;   curry2   : (f a b)   -> a -> b -> (f a b)
+;   curry3   : (f a b c) -> a -> b -> c -> (f a b c)
+;   uncurry2 : (g a)(b)  -> (a b) -> (g a b)   (collapse a 2-step curry back)
+(bind curry2 (lambda (f) (lambda (a) (lambda (b) (f a b)))))
+(bind curry3 (lambda (f) (lambda (a) (lambda (b) (lambda (c) (f a b c))))))
+(bind uncurry2 (lambda (g) (lambda (a b) ((g a) b))))
+
+; juxt — apply a LIST of 1-arg functions to a single argument, collecting each
+; result into a list (positions match the fns list). (juxt (f g h)) x -> (f(x) g(x) h(x)).
+;   fns : a list of 1-arg functions (empty list -> always the empty list)
+;   ->  : (x) -> a list of each (fn x), in fns order
+(bind juxt
+  (lambda (fns)
+    (lambda (x)
+      (bind ((out (list_of)) (i (ref 0)))
+        (do
+          (while (lt (deref i) (size fns))
+            (do
+              (append out ((get fns (deref i)) x))
+              (set_ref i (int_add (deref i) 1))))
+          out)))))
+
+; fnil — wrap `f` so a null first argument is replaced by `default` before the
+; call (Clojure's fnil, 1-arg case). Guards a function against a missing value
+; without rewriting it. (fnil f d) -> a -> (f (if (eq a null) d a)).
+;   f       : a 1-arg function
+;   default : the value substituted when the argument is null
+;   ->      : a 1-arg function that never passes null through to `f`
+(bind fnil
+  (lambda (f default)
+    (lambda (a) (f (if (eq a null) default a)))))
+
+; identity — return the argument unchanged. (x) -> x
+(bind identity (lambda (x) x))
+
+; constantly — a function ignoring its argument and always yielding `x`.
+;   x  : the fixed result
+;   -> : (_) -> x
+(bind constantly (lambda (x) (lambda (_) x)))
+
+; flip — swap the two arguments of a 2-arg function. (f) -> (a b) -> (f b a)
+(bind flip (lambda (f) (lambda (a b) (f b a))))
+
+; complement — negate a predicate. (pred) -> x -> (not (pred x))
+;   pred : an (x) -> bool predicate
+;   ->   : the complementary predicate
+(bind complement (lambda (pred) (lambda (x) (not (pred x)))))
+
+; ── caching ─────────────────────────────────────────────────────────────────
+
+; memoize — cache a 1-arg function by its argument (map-keyed: argument
+; must be a string/int-printable key; keys via value_to_string). The cache
+; lives in the closure — one per memoized function.
+(bind memoize
+  (lambda (f)
+    (bind ((cache (map_of)) (missing (map_of)))
+      (lambda (x)
+        (bind ((k (value_to_string x)))
+          (bind ((hit (get cache k missing)))
+            (if (eq hit missing)
+              (bind ((v (f x)))
+                (do (assoc cache k v) v))
+              hit)))))))
+
+; memoize_n — cache an N-ARY function, keyed on the value_to_string of the whole
+; argument LIST (so (1 2) and (2 1) get distinct cache slots). The variadic
+; lambda collects its arguments into `args`; `apply` spreads them back into `f`.
+;   f  : a function of any fixed arity
+;   -> : a same-arity function that computes each distinct call exactly once
+(bind memoize_n
+  (lambda (f)
+    (bind ((cache (map_of)) (missing (map_of)))
+      (lambda args
+        (bind ((k (value_to_string args)))
+          (bind ((hit (get cache k missing)))
+            (if (eq hit missing)
+              (bind ((v (apply f args)))
+                (do (assoc cache k v) v))
+              hit)))))))
+
+; memoize2 — memoize_n specialised to a 2-arg function (the common case).
+; Keys on the value_to_string of the (a b) pair.
+;   f  : a 2-arg function
+;   -> : a 2-arg function caching by argument pair
+(bind memoize2
+  (lambda (f)
+    (bind ((m (memoize_n f)))
+      (lambda (a b) (m a b)))))
+
+; ── one-shot / side-effect taps ───────────────────────────────────────────────
+
+; once — wrap a thunk so it runs at most once; later calls return the first
+; result without re-invoking. The done flag + cached value live in the closure.
+;   thunk : a 0-arg function
+;   ->    : a 0-arg function yielding the memoized first result
+(bind once
+  (lambda (thunk)
+    (bind ((done (ref false)) (value (ref null)))
+      (lambda ()
+        (do
+          (if (deref done)
+            null
+            (do (set_ref value (thunk)) (set_ref done true)))
+          (deref value))))))
+
+; tap — run a side-effecting `f` on `x` for its effect, then return `x` unchanged
+; (the K combinator). Handy mid-pipeline: (pipe (tap log) next).
+;   f  : a 1-arg function called for its side effect (result discarded)
+;   -> : (x) -> x, after calling (f x)
+(bind tap
+  (lambda (f) (lambda (x) (do (f x) x))))
+
+(export compose compose_all pipe pipe_all
+        partial1 partial2 curry2 curry3 uncurry2 juxt fnil
+        identity constantly flip complement
+        memoize memoize2 memoize_n once tap)

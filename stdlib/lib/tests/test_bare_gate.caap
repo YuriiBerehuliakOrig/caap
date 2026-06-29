@@ -1,0 +1,106 @@
+; stdlib/lib/tests/test_bare_gate.caap — the native-only bare-import gate
+; (stdlib.semantics.passes.bare_gate): check_forms / bare_imports? / bare_module?
+; over hand-built `(use …)` / `(import …)` / `(re_export …)` directive forms, the
+; same idiom test_imports uses for the unused-import analysis.
+
+;; @area: passes
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true assert_false)
+(use stdlib.semantics.passes.bare_gate
+  bare_module? bare_imports? check_forms)
+(use stdlib.syntax.ast sym calln lam)
+(use stdlib.lib.collections.sequence any?)
+
+(do
+  (bind ((has (lambda (fs n) (any? fs (lambda (f) (string_contains f n))))))
+    (do
+      ; ── bare_module? recognizes the native-only prefix ──
+      (assert_true (bare_module? "stdlib.bare.sync")
+        "stdlib.bare.sync is a native-only bare module")
+      (assert_true (bare_module? "stdlib.bare.atomic")
+        "stdlib.bare.atomic is a native-only bare module")
+      (assert_false (bare_module? "stdlib.lib.collections.sequence")
+        "a plain lib module is not a bare module")
+      (assert_false (bare_module? null)
+        "a null module name (malformed directive) is not a bare module")
+      ; the trailing `.` guards against a same-prefix sibling matching by accident
+      (assert_false (bare_module? "stdlib.barely")
+        "a `stdlib.bare`-PREFIXED name that is not under bare.* does not match")
+
+      ; ── a unit that imports stdlib.bare.sync -> the diagnostic fires ──
+      (bind ((forms (list_of
+                      (calln "module" (list_of (sym "demo")))
+                      (calln "use" (list_of (sym "stdlib.bare.sync")
+                                            (sym "with_critical")))
+                      (calln "bind" (list_of (sym "main")
+                        (lam (list_of)
+                          (calln "with_critical" (list_of (sym "h")))))))))
+        (do
+          (assert_true (bare_imports? forms)
+            "a unit importing stdlib.bare.sync trips the gate")
+          (bind ((fs (check_forms forms)))
+            (do
+              (assert_eq (size fs) 1
+                "exactly one finding for the one bare import")
+              (assert_true (has fs "native-only")
+                "the finding explains the module is native-only")
+              (assert_true (has fs "stdlib.bare.sync")
+                "the finding names the offending module")))))
+
+      ; ── (import stdlib.bare.atomic alias) also fires (the import shape) ──
+      (bind ((forms (list_of
+                      (calln "import" (list_of (sym "stdlib.bare.atomic")
+                                               (sym "at"))))))
+        (do
+          (assert_true (bare_imports? forms)
+            "the (import …) directive shape is gated too")
+          (assert_true (has (check_forms forms) "stdlib.bare.atomic")
+            "the import finding names stdlib.bare.atomic")))
+
+      ; ── (re_export stdlib.bare.sync …) also fires — re_export LOADS its
+      ; module like `use` (with no prior import), so it reaches the wrapper
+      ; through the eval loader too and must be gated. ──
+      (bind ((forms (list_of
+                      (calln "re_export" (list_of (sym "stdlib.bare.sync")
+                                                  (sym "spin_lock"))))))
+        (do
+          (assert_true (bare_imports? forms)
+            "the (re_export …) directive shape is gated too")
+          (assert_true (has (check_forms forms) "stdlib.bare.sync")
+            "the re_export finding names stdlib.bare.sync")))
+
+      ; ── (export …) republishes in-scope names and loads NOTHING, so it is
+      ; never flagged even when its name collides with a bare export. ──
+      (assert_eq
+        (size (check_forms (list_of
+                 (calln "export" (list_of (sym "with_critical"))))))
+        0
+        "(export …) loads no module, so it is not gated")
+
+      ; ── two bare imports -> two findings (one per offending directive) ──
+      (assert_eq
+        (size (check_forms (list_of
+                 (calln "use" (list_of (sym "stdlib.bare.sync")
+                                       (sym "spin_lock")))
+                 (calln "use" (list_of (sym "stdlib.bare.atomic")
+                                       (sym "atomic_add32"))))))
+        2
+        "one finding per bare import directive")
+
+      ; ── a unit that imports only plain modules -> NO diagnostic ──
+      (bind ((forms (list_of
+                      (calln "module" (list_of (sym "demo")))
+                      (calln "use" (list_of (sym "stdlib.lib.collections.sequence")
+                                            (sym "any?")))
+                      (calln "import" (list_of (sym "stdlib.syntax.ast") (sym "ast")))
+                      (calln "bind" (list_of (sym "x") (sym "any?"))))))
+        (do
+          (assert_false (bare_imports? forms)
+            "a unit with no bare import does not trip the gate")
+          (assert_eq (size (check_forms forms)) 0
+            "no findings when only plain modules are imported")))
+
+      ; ── an empty unit -> clean ──
+      (assert_eq (size (check_forms (list_of))) 0
+        "no directives means no findings"))))

@@ -1,0 +1,44 @@
+# Coverage-guided fuzzing for caap-peg (libFuzzer via cargo-fuzz).
+#
+# Run with a nightly toolchain and cargo-fuzz installed:
+#   cargo install cargo-fuzz
+#   cargo +nightly fuzz run parse_input
+#   cargo +nightly fuzz run parse_grammar
+#
+# Detached from the parent workspace on purpose (empty [workspace] table) so the
+# instrumented build does not perturb the main crate's build graph.
+
+[package]
+name = "caap-peg-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.caap-peg]
+path = ".."
+
+[[bin]]
+name = "parse_input"
+path = "fuzz_targets/parse_input.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_grammar"
+path = "fuzz_targets/parse_grammar.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

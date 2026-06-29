@@ -1,0 +1,330 @@
+; stdlib/lib/diag/bag.caap — structured diagnostics + an accumulating bag.
+; (module stdlib.lib.diag.bag).
+;
+; The diag-protocol (lib/diag/error) gives a THROWN error one shape; this is its
+; non-throwing sibling — a structured *diagnostic value* plus a mutable *bag*
+; that collects many of them, the way a checker/type pass emits findings without
+; aborting at the first one. A diagnostic is a tagged map:
+;
+;   {"diag" true,
+;    "severity" "error"|"warning"|"info"|"hint",
+;    "code"     <string>,            ; a diagnostic id (see lib/diag/registry)
+;    "message"  <string>,            ; human-readable text
+;    "span"     [sl sc el ec sb eb]  ; a 6-int list, or null (synthetic)
+;    "related"  [{"span","note"}…]   ; secondary locations
+;    "fixits"   [<any>…]}            ; suggested edits, shape left to producers
+;
+; A span mirrors lib/ast's six fields ORDERED as a list:
+;   [start_line start_col end_line end_col start_byte end_byte]
+; `span` builds one; `span_line`/`span_col` read the line/col render needs.
+; Everything here is pure data + string rendering — an ADDITIVE channel that
+; does not touch error.caap/registry.caap; render optionally borrows a code's
+; registered summary from the registry.
+(module stdlib.lib.diag.bag)
+
+(use stdlib.lib.diag.registry describe)
+
+; ── span helpers ────────────────────────────────────────────────────────────
+
+; span — a 6-int span list from its fields (mirrors lib/ast's span6 ordering).
+;   start_line start_col end_line end_col start_byte end_byte : ints
+;   ->                                                         : the 6-int list
+(bind span
+  (lambda (start_line start_col end_line end_col start_byte end_byte)
+    (list_of start_line start_col end_line end_col start_byte end_byte)))
+
+; span_line — the 1-based start line of a span, or 0 when `sp` is null.
+(bind span_line (lambda (sp) (if (eq sp null) 0 (get sp 0 0))))
+; span_col — the 1-based start column of a span, or 0 when `sp` is null.
+(bind span_col  (lambda (sp) (if (eq sp null) 0 (get sp 1 0))))
+; span_end_line — the 1-based END line of a span (index 2), or 0 when null.
+(bind span_end_line (lambda (sp) (if (eq sp null) 0 (get sp 2 0))))
+; span_end_col — the 1-based END column of a span (index 3), or 0 when null.
+(bind span_end_col  (lambda (sp) (if (eq sp null) 0 (get sp 3 0))))
+
+; ── constructors ────────────────────────────────────────────────────────────
+
+; diag — the general structured-diagnostic constructor (does not throw).
+;   severity : "error" | "warning" | "info" | "hint"
+;   code     : a diagnostic id (string)
+;   message  : the human-readable text
+;   span     : a 6-int span list, or null
+;   ->       : the tagged diagnostic map (empty related/fixits)
+(bind diag
+  (lambda (severity code message span)
+    (assoc (map_of)
+      "diag" true
+      "severity" severity
+      "code" code
+      "message" message
+      "span" span
+      "related" (list_of)
+      "fixits" (list_of))))
+
+; error / warning / info / hint — severity-fixed shorthands for `diag`.
+;   code / msg / span : as for diag
+(bind error   (lambda (code msg span) (diag "error"   code msg span)))
+(bind warning (lambda (code msg span) (diag "warning" code msg span)))
+(bind info    (lambda (code msg span) (diag "info"    code msg span)))
+(bind hint    (lambda (code msg span) (diag "hint"    code msg span)))
+
+; copy_diag — a fresh diagnostic map carrying `d`'s fields. `assoc` mutates a
+; map IN PLACE (docs/builtins.md), so with_related/with_fixit rebuild rather
+; than `assoc` over the caller's map; the "related"/"fixits" lists are copied
+; into fresh lists too, so appending to the copy never touches `d`.
+(bind copy_diag
+  (lambda (d)
+    (bind ((related (list_of)) (fixits (list_of)))
+      (do
+        (sequence_each (get d "related" (list_of))
+          (lambda (r) (append related r)))
+        (sequence_each (get d "fixits" (list_of))
+          (lambda (f) (append fixits f)))
+        (assoc (map_of)
+          "diag" true
+          "severity" (get d "severity" "")
+          "code" (get d "code" "")
+          "message" (get d "message" "")
+          "span" (get d "span")
+          "related" related
+          "fixits" fixits)))))
+
+; with_related — a copy of `d` carrying one more related location.
+;   d    : a diagnostic
+;   span : the related location (a 6-int list or null)
+;   note : the human note for that location
+;   ->   : a new diagnostic (d is not mutated; "related" gets one appended item)
+(bind with_related
+  (lambda (d span note)
+    (bind ((c (copy_diag d)))
+      (do
+        (append (get c "related") (assoc (map_of) "span" span "note" note))
+        c))))
+
+; with_fixit — a copy of `d` carrying one more fixit (shape opaque to bag).
+;   d     : a diagnostic
+;   fixit : the suggested edit (any value the producer/consumer agree on)
+;   ->    : a new diagnostic (d is not mutated)
+(bind with_fixit
+  (lambda (d fixit)
+    (bind ((c (copy_diag d)))
+      (do
+        (append (get c "fixits") fixit)
+        c))))
+
+; ── predicates / accessors (total: defaults rather than throws) ─────────────
+
+; severity_of — the severity string of `d`, or "" when shapeless.
+(bind severity_of (lambda (d) (get d "severity" "")))
+; code_of — the diagnostic id of `d`, or "".
+(bind code_of     (lambda (d) (get d "code" "")))
+; message_of — the human text of `d`, or "".
+(bind message_of  (lambda (d) (get d "message" "")))
+; span_of — the 6-int span of `d`, or null.
+(bind span_of     (lambda (d) (get d "span")))
+; related_of — the related-location list of `d`, or the empty list.
+(bind related_of  (lambda (d) (get d "related" (list_of))))
+; fixits_of — the fixit list of `d`, or the empty list.
+(bind fixits_of   (lambda (d) (get d "fixits" (list_of))))
+
+; is_error? — does `d` carry the "error" severity?
+;   d  : a diagnostic
+;   -> : bool (false for warning/info/hint and for shapeless values)
+(bind is_error? (lambda (d) (eq (severity_of d) "error")))
+
+; ── bag / sink (a mutable accumulator over a ref-held list) ─────────────────
+
+; make_bag — a fresh, empty accumulator.
+;   ->  : a bag (a ref to a list of diagnostics; opaque — use add!/entries)
+(bind make_bag (lambda () (ref (list_of))))
+
+; add! — append `d` to `bag`, in order. Returns `bag` (so adds chain).
+;   bag : a bag from make_bag
+;   d   : a diagnostic to record
+; `append` mutates the ref-held list in place, so no `set_ref` is needed.
+(bind add!
+  (lambda (bag d)
+    (do (append (deref bag) d) bag)))
+
+; entries — the diagnostics in `bag`, in insertion order.
+;   bag : a bag
+;   ->  : the list of diagnostics (the live list; do not mutate in place)
+(bind entries (lambda (bag) (deref bag)))
+
+; has_errors? — does `bag` hold at least one "error"-severity diagnostic?
+;   bag : a bag
+;   ->  : bool
+(bind has_errors?
+  (lambda (bag) (sequence_any (entries bag) is_error?)))
+
+; count_by_severity — a tally of `bag` by severity.
+;   bag : a bag
+;   ->  : a map severity-string -> count, including a 0 for every known
+;         severity ("error"/"warning"/"info"/"hint") so callers need no default
+(bind count_by_severity
+  (lambda (bag)
+    (bind ((tally (ref (assoc (map_of)
+                         "error" 0 "warning" 0 "info" 0 "hint" 0))))
+      (do
+        (sequence_each (entries bag)
+          (lambda (d)
+            (bind ((s (severity_of d)))
+              (set_ref tally
+                (assoc (deref tally) s (int_add (get (deref tally) s 0) 1))))))
+        (deref tally)))))
+
+; ── rendering ───────────────────────────────────────────────────────────────
+
+; render — a one-line "path:line:col: severity[code]: message" for `d`.
+; The location is the diagnostic's span (line:col); a synthetic (null) span
+; renders "<no-span>" in its place. When the code is documented in the diag
+; registry, its summary is appended as " — <summary>".
+;   d    : a diagnostic
+;   path : the source path to print ("" or null for a path-less location)
+;   ->   : the rendered line (string)
+(bind render
+  (lambda (d path)
+    (bind (
+      (sp   (span_of d))
+      (loc  (if (eq sp null) "<no-span>"
+              (string_concat_many
+                (int_to_string (span_line sp)) ":"
+                (int_to_string (span_col sp)))))
+      (head (string_concat_many
+              (if (eq path null) "" path) ":" loc ": "
+              (severity_of d) "[" (code_of d) "]: " (message_of d)))
+      (summary (describe (code_of d)))
+    )
+      (if (eq summary null) head
+        (string_concat_many head " — " summary)))))
+
+; render_related — one indented line per related location of `d`, in order:
+;   "  related: path:line:col-endline:endcol: <note>"
+; A related entry's span is the full start..end range (start line:col, then the
+; end line:col after a dash); a null span renders "<no-span>". The empty string
+; is returned when `d` carries no related locations, so a caller can append it
+; unconditionally.
+;   d    : a diagnostic
+;   path : the source path to print ("" or null for a path-less location)
+;   ->   : the related lines joined by "\n" ("" when there are none)
+(bind render_related
+  (lambda (d path)
+    (sequence_join
+      (sequence_map (related_of d)
+        (lambda (r)
+          (bind ((sp   (get r "span"))
+                 ; with_related always stores the "note" key, so a null note is
+                 ; present-with-null (a `get` default would not fire) — coalesce
+                 ; it to "" explicitly so string_concat_many never meets a null.
+                 (note (get r "note" ""))
+                 (note (if (eq note null) "" note)))
+            (string_concat_many
+              "  related: " (if (eq path null) "" path) ":"
+              (if (eq sp null) "<no-span>"
+                (string_concat_many
+                  (int_to_string (span_line sp)) ":" (int_to_string (span_col sp))
+                  "-" (int_to_string (span_end_line sp)) ":"
+                  (int_to_string (span_end_col sp))))
+              ": " note))))
+      "\n")))
+
+; render_full — a multi-line render of `d`: the one-line `render` head extended
+; with the span's END line:col (so the whole start..end RANGE is shown), then one
+; "related:" line per related location and one "fixit:" line per fixit. Unlike
+; `render` (whose single-line format is a stable contract), this surfaces the
+; full payload a checker accumulated. A null span shows just the start-side
+; "<no-span>" with no range tail. Lines are newline-joined.
+;   d    : a diagnostic
+;   path : the source path to print ("" or null for a path-less location)
+;   ->   : the rendered block (string)
+(bind render_full
+  (lambda (d path)
+    (bind (
+      (sp    (span_of d))
+      ; the start..end range appended to the one-line head when the span is real
+      (range (if (eq sp null) ""
+               (string_concat_many " (" (int_to_string (span_line sp)) ":"
+                 (int_to_string (span_col sp)) "-" (int_to_string (span_end_line sp))
+                 ":" (int_to_string (span_end_col sp)) ")")))
+      (head  (string_concat_many (render d path) range))
+      (rel   (render_related d path))
+      (fix   (sequence_join
+               (sequence_map (fixits_of d)
+                 (lambda (f) (string_concat_many "  fixit: " (value_to_string f))))
+               "\n"))
+      ; join only the non-empty sections so there are no blank lines
+      (parts (ref (list_of head)))
+    )
+      (do
+        (when (not (eq rel "")) (append (deref parts) rel))
+        (when (not (eq fix "")) (append (deref parts) fix))
+        (sequence_join (deref parts) "\n")))))
+
+; render_all — every diagnostic in `bag`, one per line (insertion order).
+;   bag  : a bag
+;   path : the source path to print on each line ("" or null for path-less)
+;   ->   : the diagnostics joined by "\n" ("" for an empty bag)
+(bind render_all
+  (lambda (bag path)
+    (sequence_join
+      (sequence_map (entries bag) (lambda (d) (render d path)))
+      "\n")))
+
+; ── bag combinators (each returns a FRESH bag; inputs are never mutated) ──────
+
+; bag_merge — a NEW bag holding every entry of `a` followed by every entry of
+; `b`, in their original orders (a's then b's). A fresh accumulator is built and
+; each source entry is `add!`ed, so neither input bag is touched — the way two
+; passes' findings combine into one report. Diagnostics are shared by reference
+; (they are immutable data), only the container is new.
+;   a / b : bags (from make_bag)
+;   ->    : a fresh bag with a's entries then b's
+(bind bag_merge
+  (lambda (a b)
+    (bind ((out (make_bag)))
+      (do
+        (sequence_each (entries a) (lambda (d) (add! out d)))
+        (sequence_each (entries b) (lambda (d) (add! out d)))
+        out))))
+
+; errors_only — a NEW bag holding just the "error"-severity entries of `bag`, in
+; their original order. The non-throwing filter `has_errors?` answers yes/no;
+; this keeps the actual error diagnostics (warnings/info/hints dropped) so a
+; caller can render or count only the blocking findings. `bag` is unchanged.
+;   bag : a bag
+;   ->  : a fresh bag of its error entries
+(bind errors_only
+  (lambda (bag)
+    (bind ((out (make_bag)))
+      (do
+        (sequence_each (entries bag)
+          (lambda (d) (when (is_error? d) (add! out d))))
+        out))))
+
+; sort_by_span — a NEW bag whose entries are `bag`'s ordered by source position:
+; start line, then start column. `sequence_sort_by`'s internal order ranks only
+; SCALAR keys (a list key leaves the order untouched), so the line/col pair is
+; folded into one monotone integer key — line * 1e9 + col — which sorts exactly
+; by line, then column (any real column is well under 1e9). A null span yields
+; key 0, so synthetic diagnostics sort first; the sort is STABLE, so entries
+; sharing a position keep their insertion order. `bag` is unchanged.
+;   bag : a bag
+;   ->  : a fresh bag with the same entries in span order
+(bind sort_by_span
+  (lambda (bag)
+    (bind ((sorted
+            (sequence_sort_by (entries bag)
+              (lambda (d)
+                (bind ((sp (span_of d)))
+                  (int_add (int_mul (span_line sp) 1000000000) (span_col sp))))))
+           (out (make_bag)))
+      (do
+        (sequence_each sorted (lambda (d) (add! out d)))
+        out))))
+
+(export span span_line span_col span_end_line span_end_col
+        diag error warning info hint with_related with_fixit
+        severity_of code_of message_of span_of related_of fixits_of is_error?
+        make_bag add! entries has_errors? count_by_severity
+        render render_related render_full render_all
+        bag_merge errors_only sort_by_span)

@@ -1,0 +1,13 @@
+; tests/bad_alias_range.caap — the alias resolves
+; for every comparison: a literal out of the TARGET's range is rejected under
+; the alias name.
+(module stdlib.fixtures.bad_alias_range)
+
+(alias byte u8)
+
+(defn take_byte ((b byte)) int
+  (int_add b 0))
+
+(bind k (take_byte 300))
+
+(export take_byte)

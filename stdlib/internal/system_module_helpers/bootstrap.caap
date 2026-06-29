@@ -1,4 +1,0 @@
-(module "stdlib.internal.system-module-helpers")
-(module-capability "host_services")
-(export "stdlib.internal.system-module-helpers")
-(ctfe-compiler-execute-bootstrap-file compiler "impl.caap")

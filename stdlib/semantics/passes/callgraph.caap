@@ -1,0 +1,135 @@
+; stdlib/semantics/passes/callgraph.caap — module-level call-graph analysis
+; (module stdlib.semantics.passes.callgraph).
+;
+; Where lint/borrow look INSIDE a form, this looks ACROSS a module: it builds
+; the graph of which top-level definition references which, then derives
+;
+;   dead definitions   a top-level name that is neither exported nor reachable
+;                      from an exported name / the module body  -> located finding
+;   recursion          a definition that (transitively) calls itself
+;                      -> recorded as a FACT, not an error (recursion is normal)
+;
+; It is the first user of the cross-pass FACT channel: the whole graph plus the
+; recursive set are published under the "callgraph" namespace, so a later pass
+; or a tool (TCO advice, auto-memoization, dead-code elimination) reads them
+; back with `fact_of` instead of recomputing.
+;
+; Model: top-level binds are the definitions (the loader threads module scope as
+; a sequence of `(bind "name" value)` forms); a name is LIVE if reachable, over
+; reference edges, from the roots — every name used in a non-bind top-level form
+; (`export`, the final expression). `register!` installs it as a load-time pass.
+(module stdlib.semantics.passes.callgraph)
+
+(use stdlib.syntax.ast def_of loc)
+(use stdlib.syntax.ir names_set free_names)
+(use stdlib.semantics.passes.registry finding_at ignored? fact! install_pass!)
+(use stdlib.lib.collections.sequence unique)
+
+; ref_set — the DEDUPED set of FREE names a definition value references. Unlike
+; names_set (every name token, incl. locals), free_names drops names bound WITHIN
+; the value — a lambda param or inner bind that SHADOWS a top-level def of the
+; same name. So `(lambda (helper) (helper))` does NOT edge to a top-level
+; `helper`: the local shadows it, and a genuinely-dead `helper` is no longer kept
+; spuriously alive (nor falsely flagged recursive) by a same-named local. Returns
+; a name list (the shape edges/BFS/the published facts expect), deduped so a name
+; referenced twice is one edge. `unique` keeps the FIRST occurrence of each
+; name (by eq), order preserved — the same order-preserving dedup, reused.
+(bind ref_set
+  (lambda (value)
+    (unique (free_names value))))
+
+; analyze — the whole graph as DATA (no findings, no facts; the testable core).
+;   located : [{node, loc}] the module's top-level forms
+;   -> { def_order:[name…], defs:{name->value}, locs:{name->loc},
+;        edges:{name->[callee…]}, dead:[name…], recursive:{name->true} }
+(bind analyze
+  (lambda (located)
+    (bind (
+      (defs (map_of)) (locs (map_of)) (def_order (list_of))
+      (roots (map_of))
+    )
+      (do
+        ; pass 1 — collect definitions (top-level binds, either binder spelling);
+        ; non-def forms (export / final expr) contribute the reachability roots.
+        ; def_order stays a SET of names (a name redefined at top level is one
+        ; node in the graph): defs/locs keep the latest, def_order lists it once,
+        ; so dead / edges / facts are each computed a single time.
+        (for f located
+          (bind ((node (get f "node")) (d (def_of (get f "node"))))
+            (if (not (eq d null))
+              (do
+                (when (not (contains defs (get d "name")))
+                  (append def_order (get d "name")))
+                (assoc defs (get d "name") (get d "value"))
+                (assoc locs (get d "name") (loc node)))
+              (for u (map_keys (names_set node)) (assoc roots u true)))))
+        ; edges: each definition -> the names it references
+        (bind ((edges (map_of)))
+          (do
+            (for nm def_order
+              (assoc edges nm (ref_set (get defs nm))))
+            ; reachability BFS from the roots, following definition edges only
+            (bind ((live (map_of)) (work (map_keys roots)))
+              (do
+                (while (gt (size work) 0)
+                  (bind ((n (get work (int_sub (size work) 1))))
+                    (do
+                      (list_remove_at work (int_sub (size work) 1))
+                      (when (not (eq (get live n false) true))
+                        (do
+                          (assoc live n true)
+                          (when (not (eq (get defs n) null))
+                            (for c (get edges n (list_of)) (append work c))))))))
+                ; dead = defined, not live, and not a leading-underscore name
+                ; (the intentional-unused convention)
+                (bind ((dead (list_of)) (recursive (map_of)))
+                  (do
+                    (for nm def_order
+                      (when (and (not (eq (get live nm false) true))
+                                 (not (ignored? nm)))
+                        (append dead nm)))
+                    ; recursion: nm reachable from its own callees over def edges
+                    (for nm def_order
+                      (bind ((seen (map_of)) (w (list_of)) (hit (ref false)))
+                        (do
+                          (for c0 (get edges nm (list_of)) (append w c0))
+                          (while (and (not (deref hit)) (gt (size w) 0))
+                            (bind ((c (get w (int_sub (size w) 1))))
+                              (do
+                                (list_remove_at w (int_sub (size w) 1))
+                                (cond
+                                  ((eq c nm) (set_ref hit true))
+                                  ((eq (get seen c false) true) null)
+                                  (else
+                                    (do
+                                      (assoc seen c true)
+                                      (when (not (eq (get defs c) null))
+                                        (for d (get edges c (list_of)) (append w d)))))))))
+                          (when (deref hit) (assoc recursive nm true)))))
+                    (assoc (map_of)
+                      "def_order" def_order "defs" defs "locs" locs
+                      "edges" edges "dead" dead "recursive" recursive)))))))))))
+
+; check_module — the pass entry: dead defs -> located findings; the graph +
+; recursive set -> facts (namespace "callgraph").
+(bind check_module
+  (lambda (located sink)
+    (bind ((g (analyze located)))
+      (do
+        ; findings: dead definitions (located via the stored loc string)
+        (for nm (get g "dead" (list_of))
+          (append sink
+            (finding_at "callgraph" (get (get g "locs" (map_of)) nm "")
+              (string_concat_many "unused top-level definition `" nm
+                "` (not exported, not referenced)"))))
+        ; facts: edges + recursive set (consumed by tools / later passes)
+        (for nm (get g "def_order" (list_of))
+          (fact! "callgraph" nm (get (get g "edges" (map_of)) nm (list_of))))
+        (for nm (map_keys (get g "recursive" (map_of)))
+          (fact! "callgraph.recursive" nm true))))))
+
+; register! — install the call-graph analysis as a load-time pass (idempotent).
+(bind register!
+  (lambda () (install_pass! "callgraph" (lambda (located sink) (check_module located sink)))))
+
+(export analyze check_module register!)

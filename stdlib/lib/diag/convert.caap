@@ -1,0 +1,120 @@
+; stdlib/lib/diag/convert.caap — diagnostic-shape converters.
+; (module stdlib.lib.diag.convert).
+;
+; The stdlib has two canonical structured shapes — the THROWN protocol error
+; (lib/diag/error) and the non-throwing diagnostic VALUE (lib/diag/bag) — but
+; many compiler/backend/tooling layers still speak older dialects: a protocol
+; error, a bare pass-finding STRING, or an ad-hoc backend diagnostic MAP. This
+; module is the ADDITIVE bridge: each converter funnels one of those dialects
+; into the canonical `diag.bag` diagnostic, so a tool can normalize once and
+; then work with a single shape (code/severity/message/span accessors).
+;
+; It only READS the source shapes and BUILDS a bag diagnostic — it changes no
+; producer, so it is safe to add wherever a layer wants to converge.
+(module stdlib.lib.diag.convert)
+
+(use stdlib.lib.diag.error error_code error_message error?)
+(use stdlib.lib.diag.bag diag span make_bag add!)
+
+; error_to_diag — a bag diagnostic from a protocol error.
+; The error's `code` and `message` carry over; `span` is the source location
+; (a 6-int span list, or null for a synthetic one); `severity` selects the
+; bag severity ("error"|"warning"|"info"|"hint") and defaults to "error" when
+; null is passed. (The error's `data` map is intentionally dropped — the bag
+; shape has no data field; a producer that needs it should attach a
+; fixit/related instead.)
+;   error    : a protocol error (a make_error / raise! value)
+;   span     : a 6-int span list, or null
+;   severity : a bag severity string, or null (-> "error")
+;   ->       : the bag diagnostic
+(bind error_to_diag
+  (lambda (error span severity)
+    (diag
+      (if (eq severity null) "error" severity)
+      (error_code error)
+      (error_message error)
+      span)))
+
+; string_to_diag — best-effort parse of a pass-finding STRING into a bag
+; diagnostic. A finding is shaped "tag: …: message" (registry.caap's
+; finding_at): the text BEFORE the first ": " becomes the diagnostic `code`,
+; and the REMAINDER (everything after that first ": ") becomes the `message`.
+; When no ": " is present the whole string is the message and the code is "".
+; Severity is fixed "error" and the span is null (a finding string carries no
+; structured location).
+;   finding : a pass-finding string
+;   ->      : the bag diagnostic
+(bind string_to_diag
+  (lambda (finding)
+    (bind ((i (string_find finding ": ")))
+      (if (eq i null)
+        (diag "error" "" finding null)
+        (diag "error"
+          (string_slice finding 0 i)
+          (string_slice finding (int_add i 2))
+          null)))))
+
+; backend_map_to_diag — a bag diagnostic from a backend emitter's ad-hoc map
+; ({code, severity, message, node_name, path}; see backend/emit/llvm.caap).
+; Severity, code and message are read with sensible defaults; when the map
+; carries a non-empty `node_name`, it is appended to the message as
+; " (<node_name>)" so the originating node survives the conversion. The backend
+; map has no span, so the diagnostic's span is null.
+;   m  : a backend diagnostic map
+;   -> : the bag diagnostic
+(bind backend_map_to_diag
+  (lambda (m)
+    (bind ((node (get m "node_name" ""))
+           (base (get m "message" ""))
+           (message
+             (if (or (eq node null) (eq node ""))
+               base
+               (string_concat_many base " (" node ")"))))
+      (diag
+        (get m "severity" "error")
+        (get m "code" "stdlib.backend.unknown")
+        message
+        null))))
+
+; ── the unified normalizer (audit #16) ──────────────────────────────────────
+; The CORE of #16's "fragmented diagnostic channels": producers emit DIFFERENT
+; shapes — a pass writes a finding STRING ("tag: loc: msg"), the backend emitters
+; an ad-hoc MAP ({code, severity, message, node_name, path}), a checked failure a
+; diag.error — so it is hard to prove the eval and native paths report the "same"
+; diagnostics. normalize_diag maps ANY of those onto the ONE canonical bag
+; diagnostic, and diagnostics_to_bag collects a mixed producer list into a single
+; bag. This unifies the channels at the CONSUMER (display/inspection) WITHOUT
+; touching what producers emit — so the byte-identical emitter contract is intact;
+; only the reader converges on one shape.
+
+; normalize_diag — one producer diagnostic (string | diag.error | backend map |
+; already-canonical bag diag) -> a canonical bag diagnostic. An unrecognised value
+; degrades to a generic "error" diag carrying its string form (never silently
+; dropped).
+(bind normalize_diag
+  (lambda (item)
+    (if (eq (value_type item) "string")
+      (string_to_diag item)
+      (if (eq (value_type item) "map")
+        (if (eq (get item "diag" false) true)
+          item                                   ; already a canonical bag diag
+          (if (error? item)
+            (error_to_diag item null null)       ; a diag.error
+            (if (or (not (eq (get item "node_name" null) null))
+                    (and (not (eq (get item "code" null) null))
+                         (not (eq (get item "message" null) null))))
+              (backend_map_to_diag item)         ; a backend emitter's ad-hoc map
+              (diag "error" "stdlib.diag.unrecognized"
+                    (value_to_string item) null))))
+        (diag "error" "stdlib.diag.unrecognized" (value_to_string item) null)))))
+
+; diagnostics_to_bag — normalize a MIXED list of producer diagnostics into ONE
+; canonical bag (insertion order preserved). The single point where eval-path and
+; native-path diagnostics become comparable.
+(bind diagnostics_to_bag
+  (lambda (items)
+    (bind ((bag (make_bag)))
+      (do (sequence_each items (lambda (it) (add! bag (normalize_diag it)))) bag))))
+
+(export error_to_diag string_to_diag backend_map_to_diag
+        normalize_diag diagnostics_to_bag)

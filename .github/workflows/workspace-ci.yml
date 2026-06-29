@@ -1,0 +1,72 @@
+# CI for the whole workspace (all crates: peg, caap, caap-cli/dap/lsp,
+# caap-sys-runtime, …).
+#
+# Enforced: rustfmt --check, build, full test suite (incl. the CAAP-native stdlib
+# `.caap` corpus under caap/tests/stdlib_*_tests.rs), clippy -D warnings, and the
+# acceptance suites. (The workspace was brought to rustfmt-clean, so fmt is now
+# enforced here rather than only peg-scoped.)
+#
+name: workspace-ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt (--check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  build:
+    name: build (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-targets
+
+  test:
+    name: test (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Full functional suite: unit + integration + doc tests across every crate,
+      # including the CAAP-native stdlib tests.
+      - run: cargo test --workspace --no-fail-fast
+
+  clippy:
+    name: clippy (-D warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  acceptance:
+    name: acceptance (ignored suites)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install native/URun acceptance tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld qemu-system-arm
+      # Slow, full-bootstrap scenarios marked #[ignore] in the normal run.
+      - run: bash scripts/test-acceptance.sh

@@ -1,0 +1,270 @@
+; stdlib/lib/collections/ordered_map.caap — a SORTED-key map + ordered set with
+; range queries (module stdlib.lib.collections.ordered_map).
+;
+; Both structures are backed by a list kept SORTED by a COMPARATOR
+;   cmp : (a b) -> int   (negative when a < b, zero when equal, positive when a > b)
+; The default comparator is the kernel `value_compare`, a TOTAL structural order
+; over ANY two values (so an ordered set may freely mix kinds — ints and strings
+; sort by stable type-rank). A custom `cmp` may be supplied to `*_new`.
+;
+;   ordered map : { entries: [[k,v], …] sorted by k, cmp }
+;   ordered set : { items:   [x, …]      sorted,       cmp }
+;
+; Lookup/insert position is found by BINARY SEARCH, so every keyed operation is
+; O(log n) probes (the list splice itself is O(n)). Operations are PURE: `put`,
+; `del`, `add` return a NEW structure and never mutate the argument.
+;
+; The standalone `binary_search(sorted_list, x, cmp)` is exported: it returns the
+; index of `x` on a HIT (>= 0), else the encoded MISS `-(insertion_point) - 1`,
+; from which the insertion point is recovered as `(- (- result) 1)`. This
+; collision-free encoding (insertion point 0 stays distinct from index 0) is the
+; conventional reading of "index-or-(-insertion_point)".
+(module stdlib.lib.collections.ordered_map)
+
+(use stdlib.lib.collections.sequence take drop)
+
+; ── internal: splice helper ──────────────────────────────────────────────────
+
+; concat_lists — concatenate LIST segments into a fresh list (every argument
+; must be a list; an element to insert is wrapped as a one-element list by the
+; caller). `take`/`drop` already copy, so the result never aliases an input. A
+; flattening helper would be wrong here: an entry is itself a [k,v] list and
+; must stay nested, not be spliced.
+(bind concat_lists
+  (lambda (&rest)
+    (bind ((out (list_of)))
+      (do
+        (for part rest
+          (for e part (append out e)))
+        out))))
+
+; ── comparator plumbing ──────────────────────────────────────────────────────
+
+; default_cmp — the kernel total structural order (used when no cmp is given).
+(bind default_cmp
+  (lambda (a b) (value_compare a b)))
+
+; cmp_of — the comparator a structure was built with.
+(bind cmp_of
+  (lambda (m) (get m "cmp" default_cmp)))
+
+; pick_cmp — resolve an optional comparator argument: the supplied one, or the
+; default when it is absent / null.
+(bind pick_cmp
+  (lambda (rest) (bind ((c (get rest 0 null))) (if (eq c null) default_cmp c))))
+
+; ── binary search (standalone, exported) ─────────────────────────────────────
+
+; binary_search — find `x` in a list SORTED by `cmp`.
+;   xs  : a list sorted ascending by cmp
+;   x   : the probe value
+;   cmp : (a b) -> int comparator
+;   ->  : the index of an equal element on a HIT (>= 0); else the encoded miss
+;         `-(insertion_point) - 1` (always < 0). Recover the insertion point —
+;         the index where `x` would be inserted to keep order — as `(- (- r) 1)`.
+(bind binary_search
+  (lambda (xs x cmp)
+    (bind ((lo (ref 0)) (hi (ref (size xs))) (found (ref -1)))
+      (do
+        (while (and (eq (deref found) -1) (lt (deref lo) (deref hi)))
+          (bind ((mid (int_div (int_add (deref lo) (deref hi)) 2))
+                 (c (cmp (get xs mid) x)))
+            (cond
+              ((eq c 0) (set_ref found mid))
+              ((lt c 0) (set_ref lo (int_add mid 1)))   ; xs[mid] < x → go right
+              (else     (set_ref hi mid)))))            ; xs[mid] > x → go left
+        (if (eq (deref found) -1)
+          ; miss: `lo` is the insertion point; encode as -(lo) - 1
+          (int_sub (int_sub 0 (deref lo)) 1)
+          (deref found))))))
+
+; insertion_point — the index where a missed `binary_search` result would slot in.
+(bind insertion_point
+  (lambda (r) (int_sub (int_sub 0 r) 1)))
+
+; ── ordered map ──────────────────────────────────────────────────────────────
+
+; omap_new — an empty ordered map; an optional comparator overrides value_compare.
+;   [cmp] : (a b) -> int
+(bind omap_new
+  (lambda (&rest)
+    (assoc (map_of) "entries" (list_of) "cmp" (pick_cmp rest))))
+
+; om_entries_raw — the backing [[k,v], …] list (sorted by key).
+(bind om_entries_raw
+  (lambda (m) (get m "entries")))
+
+; omap_size — the number of keys.
+(bind omap_size
+  (lambda (m) (size (om_entries_raw m))))
+
+; omap_with — a new ordered map with the same cmp but a different entries list.
+(bind omap_with
+  (lambda (m entries) (assoc (map_of) "entries" entries "cmp" (cmp_of m))))
+
+; key_search — binary-search the entries for key `k`, comparing on the key slot.
+(bind key_search
+  (lambda (m k)
+    (bind ((cmp (cmp_of m)))
+      (binary_search (om_entries_raw m) k
+        (lambda (entry probe) (cmp (get entry 0) probe))))))
+
+; omap_has? — does key `k` exist?
+(bind omap_has?
+  (lambda (m k) (not (lt (key_search m k) 0))))
+
+; omap_get — the value at key `k`, or `default` when absent.
+(bind omap_get
+  (lambda (m k default)
+    (bind ((i (key_search m k)))
+      (if (lt i 0) default (get (get (om_entries_raw m) i) 1)))))
+
+; omap_put — a NEW map with `k`→`v` inserted in key order (replacing on equal k).
+(bind omap_put
+  (lambda (m k v)
+    (bind ((es (om_entries_raw m)) (i (key_search m k)) (entry (list_of k v)))
+      (if (lt i 0)
+        ; miss: splice the entry at the insertion point
+        (bind ((ip (insertion_point i)))
+          (omap_with m (concat_lists (take es ip) (list_of entry) (drop es ip))))
+        ; hit: replace the value at index i
+        (omap_with m (concat_lists (take es i) (list_of entry) (drop es (int_add i 1))))))))
+
+; omap_del — a NEW map without key `k` (unchanged when `k` is absent).
+(bind omap_del
+  (lambda (m k)
+    (bind ((es (om_entries_raw m)) (i (key_search m k)))
+      (if (lt i 0)
+        m
+        (omap_with m (concat_lists (take es i) (drop es (int_add i 1))))))))
+
+; omap_keys — every key, IN ASCENDING ORDER.
+(bind omap_keys
+  (lambda (m)
+    (bind ((out (list_of)))
+      (do (for e (om_entries_raw m) (append out (get e 0))) out))))
+
+; omap_values — every value, in key order.
+(bind omap_values
+  (lambda (m)
+    (bind ((out (list_of)))
+      (do (for e (om_entries_raw m) (append out (get e 1))) out))))
+
+; omap_entries — every [k,v] pair, in key order (a fresh copy of the backing list).
+(bind omap_entries
+  (lambda (m) (take (om_entries_raw m) (omap_size m))))
+
+; omap_min_key / omap_max_key — the least / greatest key, or null when empty.
+(bind omap_min_key
+  (lambda (m)
+    (bind ((es (om_entries_raw m)))
+      (if (eq (size es) 0) null (get (get es 0) 0)))))
+(bind omap_max_key
+  (lambda (m)
+    (bind ((es (om_entries_raw m)) (n (omap_size m)))
+      (if (eq n 0) null (get (get es (int_sub n 1)) 0)))))
+
+; omap_floor — the LARGEST key whose cmp-order is <= `k`, or null when none. On
+; a hit the STORED key is returned (not the probe) — they share a cmp-class but
+; under a custom comparator need not be the identical value.
+(bind omap_floor
+  (lambda (m k)
+    (bind ((es (om_entries_raw m)) (i (key_search m k)))
+      (if (lt i 0)
+        ; miss: insertion point ip; the floor is the key just before it
+        (bind ((ip (insertion_point i)))
+          (if (eq ip 0) null (get (get es (int_sub ip 1)) 0)))
+        (get (get es i) 0)))))
+
+; omap_ceil — the SMALLEST key whose cmp-order is >= `k`, or null when none. On
+; a hit the STORED key is returned (see omap_floor).
+(bind omap_ceil
+  (lambda (m k)
+    (bind ((es (om_entries_raw m)) (i (key_search m k)))
+      (if (lt i 0)
+        ; miss: insertion point ip is the first key strictly greater than k
+        (bind ((ip (insertion_point i)))
+          (if (eq ip (size es)) null (get (get es ip) 0)))
+        (get (get es i) 0)))))
+
+; omap_between — every [k,v] entry whose key is in the INCLUSIVE range [lo, hi],
+; in key order. An empty list when lo > hi or nothing falls in range.
+(bind omap_between
+  (lambda (m lo hi)
+    (bind ((cmp (cmp_of m)) (out (list_of)))
+      (do
+        (for e (om_entries_raw m)
+          (bind ((k (get e 0)))
+            (when (and (not (lt (cmp k lo) 0)) (not (gt (cmp k hi) 0)))
+              (append out e))))
+        out))))
+
+; ── ordered set (same backing structure, items instead of entries) ───────────
+
+; oset_new — an empty ordered set; an optional comparator overrides value_compare.
+(bind oset_new
+  (lambda (&rest)
+    (assoc (map_of) "items" (list_of) "cmp" (pick_cmp rest))))
+
+(bind os_items_raw (lambda (s) (get s "items")))
+
+; oset_size — the number of elements.
+(bind oset_size (lambda (s) (size (os_items_raw s))))
+
+(bind oset_with
+  (lambda (s items) (assoc (map_of) "items" items "cmp" (cmp_of s))))
+
+; item_search — binary-search the items for `x`.
+(bind item_search
+  (lambda (s x) (binary_search (os_items_raw s) x (cmp_of s))))
+
+; oset_has? — does `x` belong to the set?
+(bind oset_has?
+  (lambda (s x) (not (lt (item_search s x) 0))))
+
+; oset_add — a NEW set with `x` inserted in order (a no-op when already present).
+(bind oset_add
+  (lambda (s x)
+    (bind ((xs (os_items_raw s)) (i (item_search s x)))
+      (if (lt i 0)
+        (bind ((ip (insertion_point i)))
+          (oset_with s (concat_lists (take xs ip) (list_of x) (drop xs ip))))
+        s))))
+
+; oset_del — a NEW set without `x` (unchanged when `x` is absent).
+(bind oset_del
+  (lambda (s x)
+    (bind ((xs (os_items_raw s)) (i (item_search s x)))
+      (if (lt i 0)
+        s
+        (oset_with s (concat_lists (take xs i) (drop xs (int_add i 1))))))))
+
+; oset_items — every element, IN ASCENDING ORDER (a fresh copy).
+(bind oset_items
+  (lambda (s) (take (os_items_raw s) (oset_size s))))
+
+; oset_min / oset_max — the least / greatest element, or null when empty.
+(bind oset_min
+  (lambda (s)
+    (bind ((xs (os_items_raw s))) (if (eq (size xs) 0) null (get xs 0)))))
+(bind oset_max
+  (lambda (s)
+    (bind ((xs (os_items_raw s)) (n (oset_size s)))
+      (if (eq n 0) null (get xs (int_sub n 1))))))
+
+; oset_between — every element in the INCLUSIVE range [lo, hi], in order.
+(bind oset_between
+  (lambda (s lo hi)
+    (bind ((cmp (cmp_of s)) (out (list_of)))
+      (do
+        (for x (os_items_raw s)
+          (when (and (not (lt (cmp x lo) 0)) (not (gt (cmp x hi) 0)))
+            (append out x)))
+        out))))
+
+(export binary_search insertion_point default_cmp
+        omap_new omap_put omap_get omap_has? omap_del
+        omap_keys omap_values omap_entries omap_size
+        omap_min_key omap_max_key omap_floor omap_ceil omap_between
+        oset_new oset_add oset_has? oset_del oset_items oset_size
+        oset_min oset_max oset_between)

@@ -1,0 +1,90 @@
+; stdlib/boot/native_emit.caap — lazy native/codegen layer for stdlib.
+; MODULE IDENTITY: a RAW bootstrap script (run via ctfe_compiler_execute_bootstrap_file /
+; run_expanded BEFORE the `module` form is a bound name), so it carries NO `(module …)`
+; form — adding one would raise `unknown name: module`. Its registry identity is set
+; explicitly via ctfe_compiler_register_value. Allowlisted in stdlib/CONVENTIONS.md +
+; stdlib_module_identity_check (caap/tests/stdlib_governance_tests.rs).
+; Execute it after stdlib/bootstrap.caap in a composed bootstrap file, then
+; drive the stdlib tools:
+;
+;   ; composed.caap: (do (execute stdlib/bootstrap.caap)
+;   ;                    (execute stdlib/boot/native_emit.caap))
+;   caap composed.caap tools/s2_emit.caap  program.caap > program.ll
+;   caap composed.caap tools/s2_build.caap program.caap app
+;
+; The compile layer loads HERE, on demand (paths relative to boot/): the
+; bootstrap keeps every ordinary session free of it. Dependency order —
+; loading by path registers each module's name, so the next one's
+; use/import resolves from the registry. The leaf groundwork (render/equal/ir)
+; precedes the kits; each kit is loaded after the ones it imports.
+(bind ((load (get (ctfe_compiler_lookup_value compiler "stdlib.load") "load")))
+  (do
+    (load "../syntax/render.caap")  ; tree -> source text (rendered once)
+    (load "../lib/core/equal.caap")     ; deep_eq (ir's node_eq builds on it)
+    (load "../syntax/ir.caap")      ; whole-tree transforms the kits build on
+    (load "../backend/prep.caap")        ; the native backend (prep_program)
+    (load "../backend/emit/llvm.caap")          ; LLVM IR emit (emit_program/_freestanding)
+    (load "../backend/emit/wasm.caap")          ; WebAssembly WAT emit (emit_program/_module)
+    (load "../frontend/surface.caap")       ; the surface-grammar host (clike builds on it)
+    (load "../backend/driver.caap")         ; drives clang/linker over emitted IR (imports llvm)
+    (load "../backend/driver_wasm.caap")    ; drives wat2wasm over emitted WAT (imports emit.wasm)
+    (load "../frontend/clike.caap")))       ; the C-like surface grammar (imports surface)
+
+; Native generics: the monomorphization transform is registered by backend/prep
+; itself (loaded above), so every native codegen entry — not just this leg —
+; specializes generics before the gate. Nothing to do here.
+
+; Enable load-time partial evaluation for the codegen path. PE (constprop ->
+; constfold -> simplify -> dce, to a fixpoint) is BEHAVIOUR-PRESERVING — it only
+; folds constants and drops dead code, so a program's RESULT never changes; only
+; the emitted IR is optimized, which is exactly what codegen benefits from. It is
+; OPT-IN via this native leg (the fixpoint adds load-time cost, so the base
+; bootstrap stays fast). Mirror boot/peval.caap: load the transform and register
+; it AFTER the kits, so loading peval's deps doesn't disturb the kit modules.
+(bind ((load (get (ctfe_compiler_lookup_value compiler "stdlib.load") "load")))
+  ((get (load "../semantics/passes/peval.caap") "register!")))
+
+; The NATIVE backend: prep_program lowers a program through the native kit
+; (the path the in-process native runtime consumes). Registered under
+; `stdlib.native.emit` for tools and the loader to reach by name.
+(ctfe_compiler_register_value
+  compiler
+  "stdlib.native.emit"
+  (get
+    (ctfe_compiler_lookup_value compiler "stdlib.backend.prep")
+    "prep_program"))
+
+; The ALL-stdlib backend: the text is LLVM IR from backend/emit/llvm. tools/s2_emit.caap
+; prints it; tools/s2_build.caap builds it with stdlib.backend.driver.
+(ctfe_compiler_register_value
+  compiler
+  "stdlib.llvm.emit"
+  (get
+    (ctfe_compiler_lookup_value compiler "stdlib.backend.emit.llvm")
+    "emit_program"))
+
+; The FREESTANDING backend: an OS kernel object — no `main`/exit-code
+; contract; the IR compiles with `clang -ffreestanding -nostdlib -c`.
+(ctfe_compiler_register_value
+  compiler
+  "stdlib.llvm.emit_freestanding"
+  (get
+    (ctfe_compiler_lookup_value compiler "stdlib.backend.emit.llvm")
+    "emit_freestanding"))
+
+; The WASM backend: the text is WebAssembly (WAT) from backend/emit/wasm — the sibling
+; of the LLVM backend. `tools/s2_emit.caap FILE stdlib.wasm.emit` prints it
+; (wat2wasm/wasmtime it). emit = hosted (needs `main`); emit_module = no-`main`.
+(ctfe_compiler_register_value
+  compiler
+  "stdlib.wasm.emit"
+  (get
+    (ctfe_compiler_lookup_value compiler "stdlib.backend.emit.wasm")
+    "emit_program"))
+
+(ctfe_compiler_register_value
+  compiler
+  "stdlib.wasm.emit_module"
+  (get
+    (ctfe_compiler_lookup_value compiler "stdlib.backend.emit.wasm")
+    "emit_module"))

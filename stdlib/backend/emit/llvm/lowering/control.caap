@@ -1,0 +1,41 @@
+; stdlib/backend/emit/llvm/lowering/control.caap - structured control lowering.
+;
+; Internal leaf behind stdlib.backend.emit.llvm.lowering.
+(module stdlib.backend.emit.llvm.lowering.control)
+
+(use stdlib.backend.emit.llvm.instructions label! emit! open_block!)
+
+(bind lower_while
+  (lambda (self args st env fns)
+    (bind (
+      (head_l (label! st "loop"))
+      (body_l (label! st "body"))
+      (end_l (label! st "endloop"))
+    )
+      (do
+        (emit! st (string_concat_many "br label %" head_l))
+        (open_block! st head_l)
+        (bind ((c (self self (get args 0) st env fns)))
+          (do
+            (unless (eq (get c "type") "i1")
+              (throw "native codegen: while condition must be a comparison"))
+            (emit! st (string_concat_many
+              "br i1 " (get c "repr" "?")
+              ", label %" body_l ", label %" end_l))
+            (open_block! st body_l)
+            (for k (sequence_range 1 (size args))
+              (self self (get args k) st env fns))
+            (emit! st (string_concat_many "br label %" head_l))
+            (open_block! st end_l)
+            (assoc (map_of) "repr" "0" "type" null "ct" null)))))))
+
+(bind lower_do
+  (lambda (self args st env fns)
+    (bind ((out (assoc (map_of) "repr" "0" "type" null "ct" null))
+           (slot (map_of)))
+      (do
+        (assoc slot "v" out)
+        (for a args (assoc slot "v" (self self a st env fns)))
+        (get slot "v")))))
+
+(export lower_while lower_do)

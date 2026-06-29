@@ -1,0 +1,121 @@
+; stdlib/lib/test_graph.caap — DOT rendering + the loader's live dep graph.
+
+;; @area: collections
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.collections.graph to_dot nodes successors has_node? has_edge?
+     node_count edge_count add_edge transpose remove_edge remove_node
+     predecessors out_degree in_degree add_node add_edges from_edges)
+(use stdlib.lib.collections.sequence contains?)
+
+(do
+  (bind ((g (assoc (map_of) "a" (list_of "b" "c") "b" (list_of))))
+    (bind ((dot (to_dot g "deps")))
+      (do
+        (assert_true (string_contains dot "digraph \"deps\"") "header")
+        (assert_true (string_contains dot "\"a\" -> \"b\";") "edge a->b")
+        (assert_true (string_contains dot "\"a\" -> \"c\";") "edge a->c")
+        (assert_true (string_contains dot "\"b\";") "isolated node listed"))))
+
+  ; queries + pure edits over the same adjacency shape
+  (bind ((g (assoc (map_of) "a" (list_of "b" "c") "b" (list_of))))
+    (do
+      (assert_eq (node_count g) 2 "node_count = declared keys")
+      (assert_eq (edge_count g) 2 "edge_count = total edges")
+      (assert_true (has_node? g "a") "has_node? declared")
+      (assert_eq (has_node? g "z") false "has_node? unknown")
+      (assert_true (contains? (successors g "a") "b") "successors lists b")
+      (assert_eq (size (successors g "z")) 0 "successors of unknown is empty")
+      (assert_true (has_edge? g "a" "b") "has_edge? present")
+      (assert_eq (has_edge? g "a" "z") false "has_edge? absent target")
+      (assert_eq (has_edge? g "z" "a") false "has_edge? unknown source")
+      ; add_edge is pure and creates missing endpoints
+      (bind ((g2 (add_edge g "a" "d")))
+        (do
+          (assert_true (has_edge? g2 "a" "d") "add_edge adds the edge")
+          (assert_true (has_node? g2 "d") "add_edge creates the target node")
+          (assert_eq (has_edge? g "a" "d") false "add_edge did not mutate the input")))
+      ; transpose reverses every edge and keeps isolated nodes
+      (bind ((t (transpose g)))
+        (do
+          (assert_true (has_edge? t "b" "a") "transpose reverses a->b")
+          (assert_true (has_edge? t "c" "a") "transpose reverses a->c")
+          (assert_eq (has_edge? t "a" "b") false "transpose drops the original direction")
+          (assert_true (has_node? t "b") "transpose keeps node b")))
+      ; remove_edge is pure and keeps both endpoints as nodes
+      (bind ((g3 (remove_edge g "a" "b")))
+        (do
+          (assert_eq (has_edge? g3 "a" "b") false "remove_edge drops the edge")
+          (assert_true (has_edge? g3 "a" "c") "remove_edge keeps the other edge")
+          (assert_true (has_node? g3 "a") "remove_edge keeps the source node")
+          (assert_true (has_node? g3 "b") "remove_edge keeps the target node")
+          (assert_true (has_edge? g "a" "b") "remove_edge did not mutate the input")))
+      ; remove_node drops the node and every edge pointing at it
+      (bind ((g4 (remove_node g "b")))
+        (do
+          (assert_eq (has_node? g4 "b") false "remove_node drops the node")
+          (assert_eq (has_edge? g4 "a" "b") false "remove_node drops edges into it")
+          (assert_true (has_edge? g4 "a" "c") "remove_node keeps unrelated edges")
+          (assert_true (has_node? g "b") "remove_node did not mutate the input")))
+      (assert_true (contains? (nodes g) "a") "nodes lists declared keys")
+      ; predecessors / degrees over the same g (a->b, a->c)
+      (assert_true (contains? (predecessors g "b") "a") "predecessors of b includes a")
+      (assert_eq (size (predecessors g "b")) 1 "b has one predecessor")
+      (assert_eq (size (predecessors g "a")) 0 "a has no predecessors")
+      (assert_eq (size (predecessors g "z")) 0 "predecessors of unknown is empty")
+      (assert_eq (out_degree g "a") 2 "out_degree a = 2")
+      (assert_eq (out_degree g "b") 0 "out_degree b = 0")
+      (assert_eq (out_degree g "z") 0 "out_degree of unknown = 0")
+      (assert_eq (in_degree g "b") 1 "in_degree b = 1")
+      (assert_eq (in_degree g "c") 1 "in_degree c = 1")
+      (assert_eq (in_degree g "a") 0 "in_degree a = 0")
+      ; add_node: isolated + idempotent + pure
+      (bind ((gn (add_node g "z")))
+        (do
+          (assert_true (has_node? gn "z") "add_node creates the node")
+          (assert_eq (out_degree gn "z") 0 "add_node node is isolated")
+          (assert_eq (has_node? g "z") false "add_node did not mutate the input")))
+      (bind ((gi (add_node g "a")))         ; idempotent on an existing node
+        (do
+          (assert_true (has_edge? gi "a" "b") "add_node keeps existing edges (a->b)")
+          (assert_true (has_edge? gi "a" "c") "add_node keeps existing edges (a->c)")
+          (assert_eq (out_degree gi "a") 2 "add_node idempotent: degree unchanged")))
+      ; add_edges: bulk, creating endpoints
+      (bind ((gb (add_edges g (list_of (list_of "b" "d") (list_of "d" "e")))))
+        (do
+          (assert_true (has_edge? gb "b" "d") "add_edges adds b->d")
+          (assert_true (has_edge? gb "d" "e") "add_edges adds d->e")
+          (assert_true (has_node? gb "e") "add_edges creates new endpoints")
+          (assert_eq (has_edge? g "b" "d") false "add_edges did not mutate the input")))))
+
+  ; from_edges builds a fresh graph from a [from to] list
+  (bind ((fe (from_edges (list_of (list_of "a" "b") (list_of "a" "c") (list_of "b" "c")))))
+    (do
+      (assert_true (has_edge? fe "a" "b") "from_edges: a->b")
+      (assert_true (has_edge? fe "a" "c") "from_edges: a->c")
+      (assert_true (has_edge? fe "b" "c") "from_edges: b->c")
+      (assert_eq (node_count fe) 3 "from_edges declares every endpoint")
+      (assert_eq (edge_count fe) 3 "from_edges has exactly the given edges")
+      (assert_eq (out_degree fe "c") 0 "from_edges: successor-only node has no out-edges")))
+  (assert_eq (node_count (from_edges (list_of))) 0 "from_edges of [] is the empty graph")
+
+  ; the LOADER records this very module BEFORE building it (deps are known
+  ; at scan time; they load during build, appending their own entries after
+  ; ours — so we find ourselves by path, not by position)
+  (bind ((api (ctfe_compiler_lookup_value compiler "stdlib.load")))
+    (bind (
+      (dg ((get api "dep_graph")))
+      (log ((get api "load_log")))
+    )
+      (bind ((me (sequence_find log
+                   (lambda (e2) (string_ends_with (get e2 "path" "")
+                                                  "test_graph.caap")))))
+        (do
+          (assert_true (contains (map_keys dg) "stdlib.lib.collections.graph")
+            "graph lib itself is in the dep graph")
+          (assert_true (contains? (get me "deps" (list_of)) "stdlib.lib.collections.graph")
+            "this test's dependency on lib/graph is recorded")
+          (assert_true (string_ends_with (get me "path" "") "test_graph.caap")
+            "log entry carries the canonical path")))))
+  true)

@@ -1,0 +1,191 @@
+; stdlib/lib/tests/test_passes.caap — in-language tests for lib/passes'
+; registry: the fact store (soft + typed), the loc helper, and the
+; dependency-aware ordering scheduler.
+;
+; The live registries are exercised by the Rust fixture tests — registering
+; passes HERE would affect every later load in the session. The ordering tests
+; therefore drive `ordered` over LOCAL entry lists, never the live `registry`.
+
+;; @area: passes
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.registry
+     fact! fact_of facts_of loc_of register_pass! unregister_pass!
+     deps_of no_deps ordered entry_of
+     fact_schema! fact_typed! fact_typed_of fact_typed? clear_passes!)
+
+; order — the emitted names as a comma-joined STRING (kernel `eq` compares lists
+; by identity, not contents, so the ordering assertions compare strings, the
+; established test idiom of reducing a list to a scalar). entry_of is
+; re-exported so a test can build records directly.
+(bind order
+  (lambda (entries)
+    (sequence_join (sequence_map entries (lambda (e) (get e "name"))) ",")))
+
+; ent — a record with a dummy runner and the given edges.
+(bind ent
+  (lambda (name deps) (entry_of name (lambda (located sink) null) deps)))
+
+(do
+  ; ── soft fact store ────────────────────────────────────────────────────────
+  (fact! "t.effects" "f" "pure")
+  (fact! "t.effects" "g" "impure")
+  (assert_eq (fact_of "t.effects" "f" null) "pure" "fact round-trips")
+  (assert_eq (fact_of "t.effects" "missing" "dflt") "dflt" "fact default")
+  (assert_eq (size (map_keys (facts_of "t.effects"))) 2 "namespace table")
+  (assert_eq (size (map_keys (facts_of "t.empty"))) 0 "empty namespace")
+  (assert_eq (loc_of null "fallback:1:1") "fallback:1:1" "loc_of falls back")
+
+  ; unregister by name: net-zero on the session (register, then remove)
+  (register_pass! "t.ephemeral" (lambda (located sink) null))
+  (assert_eq (unregister_pass! "t.ephemeral") true "removed by name")
+  (assert_eq (unregister_pass! "t.ephemeral") false "second removal: absent")
+
+  ; ── ordering: append-order is the default (no edges => identity) ───────────
+  (assert_eq
+    (order (ordered (list_of (ent "a" no_deps) (ent "b" no_deps) (ent "c" no_deps))
+                    "pass"))
+    "a,b,c"
+    "no edges: registration order preserved")
+
+  ; `after`: borrow declares it runs after alias, though registered first
+  (assert_eq
+    (order (ordered
+             (list_of (ent "borrow" (deps_of (list_of "alias") (list_of) (list_of)))
+                      (ent "alias"  no_deps))
+             "pass"))
+    "alias,borrow"
+    "after edge reorders before the dependency")
+
+  ; `before`: the mirror — alias declares it runs before borrow
+  (assert_eq
+    (order (ordered
+             (list_of (ent "borrow" no_deps)
+                      (ent "alias"  (deps_of (list_of) (list_of "borrow") (list_of))))
+             "pass"))
+    "alias,borrow"
+    "before edge reorders the dependent after it")
+
+  ; a folder chain feeding peval: each declares `after` the folders => peval last
+  (assert_eq
+    (order (ordered
+             (list_of (ent "peval"
+                        (deps_of (list_of "constfold" "simplify" "dce")
+                                 (list_of) (list_of)))
+                      (ent "constfold" no_deps)
+                      (ent "simplify"  no_deps)
+                      (ent "dce"       no_deps))
+             "transform"))
+    "constfold,simplify,dce,peval"
+    "peval runs after every folder it consumes")
+
+  ; `requires`: a present dependency orders like `after`
+  (assert_eq
+    (order (ordered
+             (list_of (ent "b" (deps_of (list_of) (list_of) (list_of "a")))
+                      (ent "a" no_deps))
+             "pass"))
+    "a,b"
+    "requires orders after the required pass")
+
+  ; `requires` a MISSING pass: hard, named error
+  (assert_true
+    (string_contains
+      (try (ordered (list_of (ent "b" (deps_of (list_of) (list_of) (list_of "a"))))
+                    "pass")
+        (catch e e))
+      "requires")
+    "missing requires is a hard error")
+
+  ; dangling `after` (soft hint at an uninstalled pass): tolerated, no edge
+  (assert_eq
+    (order (ordered
+             (list_of (ent "x" (deps_of (list_of "ghost") (list_of) (list_of)))
+                      (ent "y" no_deps))
+             "pass"))
+    "x,y"
+    "dangling after imposes no edge")
+
+  ; a cycle is reported, naming the offenders
+  (assert_true
+    (string_contains
+      (try (ordered
+             (list_of (ent "p" (deps_of (list_of "q") (list_of) (list_of)))
+                      (ent "q" (deps_of (list_of "p") (list_of) (list_of))))
+             "pass")
+        (catch e e))
+      "cycle")
+    "a dependency cycle is a hard error")
+
+  ; ── typed facts: schema-checked channel over the same store ────────────────
+  (fact_schema! "t.recursive" "string" "bool")
+  (fact_typed! "t.recursive" "fib" true)
+  (assert_eq (fact_typed_of "t.recursive" "fib") true "typed fact round-trips")
+  (assert_eq (fact_typed? "t.recursive" "fib") true "fact_typed? finds it")
+  (assert_eq (fact_typed? "t.recursive" "loop") false "fact_typed? absent")
+  ; a soft reader sees the typed write (one shared store)
+  (assert_eq (fact_of "t.recursive" "fib" null) true "soft read of a typed fact")
+
+  ; typed read of an ABSENT key throws (the contract: producer must have run)
+  (assert_true
+    (string_contains
+      (try (fact_typed_of "t.recursive" "absent") (catch e e)) "no fact")
+    "typed read of a missing key throws")
+
+  ; a value of the wrong type is rejected at write
+  (assert_true
+    (string_contains
+      (try (fact_typed! "t.recursive" "g" "not-a-bool") (catch e e)) "must be bool")
+    "typed write rejects a wrong-typed value")
+  ; a key of the wrong type is rejected too
+  (assert_true
+    (string_contains
+      (try (fact_typed! "t.recursive" 7 true) (catch e e)) "must be string")
+    "typed write rejects a wrong-typed key")
+  ; typed access on an undeclared namespace is an error (declare first)
+  (assert_true
+    (string_contains
+      (try (fact_typed! "t.undeclared" "k" true) (catch e e)) "no schema")
+    "typed write needs a schema")
+
+  ; ── A3c: the type pass's two typed channels reject off-schema writes ────────
+  ; types/infer declares these schemas (string-keyed) and publishes via
+  ; fact_typed!: "fn_effect" carries a string ("pure"/"impure"), "match_enum" a
+  ; list of variant values. Mirror the declarations and prove a value of the
+  ; wrong type is a hard throw at the write — the contract A3c establishes.
+  (fact_schema! "fn_effect" "string" "string")
+  (fact_schema! "match_enum" "string" "list")
+  ; well-typed writes round-trip (and a soft reader, as both passes use, sees them)
+  (fact_typed! "fn_effect" "f.caap:1:1" "impure")
+  (assert_eq (fact_of "fn_effect" "f.caap:1:1" null) "impure"
+    "fn_effect typed write reads back soft")
+  (fact_typed! "match_enum" "m.caap:2:1" (list_of 0 1 2))
+  (assert_eq (size (fact_of "match_enum" "m.caap:2:1" (list_of))) 3
+    "match_enum typed write reads back soft")
+  ; off-schema: a non-string fn_effect value is rejected
+  (assert_true
+    (string_contains
+      (try (fact_typed! "fn_effect" "g.caap:1:1" true) (catch e e))
+      "must be string")
+    "fn_effect rejects a non-string value")
+  ; off-schema: a non-list match_enum value is rejected
+  (assert_true
+    (string_contains
+      (try (fact_typed! "match_enum" "m.caap:3:1" "not-a-list") (catch e e))
+      "must be list")
+    "match_enum rejects a non-list value")
+  ; off-schema: a non-string key (loc must be a string) is rejected
+  (assert_true
+    (string_contains
+      (try (fact_typed! "fn_effect" 7 "pure") (catch e e))
+      "must be string")
+    "fn_effect rejects a non-string key")
+
+  ; clear_passes! drops schemas too: the namespace is undeclared again
+  (clear_passes!)
+  (assert_true
+    (string_contains
+      (try (fact_typed_of "t.recursive" "fib") (catch e e)) "no schema")
+    "clear_passes! drops typed schemas")
+  true)

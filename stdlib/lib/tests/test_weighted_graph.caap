@@ -1,0 +1,114 @@
+; stdlib/lib/tests/test_weighted_graph.caap — in-language tests for lib/collections/weighted_graph.
+; NOTE on equality: the kernel `eq` compares lists/maps by IDENTITY, so list and
+; record results are compared structurally with `value_eq` (scalars still use
+; assert_eq).
+
+;; @area: collections
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.collections.weighted_graph
+  wg_new wg_add_edge wg_add_undirected wg_nodes wg_edges wg_to_dot
+  wg_dijkstra wg_shortest_path wg_bellman_ford wg_kruskal_mst wg_mst_weight)
+(use stdlib.lib.collections.sequence length contains?)
+
+; node_names — the "to" field of every edge in an edge list (for membership).
+(bind node_names
+  (lambda (edges)
+    (bind ((out (list_of)))
+      (do (sequence_each edges (lambda (e) (append out (get e "to")))) out))))
+
+(do
+  ; ── build the directed triangle A->B=1, B->C=2, A->C=4 ────────────────────
+  (bind ((g (wg_add_edge (wg_add_edge (wg_add_edge (wg_new) "A" "B" 1)
+              "B" "C" 2) "A" "C" 4)))
+    (do
+      ; nodes / edges queries
+      (assert_eq (length (wg_nodes g)) 3 "three nodes A,B,C")
+      (assert_true (contains? (wg_nodes g) "A") "node A present")
+      (assert_true (contains? (wg_nodes g) "C") "node C present")
+      (assert_eq (length (wg_edges g "A")) 2 "A has two outgoing edges")
+      (assert_eq (length (wg_edges g "C")) 0 "C is a sink (no outgoing edges)")
+      (assert_true (contains? (node_names (wg_edges g "A")) "B") "A->B exists")
+      (assert_true (contains? (node_names (wg_edges g "A")) "C") "A->C exists")
+
+      ; ── Dijkstra from A: C is cheaper via B (1+2=3) than direct (4) ───────
+      (bind ((res (wg_dijkstra g "A")) (dist (get res "dist")) (prev (get res "prev")))
+        (do
+          (assert_eq (get dist "A") 0 "dist A->A is 0")
+          (assert_eq (get dist "B") 1 "dist A->B is 1")
+          (assert_eq (get dist "C") 3 "dist A->C is 3 (via B, not the direct 4)")
+          (assert_eq (get prev "C") "B" "C's predecessor on the shortest path is B")
+          (assert_eq (get prev "B") "A" "B's predecessor is A")))
+
+      ; ── shortest path A..C is [A B C] ─────────────────────────────────────
+      (assert_true (value_eq (wg_shortest_path g "A" "C") (list_of "A" "B" "C"))
+        "shortest path A->C is [A B C]")
+      (assert_true (value_eq (wg_shortest_path g "A" "A") (list_of "A"))
+        "shortest path A->A is [A]")
+      (assert_true (value_eq (wg_shortest_path g "A" "B") (list_of "A" "B"))
+        "shortest path A->B is [A B]")
+
+      ; ── unreachable: C is a sink, nothing is reachable from it ────────────
+      (bind ((from_c (wg_dijkstra g "C")))
+        (do
+          (assert_eq (get (get from_c "dist") "C") 0 "from C, dist C is 0")
+          (assert_true (not (contains (get from_c "dist") "A")) "A unreachable from C (absent)")
+          (assert_true (not (contains (get from_c "dist") "B")) "B unreachable from C (absent)")))
+      (assert_true (value_eq (wg_shortest_path g "C" "A") (list_of))
+        "no path C->A (empty list)")
+
+      ; ── Kruskal MST (treat as undirected): keep A-B(1) and B-C(2) ─────────
+      (bind ((mst (wg_kruskal_mst g)))
+        (do
+          (assert_eq (length mst) 2 "MST of 3 connected nodes has 2 edges")
+          (assert_eq (wg_mst_weight mst) 3 "MST total weight is 3 (A-B=1 + B-C=2)")))
+
+      ; ── Bellman-Ford agrees with Dijkstra on the non-negative graph ───────
+      (bind ((bf (wg_bellman_ford g "A")))
+        (do
+          (assert_eq (get (get bf "dist") "C") 3 "Bellman-Ford dist A->C is 3")
+          (assert_true (not (get bf "negative_cycle")) "no negative cycle here")))))
+
+  ; ── undirected helper: wg_add_undirected adds both directions ─────────────
+  (bind ((u (wg_add_undirected (wg_new) "X" "Y" 5)))
+    (do
+      (assert_eq (length (wg_edges u "X")) 1 "X->Y edge present")
+      (assert_eq (length (wg_edges u "Y")) 1 "Y->X edge present (undirected)")
+      (assert_eq (get (get (wg_edges u "X") 0) "weight") 5 "edge weight is 5")
+      ; one undirected edge ⇒ MST is that single edge, weight 5
+      (assert_eq (wg_mst_weight (wg_kruskal_mst u)) 5 "MST of one undirected edge weighs 5")))
+
+  ; ── Bellman-Ford with a NEGATIVE edge (no cycle) ──────────────────────────
+  ; S->A=4, S->B=5, B->A=-3  ⇒  A reached cheaper via B (5-3=2) than direct 4.
+  (bind ((gneg (wg_add_edge (wg_add_edge (wg_add_edge (wg_new) "S" "A" 4)
+                 "S" "B" 5) "B" "A" -3)))
+    (bind ((bf (wg_bellman_ford gneg "S")))
+      (do
+        (assert_eq (get (get bf "dist") "A") 2 "negative edge: A reached at cost 2 via B")
+        (assert_eq (get (get bf "dist") "B") 5 "B reached at cost 5")
+        (assert_true (not (get bf "negative_cycle")) "negative edge, but no negative cycle"))))
+
+  ; ── Bellman-Ford DETECTS a negative cycle ─────────────────────────────────
+  ; S->A=1, A->B=-2, B->A=-2  ⇒  the A<->B loop has total weight -4 (a cycle).
+  (bind ((gcyc (wg_add_edge (wg_add_edge (wg_add_edge (wg_new) "S" "A" 1)
+                 "A" "B" -2) "B" "A" -2)))
+    (bind ((bf (wg_bellman_ford gcyc "S")))
+      (assert_true (get bf "negative_cycle") "reachable negative cycle is detected")))
+
+  ; ── DOT rendering carries weight labels ───────────────────────────────────
+  (bind ((g2 (wg_add_edge (wg_new) "A" "B" 7))
+         (dot (wg_to_dot g2 "demo")))
+    (do
+      (assert_true (string_contains dot "digraph \"demo\"") "DOT has the titled digraph")
+      (assert_true (string_contains dot "\"A\" -> \"B\"") "DOT has the A->B edge")
+      (assert_true (string_contains dot "label=\"7\"") "DOT edge carries the weight label")))
+
+  ; negative weights render with their sign; node names with quotes are escaped
+  (bind ((g3 (wg_add_edge (wg_new) "n\"x" "B" -5))
+         (dot3 (wg_to_dot g3 "t")))
+    (do
+      (assert_true (string_contains dot3 "label=\"-5\"") "DOT renders negative weight labels")
+      (assert_true (string_contains dot3 "\\\"") "DOT escapes a quote in a node name")))
+
+  true)

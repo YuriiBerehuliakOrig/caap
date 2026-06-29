@@ -1,0 +1,217 @@
+; stdlib/lib/tests/test_bag.caap — in-language tests for lib/diag/bag.
+
+;; @area: collections
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.diag.bag
+     span span_line span_col span_end_line span_end_col
+     diag error warning info hint with_related with_fixit
+     severity_of code_of message_of span_of related_of fixits_of is_error?
+     make_bag add! entries has_errors? count_by_severity
+     render render_related render_full render_all
+     bag_merge errors_only sort_by_span)
+
+(do
+  ; ── constructors / accessors ──────────────────────────────────────────────
+  (bind ((e (error "E001" "boom" (span 1 1 1 4 0 3))))
+    (do
+      (assert_eq (severity_of e) "error"   "error severity")
+      (assert_eq (code_of e)     "E001"    "code accessor")
+      (assert_eq (message_of e)  "boom"    "message accessor")
+      (assert_true (is_error? e)           "is_error? on error")
+      (assert_eq (get (span_of e) 0) 1     "span start line")
+      (assert_eq (get (span_of e) 1) 1     "span start col")))
+
+  (bind ((w (warning "W002" "careful" (span 2 3 2 8 10 15))))
+    (do
+      (assert_eq (severity_of w) "warning" "warning severity")
+      (assert_eq (is_error? w) false       "is_error? on warning")))
+
+  (assert_eq (severity_of (info "I" "x" null)) "info" "info shorthand")
+  (assert_eq (severity_of (hint "H" "x" null)) "hint" "hint shorthand")
+  (assert_eq (span_of (info "I" "x" null)) null "null span passes through")
+
+  ; ── diag (general) + related/fixit (immutable copies) ─────────────────────
+  (bind ((d (diag "error" "C" "m" null)))
+    (do
+      (assert_eq (size (related_of d)) 0 "fresh diag has no related")
+      (assert_eq (size (fixits_of d))  0 "fresh diag has no fixits")
+      (bind ((d2 (with_related d (span 9 1 9 2 0 1) "see here")))
+        (do
+          (assert_eq (size (related_of d2)) 1 "with_related appends")
+          (assert_eq (get (get (related_of d2) 0) "note") "see here" "related note")
+          (assert_eq (size (related_of d)) 0 "original diag unchanged by with_related")))
+      (bind ((d3 (with_fixit d "replace x with y")))
+        (do
+          (assert_eq (size (fixits_of d3)) 1 "with_fixit appends")
+          (assert_eq (size (fixits_of d))  0 "original diag unchanged by with_fixit")))))
+
+  ; ── bag / sink ────────────────────────────────────────────────────────────
+  (bind ((b (make_bag)))
+    (do
+      (assert_eq (size (entries b)) 0     "fresh bag empty")
+      (assert_eq (has_errors? b) false    "empty bag has no errors")
+      (add! b (error   "E001" "boom"    (span 1 1 1 4 0 3)))
+      (add! b (warning "W002" "careful" (span 2 3 2 8 10 15)))
+      (add! b (info    "I003" "noted"   null))
+      (assert_eq (size (entries b)) 3     "three diagnostics accumulated")
+      (assert_true (has_errors? b)        "has_errors? true once an error is added")
+      ; insertion order preserved
+      (assert_eq (code_of (get (entries b) 0)) "E001" "order: first is the error")
+      (assert_eq (code_of (get (entries b) 2)) "I003" "order: last is the info")
+      ; count_by_severity
+      (bind ((cnt (count_by_severity b)))
+        (do
+          (assert_eq (get cnt "error")   1 "count: one error")
+          (assert_eq (get cnt "warning") 1 "count: one warning")
+          (assert_eq (get cnt "info")    1 "count: one info")
+          (assert_eq (get cnt "hint")    0 "count: no hints")))
+      ; ── rendering ──────────────────────────────────────────────────────────
+      (assert_eq
+        (render (error "E001" "msg" (span 1 1 1 4 0 3)) "f")
+        "f:1:1: error[E001]: msg"
+        "render produces path:line:col: severity[code]: message")
+      (assert_eq
+        (render (warning "W002" "careful" (span 2 3 2 8 10 15)) "f")
+        "f:2:3: warning[W002]: careful"
+        "render of a warning at 2:3")
+      (assert_eq
+        (render (info "I003" "noted" null) "f")
+        "f:<no-span>: info[I003]: noted"
+        "render of a null span shows <no-span>")
+      ; render_all joins the bag's lines with newlines, in order
+      (assert_eq
+        (render_all b "f")
+        (string_concat_many
+          "f:1:1: error[E001]: boom" "\n"
+          "f:2:3: warning[W002]: careful" "\n"
+          "f:<no-span>: info[I003]: noted")
+        "render_all newline-joins every entry")))
+
+  ; ── registry summary is appended when the code is documented ──────────────
+  (assert_true
+    (string_contains
+      (render (error "stdlib.json.encode" "boom" (span 1 1 1 2 0 1)) "f")
+      "json_stringify")
+    "render appends the registered summary for a known code")
+
+  ; ── span END accessors (indices 2 / 3) ────────────────────────────────────
+  (bind ((sp (span 3 5 7 9 0 1)))
+    (do
+      (assert_eq (span_line sp)     3 "span_line is the start line")
+      (assert_eq (span_col sp)      5 "span_col is the start col")
+      (assert_eq (span_end_line sp) 7 "span_end_line is index 2")
+      (assert_eq (span_end_col sp)  9 "span_end_col is index 3")))
+  (assert_eq (span_end_line null) 0 "span_end_line of null span is 0")
+  (assert_eq (span_end_col null)  0 "span_end_col of null span is 0")
+
+  ; ── render_related: one indented line per related location ─────────────────
+  (bind ((d (with_related
+              (with_related (error "E" "m" (span 1 1 1 2 0 1))
+                (span 9 1 9 4 0 3) "first")
+              (span 12 2 12 5 0 3) "second")))
+    (do
+      (assert_eq (size (related_of d)) 2 "two related locations")
+      (bind ((rr (render_related d "f")))
+        (do
+          (assert_true (string_contains rr "related:") "render_related labels each line")
+          (assert_true (string_contains rr "9:1-9:4") "render_related shows start-end range")
+          (assert_true (string_contains rr "first")  "render_related shows the note")
+          (assert_true (string_contains rr "second") "render_related shows every note")))))
+  ; render_related of a diag with no related is the empty string
+  (assert_eq (render_related (error "E" "m" null) "f") "" "render_related of no-related is empty")
+  ; a null note renders as an empty tail (no "null" leaks into the line)
+  (bind ((dn (with_related (error "E" "m" null) (span 1 1 1 2 0 1) null)))
+    (assert_eq (string_contains (render_related dn "f") "null") false
+      "render_related coalesces a null note to empty"))
+
+  ; ── render_full: head + range + related + fixits ──────────────────────────
+  (bind ((df (with_fixit
+               (with_related (error "E001" "boom" (span 1 1 2 5 0 9))
+                 (span 4 1 4 3 0 2) "see also")
+               "replace x with y")))
+    (bind ((out (render_full df "f")))
+      (do
+        ; the one-line head is still present
+        (assert_true (string_contains out "f:1:1: error[E001]: boom") "render_full keeps the head")
+        ; the END of the span is now shown as a range
+        (assert_true (string_contains out "1:1-2:5") "render_full shows the start-end range")
+        ; related + fixit payloads are rendered
+        (assert_true (string_contains out "see also") "render_full renders related notes")
+        (assert_true (string_contains out "fixit: replace x with y") "render_full renders fixits"))))
+  ; render_full of a null-span, payload-free diag is just its render head
+  (assert_eq (render_full (info "I" "x" null) "f") (render (info "I" "x" null) "f")
+    "render_full degrades to render for a bare diag")
+
+  ; ── bag_merge: a fresh bag with a's entries then b's (inputs untouched) ─────
+  (bind ((ba (make_bag)) (bb (make_bag)))
+    (do
+      (add! ba (error   "A1" "a-one" null))
+      (add! ba (warning "A2" "a-two" null))
+      (add! bb (info    "B1" "b-one" null))
+      (bind ((m (bag_merge ba bb)))
+        (do
+          (assert_eq (size (entries m)) 3 "bag_merge holds both bags' entries")
+          (assert_eq (code_of (get (entries m) 0)) "A1" "merge order: a's first")
+          (assert_eq (code_of (get (entries m) 1)) "A2" "merge order: a's second")
+          (assert_eq (code_of (get (entries m) 2)) "B1" "merge order: b's after a's")
+          ; inputs are not mutated
+          (assert_eq (size (entries ba)) 2 "bag_merge leaves a unchanged")
+          (assert_eq (size (entries bb)) 1 "bag_merge leaves b unchanged")))))
+  ; merging two empty bags yields an empty bag
+  (assert_eq (size (entries (bag_merge (make_bag) (make_bag)))) 0
+    "bag_merge of two empty bags is empty")
+
+  ; ── errors_only: keep just the error-severity entries (input untouched) ─────
+  (bind ((b (make_bag)))
+    (do
+      (add! b (error   "E1" "boom"    null))
+      (add! b (warning "W1" "careful" null))
+      (add! b (info    "I1" "noted"   null))
+      (add! b (error   "E2" "again"   null))
+      (bind ((eo (errors_only b)))
+        (do
+          (assert_eq (size (entries eo)) 2 "errors_only keeps only the errors")
+          (assert_eq (code_of (get (entries eo) 0)) "E1" "errors_only keeps order: E1")
+          (assert_eq (code_of (get (entries eo) 1)) "E2" "errors_only keeps order: E2")
+          (assert_true (has_errors? eo) "errors_only bag still reports errors")
+          ; the source bag is not mutated
+          (assert_eq (size (entries b)) 4 "errors_only leaves the source bag intact")))))
+  ; errors_only of an error-free bag is empty
+  (bind ((bw (make_bag)))
+    (do
+      (add! bw (warning "W" "w" null))
+      (assert_eq (size (entries (errors_only bw))) 0
+        "errors_only of a warnings-only bag is empty")))
+
+  ; ── sort_by_span: entries ordered by span start line, then col ─────────────
+  (bind ((b (make_bag)))
+    (do
+      (add! b (error "L3"  "third"  (span 3 1 3 2 0 1)))
+      (add! b (error "L1"  "first"  (span 1 5 1 6 0 1)))
+      (add! b (error "L1b" "first-col2" (span 1 2 1 3 0 1)))
+      (add! b (error "L2"  "second" (span 2 9 2 9 0 1)))
+      (bind ((s (sort_by_span b)))
+        (do
+          ; 1:2 < 1:5 < 2:9 < 3:1
+          (assert_eq (code_of (get (entries s) 0)) "L1b" "sort: lowest line/col first")
+          (assert_eq (code_of (get (entries s) 1)) "L1"  "sort: same line, higher col next")
+          (assert_eq (code_of (get (entries s) 2)) "L2"  "sort: next line")
+          (assert_eq (code_of (get (entries s) 3)) "L3"  "sort: highest line last")
+          ; the source bag's insertion order is untouched
+          (assert_eq (code_of (get (entries b) 0)) "L3" "sort_by_span leaves the source intact")))))
+  ; a null span sorts as 0:0 (synthetic diagnostics come first); stable order kept
+  (bind ((b (make_bag)))
+    (do
+      (add! b (error "R" "real"      (span 5 1 5 2 0 1)))
+      (add! b (error "S1" "synth-1"  null))
+      (add! b (error "S2" "synth-2"  null))
+      (bind ((s (sort_by_span b)))
+        (do
+          (assert_eq (code_of (get (entries s) 0)) "S1"
+            "sort_by_span: null span sorts first, stable order S1 before S2")
+          (assert_eq (code_of (get (entries s) 1)) "S2" "sort_by_span: stable among nulls")
+          (assert_eq (code_of (get (entries s) 2)) "R"  "sort_by_span: real span after nulls")))))
+
+  true)

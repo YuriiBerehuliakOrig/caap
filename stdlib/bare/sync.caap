@@ -1,0 +1,201 @@
+; stdlib/bare/sync.caap — reusable concurrency primitives over bare atomic +
+; critical (module stdlib.bare.sync).
+;
+; The bare layer already exposes the two mutual-exclusion mechanisms a
+; freestanding target needs: stdlib.bare.critical masks interrupts (single-core
+; mutual exclusion against the scheduler), and stdlib.bare.atomic gives lock-free
+; words (the SMP / multi-core building block). This module composes them into the
+; small, reusable shapes a driver/kernel repeats by hand: a SCOPED critical
+; section, a test-and-set SPINLOCK, and a single-producer/single-consumer RING
+; buffer. examples/urun inlines the save/restore pair at each call site; the
+; wrappers here pair them once so the restore always matches the save.
+;
+; These are POLICY over the existing bare wrappers — zero kernel and zero backend
+; changes. They reimplement nothing: the IRQ save/restore comes from
+; stdlib.bare.critical and the atomics from stdlib.bare.atomic, reached through
+; `(use …)`, never re-derived from `asm`/`atomic_*` here.
+;
+; SCOPE — NATIVE/clike-targeted (the underlying critical/atomic wrappers lower
+; only through the LLVM backend, reached by a native program's `(use …)` through
+; the backend prep path). NOT loadable by the plain eval loader — a lock word and
+; an interrupt save/restore have no meaning in the CTFE sandbox. See
+; stdlib/bare/README.md. Addresses are u32 on a 32-bit MCU; widen to u64 on a
+; 64-bit target (the underlying atomic_*32 helpers fix the width).
+(module stdlib.bare.sync)
+
+(use stdlib.bare.critical critical_save critical_restore)
+(use stdlib.bare.atomic atomic_load32 atomic_store32 atomic_cas32)
+
+; ── scoped critical section — run a thunk with interrupts masked ──────────────
+; with_critical — save+disable interrupts (via critical_save), invoke `thunk` (a
+; zero-arg function passed by ADDRESS — a `(fn_ptr name)` value cast to u32),
+; then restore the prior PRIMASK (via critical_restore) — so the restore ALWAYS
+; pairs with the save, even on a path that forgets to. The thunk runs with IRQs
+; masked, so it owns the core; keep it short. This is the nesting-safe idiom:
+; critical_restore puts interrupts back exactly as they were on entry (it does
+; NOT force-enable if the section was entered already masked).
+;
+; NORMAL-RETURN-SCOPED — the restore matches the save ONLY on a NORMAL return of
+; the thunk's indirect `call_ptr`. There is no unwind/finally primitive on the
+; native backend (the IR has no exception/cleanup edge): the restore is just the
+; statement of the `do` after the call, reached only once the call returns its
+; value. So a thunk that TRAPS or ABORTS (a fault, a `wfi` that never wakes, a
+; longjmp-style escape that does not return through this frame) skips the
+; critical_restore and may LEAVE INTERRUPTS MASKED. Keep the thunk total and
+; short; do any fallible/abortable work OUTSIDE the section.
+;
+; NOTE: the thunk is a function POINTER (u32 address), not a closure — the native
+; backend has no closure type. Pass `(fn_ptr my_handler)` (as u32); with_critical
+; lands the indirect `call_ptr` to it. The thunk returns i32 (its value is
+; returned to the caller); use 0 if it has nothing to report.
+;   thunk : the function's address — `(fn_ptr name)` cast to u32
+;   ->    : whatever the thunk returned
+(defn with_critical ((thunk u32)) i32 (mutation)
+  (bind ((prev (critical_save)))
+    (bind ((result (call_ptr (int_to_ptr thunk u8) i32)))
+      (do
+        (critical_restore prev)
+        result))))
+
+; with_critical_arg — the same scoped critical section, but the body takes ONE
+; argument. Same save/disable -> invoke -> restore shape as with_critical; the
+; extra arg is passed to the indirect `call_ptr` so a body that needs context
+; (e.g. a pointer to the structure it guards) does not have to read it from a
+; global. The body is a function of one u32 argument returning i32 — pass its
+; address as `(fn_ptr name)` cast to u32, exactly like with_critical.
+;
+; NORMAL-RETURN-SCOPED — like with_critical, the restore pairs with the save only
+; on a NORMAL return of the body's `call_ptr`. With no unwind/finally primitive,
+; a body that TRAPS or ABORTS skips critical_restore and may LEAVE INTERRUPTS
+; MASKED; keep the body total and do fallible work outside the section.
+;   thunk : the function's address — `(fn_ptr name)` cast to u32
+;   arg   : the single u32 argument handed to the body
+;   ->    : whatever the body returned
+(defn with_critical_arg ((thunk u32) (arg u32)) i32 (mutation)
+  (bind ((prev (critical_save)))
+    (bind ((result (call_ptr (int_to_ptr thunk u8) i32 arg)))
+      (do
+        (critical_restore prev)
+        result))))
+
+; ── spinlock — test-and-set mutual exclusion over an atomic word ──────────────
+; A spinlock is a single u32 word at a fixed address: 0 = free, 1 = held. UNLIKE
+; a critical section it does NOT mask interrupts — it busy-waits, so it is the
+; right primitive when the holder runs on ANOTHER core (SMP), not when the
+; contender is an interrupt on the SAME core (use a critical section / with_critical
+; for that — spinning against a same-core ISR that holds the lock deadlocks).
+;
+; spin_init — set the lock word to 0 (free). Returns 0. Call once before first use.
+;   lock : the lock word's integer address
+;   ->   : 0
+(defn spin_init ((lock u32)) i32 (mutation)
+  (atomic_store32 lock 0))
+
+; spin_lock — atomically acquire the lock, spinning until it is free. Uses the
+; compare-and-swap head (atomic_cas32): try to swap 0 -> 1; CAS returns the value
+; it FOUND, so a result other than 0 means the lock was held — retry. The loop
+; condition IS the CAS, so the swap happens once per iteration (test-AND-set).
+;   lock : the lock word's integer address
+;   ->   : 0 (returns once the lock is held by this caller)
+(defn spin_lock ((lock u32)) i32 (mutation)
+  (do
+    (while (ne (atomic_cas32 lock 0 1) 0)
+      (do 0))
+    0))
+
+; spin_unlock — release the lock by atomically storing 0 (free). Only the holder
+; should call this. Returns 0.
+;   lock : the lock word's integer address
+;   ->   : 0
+(defn spin_unlock ((lock u32)) i32 (mutation)
+  (atomic_store32 lock 0))
+
+; spin_trylock — try ONCE to acquire the lock without spinning. Returns 1 if it
+; was free (and is now held by this caller), 0 if it was already held. Use when a
+; caller must not block (an ISR, or a back-off loop with other work).
+;   lock : the lock word's integer address
+;   ->   : 1 on acquire, 0 if already held
+(defn spin_trylock ((lock u32)) i32 (mutation)
+  (if (eq (atomic_cas32 lock 0 1) 0) 1 0))
+
+; ── SPSC ring buffer — one producer, one consumer, lock-free over u32 slots ───
+; A single-producer/single-consumer ring buffer of u32 words. The classic
+; lock-free FIFO: ONE thread/ISR pushes, ONE pops, no lock needed — the producer
+; only writes `head`, the consumer only writes `tail`, each reads the other
+; atomically. State is two atomic index words plus a slot array, all at fixed
+; addresses the caller lays out:
+;   head_addr : a u32 word — total items EVER pushed (the producer's cursor)
+;   tail_addr : a u32 word — total items EVER popped (the consumer's cursor)
+;   buf_base  : the slot array's base address (capacity u32 words)
+;   cap_mask  : capacity - 1, where capacity is a POWER OF TWO (so index & mask
+;               wraps without a divide). E.g. an 8-slot ring -> cap_mask = 7.
+; `head`/`tail` are monotonically increasing and never masked except to index a
+; slot, so a full ring (head - tail == capacity) is distinct from an empty one
+; (head == tail) with no wasted slot.
+;
+; ring_init — reset head and tail to 0 (empty). Returns 0. Call once.
+;   head_addr / tail_addr : the two index words' addresses
+;   ->                    : 0
+(defn ring_init ((head_addr u32) (tail_addr u32)) i32 (mutation)
+  (do
+    (atomic_store32 head_addr 0)
+    (atomic_store32 tail_addr 0)
+    0))
+
+; ring_count — items currently in the ring (head - tail). 0 == empty;
+; == capacity == full. A SAFE snapshot for a single observer; the count may grow
+; under your feet if the other side is the opposite role.
+;   head_addr / tail_addr : the two index words' addresses
+;   ->                    : the number of pending items
+(defn ring_count ((head_addr u32) (tail_addr u32)) u32 (mutation)
+  (int_sub (atomic_load32 head_addr) (atomic_load32 tail_addr)))
+
+; ring_push — PRODUCER side. If the ring is not full, write `val` into the slot
+; at (head & cap_mask), then publish the new head (the atomic store of head is
+; the release that makes the slot write visible to the consumer). Returns 1 on
+; success, 0 if the ring was full (caller should drop or back off).
+;   head_addr / tail_addr : the index words' addresses
+;   buf_base              : the slot array's base address
+;   cap_mask              : capacity - 1 (capacity a power of two)
+;   val                   : the u32 to enqueue
+;   ->                    : 1 on push, 0 if full
+(defn ring_push ((head_addr u32) (tail_addr u32)
+                 (buf_base u32) (cap_mask u32) (val u32)) i32 (mutation)
+  (bind ((head (atomic_load32 head_addr))
+         (tail (atomic_load32 tail_addr)))
+    (if (eq (int_sub head tail) (int_add cap_mask 1))
+      0
+      (do
+        ; slot address = buf_base + (head & cap_mask) * 4  (u32 words)
+        (atomic_store32
+          (int_add buf_base (int_shl (int_and head cap_mask) 2))
+          val)
+        (atomic_store32 head_addr (int_add head 1))
+        1))))
+
+; ring_pop — CONSUMER side. If the ring is non-empty, read the slot at
+; (tail & cap_mask), publish the new tail (freeing the slot for the producer),
+; and return 1; the popped value is stored through `out_addr` (a u32 word the
+; caller supplies) so the i32 return can carry success/empty out of band — a
+; single native return cannot carry both a value AND an emptiness flag.
+;   head_addr / tail_addr : the index words' addresses
+;   buf_base              : the slot array's base address
+;   cap_mask              : capacity - 1 (capacity a power of two)
+;   out_addr              : a u32 word that receives the popped value on success
+;   ->                    : 1 on pop (value written to out_addr), 0 if empty
+(defn ring_pop ((head_addr u32) (tail_addr u32)
+                (buf_base u32) (cap_mask u32) (out_addr u32)) i32 (mutation)
+  (bind ((head (atomic_load32 head_addr))
+         (tail (atomic_load32 tail_addr)))
+    (if (eq head tail)
+      0
+      (do
+        (atomic_store32 out_addr
+          (atomic_load32
+            (int_add buf_base (int_shl (int_and tail cap_mask) 2))))
+        (atomic_store32 tail_addr (int_add tail 1))
+        1))))
+
+(export with_critical with_critical_arg
+        spin_init spin_lock spin_unlock spin_trylock
+        ring_init ring_count ring_push ring_pop)

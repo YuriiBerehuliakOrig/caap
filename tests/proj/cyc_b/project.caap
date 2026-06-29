@@ -1,0 +1,1 @@
+(assoc (map_of) "name" "cyc_pb" "roots" (list_of) "deps" (list_of "../cyc_a/project.caap"))

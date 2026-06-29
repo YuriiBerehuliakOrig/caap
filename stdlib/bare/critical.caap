@@ -1,0 +1,47 @@
+; stdlib/bare/critical.caap — critical sections over the CPU IRQ helpers
+; (module stdlib.bare.critical).
+;
+; A critical section is the single-core mutual-exclusion primitive: mask
+; interrupts so the scheduler (driven by SysTick/PendSV) cannot preempt a
+; read-modify-write of shared state, then unmask. On Cortex-M this is PRIMASK,
+; reached through stdlib.bare.cpu's `cpsid i` / `cpsie i` (and, for the nesting-
+; safe variant, `mrs/msr primask`). This is exactly the mechanism
+; examples/urun and `docs/design-bare-metal.md` Phase 3 use — factored out
+; here so a driver writes `(critical_enter)` … `(critical_leave)` once.
+;
+; SCOPE — NATIVE/clike-targeted (the underlying `asm` lowers in the LLVM/WASM
+; backends, reached by a native program's `(use …)` through the backend prep
+; path). NOT loadable by the plain eval loader. See stdlib/bare/README.md.
+(module stdlib.bare.critical)
+
+(use stdlib.bare.cpu irq_disable irq_enable primask_read primask_write)
+
+; ── simple (non-nesting) critical section ────────────────────────────────────
+; critical_enter / critical_leave — mask all interrupts, then unconditionally
+; re-enable them. Correct when the section is NEVER entered with interrupts
+; already masked (the common case: top-level driver code, not nested inside
+; another critical section or an interrupt handler). For nested use, prefer the
+; save/restore pair below.
+;   -> : 0
+(defn critical_enter () i32 (mutation) (irq_disable))
+(defn critical_leave () i32 (mutation) (irq_enable))
+
+; ── nesting-safe critical section (save / restore PRIMASK) ───────────────────
+; critical_save — mask interrupts and RETURN the prior PRIMASK, so a later
+; critical_restore puts interrupts back exactly as they were (re-enabling only
+; if they were enabled on entry). Use as:
+;   prev u32 = critical_save()    // mask, remember prior state
+;   …read-modify-write shared state…
+;   critical_restore(prev)        // restore — does NOT force-enable if nested
+; This is the correct idiom inside code that may already run with IRQs masked.
+;   critical_save    -> the PRIMASK value to hand back to critical_restore
+;   critical_restore : that saved PRIMASK value
+(defn critical_save () u32 (mutation)
+  (bind ((prev (primask_read)))
+    (do
+      (irq_disable)
+      prev)))
+(defn critical_restore ((prev u32)) i32 (mutation)
+  (primask_write prev))
+
+(export critical_enter critical_leave critical_save critical_restore)

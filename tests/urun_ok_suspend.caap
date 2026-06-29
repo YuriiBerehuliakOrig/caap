@@ -1,0 +1,4 @@
+; ur-suspend SILENCE: a park preceded by a reachable enqueue — must NOT fire.
+(defn ur_list_push_x ((l i32) (n i32)) i32 0)
+(defn _ur_thread_suspend_timed ((t i32) (c u32) (o u32) (w u32)) i32 0)
+(defn _probe_paired ((t i32)) i32 (do (ur_list_push_x 0 t) (_ur_thread_suspend_timed t 1 2 3)))

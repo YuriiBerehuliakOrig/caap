@@ -1,0 +1,257 @@
+; stdlib/semantics/passes/struct_monomorph.caap — NATIVE GENERIC STRUCTS by
+; monomorphization, a whole-module TRANSFORM (module
+; stdlib.semantics.passes.struct_monomorph).
+;
+; The struct analog of the function monomorph (semantics/passes/monomorph): a
+; `struct List<T, lf>` declared once, specialized per `List<Concrete,…>` USE.
+; A generic struct declares its parameters as PHANTOM fields typed `type` (an
+; element/type parameter) or `field` (an intrusive link-field name) — the same
+; compile-time-param convention functions use — followed by the REAL fields that
+; mention them: `List struct = { T type, lf field, head T* }`. Instantiations are
+; discovered NOT from call sites but from TYPE SPELLINGS — every `Ctor<Args>` in a
+; struct field / function-signature marker whose `Ctor` is a generic struct (the
+; `<…>` spelling produced by clike read_type / by the function monomorph after it
+; substitutes the type variables). For each unique `(Ctor, Args)` the pass mints a
+; mangled concrete struct (real fields only, type args substituted), rewrites
+; every spelling to the mangled name, and drops the templates — so the gate and
+; codegen meet only concrete structs.
+;
+; Runs AFTER the function monomorph (registered later in prep), so the operation
+; signatures' `List<T,lf>` have already become concrete `List<UR_THREAD,…>`.
+;
+; LIMITATION (documented, not silent): a real field whose type is ITSELF a generic
+; struct (`Node<T>` inside `List<T>`) is not yet transitively specialized (a single
+; level; the urun lists are flat). subst over a real field type handles the bare
+; var + the `ptr_` constructor, not the nested `<…>` spelling — revisit with a
+; fixed-point worklist when a caller needs nesting.
+(module stdlib.semantics.passes.struct_monomorph)
+
+(use stdlib.syntax.ast call? head_is? arg args_of name_of literal_of sym lit call calln)
+(use stdlib.syntax.ir match_node)
+(use stdlib.semantics.types.records marker? struct_marker)
+(use stdlib.semantics.types.registry ctor_of)
+(use stdlib.semantics.passes.monomorph subst_ty nargs pad_omitted_fields)
+(use stdlib.semantics.passes.registry install_transform!)
+
+; struct_shape / decode_struct — read an expanded `(do <marker> (bind make_N c))`
+; as a STRUCT (marker tag `::struct`); null for a defn or any other shape.
+(bind struct_shape
+  (calln "do" (list_of (sym "?marker")
+                       (calln "bind" (list_of (sym "?ctorname") (sym "?ctorval"))))))
+(bind decode_struct
+  (lambda (node)
+    (bind ((b (match_node struct_shape node)))
+      (if (or (eq b null) (not (marker? (get b "?marker"))))
+        null
+        (struct_marker (get b "?marker"))))))   ; {name, fields:[{name,type}]} | null
+
+; phantom? — is a field a compile-time PARAMETER (type `type`/`field`) rather than
+; real storage?
+(bind phantom? (lambda (f) (or (eq (get f "type") "type") (eq (get f "type") "field"))))
+
+; generic_struct? / classify_fields — a struct is generic iff it has a phantom
+; parameter field; classify splits the ordered phantom param NAMES from the real
+; fields.
+(bind generic_struct?
+  (lambda (sm)
+    (bind ((found (ref false)))
+      (do (for f (get sm "fields") (when (phantom? f) (set_ref found true)))
+          (deref found)))))
+(bind classify_fields
+  (lambda (sm)
+    (bind ((params (list_of)) (real (list_of)))
+      (do
+        (for f (get sm "fields")
+          (if (phantom? f) (append params (get f "name")) (append real f)))
+        (assoc (map_of) "params" params "real" real)))))
+
+; mangle_struct — `List` + args -> `List__UR_THREAD__ur_thread_suspend_next`.
+; An arg containing the `__` separator would make the name ambiguous — reject it.
+(bind mangle_struct
+  (lambda (ctor args)
+    (bind ((m (ref ctor)))
+      (do
+        (for a args
+          (do
+            (when (not (eq (string_find a "__") null))
+              (throw (string_concat_many "struct_monomorph: argument `" a
+                "` to generic struct `" ctor "` contains `__` (ambiguous mangled name)")))
+            (set_ref m (string_concat_many (deref m) "__" a))))
+        (deref m)))))
+
+; params_spec — the kernel lambda parameter clause for `names` (or literal null).
+(bind params_spec
+  (lambda (names)
+    (if (eq (size names) 0)
+      (lit null)
+      (bind ((rest (list_of)) (k (ref 1)))
+        (do
+          (while (lt (deref k) (size names))
+            (do (append rest (sym (get names (deref k)))) (set_ref k (int_add (deref k) 1))))
+          (call (sym (get names 0)) rest))))))
+
+; rw_spell — given the generics index + the running instantiation map, returns a
+; spelling-rewriter: `Ctor<Args>` (or `ptr_Ctor<Args>`) for a GENERIC Ctor becomes
+; its mangled name and records the instantiation; everything else passes through.
+(bind rw_spell
+  (lambda (generics insts)
+    (bind ((kinds_of (lambda (c) (bind ((g (get generics c))) (if (eq g null) null (get g "kinds"))))))
+    (lambda (sp0)
+      ; canonicalise a defaulted `field` parameter first (`List<UR_TIMER>` ->
+      ; `List<UR_TIMER&next>`) so the mangled name + instantiation are complete.
+      (bind ((sp (pad_omitted_fields sp0 kinds_of)))
+      (if (eq sp null)
+        sp
+        (bind ((is_ptr (string_starts_with sp "ptr_"))
+               (base (if is_ptr (string_slice sp 4 (size sp)) sp))
+               (ctor (ctor_of base)))
+          (if (or (eq ctor null) (eq (get generics ctor) null))
+            sp
+            (bind ((args (nargs base)) (mangled (mangle_struct ctor (nargs base))))
+              (do
+                (when (eq (get insts mangled) null)
+                  (assoc insts mangled
+                    (assoc (map_of) "ctor" ctor "args" args "mangled" mangled)))
+                (if is_ptr (string_concat_many "ptr_" mangled) mangled)))))))))))
+
+; rewrite_marker — apply `rw` to every TYPE slot of a `::struct` / `::defn_sig`
+; marker literal, returning the rebuilt marker node (field/param names untouched).
+(bind rewrite_marker
+  (lambda (mnode rw)
+    (bind ((v (literal_of mnode)))
+      (if (eq v null)
+        mnode
+        (cond
+          ((eq (get v 0) "::struct")
+            (bind ((out (list_of "::struct" (get v 1))) (i (ref 2)))
+              (do
+                (while (lt (deref i) (size v))
+                  (do
+                    (append out (get v (deref i)))
+                    (append out (rw (get v (int_add (deref i) 1))))
+                    (set_ref i (int_add (deref i) 2))))
+                (lit out))))
+          ((eq (get v 0) "::defn_sig")
+            (bind ((out (list_of "::defn_sig" (get v 1) (rw (get v 2)) (get v 3))) (i (ref 4)))
+              (do
+                (while (lt (deref i) (size v))
+                  (do
+                    (append out (get v (deref i)))
+                    (append out (rw (get v (int_add (deref i) 1))))
+                    (set_ref i (int_add (deref i) 2))))
+                (lit out))))
+          (else mnode))))))
+
+; build_struct_spec — emit one specialized struct `(do <marker> (bind make_M c))`
+; + its located entry, from a recorded instantiation. Drops the phantom params;
+; substitutes the type args into each real field; rebuilds the constructor over
+; the real fields only.
+(bind build_struct_spec
+  (lambda (inst generics)
+    (bind (
+      (gen     (get generics (get inst "ctor")))
+      (args    (get inst "args"))
+      (mangled (get inst "mangled"))
+      (params  (get gen "params"))
+      (real    (get gen "real"))
+      (subst   (map_of))
+      (k       (ref 0))
+    )
+      (do
+        (while (lt (deref k) (size params))
+          (do (assoc subst (get params (deref k)) (get args (deref k)))
+              (set_ref k (int_add (deref k) 1))))
+        (bind (
+          (mk    (list_of "::struct" mangled))
+          (rnames (list_of))
+          (cargs (list_of (calln "map_of" (list_of)) (lit "__type") (lit mangled)))
+        )
+          (do
+            (for f real
+              (do
+                (append mk (get f "name"))
+                (append mk (subst_ty (get f "type") subst))
+                (append rnames (get f "name"))
+                (append cargs (lit (get f "name")))
+                (append cargs (sym (get f "name")))))
+            (bind (
+              (node (calln "do" (list_of
+                      (lit mk)
+                      (calln "bind" (list_of
+                        (sym (string_concat_many "make_" mangled))
+                        (calln "lambda" (list_of (params_spec rnames)
+                                                 (calln "assoc" cargs))))))))
+              (tmpl (get gen "entry"))
+            )
+              (assoc (map_of) "node" node
+                              "label" (get tmpl "label")
+                              "root" (get tmpl "root")))))))))
+
+; program_globals — the native prep's `acc.globals` list ({name, type, init}…),
+; published before the transforms run. A global of generic struct type carries a
+; `List<…>` spelling in this SEPARATE table (it never enters the expanded stream),
+; so its type must be rewritten to the mangled concrete struct here too — otherwise
+; codegen meets `List<TH&nxt>` for the global cell and cannot lower it. Mutated in
+; place (same maps prep emits from).
+(bind program_globals (ref (list_of)))
+(bind set_struct_globals!
+  (lambda (gs) (set_ref program_globals gs)))
+
+; run — index generic structs, rewrite every marker's type spellings (collecting
+; instantiations), append one specialization per unique instantiation, and drop
+; the templates — in place on `located`. Fast no-op without a generic struct.
+(bind run
+  (lambda (located)
+    (bind ((generics (map_of)) (gen_idxs (list_of)) (i (ref 0)))
+      (do
+        (for f located
+          (do
+            (bind ((sm (decode_struct (get f "node"))))
+              (when (and (not (eq sm null)) (generic_struct? sm))
+                (bind ((cf (classify_fields sm)) (kinds (list_of)))
+                  (do
+                    ; the ordered compile-time parameter KINDS ("type"/"field"), so a
+                    ; spelling with an OMITTED trailing `field` parameter defaults it.
+                    (for fld (get sm "fields") (when (phantom? fld) (append kinds (get fld "type"))))
+                    (assoc generics (get sm "name")
+                      (assoc (map_of) "sm" sm "params" (get cf "params")
+                                      "real" (get cf "real") "kinds" kinds "entry" f))
+                    (append gen_idxs (deref i))))))
+            (set_ref i (int_add (deref i) 1))))
+        (when (gt (size (map_keys generics)) 0)
+          (bind ((insts (map_of)) (rw (rw_spell generics insts)))
+            (do
+              ; rewrite the program globals' type spellings (and record any
+              ; instantiation reached ONLY through a global) before specializing.
+              (for g (deref program_globals)
+                (assoc g "type" (rw (get g "type"))))
+              (for f located
+                (bind ((node (get f "node")))
+                  (when (and (call? node) (head_is? node "do"))
+                    ; rewrite ONLY the leading marker (arg 0); preserve every
+                    ; other child — an enum is `(do <::enum> (bind v0 ..) …)` with
+                    ; one bind PER variant, so keeping just args 0/1 would drop them.
+                    (bind ((as (args_of node)) (out (list_of)))
+                      (when (gt (size as) 0)
+                        (do
+                          (append out (rewrite_marker (get as 0) rw))
+                          (bind ((k (ref 1)))
+                            (while (lt (deref k) (size as))
+                              (do (append out (get as (deref k)))
+                                  (set_ref k (int_add (deref k) 1)))))
+                          (assoc f "node" (calln "do" out))))))))
+              (for mangled (map_keys insts)
+                (append located (build_struct_spec (get insts mangled) generics)))
+              (bind ((j (ref (int_sub (size gen_idxs) 1))))
+                (while (ge (deref j) 0)
+                  (do (list_remove_at located (get gen_idxs (deref j)))
+                      (set_ref j (int_sub (deref j) 1))))))))))))
+
+; register_struct_monomorph! — installed by backend/prep AFTER the function
+; monomorph, so operation signatures' generic spellings are already concrete.
+(bind register_struct_monomorph!
+  (lambda () (install_transform! "struct_monomorph" run)))
+
+(export decode_struct generic_struct? classify_fields mangle_struct
+        rw_spell rewrite_marker build_struct_spec run
+        set_struct_globals! register_struct_monomorph!)

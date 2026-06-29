@@ -1,0 +1,29 @@
+; stdlib/semantics/types/infer/store.caap - cross-module signature store.
+;
+; Internal leaf behind stdlib.semantics.types.infer. It owns only the module
+; signature table and the public store operations re-exported by the facade.
+(module stdlib.semantics.types.infer.store)
+
+; module name -> { fn name -> record }
+(bind signatures (map_of))
+
+(bind register_sigs!
+  (lambda (module_name harvest)
+    (do
+      (when (gt (size harvest) 0)
+        (assoc signatures module_name harvest))
+      null)))
+
+(bind declare_sigs!
+  (lambda (module_name records)
+    (bind ((found (get signatures module_name (map_of))))
+      (do
+        (for r records (assoc found (get r "fname") r))
+        (assoc signatures module_name found)
+        null))))
+
+(bind sig_of
+  (lambda (module_name fn_name)
+    (get (get signatures module_name (map_of)) fn_name)))
+
+(export register_sigs! declare_sigs! sig_of)

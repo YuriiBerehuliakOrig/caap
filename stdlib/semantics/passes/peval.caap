@@ -1,0 +1,127 @@
+; stdlib/semantics/passes/peval.caap — partial evaluation (module
+; stdlib.semantics.passes.peval). ROADMAP A1, the tractable core.
+;
+; A whole-module TRANSFORM that drives the existing rewrites to a FIXPOINT, with
+; one new ingredient — constant propagation — so they feed each other:
+;
+;   constprop   (bind ((x 5)) (int_add x 1))  ->  (bind ((x 5)) (int_add 5 1))
+;               substitute literal-bound names into their scope (capture-avoiding
+;               via lib/ir subst_safe; a shadowed name is left untouched).
+;   fold        (constfold) evaluate pure literal calls
+;   simplify    dead-branch ((if <bool-lit> …)) + beta
+;   dce         drop the now-unused bindings
+;
+; Each enables the next — propagate a literal, the call folds, a branch dies, the
+; binding is dead — so peval loops until nothing changes (node_eq), capped so a
+; pathological input can never hang. `(bind ((x 2) (y (int_mul x 3))) (int_add y
+; 1))` collapses to `7`. This is the from-scratch counterpart of v1's
+; binding-time/specialize toolchain, built from the pure rewrite blocks.
+(module stdlib.semantics.passes.peval)
+
+(use stdlib.syntax.ast
+  call? literal? name? head_is? args_of arg string_lit? bind_pairs sym lit call)
+(use stdlib.syntax.ir subst_safe node_eq transform)
+(use stdlib.semantics.passes.constfold fold_node)
+(use stdlib.semantics.passes.simplify simplify_node)
+(use stdlib.semantics.passes.dce rewrite_node)
+(use stdlib.semantics.passes.registry install_transform!)
+
+; prop_value — the value of a pair, reduced to something PROPAGATABLE, else null.
+; A literal or a name is already a pure, duplicate-safe value. A COMPUTED value
+; that constant-FOLDS to a literal in this same round (e.g. `(int_add 1 2)` -> 3)
+; is too — so we fold it once here and propagate the result, instead of waiting a
+; whole extra fixpoint round for fold to land before constprop can see it. Folding
+; is the same pure rewrite the round runs anyway; doing it inside constprop only
+; reorders the work, never changes the fixpoint. Returns the propagatable node, or
+; null when the value is neither a value nor literal-folding.
+(bind prop_value
+  (lambda (value)
+    (if (or (literal? value) (name? value))
+      value
+      (bind ((fv (fold_node value)))
+        (if (literal? fv) fv null)))))
+
+; constprop — substitute literal-/name-valued bindings into their scope, via
+; ir.transform. transform rebuilds children FIRST (span preserved); at each
+; `(bind … )` node the pairs/body are already propagated, then THIS bind's
+; literal/copy/constant-folding bindings are pushed in with subst_safe (capture-
+; avoiding, let*: earlier names visible). Both literals and names are pure values,
+; safe to duplicate; a value that constant-folds to a literal this round is folded
+; in place and propagated too (prop_value). The outer→inner pass settles with the
+; rest under peval's fixpoint.
+(bind constprop
+  (lambda (node)
+    (transform node
+      (lambda (n)
+        (if (and (call? n) (head_is? n "bind") (string_lit? (arg n 0)))
+          (bind (
+            (bp (bind_pairs n))
+            (pairs (get bp "pairs")) (body (get bp "body"))
+            (lit_map (map_of)) (folded (map_of)) (parts (list_of))
+          )
+            (do
+              (for p pairs
+                (bind ((pv (prop_value (get p "value"))))
+                  (when (not (eq pv null))
+                    (do
+                      (assoc lit_map (get p "name") pv)
+                      ; remember the reduced value so the pair binds the FOLDED
+                      ; literal too (not just the substituted callers), keeping the
+                      ; `(bind …)` self-consistent in one round.
+                      (assoc folded (get p "name") pv)))))
+              ; FAST PATH: nothing to propagate -> subst_safe would be the identity
+              ; on every pair value and body element. Return null (transform keeps
+              ; the already-rebuilt node) instead of N redundant capture-avoiding
+              ; tree rebuilds. This is the common case (most binds bind COMPUTED
+              ; values, not literals/names).
+              (if (eq (size lit_map) 0)
+                null
+                (do
+                  (for p pairs
+                    (bind ((nm (get p "name")))
+                      (do
+                        (append parts (lit nm))
+                        ; a pair we reduced binds the folded literal directly; the
+                        ; rest are still propagated through (subst_safe).
+                        (append parts
+                          (if (contains folded nm)
+                            (get folded nm)
+                            (subst_safe (get p "value") lit_map))))))
+                  (for b body (append parts (subst_safe b lit_map)))
+                  (call (sym "bind") parts)))))
+          null)))))
+
+; round — one optimization pass in pipeline order: constprop -> constfold ->
+; simplify (dead-branch + beta) -> dce. The nesting reads inside-out, and the
+; order is load-bearing: propagating a literal lets the call FOLD, a folded
+; condition lets simplify DROP the dead branch, and the now-unread binding lets
+; dce DELETE it — each stage feeds the next. `peval_node` re-runs this to a
+; fixpoint because one round's deletions can expose more work for the next.
+(bind round
+  (lambda (node)
+    (rewrite_node (simplify_node (fold_node (constprop node))))))
+
+; peval_node — drive `round` to a fixpoint (capped at 16 iterations; convergent
+; rewrites settle far sooner, the cap only bounds a pathological input).
+(bind peval_node
+  (lambda (node)
+    (bind ((cur (ref node)) (i (ref 0)) (done (ref false)))
+      (do
+        (while (and (not (deref done)) (lt (deref i) 16))
+          (bind ((next (round (deref cur))))
+            (if (node_eq next (deref cur))
+              (set_ref done true)
+              (do (set_ref cur next) (set_ref i (int_add (deref i) 1))))))
+        (deref cur)))))
+
+; run — the transform entry: partially evaluate every located form IN PLACE.
+(bind run
+  (lambda (located)
+    (for f located (assoc f "node" (peval_node (get f "node"))))))
+
+; register! — install partial evaluation as a load-time TRANSFORM (idempotent).
+; It SUPERSEDES constfold/simplify/dce (it runs all of them to a fixpoint);
+; register one or the other, not both.
+(bind register! (lambda () (install_transform! "peval" run)))
+
+(export constprop peval_node run register!)

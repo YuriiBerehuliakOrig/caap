@@ -1,0 +1,3 @@
+; ur-fastpath SILENCE: a suspend correctly guarded by a conditional — must NOT fire.
+(defn _ur_thread_suspend_timed ((t i32) (c u32) (o u32) (w u32)) i32 0)
+(defn _probe_guarded ((t i32)) i32 (if t (_ur_thread_suspend_timed t 1 2 3) 0))

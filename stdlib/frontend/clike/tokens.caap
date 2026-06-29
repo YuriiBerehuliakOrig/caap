@@ -1,0 +1,131 @@
+; stdlib/frontend/clike/tokens.caap - ParsedForm token helpers for stdlib.frontend.clike.
+;
+; The lexer grammar stays in clike/grammar.caap. This leaf owns only token access,
+; source-span helpers, diagnostics, and token-list splitters used by the lowerer.
+(module stdlib.frontend.clike.tokens)
+
+; ── token accessors (ParsedForm maps) ───────────────────────────────────────
+(bind tkind  (lambda (t) (get t "kind")))
+(bind tval   (lambda (t) (get t "value")))
+(bind titems (lambda (t) (get t "items" (list_of))))
+(bind tsym?
+  (lambda (t v)
+    (and (not (eq t null))
+         (and (eq (tkind t) "symbol")
+              (or (eq v null) (eq (tval t) v))))))
+(bind tnum?  (lambda (t) (and (not (eq t null)) (eq (tkind t) "integer"))))
+(bind tstr?  (lambda (t) (and (not (eq t null)) (eq (tkind t) "string"))))
+
+; operator-run helpers — the grammar intentionally lexes operator characters as
+; broad runs. Semantic contexts (types, expressions, splitters) decide how much
+; of a run they mean.
+(bind chars_all_in?
+  (lambda (s allowed)
+    (and (gt (size s) 0)
+         (bind ((ok (ref true)))
+           (do
+             (for ch (string_chars s)
+               (unless (string_contains allowed ch) (set_ref ok false)))
+             (deref ok))))))
+
+(bind tsym_run_all?
+  (lambda (t allowed)
+    (and (tsym? t null) (chars_all_in? (tval t) allowed))))
+
+(bind leading_char_count
+  (lambda (s ch)
+    (bind ((i (ref 0)) (go (ref true)))
+      (do
+        (while (and (deref go) (lt (deref i) (size s)))
+          (if (eq (string_slice s (deref i) (int_add (deref i) 1)) ch)
+            (set_ref i (int_add (deref i) 1))
+            (set_ref go false)))
+        (deref i)))))
+
+(bind tsym_leading_count
+  (lambda (t ch)
+    (if (tsym? t null) (leading_char_count (tval t) ch) 0)))
+
+(bind tsym_suffix_after_leading
+  (lambda (t ch)
+    (bind ((n (tsym_leading_count t ch)))
+      (if (gt n 0) (string_slice (tval t) n (size (tval t))) null))))
+
+(bind tsym_suffix_after_prefix
+  (lambda (t prefix)
+    (if (and (tsym? t null) (string_starts_with (tval t) prefix))
+      (string_slice (tval t) (size prefix) (size (tval t)))
+      null)))
+
+; split_dots — "a.b.c" -> ["a" "b" "c"] (dots ride inside ident tokens).
+(bind split_dots
+  (lambda (nm) (string_split nm ".")))
+
+; the engine stamps each form with its PRODUCING RULE and an honest
+; delimiter — bracket kinds dispatch declaratively
+(bind tlist?
+  (lambda (t d)
+    (and (not (eq t null)) (eq (get t "delimiter") d))))
+
+; tloc — a token's "line:col: " prefix (the engine's spans point at the
+; token itself), empty for a missing token.
+(bind tloc
+  (lambda (t)
+    (bind ((sp (if (eq t null) null (get t "span"))))
+      (if (eq sp null) ""
+        (string_concat_many
+          (int_to_string (get sp "start_line" 0)) ":"
+          (int_to_string (get sp "start_col" 0)) ": ")))))
+
+; stamp — the lowered spec carries its source TOKEN's span (C3), so the
+; loader's gate findings for surface files come out located.
+(bind stamp
+  (lambda (spec t)
+    (bind ((sp (if (eq t null) null (get t "span"))))
+      (if (eq sp null) spec (ctfe_spec_with_span spec sp)))))
+
+(bind oops
+  (lambda (where t)
+    (throw (string_concat_many
+      "clike: " (tloc t) where ", got "
+      (if (eq t null) "end of input" (value_to_string (tval t)))))))
+
+; split_commas — sub-token-lists of `toks` between "," symbols.
+(bind split_commas
+  (lambda (toks)
+    (bind ((out (list_of)) (cur (ref (list_of))))
+      (do
+        (for t toks
+          (if (tsym? t ",")
+            (do (append out (deref cur)) (set_ref cur (list_of)))
+            (append (deref cur) t)))
+        (when (gt (size (deref cur)) 0) (append out (deref cur)))
+        out))))
+
+; split_commas_types — like split_commas but `<…>`-DEPTH-AWARE: a comma inside
+; generic arguments (`List<UR_THREAD, ur_thread_suspend_next>`) does NOT split.
+; For TYPE-position lists (parameters, struct fields) only — never call arguments,
+; where `<` is the comparison operator. `>>` (one token in the lexer) closes two
+; levels. A depth that never returns to 0 (a stray `<`) just keeps the tail in one
+; group; the type reader then reports the malformed type, not the splitter.
+(bind split_commas_types
+  (lambda (toks)
+    (bind ((out (list_of)) (cur (ref (list_of))) (depth (ref 0)))
+      (do
+        (for t toks
+          (cond
+            ((tsym? t "<") (do (set_ref depth (int_add (deref depth) 1)) (append (deref cur) t)))
+            ((gt (tsym_leading_count t ">") 0)
+              (do (set_ref depth
+                    (int_sub (deref depth) (tsym_leading_count t ">")))
+                  (append (deref cur) t)))
+            ((and (tsym? t ",") (le (deref depth) 0))
+              (do (append out (deref cur)) (set_ref cur (list_of))))
+            (else (append (deref cur) t))))
+        (when (gt (size (deref cur)) 0) (append out (deref cur)))
+        out))))
+
+(export tkind tval titems tsym? tnum? tstr? tlist? tloc stamp oops
+        chars_all_in? tsym_run_all? tsym_leading_count tsym_suffix_after_leading
+        tsym_suffix_after_prefix
+        split_dots split_commas split_commas_types)

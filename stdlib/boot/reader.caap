@@ -1,0 +1,200 @@
+; stdlib/boot/reader.caap — source READING: text -> located forms (module stdlib.reader).
+; MODULE IDENTITY: a RAW bootstrap script (run via ctfe_compiler_execute_bootstrap_file /
+; run_expanded BEFORE the `module` form is a bound name), so it carries NO `(module …)`
+; form — adding one would raise `unknown name: module`. Its registry identity is set
+; explicitly via ctfe_compiler_register_value. Allowlisted in stdlib/CONVENTIONS.md +
+; stdlib_module_identity_check (caap/tests/stdlib_governance_tests.rs).
+;
+; The reader responsibility extracted from the loader: turn a file path into
+; {path, located} — either through a surface KIT (a file whose first non-comment
+; line is `(surface KIT …)`, lowered by the named front-end) or through the kernel
+; parser (the default). `make` binds it over `resolve_import` (used only to resolve
+; a surface kit module — the one outward dependency); `loc`/`err_text` are private.
+; The module holds no loader state.
+(do
+  (bind (
+    ; loc — a form's "path:line:col" from the unit's span (default reader).
+    (loc
+      (lambda (unit form)
+        (bind ((span (ctfe_unit_node_span unit (ctfe_node_id form))))
+          (if (eq span null)
+            "<unknown>"
+            (string_concat_many
+              (get span "path" "?") ":"
+              (int_to_string (get span "start_line" 0)) ":"
+              (int_to_string (get span "start_col" 0)))))))
+
+    ; err_text — best-effort message from a thrown value (a map carries a
+    ; "message"; anything else stringifies). Lets a deep kit failure surface as a
+    ; readable, located diagnostic rather than silence.
+    (err_text
+      (lambda (e)
+        (if (eq (value_type e) "map")
+          ; (get e "message" default) yields null for a PRESENT-but-null key,
+          ; so re-check and fall back to the value's display — err_text must
+          ; never return null (a deep kit failure must surface as readable text;
+          ; surface_of_diag's "unknown" reason relies on this too).
+          (bind ((m (get e "message" null)))
+            (if (eq m null) (value_to_string e) m))
+          (value_to_string e))))
+
+    ; make — bind the reader over `resolve_import` (resolves a surface kit module).
+    (make
+      (lambda (resolve_import)
+        (bind (
+          ; surface_of_diag — the TRI-STATE verdict, so tooling can tell a
+          ; headerless file from one whose header could not be read:
+          ;   {status, kit, reason}
+          ;     "present" — a (surface KIT …) header; kit = the KIT name.
+          ;     "absent"  — read OK, no surface header; kit = null.
+          ;     "unknown" — the file could not be read (no fs service, missing
+          ;                 file, …); kit = null, reason = the error text.
+          ; The header scan is unchanged; only the fs-read failure, previously
+          ; swallowed into null (indistinguishable from "absent"), now becomes
+          ; "unknown" carrying its reason.
+          (surface_of_diag
+            (lambda (raw_path)
+              (bind (
+                ; best-effort: a session without the fs host service cannot carry
+                ; surface-headed files anyway — every other load stays untouched.
+                ; A read failure is captured as a reason (not swallowed) so the
+                ; "unknown" verdict can name why the header is unreadable.
+                (reason (ref null))
+                (text (try ((host_service_export "fs" "read_text" "compile_time")
+                            raw_path)
+                        (catch e (do (set_ref reason (err_text e)) null))))
+                (out (ref null))
+                (done (ref false))
+              )
+                (do
+                  (when (eq text null) (set_ref done true))
+                  (for line (string_lines (if (eq text null) "" text))
+                    (unless (deref done)
+                      (bind ((t (string_trim line)))
+                        (unless (or (eq t "")
+                                    (or (string_starts_with t ";")
+                                        (string_starts_with t "//")))
+                          (do
+                            (set_ref done true)
+                            (when (and (string_starts_with t "(surface ")
+                                       (string_ends_with t ")"))
+                              ; the KIT is the first word; a second word names the
+                              ; module (the kit reads it from the header itself)
+                              (set_ref out
+                                (get (string_split
+                                       (string_trim
+                                         (string_slice t 9 (int_sub (size t) 1)))
+                                       " ")
+                                     0))))))))
+                  (cond
+                    ((not (eq (deref out) null))
+                      (assoc (map_of) "status" "present"
+                        "kit" (deref out) "reason" null))
+                    ((eq text null)
+                      (assoc (map_of) "status" "unknown"
+                        "kit" null "reason" (deref reason)))
+                    (else
+                      (assoc (map_of) "status" "absent"
+                        "kit" null "reason" null)))))))
+
+          ; surface_of — the COMPAT accessor: the kit name of a surface header,
+          ; or null when absent OR unreadable (both falsy, exactly as before).
+          ; It DROPS the reason, so it cannot tell "no header" from "could not
+          ; read" — PREFER surface_of_diag (the tri-state {status, kit, reason})
+          ; for any consumer that needs to.
+          ;
+          ; Retained (NOT dead) because its two internal callers genuinely want
+          ; this falsy presence check and re-read the file on the chosen path,
+          ; where a real read failure is NOT swallowed: loader.load picks
+          ; default_read vs surface_read, and analyze_source picks analyze_default
+          ; vs surface_analyze — both default paths re-read via
+          ; ctfe_compiler_load_surface_file_template, which RAISES on an
+          ; unreadable file. The weak-diagnostic public path
+          ; (analyze_source_with_root) is built on surface_of_diag, not this shim.
+          (surface_of
+            (lambda (raw_path)
+              (get (surface_of_diag raw_path) "kit" null)))
+
+          ; surface_read — {path, located} for a surface-headed file: the kit's
+          ; lower_program produces the specs (a lowering failure is a located
+          ; error); locs fall back to the file path. A kit that cannot be resolved
+          ; is a LOCATED failure — never a silent fall-through to the default reader.
+          (surface_read
+            (lambda (raw_path kit_name)
+              (bind (
+                (path (ctfe_source_canonicalize raw_path))
+                ; resolve_import raises for ANY kit-load failure — a missing module
+                ; OR a kit that exists but is itself broken. Re-raise as a located
+                ; surface error; the original cause (err_text) tells which.
+                (kit (try (resolve_import kit_name)
+                       (catch e
+                         (runtime_error
+                           (string_concat_many
+                             path ": surface kit \"" kit_name
+                             "\" could not be loaded: " (err_text e))))))
+                (text ((host_service_export "fs" "read_text" "compile_time") raw_path))
+              )
+                (bind (
+                  (lower_at (get kit "lower_program_at"))
+                  (lower (get kit "lower_program"))
+                )
+                  (do
+                    (when (and (eq lower null) (eq lower_at null))
+                      (runtime_error
+                        (string_concat_many
+                          path ": surface kit \"" kit_name
+                          "\" exports no lower_program")))
+                    (bind ((r (if (eq lower_at null)
+                                (lower text)
+                                (lower_at text path))))
+                      (do
+                        (unless (get r "ok" false)
+                          (runtime_error
+                            (string_concat_many
+                              path ": " (get r "error" "surface lowering failed"))))
+                        (bind ((located (list_of)))
+                          (do
+                            ; a kit that STAMPS its specs (C3) gives every form a
+                            ; real "path:line:col"; unstamped specs fall back to
+                            ; the file path
+                            (for spec (get r "forms" (list_of))
+                              (bind ((sp (ctfe_spec_span spec)))
+                                (append located
+                                  (assoc (map_of) "spec" spec
+                                    "loc" (if (eq sp null) path
+                                            (string_concat_many
+                                              (get sp "path" path) ":"
+                                              (int_to_string (get sp "start_line" 0))
+                                              ":"
+                                              (int_to_string (get sp "start_col" 0))))))))
+                            (assoc (map_of) "path" path "located" located))))))))))
+
+          ; default_read — {path, located} through the kernel parser (the normal
+          ; path): canonical path from the unit's own spans.
+          (default_read
+            (lambda (raw_path)
+              (bind (
+                (unit (ctfe_compiler_load_surface_file_template compiler raw_path))
+                (forms (ctfe_unit_top_level_forms unit))
+                (path
+                  (if (eq (size forms) 0)
+                    raw_path
+                    (bind ((span (ctfe_unit_node_span unit (ctfe_node_id (get forms 0)))))
+                      (if (eq span null) raw_path (get span "path" raw_path)))))
+                (located (list_of))
+              )
+                (do
+                  (for form forms
+                    (append located
+                      (assoc (map_of)
+                        "spec" (ctfe_node_to_spec form)
+                        "loc" (loc unit form))))
+                  (assoc (map_of) "path" path "located" located)))))
+        )
+          (assoc (map_of)
+            "surface_of" surface_of "surface_of_diag" surface_of_diag
+            "surface_read" surface_read
+            "default_read" default_read))))
+  )
+    (ctfe_compiler_register_value compiler "stdlib.reader"
+      (assoc (map_of) "make" make))))

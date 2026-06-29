@@ -1,0 +1,27 @@
+; stdlib/boot/opt_O3.caap — a composed BOOTSTRAP that compiles at -O3.
+; MODULE IDENTITY: a RAW bootstrap script (run via ctfe_compiler_execute_bootstrap_file /
+; run_expanded BEFORE the `module` form is a bound name), so it carries NO `(module …)`
+; form — adding one would raise `unknown name: module`. Its registry identity is set
+; explicitly via ctfe_compiler_register_value. Allowlisted in stdlib/CONVENTIONS.md +
+; stdlib_module_identity_check (caap/tests/stdlib_governance_tests.rs).
+;
+; Run it INSTEAD OF stdlib/bootstrap.caap; the program after it is compiled with
+; the O3 transform set active (the boot/peval.caap composition pattern):
+;
+;   caap stdlib/boot/opt_O3.caap program.caap
+;
+; It runs the base bootstrap, then loads opt.caap and enables level O3 —
+; O2 (constfold, dce, simplify, algebra, cse, inline, licm, peval) PLUS
+; dead_store, ccp (the aggressive passes; pe is excluded — not behaviour-
+; preserving on general code). Every module loaded afterwards is
+; run through them before the load-time check gate; these passes are still
+; BEHAVIOUR-PRESERVING (they rewrite the IR, not the result), so the program's
+; RESULT is unchanged — only the IR is optimized, at higher load-time cost. See
+; opt.caap for the full level table. (Raw kernel forms: a bootstrap file
+; evaluates in the compile-time phase with `compiler` bound; execute_bootstrap_file
+; / load paths resolve relative to THIS file's directory — stdlib/boot/ — so the
+; base bootstrap is "../bootstrap.caap" and the sibling registry is "opt.caap".)
+(do
+  (ctfe_compiler_execute_bootstrap_file compiler "../bootstrap.caap")
+  (bind ((load (get (ctfe_compiler_lookup_value compiler "stdlib.load") "load")))
+    ((get (load "opt.caap") "enable_opt!") "O3")))

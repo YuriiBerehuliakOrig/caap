@@ -1,0 +1,139 @@
+; stdlib/semantics/passes/escape.caap — escape analysis for borrowed references
+; (module stdlib.semantics.passes.escape).
+;
+; The companion to semantics/passes/borrow: borrow enforces the aliasing rules WHILE a
+; reference is live; escape catches the reference OUTLIVING its scope — the
+; classic `return &local`. For a borrow handle `r` introduced by
+;
+;   (borrow x (lambda (r) body))   /   (borrow_mut x (lambda (r) body))
+;
+; it asks: does `r` reach the RESULT position of `body`? It escapes when the body
+; returns `r` directly, or returns through `do`/`if`/`bind` to `r`, returns a
+; CLOSURE that captures `r` (a dangling borrow), or STORES `r` into a returned
+; data structure (`(pair r s)`, `(list_of r)`, `(assoc m "f" r)`, `(ref r)`) — a
+; constructor result outlives the call, so a handle it captures dangles. It stays
+; precise and low-false-positive: it recurses per CONSTRUCTOR ARGUMENT (not over
+; every free name), so a `(println r)` tail or a `(get m r)` index does NOT flag,
+; keeping the common read-borrow pattern clean. `register!` installs it.
+(module stdlib.semantics.passes.escape)
+
+(use stdlib.syntax.ast
+  call? name? name_of literal_of head_of head_is? args_of arg walk string_lit? bind_pairs)
+(use stdlib.syntax.ir free_names)
+(use stdlib.lib.collections.map merge)
+(use stdlib.semantics.passes.registry note! install_pass!)
+
+; constructors — call heads that BUILD a value capturing their arguments: a
+; borrow handle passed to one is embedded in a structure that survives the
+; constructor call, so it escapes whatever its name arguments escape. Storing
+; into a ref (`(ref r)`) is the same — `r` outlives the borrow through the cell.
+; The list is the kernel's data builders + the borrow-relevant `ref`; a head not
+; here is treated as opaque (no DIRECT escape), keeping false positives low.
+(bind constructors
+  (assoc (map_of)
+    "pair" true "tuple" true "list_of" true "map_of" true
+    "assoc" true "cons" true "ref" true))
+(bind constructor? (lambda (h) (and (not (eq h null)) (eq (get constructors h false) true))))
+
+; resolve — rewrite a result set through a bind's aliases: a name bound to `v`
+; escapes whatever `v` escapes (`(bind ((y r)) y)` returns y, so r escapes).
+; let* is acyclic, so this terminates; `seen` guards against malformed cycles.
+(bind resolve
+  (lambda (self esc nameset alias seen)
+    (bind ((out (map_of)))
+      (do
+        (for nm (map_keys nameset)
+          (cond
+            ((eq (get seen nm false) true) (assoc out nm true))
+            ((not (eq (get alias nm) null))
+              (bind ((seen2 (merge seen (assoc (map_of) nm true)))
+                     (sub (esc esc (get alias nm))))
+                (for k (map_keys (self self esc sub alias seen2))
+                  (assoc out k true))))
+            (else (assoc out nm true))))
+        out))))
+
+; escaping — the set (name->true) of names that may BE the result of `node`
+; (its result position), following do/if/bind (with alias resolution) and
+; counting closure captures.
+(bind escaping
+  (lambda (self node)
+    (cond
+      ((eq node null) (map_of))
+      ((name? node) (assoc (map_of) (name_of node) true))
+      ((not (call? node)) (map_of))
+      ((head_is? node "do")
+        (bind ((as (args_of node)))
+          (if (eq (size as) 0) (map_of)
+            (self self (get as (int_sub (size as) 1))))))
+      ((head_is? node "if")
+        (merge (self self (arg node 1)) (self self (arg node 2))))
+      ((and (head_is? node "bind") (string_lit? (arg node 0)))
+        (bind (
+          (bp (bind_pairs node)) (pairs (get bp "pairs")) (body (get bp "body"))
+          (alias (map_of))
+          (tail (if (eq (size body) 0) null
+                  (get body (int_sub (size body) 1))))
+        )
+          (do
+            (for p pairs (assoc alias (get p "name") (get p "value")))
+            (resolve resolve self (self self tail) alias (map_of)))))
+      ; a returned closure escapes every name it captures from outside
+      ((head_is? node "lambda")
+        (bind ((out (map_of)))
+          (do (for nm (free_names node) (assoc out nm true)) out)))
+      ; a data constructor STORES its arguments into the returned value, which
+      ; outlives the call: the result escapes whatever each argument escapes.
+      ; Recursing per-argument (not free_names) keeps it precise — `(pair r s)`
+      ; escapes {r,s}, `(list_of (get m r))` does NOT escape r (it is only read
+      ; to index), and a nested `(pair (pair r s) t)` composes through this branch.
+      ((constructor? (head_of node))
+        (bind ((out (map_of)))
+          (do
+            (for a (args_of node)
+              (for k (map_keys (self self a)) (assoc out k true)))
+            out)))
+      ; any other call result is not a DIRECT handle escape
+      (else (map_of)))))
+
+
+; check — find borrow handles that escape their scope. Walks the whole tree, so
+; every `borrow`/`borrow_mut` (incl. nested ones) is checked independently: for
+; each, the handle name `r` is the lambda's first param, and it escapes when `r`
+; is in the body's `escaping` set.
+;   node : the form to analyze
+;   ->   : list of located findings (an "escape: path:line:col: msg" each)
+(bind check
+  (lambda (node)
+    (bind ((findings (list_of)))
+      (do
+        (walk node
+          (lambda (n)
+            (when (and (call? n)
+                       (or (head_is? n "borrow") (head_is? n "borrow_mut")))
+              (bind ((f (arg n 1)))
+                (when (and (not (eq f null)) (head_is? f "lambda"))
+                  (bind ((params (literal_of (arg f 0))) (body (arg f 1)))
+                    (when (and (not (eq params null)) (gt (size params) 0))
+                      (bind ((r (get params 0)) (esc (escaping escaping body)))
+                        (when (eq (get esc r false) true)
+                          (note! findings "escape" n
+                            (string_concat_many "borrowed reference `" r
+                              "` escapes its borrow scope")))))))))))
+        findings))))
+
+; check_module — the loader pass entry: `check` every located form into the sink.
+;   located : [{node, loc}] the module's expanded top-level forms
+;   sink    : the findings list to append to
+;   ->      : null
+(bind check_module
+  (lambda (located sink)
+    (for f located
+      (for finding (check (get f "node"))
+        (append sink finding)))))
+
+; register! — install escape analysis as a load-time pass (idempotent).
+(bind register!
+  (lambda () (install_pass! "escape" (lambda (located sink) (check_module located sink)))))
+
+(export escaping check check_module register!)

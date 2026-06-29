@@ -1,0 +1,437 @@
+; stdlib/boot/check.caap — the load-time semantic checker (tier 0.5).
+; MODULE IDENTITY: a RAW bootstrap script (run via ctfe_compiler_execute_bootstrap_file /
+; run_expanded BEFORE the `module` form is a bound name), so it carries NO `(module …)`
+; form — adding one would raise `unknown name: module`. Its registry identity is set
+; explicitly via ctfe_compiler_register_value. Allowlisted in stdlib/CONVENTIONS.md +
+; stdlib_module_identity_check (caap/tests/stdlib_governance_tests.rs).
+;
+; Validates an EXPANDED module body (pure kernel AST) before the loader
+; evaluates it, so the two classic eval-time explosions become load-time
+; diagnostics instead:
+;
+;   - unknown names  ("unknown name `lenght`")    — typos caught at load
+;   - wrong arity    ("`f` expects 2 args, got 1") — for kernel builtins AND
+;                                                    user lambdas bound in scope
+;
+; The kernel's callable vocabulary (names, arities, purity) comes from
+; ctfe_kernel_vocabulary — live introspection, nothing hand-kept. Binding forms
+; are walked with real scoping rules (lambda params, bind/letrec, match
+; patterns, catch clauses, flat-bind accumulation through do-bodies).
+;
+; Conservative by design: heads we don't structurally understand are treated as
+; ordinary calls; only errors we are SURE about are reported (no false alarms).
+; Like the loader, this file runs THROUGH the expander and uses the sugar.
+;
+; Published as `stdlib.check`:
+;   check_node   node base_scope sink -> null   (appends diagnostic strings)
+;   check_forms  located base_scope sink -> null
+;     `located` is a list of {node, loc} for a module's top-level forms, in
+;     order; scope threads across them (flat binds extend it) and every
+;     finding is prefixed with the form's "path:line:col" location.
+(do
+  (bind (
+    ; ── kernel vocabulary ───────────────────────────────────────────────────
+    (vocab (ctfe_kernel_vocabulary))
+
+    ; ── location & reporting ────────────────────────────────────────────────
+    ; the current form's fallback "path:line:col"; loc_of/report! give each
+    ; finding the OFFENDING node's own span (sub-EXPRESSION precision — expand
+    ; preserves origin spans), falling back to the form when a node has none.
+    (current_floc (ref "<unknown>"))
+
+    ; loc_of — a node's "path:line:col", falling back to the current form's
+    ; location when the node carries no span (a synthetic/expanded node).
+    ;   node : the offending node (may be null)
+    ;   ->   : the located prefix string
+    (loc_of
+      (lambda (node)
+        (bind ((sp (if (eq node null) null (ctfe_spec_span node))))
+          (if (eq sp null)
+            (deref current_floc)
+            (string_concat_many
+              (get sp "path" "?") ":"
+              (int_to_string (get sp "start_line" 0)) ":"
+              (int_to_string (get sp "start_col" 0)))))))
+
+    ; report! — append one located finding "loc: msg" to `sink`.
+    ;   sink : the diagnostics list
+    ;   msg  : the message body (the located prefix is prepended)
+    ;   node : the offending node, for its span (loc_of's fallback applies)
+    (report!
+      (lambda (sink msg node)
+        (append sink (string_concat_many (loc_of node) ": " msg))))
+
+    ; ── scope & parameter helpers ───────────────────────────────────────────
+    ; match-pattern type guards — kernel `match` resolves these itself; they are
+    ; not registry builtins, so the checker must know them by name.
+    (guard_preds
+      (list_of "null?" "bool?" "int?" "float?" "str?" "list?" "map?"))
+
+    ; copy_scope — fresh child scope from `scope` (scopes are maps name->info;
+    ; maps mutate in place, so extension always works on a copy).
+    ;   scope : the parent scope map
+    ;   ->    : a new map with the same entries
+    (copy_scope
+      (lambda (scope)
+        (bind ((child (map_of)))
+          (do
+            (for k (map_keys scope) (assoc child k (get scope k)))
+            child))))
+
+    ; param_name — a lambda parameter's binding name, with any rest marker
+    ; stripped ("&rest" binds as both "&rest" and "rest" to be safe).
+    ;   node : a parameter name node
+    ;   sink : unused here (params are declarations)
+    ;   ->   : the raw identifier, or null for non-name params
+    (param_name
+      (lambda (node)
+        (if (eq (syntax_kind node) "name") (syntax_name_identifier node) null)))
+
+    ; param_names — the parameter name strings of a lambda/macro params node.
+    ; The kernel accepts two shapes and both appear in practice: a call of names
+    ; `(p1 p2 …)` (hand-built specs) and a LITERAL tuple of strings (specs read
+    ; back from parsed source via ctfe_node_to_spec).
+    ;   params_node : the params node
+    ;   ->          : list of raw name strings (may include a "&rest" marker)
+    (param_names
+      (lambda (params_node)
+        (bind ((out (list_of)))
+          (do
+            (case (syntax_kind params_node)
+              ("call"
+                (for item
+                  (prepend (syntax_call_callee params_node)
+                           (syntax_call_args params_node))
+                  (when_let (nm (param_name item)) (append out nm))))
+              ("literal"
+                (bind ((v (syntax_literal_value params_node)))
+                  (when (not (eq v null))
+                    (for s v (when (eq (value_type s) "string") (append out s))))))
+              (else null))
+            out))))
+
+    ; add_params — bind every lambda parameter into `scope` (in place).
+    ;   params_node : the params node (either kernel shape)
+    ;   scope       : the scope map to extend
+    (add_params
+      (lambda (params_node scope)
+        (for nm (param_names params_node)
+          (do
+            (assoc scope nm true)
+            ; "&rest" declares; the body references bare "rest"
+            (when (string_starts_with nm "&")
+              (assoc scope (string_slice nm 1) true))))))
+
+    ; prepend — fresh list [x, items…] (local copy of the builders helper).
+    (prepend
+      (lambda (x items)
+        (bind ((out (list_of x)))
+          (do (sequence_each items (lambda (e) (append out e))) out))))
+
+    ; ── arity analysis ──────────────────────────────────────────────────────
+    ; lambda_arity — {min, max} for a lambda value node, for call-site checks.
+    ;   value : any node; only (lambda (params…) …) yields arity info
+    ;   ->    : {min, max(-1 = unbounded)} or true (no arity info)
+    (lambda_arity
+      (lambda (value)
+        (if (and (eq (syntax_kind value) "call")
+                 (and (eq (syntax_kind (syntax_call_callee value)) "name")
+                      (eq (syntax_name_identifier (syntax_call_callee value)) "lambda")))
+          (bind ((names (param_names (get (syntax_call_args value) 0))))
+            (if (sequence_any names (lambda (n) (string_starts_with n "&")))
+              (assoc (map_of) "min" (int_sub (size names) 1) "max" -1)
+              (assoc (map_of) "min" (size names) "max" (size names))))
+          true)))
+
+    ; check_call_arity — compare a call's arg count against the head's known
+    ; arity (from the kernel vocabulary or a scope-recorded lambda).
+    ;   head / n : the head name and the actual argument count
+    ;   info     : vocab entry, scope arity record, or true (no info)
+    ;   sink     : diagnostics list
+    (check_call_arity
+      (lambda (head n info sink node)
+        (when (eq (value_type info) "map")
+          (bind (
+            (lo (get info "min" (get info "min_arity" 0)))
+            (hi_raw (get info "max" (get info "max_arity")))
+            (hi (if (eq hi_raw null) -1 hi_raw))
+          )
+            (when (or (lt n lo) (and (not (eq hi -1)) (lt hi n)))
+              (report! sink
+                (string_concat_many
+                  "`" head "` expects "
+                  (int_to_string lo)
+                  (if (eq hi -1) "+" (if (eq hi lo) "" (string_concat_many ".." (int_to_string hi))))
+                  " arg(s), got " (int_to_string n))
+                node))))))
+
+    ; ── the recursive walker ────────────────────────────────────────────────
+    ; check — the recursive walker.
+    ;   self  : itself (recursion idiom)
+    ;   node  : the node to validate
+    ;   scope : map of names bound at this point (value: true | arity record)
+    ;   sink  : list collecting diagnostic strings
+    ;   ->    : the scope visible AFTER this form (flat `bind` extends it; the
+    ;           caller threads it through `do` bodies)
+    (check
+      (lambda (self node scope sink)
+        (case (syntax_kind node)
+          ("literal" scope)
+          ("name"
+            ; a bare name resolves if it's in scope, in the kernel vocabulary,
+            ; or is the ambient `compiler` handle (in scope for every bootstrap
+            ; form, but not a vocabulary entry); otherwise it's an unknown name.
+            (bind ((nm (syntax_name_identifier node)))
+              (do
+                (when (and (not (contains scope nm))
+                           (and (not (contains vocab nm)) (not (eq nm "compiler"))))
+                  (report! sink (string_concat_many "unknown name `" nm "`") node))
+                scope)))
+          (else ; a call
+            (bind (
+              (callee (syntax_call_callee node))
+              (args (syntax_call_args node))
+              (head (if (eq (syntax_kind callee) "name")
+                      (syntax_name_identifier callee) null))
+            )
+              (case head
+                ; (lambda (p…) body…) / (macro (p…) body…): params bind in a child
+                ("lambda"
+                  (bind ((child (copy_scope scope)))
+                    (do
+                      (add_params (get args 0) child)
+                      (for i (sequence_range 1 (size args))
+                        (self self (get args i) child sink))
+                      scope)))
+                ("macro"
+                  (bind ((child (copy_scope scope)))
+                    (do
+                      (add_params (get args 0) child)
+                      (for i (sequence_range 1 (size args))
+                        (self self (get args i) child sink))
+                      scope)))
+                ; bind — four kernel shapes:
+                ;   flat-single-string (bind "name" value): a 2-arg bind whose name
+                ;     is a literal STRING and which carries NO body, treated like a
+                ;     top-level DEFINITION whose binding stays visible to later
+                ;     sibling forms (the kernel's canonical-flat string-bind form is
+                ;     always ≥3 args — pairs + one body — so the 2-arg shape is
+                ;     unambiguous). The `pe` pass emits its specialized variants as
+                ;     NAME-node binders `(bind scale__3 (lambda (x) …))` (the kernel's
+                ;     evaluable top-level-def shape — a variant must be reachable from
+                ;     the redirected call sites at eval time), which take the flat
+                ;     bare-name path below; this literal-string case stays for any
+                ;     hand-written 2-arg string-binder def. Treated like flat bare-name;
+                ;   canonical flat (from parsed source): ["n1" v1 "n2" v2 … body…]
+                ;     — string-literal/value pairs, then the body (always ≥3 args);
+                ;     all names are pre-defined (letrec), everything runs in a child env;
+                ;   flat (bind name val body…): value first, name visible after;
+                ;   multi (bind ((n v)…) body…): letrec in a child env.
+                ("bind"
+                  (bind ((first (get args 0)))
+                    (if (and (and (eq (syntax_kind first) "literal")
+                                  (eq (value_type (syntax_literal_value first)) "string"))
+                             (lt (size args) 3))
+                      ; flat-single-string top-level def — name visible afterwards,
+                      ; value checked with the name already in scope (a self-
+                      ; recursive lambda variant may legally reference itself).
+                      (bind (
+                        (nm (syntax_literal_value first))
+                        (value (get args 1))
+                        (extended (copy_scope scope))
+                      )
+                        (do
+                          (assoc extended nm (lambda_arity value))
+                          (self self value extended sink)
+                          extended))
+                    (if (and (eq (syntax_kind first) "literal")
+                             (eq (value_type (syntax_literal_value first)) "string"))
+                      (bind (
+                        (child (copy_scope scope))
+                        (n (size args))
+                        (state (map_of))
+                      )
+                        (do
+                          (assoc state "i" 0)
+                          ; pass 1: pre-bind every pair name (letrec)
+                          (while (and (lt (int_add (get state "i" 0) 1) n)
+                                      (and (eq (syntax_kind (get args (get state "i" 0))) "literal")
+                                           (eq (value_type (syntax_literal_value (get args (get state "i" 0)))) "string")))
+                            (do
+                              (assoc child
+                                (syntax_literal_value (get args (get state "i" 0)))
+                                (lambda_arity (get args (int_add (get state "i" 0) 1))))
+                              (assoc state "i" (int_add (get state "i" 0) 2))))
+                          ; pass 2: check pair values, then the body, in the child
+                          (bind ((pairs_end (get state "i" 0)))
+                            (do
+                              (assoc state "j" 1)
+                              (while (lt (get state "j" 0) pairs_end)
+                                (do
+                                  (self self (get args (get state "j" 0)) child sink)
+                                  (assoc state "j" (int_add (get state "j" 0) 2))))
+                              (for k (sequence_range pairs_end n)
+                                (self self (get args k) child sink))))
+                          scope))
+                    (if (eq (syntax_kind first) "name")
+                      (bind (
+                        (nm (syntax_name_identifier first))
+                        (value (get args 1))
+                        (extended (copy_scope scope))
+                      )
+                        (do
+                          ; check the value with the name already in scope: a
+                          ; flat-bound LAMBDA may legally call itself (the body
+                          ; resolves at call time, when the binding exists)
+                          (assoc extended nm (lambda_arity value))
+                          (self self value extended sink)
+                          (for i (sequence_range 2 (size args))
+                            (self self (get args i) extended sink))
+                          extended))
+                      (bind ((child (copy_scope scope)))
+                        (do
+                          ; pre-bind every pair name (letrec), then check values
+                          (when (eq (syntax_kind first) "call")
+                            (for pair
+                              (prepend (syntax_call_callee first) (syntax_call_args first))
+                              (when (eq (syntax_kind pair) "call")
+                                (bind ((pn (syntax_call_callee pair)))
+                                  (when (eq (syntax_kind pn) "name")
+                                    (assoc child
+                                      (syntax_name_identifier pn)
+                                      (lambda_arity (get (syntax_call_args pair) 0))))))))
+                          (when (eq (syntax_kind first) "call")
+                            (for pair
+                              (prepend (syntax_call_callee first) (syntax_call_args first))
+                              (when (eq (syntax_kind pair) "call")
+                                (self self (get (syntax_call_args pair) 0) child sink))))
+                          (for i (sequence_range 1 (size args))
+                            (self self (get args i) child sink))
+                          scope)))))))
+                ; do — thread the scope so earlier flat binds reach later forms
+                ("do"
+                  (bind ((state (map_of)))
+                    (do
+                      (assoc state "scope" scope)
+                      (for a args
+                        (assoc state "scope"
+                          (self self a (get state "scope") sink)))
+                      (get state "scope"))))
+                ; match — pattern may bind a name for its clause body
+                ("match"
+                  (do
+                    (self self (get args 0) scope sink)
+                    (for i (sequence_range 1 (size args))
+                      (bind ((clause (get args i)))
+                        (when (eq (syntax_kind clause) "call")
+                          (bind (
+                            (pattern (syntax_call_callee clause))
+                            (child (copy_scope scope))
+                          )
+                            (do
+                              (case (syntax_kind pattern)
+                                ("name"
+                                  (bind ((pn (syntax_name_identifier pattern)))
+                                    (unless (or (eq pn "else") (eq pn "_"))
+                                      (assoc child pn true))))
+                                ("call"
+                                  ; (int? n) guard: pred from the fixed list, n binds
+                                  (bind (
+                                    (pred (syntax_call_callee pattern))
+                                    (pa (syntax_call_args pattern))
+                                  )
+                                    (do
+                                      (when (and (eq (syntax_kind pred) "name")
+                                                 (not (sequence_any guard_preds
+                                                   (lambda (g) (eq g (syntax_name_identifier pred))))))
+                                        (report! sink
+                                          (string_concat_many
+                                            "unknown match guard `"
+                                            (syntax_name_identifier pred) "`")
+                                          pred))
+                                      (when (and (gt (size pa) 0)
+                                                 (eq (syntax_kind (get pa 0)) "name"))
+                                        (assoc child
+                                          (syntax_name_identifier (get pa 0)) true)))))
+                                (else null))
+                              (for b (syntax_call_args clause)
+                                (self self b child sink)))))))
+                    scope))
+                ; try — (try expr (catch e handler…)): e binds in the handler
+                ("try"
+                  (do
+                    (self self (get args 0) scope sink)
+                    (when (gt (size args) 1)
+                      (bind ((clause (get args 1)))
+                        (when (eq (syntax_kind clause) "call")
+                          (bind (
+                            (items (prepend (syntax_call_callee clause)
+                                            (syntax_call_args clause)))
+                            (child (copy_scope scope))
+                          )
+                            (do
+                              (when (and (gt (size items) 1)
+                                         (eq (syntax_kind (get items 1)) "name"))
+                                (assoc child
+                                  (syntax_name_identifier (get items 1)) true))
+                              (for i (sequence_range 2 (size items))
+                                (self self (get items i) child sink)))))))
+                    scope))
+                ; set! — the target must already be bound
+                ("set!"
+                  (do
+                    (self self (get args 0) scope sink)
+                    (when (gt (size args) 1)
+                      (self self (get args 1) scope sink))
+                    scope))
+                ; quote — its argument is data, not code
+                ("quote" scope)
+                (else
+                  ; ordinary call: callee + args are expressions; arity-check
+                  ; known heads (scope lambdas and vocabulary entries)
+                  (do
+                    (self self callee scope sink)
+                    (for a args (self self a scope sink))
+                    (when (not (eq head null))
+                      (check_call_arity head (size args)
+                        (if (contains scope head)
+                          (get scope head)
+                          (get vocab head))
+                        sink node))
+                    scope))))))))
+  )
+    ; ── published surface (`stdlib.check`) ─────────────────────────────────
+    ; check_node  — validate ONE expanded node against `base_scope`, appending
+    ;   findings to `sink`. (Scope extension is internal; the caller gets null.)
+    ;     node       : an expanded kernel node
+    ;     base_scope : names visible from outside (e.g. import params)
+    ;     sink       : the diagnostics list to append to
+    ;     ->         : null
+    ; check_forms — validate a module's `located` forms in order, THREADING the
+    ;   scope so a flat top-level `bind` reaches later forms; each finding is
+    ;   located at its offending node (falling back to the form's own loc).
+    ;     located    : [{node, loc}] the expanded top-level forms, in order
+    ;     base_scope : names visible from outside the module body
+    ;     sink       : the diagnostics list to append to
+    ;     ->         : null
+    (ctfe_compiler_register_value
+      compiler
+      "stdlib.check"
+      (assoc (map_of)
+        "check_node"
+        (lambda (node base_scope sink)
+          (do (check check node base_scope sink) null))
+        "check_forms"
+        (lambda (located base_scope sink)
+          (bind ((state (map_of)))
+            (do
+              (assoc state "scope" base_scope)
+              (for f located
+                (do
+                  ; the form's loc is the FALLBACK; the walker locates each
+                  ; finding at its offending node
+                  (set_ref current_floc (get f "loc" "<unknown>"))
+                  (assoc state "scope"
+                    (check check (get f "node")
+                           (get state "scope") sink))))
+              null)))))))

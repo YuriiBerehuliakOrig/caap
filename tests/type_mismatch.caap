@@ -1,0 +1,5 @@
+; tests/type_mismatch.caap — a certain kernel-table type error:
+; int_add over a string literal must fail at load time.
+(module stdlib.fixtures.type_mismatch)
+(bind broken (lambda () (int_add 1 "x")))
+(export broken)

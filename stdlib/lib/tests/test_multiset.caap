@@ -1,0 +1,160 @@
+; stdlib/lib/tests/test_multiset.caap — in-language tests for
+; lib/collections/multiset: a bag / multiset (element→count) over ARBITRARY
+; structural keys (built on lib/collections/dict). Covers counting, add/remove
+; (with the floor-at-0 / drop-at-0 rule), aggregate views, most-common, the four
+; binary merges (union=max, sum=add, intersection=min, difference), purity, and
+; structural (list) elements.
+
+;; @area: collections
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.core.equal deep_eq)
+(use stdlib.lib.collections.sequence any? filter)
+(use stdlib.lib.collections.multiset
+     ms_new ms_of ms_add ms_add_n ms_remove ms_remove_n
+     ms_count ms_contains?
+     ms_size ms_distinct ms_elements ms_to_list
+     ms_most_common
+     ms_union ms_sum ms_intersection ms_difference)
+
+(do
+  ; ── ms_of counts duplicates: [a a b] -> count a=2, b=1, distinct=2, size=3 ───
+  (bind ((m (ms_of (list_of "a" "a" "b"))))
+    (do
+      (assert_eq (ms_count m "a") 2     "ms_of: a counted twice")
+      (assert_eq (ms_count m "b") 1     "ms_of: b counted once")
+      (assert_eq (ms_count m "z") 0     "ms_count of absent element is 0")
+      (assert_true (ms_contains? m "a") "ms_contains? present element")
+      (assert_eq (ms_contains? m "z") false "ms_contains? absent element is false")
+      (assert_eq (ms_distinct m) 2      "two distinct elements")
+      (assert_eq (ms_size m) 3          "total count (size) is 3")))
+
+  ; ── ms_new is empty ─────────────────────────────────────────────────────────
+  (assert_eq (ms_size (ms_new)) 0     "fresh multiset has size 0")
+  (assert_eq (ms_distinct (ms_new)) 0 "fresh multiset has 0 distinct")
+
+  ; ── ms_add / ms_add_n (purity: source untouched) ────────────────────────────
+  (bind ((m0 (ms_of (list_of "a")))
+         (m1 (ms_add m0 "a"))
+         (m2 (ms_add_n m1 "b" 3)))
+    (do
+      (assert_eq (ms_count m1 "a") 2 "ms_add bumps a to 2")
+      (assert_eq (ms_count m2 "b") 3 "ms_add_n adds 3 of b")
+      (assert_eq (ms_count m0 "a") 1 "ms_add did NOT mutate the source")
+      (assert_eq (ms_count m0 "b") 0 "source never saw b")
+      ; ms_add_n with 0 is a no-op
+      (assert_eq (ms_count (ms_add_n m0 "a" 0) "a") 1 "ms_add_n 0 is a no-op")))
+
+  ; ── ms_remove / ms_remove_n: floor at 0, drop the key at 0 ──────────────────
+  (bind ((m (ms_of (list_of "a" "a" "a" "b"))))   ; a=3, b=1
+    (do
+      ; remove one a -> a=2 (still present)
+      (bind ((m1 (ms_remove m "a")))
+        (do
+          (assert_eq (ms_count m1 "a") 2 "ms_remove drops a's count by 1")
+          (assert_true (ms_contains? m1 "a") "a still present at count 2")))
+      ; remove b to exactly 0 -> key dropped
+      (bind ((m2 (ms_remove m "b")))
+        (do
+          (assert_eq (ms_count m2 "b") 0 "ms_remove to 0 yields count 0")
+          (assert_eq (ms_contains? m2 "b") false "ms_remove to 0 DROPS the key")
+          (assert_eq (ms_distinct m2) 1 "dropping b leaves 1 distinct element")))
+      ; remove MORE than present -> floored at 0, key dropped (never negative)
+      (bind ((m3 (ms_remove_n m "a" 99)))
+        (do
+          (assert_eq (ms_count m3 "a") 0 "ms_remove_n floors at 0 (never negative)")
+          (assert_eq (ms_contains? m3 "a") false "over-removal drops the key")))
+      ; removing an absent element is a no-op
+      (assert_eq (ms_distinct (ms_remove m "zzz")) 2 "removing an absent element is a no-op")
+      ; source untouched throughout
+      (assert_eq (ms_count m "a") 3 "ms_remove* did NOT mutate the source")
+      (assert_eq (ms_size m) 4      "source total still 4")))
+
+  ; ── ms_elements / ms_to_list ────────────────────────────────────────────────
+  (bind ((m (ms_of (list_of "x" "x" "y"))))
+    (do
+      (assert_eq (size (ms_elements m)) 2 "ms_elements lists the 2 distinct elements")
+      (assert_true (any? (ms_elements m) (lambda (e) (eq e "x"))) "ms_elements includes x")
+      ; ms_to_list repeats each element by its count -> total length = ms_size
+      (assert_eq (size (ms_to_list m)) 3 "ms_to_list length equals total count")
+      ; x appears twice, y once, in the flat list
+      (assert_eq (size (filter (ms_to_list m) (lambda (e) (eq e "x")))) 2
+        "ms_to_list repeats x twice")
+      (assert_eq (size (filter (ms_to_list m) (lambda (e) (eq e "y")))) 1
+        "ms_to_list repeats y once")))
+
+  ; ── ms_most_common: top-k [element count] by count DESCENDING ───────────────
+  (bind ((m (ms_of (list_of "a" "a" "a" "b" "b" "c"))))   ; a=3, b=2, c=1
+    (do
+      (bind ((top2 (ms_most_common m 2)))
+        (do
+          (assert_eq (size top2) 2 "most_common 2 returns two pairs")
+          ; highest count first
+          (assert_true (deep_eq (get top2 0) (list_of "a" 3)) "most_common[0] is [a 3]")
+          (assert_true (deep_eq (get top2 1) (list_of "b" 2)) "most_common[1] is [b 2]")))
+      ; k larger than distinct count returns them all (3), still descending
+      (bind ((all (ms_most_common m 10)))
+        (do
+          (assert_eq (size all) 3 "most_common k>distinct returns all distinct")
+          (assert_true (deep_eq (get all 2) (list_of "c" 1)) "most_common last is [c 1]")))
+      ; k=0 returns nothing
+      (assert_eq (size (ms_most_common m 0)) 0 "most_common 0 returns empty")))
+
+  ; ── binary merges: union=MAX, sum=ADD, intersection=MIN, difference=a-b≥0 ────
+  (bind ((a (ms_of (list_of "x" "x" "x" "y")))         ; x=3, y=1
+         (b (ms_of (list_of "x" "y" "y" "z"))))        ; x=1, y=2, z=1
+    (do
+      ; union — MAX of counts: x=max(3,1)=3, y=max(1,2)=2, z=max(0,1)=1
+      (bind ((u (ms_union a b)))
+        (do
+          (assert_eq (ms_count u "x") 3 "union(MAX): x = max(3,1) = 3")
+          (assert_eq (ms_count u "y") 2 "union(MAX): y = max(1,2) = 2")
+          (assert_eq (ms_count u "z") 1 "union(MAX): z = max(0,1) = 1")
+          (assert_eq (ms_distinct u) 3 "union spans all 3 distinct elements")
+          (assert_eq (ms_size u) 6     "union total = 3+2+1")))
+      ; sum — ADD of counts: x=4, y=3, z=1
+      (bind ((s (ms_sum a b)))
+        (do
+          (assert_eq (ms_count s "x") 4 "sum(ADD): x = 3+1 = 4")
+          (assert_eq (ms_count s "y") 3 "sum(ADD): y = 1+2 = 3")
+          (assert_eq (ms_count s "z") 1 "sum(ADD): z = 0+1 = 1")
+          (assert_eq (ms_size s) 8      "sum total = total(a) + total(b) = 4+4")))
+      ; intersection — MIN of counts: x=min(3,1)=1, y=min(1,2)=1, z=min(0,1)=0(drop)
+      (bind ((i (ms_intersection a b)))
+        (do
+          (assert_eq (ms_count i "x") 1 "intersection(MIN): x = min(3,1) = 1")
+          (assert_eq (ms_count i "y") 1 "intersection(MIN): y = min(1,2) = 1")
+          (assert_eq (ms_count i "z") 0 "intersection(MIN): z = min(0,1) = 0")
+          (assert_eq (ms_contains? i "z") false "intersection drops z (count 0)")
+          (assert_eq (ms_distinct i) 2 "intersection keeps only shared elements")))
+      ; difference — a's counts minus b's, floored at 0:
+      ;   x=3-1=2, y=max(0,1-2)=0(drop), z absent in a -> 0
+      (bind ((d (ms_difference a b)))
+        (do
+          (assert_eq (ms_count d "x") 2 "difference: x = 3-1 = 2")
+          (assert_eq (ms_count d "y") 0 "difference: y = max(0, 1-2) = 0 (floored)")
+          (assert_eq (ms_contains? d "y") false "difference drops y (floored to 0)")
+          (assert_eq (ms_contains? d "z") false "difference: z absent in a stays absent")
+          (assert_eq (ms_distinct d) 1 "difference keeps only x")))
+      ; purity: neither input mutated by any merge
+      (assert_eq (ms_count a "x") 3 "merges did NOT mutate a")
+      (assert_eq (ms_count b "y") 2 "merges did NOT mutate b")))
+
+  ; ── STRUCTURAL (list) elements: [1 2] as a key via dict ─────────────────────
+  (bind ((m (ms_of (list_of (list_of 1 2) (list_of 1 2) (list_of 3 4)))))
+    (do
+      ; two DISTINCT but structurally-equal [1 2] lists collapse to one element
+      (assert_eq (ms_count m (list_of 1 2)) 2 "structural list element [1 2] counted twice")
+      (assert_eq (ms_count m (list_of 3 4)) 1 "structural list element [3 4] counted once")
+      (assert_eq (ms_count m (list_of 9 9)) 0 "absent structural list element is 0")
+      (assert_eq (ms_distinct m) 2 "two distinct structural elements")
+      (assert_eq (ms_size m) 3 "structural multiset total is 3")
+      ; ms_elements carries the actual list values
+      (assert_true (any? (ms_elements m) (lambda (e) (deep_eq e (list_of 1 2))))
+        "ms_elements includes the [1 2] list element")
+      ; add/remove honor structural identity
+      (bind ((m2 (ms_remove m (list_of 1 2))))
+        (assert_eq (ms_count m2 (list_of 1 2)) 1 "ms_remove honors structural key [1 2]"))))
+
+  true)

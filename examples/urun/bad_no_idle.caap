@@ -1,0 +1,58 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  bad_no_idle — a FAULT-INJECTION entry (NOT a module). It brings the kernel up
+//  exactly like sample_urun but DELIBERATELY omits the permanently-ready idle
+//  thread, then creates one worker that blocks forever. When the worker parks, the
+//  ready list is empty — the misconfiguration — so _ur_thread_schedule reaches
+//  _ur_misconfig_halt and emits the 0xDEADBEEF sentinel over UART. Used only by the
+//  fault-injection acceptance test (passed to ur_build as the entry arg); the
+//  normal build still uses sample_urun.caap.
+// ═══════════════════════════════════════════════════════════════════════════
+(surface stdlib.frontend.clike)
+
+use stdlib.urun.ur_port (putc, ur_systick_config)
+use stdlib.urun.ur_scheduler (UR_THREAD, ur_thread_first_psp)
+use stdlib.urun.ur_thread (ur_thread_create, ur_stack_base, ur_stack_top)
+use stdlib.urun.ur_semaphore (UR_SEMAPHORE, ur_semaphore_create, ur_semaphore_get)
+use stdlib.urun.ur_status (UR_WAIT_FOREVER)
+// SysTick is enabled below, and the ASM port's SysTick handler calls this symbol.
+use stdlib.urun.ur_timer (_ur_timer_interrupt)
+
+// the asm port's first-thread launch (resolved by ur_port_cortexm3.s).
+start_first_task (psp0 u32) i32
+
+ur_thread_pool UR_THREAD[1]
+ur_sem_pool UR_SEMAPHORE[1]
+stack0 u32[256]
+
+ur_sem () UR_SEMAPHORE* = { ur_sem_pool + 0 }
+
+// the ONLY thread: block forever on a semaphore nobody posts. When it parks, the
+// ready list is empty (there is NO idle thread — the injected fault), so the
+// scheduler halts diagnosably with the 0xDEADBEEF sentinel.
+bad_worker () i32 = {
+  ur_semaphore_get(ur_sem(), UR_WAIT_FOREVER())
+  while 0 == 0 { }
+  0
+}
+
+ur_application_define () i32 = {
+  ur_semaphore_create(ur_sem(), 0)
+  ur_thread_create(ur_thread_pool + 0,
+                   fn_ptr(bad_worker) as u32, 1, ur_stack_base(stack0), ur_stack_top(stack0))
+  0
+}
+
+UART0_CTRL u32 const volatile = 0x40004008
+SHPR3 u32 const volatile = 0xE000ED20
+PENDSV_LOWEST u32 const = 0xFF0000
+SYSTICK_RELOAD u32 const = 100000
+
+c_entry () i32 = {
+  UART0_CTRL = 1                            // enable UART0 TX
+  putc(77)                                  // 'M' — kernel entered (then the halt)
+  SHPR3 = PENDSV_LOWEST
+  ur_systick_config(SYSTICK_RELOAD)
+  ur_application_define()
+  start_first_task(ur_thread_first_psp())
+  0
+}

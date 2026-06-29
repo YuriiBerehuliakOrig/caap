@@ -1,0 +1,315 @@
+; stdlib/semantics/dominators.caap — dominators, immediate dominators, and the
+; dominance frontier over a CFG (module stdlib.semantics.dominators).
+;
+; The substrate an SSA / optimizing middle-end stands on. Where dataflow.caap
+; answers "what holds along PATHS to here", dominance answers a STRUCTURAL
+; question about the CFG itself: which blocks lie on EVERY path from the entry
+; to a given block. A block d DOMINATES a block n when every path from the entry
+; to n goes through d; d STRICTLY dominates n when additionally d ≠ n; the
+; IMMEDIATE dominator idom(n) is the unique strict dominator of n that is itself
+; dominated by every other strict dominator (the closest one up the tree). The
+; DOMINANCE FRONTIER of n is, intuitively, the set of blocks just BEYOND n's
+; dominated region — exactly where φ-functions go in SSA construction.
+;
+; ── the model ────────────────────────────────────────────────────────────────
+;   dominators(node) -> over (build_cfg node), the classic iterative fixpoint
+;     (Allen & Cocke):  Dom(entry) = {entry}
+;                       Dom(n)     = {n} ∪ (⋂ over preds p of Dom(p))
+;   iterated to a fixpoint. Dom sets are intersected, so the lattice is sets
+;   under INTERSECTION (top = "all blocks", bottom narrows) — non-entry blocks
+;   are initialised to the full block set so the first intersection is a true
+;   meet, not an accident of starting empty. The result is
+;     { dom:{id->idset}, cfg }  where an idset is a set of block ids.
+;
+;   idom(node) / idom_of(result, id) -> the immediate dominator of each block
+;   (an int, or null for the entry whose only "dominator" is itself). Derived
+;   from the Dom sets: idom(n) is the strict dominator of n that does NOT
+;   strictly dominate any other strict dominator of n.
+;
+;   dominates?(result, a, b) -> does a dominate b (a ∈ Dom(b))? strictly_
+;   dominates? adds a ≠ b.
+;
+;   dominance_frontier(result) -> { id->[id…] } (Cytron et al.): a block b is in
+;   DF(n) when n dominates a PREDECESSOR of b but does NOT strictly dominate b
+;   itself. Computed by walking every CFG edge a→b and climbing the dominator
+;   tree from a up to (but not including) idom(b), adding b to each climbed
+;   node's frontier.
+;
+; ── boundaries ───────────────────────────────────────────────────────────────
+; A pure ANALYSIS substrate, like dataflow.caap — not a registered pass, no IR
+; mutation, no fact store. It assumes the CFG from build_cfg (a single entry,
+; id 0). Unreachable blocks (no path from entry) are handled but degenerate:
+; the entry never appears in their Dom set (it is not on a "path" they have no
+; path TO), so their Dom set is relative to their own unreachable region rather
+; than the whole graph — meaningful dominance is only over REACHABLE blocks, so
+; callers that care should restrict to those. Block ids are ints; an id-set is a
+; map keyed by the STRINGIFIED id with the int id as the value (so map_values
+; recovers the real ids), matching dataflow.caap's stringified-key convention.
+(module stdlib.semantics.dominators)
+
+(use stdlib.semantics.dataflow
+  build_cfg cfg_block_ids cfg_pred cfg_entry)
+
+; ── id-sets (a set of int block ids) ─────────────────────────────────────────
+; A set of block ids is a map { int_to_string(id) -> id }: keys are stringified
+; (kernel map keys are strings, the dataflow convention) and the VALUE is the
+; raw int id, so id_set_items recovers ints without parsing. Every operation is
+; pure — derived sets are fresh maps, inputs never mutate.
+
+; id_set_of — an id-set from a list of int ids.
+;   ids : a list of int block ids
+;   ->  : a fresh id-set
+(bind id_set_of
+  (lambda (ids)
+    (bind ((s (map_of)))
+      (do (for id ids (assoc s (int_to_string id) id)) s))))
+
+; id_set_has? — is `id` a member of the id-set?
+;   s / id : an id-set and a candidate int id
+;   ->     : bool
+(bind id_set_has?
+  (lambda (s id) (not (eq (get s (int_to_string id) null) null))))
+
+; id_set_items — the member ids as a list of ints (order unspecified).
+;   s  : an id-set
+;   -> : a list of int ids
+(bind id_set_items (lambda (s) (map_values s)))
+
+; id_set_add — pure: a fresh id-set with `id` added.
+;   s / id : an id-set and the int id to add
+;   ->     : a fresh id-set (s untouched)
+(bind id_set_add
+  (lambda (s id)
+    (bind ((out (map_of)))
+      (do
+        (for k (map_keys s) (assoc out k (get s k)))
+        (assoc out (int_to_string id) id)
+        out))))
+
+; intersect — the ids in BOTH `a` and `b` (a fresh id-set). The meet of the Dom
+; lattice: confluence at a block keeps only the dominators common to every
+; predecessor.
+;   a / b : two id-sets
+;   ->    : a fresh id-set
+(bind intersect
+  (lambda (a b)
+    (bind ((out (map_of)))
+      (do
+        (for k (map_keys a)
+          (when (not (eq (get b k null) null)) (assoc out k (get a k))))
+        out))))
+
+; ── the dominator fixpoint ───────────────────────────────────────────────────
+; The classic forward iterative algorithm. We do NOT use the generic dataflow
+; `solve` because Dom is a per-block INTERSECTION OVER PREDECESSORS that also
+; includes the block itself ({n} ∪ ⋂preds) — easier and clearer spelled out
+; directly than dressed as a transfer/join lattice. We repeat a full sweep over
+; all blocks until no Dom set changes (a fixpoint); monotone narrowing of a
+; finite set ⇒ termination.
+
+; dom_step — recompute Dom(id) for one block from the current dom map.
+;   cfg / dom / id : the CFG, the current id->idset dom map, the block id
+;   entry          : the entry block id
+;   ->             : the new id-set for Dom(id)
+; Dom(entry) = {entry}; otherwise {id} ∪ (⋂ over preds p of Dom(p)). With no
+; predecessors (entry, or an unreachable block) there is nothing to intersect,
+; so Dom(id) stays the seeded value (the universe) plus {id}; for the entry we
+; special-case it to exactly {entry}.
+(bind dom_step
+  (lambda (cfg dom id entry)
+    (if (eq id entry)
+      (id_set_of (list_of entry))
+      (bind (
+        (preds (cfg_pred cfg id))
+        (acc (ref null))   ; null = "no predecessor folded yet"
+      )
+        (do
+          (for p preds
+            (bind ((dp (get dom (int_to_string p))))
+              (set_ref acc
+                (if (eq (deref acc) null)
+                  dp                              ; first pred: seed the meet
+                  (intersect (deref acc) dp)))))  ; later preds: narrow it
+          ; {id} ∪ (⋂ preds); with no preds folded, acc is null ⇒ just {id}.
+          (id_set_add
+            (if (eq (deref acc) null) (map_of) (deref acc))
+            id))))))
+
+; dominators — compute the Dom set of every block of a body.
+;   node : the IR body (as for build_cfg)
+;   ->   : { dom:{id->idset}, cfg } where dom[id] is the set of block ids that
+;          dominate block id (id itself included).
+; Non-entry blocks are seeded to the UNIVERSE (every block id) so the first
+; predecessor intersection is a real meet; the entry is seeded to {entry}. We
+; sweep all blocks repeatedly, rebuilding each Dom set, until a sweep changes
+; nothing (value_eq, order-insensitive — a rebuilt set carries a different key
+; order than the prior, and kernel `eq` is order-sensitive on maps).
+(bind dominators
+  (lambda (node)
+    (bind (
+      (cfg (build_cfg node))
+      (entry (cfg_entry cfg))
+      (ids (cfg_block_ids cfg))
+      (universe (id_set_of ids))
+      (dom (map_of))
+    )
+      (do
+        ; seed: entry = {entry}; every other block = the universe
+        (for id ids
+          (assoc dom (int_to_string id)
+            (if (eq id entry) (id_set_of (list_of entry)) universe)))
+        ; sweep to a fixpoint
+        (bind ((changed (ref true)))
+          (while (deref changed)
+            (do
+              (set_ref changed false)
+              (for id ids
+                (bind (
+                  (old (get dom (int_to_string id)))
+                  (new (dom_step cfg dom id entry))
+                )
+                  (unless (value_eq new old)
+                    (do
+                      (assoc dom (int_to_string id) new)
+                      (set_ref changed true))))))))
+        (assoc (map_of) "dom" dom "cfg" cfg)))))
+
+; ── dominance queries ────────────────────────────────────────────────────────
+
+; dom_set — the Dom set (id-set) of block `id` in a result (empty if unknown).
+;   result / id : a dominators result and a block id
+;   ->          : the id-set Dom(id)
+(bind dom_set
+  (lambda (result id) (get (get result "dom") (int_to_string id) (map_of))))
+
+; dominates? — does block `a` dominate block `b` (a ∈ Dom(b))?
+;   result / a / b : a dominators result and two block ids
+;   ->             : bool (a block dominates itself, so dominates?(r,x,x) = true)
+(bind dominates?
+  (lambda (result a b) (id_set_has? (dom_set result b) a)))
+
+; strictly_dominates? — does `a` dominate `b` with a ≠ b?
+;   result / a / b : a dominators result and two block ids
+;   ->             : bool
+(bind strictly_dominates?
+  (lambda (result a b)
+    (and (not (eq a b)) (dominates? result a b))))
+
+; ── immediate dominators ─────────────────────────────────────────────────────
+; idom(n) is the strict dominator of n closest to n: the one strict dominator
+; that does NOT strictly dominate any OTHER strict dominator of n. Equivalently,
+; among Dom(n)−{n}, the unique element s such that every other strict dominator
+; strictly dominates s. We find it by scanning the strict dominators for the one
+; that strictly dominates none of the others — that s is the closest to n.
+
+; idom_of — the immediate dominator of block `id`, or null (the entry, or any
+; block with no strict dominator).
+;   result / id : a dominators result and a block id
+;   ->          : the int id of idom(id), or null
+(bind idom_of
+  (lambda (result id)
+    (bind (
+      ; the strict dominators of id: Dom(id) minus id itself
+      (sdoms (list_of))
+      (dm (dom_set result id))
+    )
+      (do
+        (for d (id_set_items dm) (unless (eq d id) (append sdoms d)))
+        (if (eq (size sdoms) 0)
+          null   ; no strict dominator ⇒ the entry (or a degenerate root)
+          ; the idom is the strict dominator that strictly dominates none of the
+          ; OTHER strict dominators (every other one sits above it, so it is the
+          ; closest to id).
+          (bind ((found (ref null)))
+            (do
+              (for s sdoms
+                (when (eq (deref found) null)
+                  (bind ((ok (ref true)))
+                    (do
+                      (for d sdoms
+                        (when (and (not (eq d s))
+                                   (strictly_dominates? result s d))
+                          (set_ref ok false)))
+                      (when (deref ok) (set_ref found s))))))
+              (deref found))))))))
+
+; idom — the immediate-dominator map of every block of a body: { id -> idom|null }.
+;   node : the IR body (as for build_cfg)
+;   ->   : { id -> int|null } (entry maps to null)
+(bind idom
+  (lambda (node)
+    (bind ((result (dominators node)) (out (map_of)))
+      (do
+        (for id (cfg_block_ids (get result "cfg"))
+          (assoc out (int_to_string id) (idom_of result id)))
+        out))))
+
+; ── dominance frontier (Cytron et al.) ───────────────────────────────────────
+; DF(n) = the blocks where n dominates a PREDECESSOR but does not STRICTLY
+; dominate the block. The standard edge-walk: for every CFG edge a→b, climb the
+; dominator tree from a upward, adding b to DF of each node climbed, stopping
+; at idom(b) (b's strict dominators above idom(b) DO strictly dominate b, so b
+; is not in their frontier). A runner starting at `a` and walking idom-parents
+; until it reaches idom(b) covers exactly { runner : runner dom a and runner
+; does not strictly dominate b }.
+
+; df_add! — add `b` to runner's frontier list in `df` if not already present.
+;   df / runner / b : the id->list frontier map, a node id, the frontier block id
+;   ->              : null (mutates df in place)
+(bind df_add!
+  (lambda (df runner b)
+    (bind ((lst (get df (int_to_string runner))))
+      (when (not (sequence_any lst (lambda (x) (eq x b))))
+        (append lst b)))))
+
+; dominance_frontier — the dominance frontier of every block.
+;   result : a dominators result (from dominators)
+;   ->     : { id -> [id…] } — DF(id) for each block id (lists may be empty)
+(bind dominance_frontier
+  (lambda (result)
+    (bind (
+      (cfg (get result "cfg"))
+      (ids (cfg_block_ids cfg))
+      (df (map_of))
+    )
+      (do
+        (for id ids (assoc df (int_to_string id) (list_of)))
+        ; walk every edge a→b
+        (for b ids
+          (bind (
+            (preds (cfg_pred cfg b))
+            (idb (idom_of result b))
+          )
+            ; a frontier arises only at a join (>= 2 preds), but the climb is
+            ; correct for any pred count: a single-pred block's pred IS idom(b),
+            ; so the loop body never runs. We run it for every pred uniformly.
+            (for a preds
+              (bind ((runner (ref a)) (seen (map_of)))
+                ; climb from a up the dom tree until we reach idom(b) (or fall
+                ; off the top at the entry, idom = null): b ∈ DF(runner) while
+                ; runner does not strictly dominate b. `seen` guards termination:
+                ; a well-formed dominator tree (the one `dominators` builds) is
+                ; acyclic so the climb always halts at idb or null, but this is
+                ; an EXPORTED substrate over an arbitrary `result` — a malformed
+                ; result with a cyclic idom relation that misses idb would
+                ; otherwise spin forever, so we stop if a node repeats.
+                (while (and (not (eq (deref runner) null))
+                            (not (eq (deref runner) idb))
+                            (eq (get seen (int_to_string (deref runner)) null) null))
+                  (do
+                    (assoc seen (int_to_string (deref runner)) true)
+                    (df_add! df (deref runner) b)
+                    (set_ref runner (idom_of result (deref runner)))))))))
+        df))))
+
+(export
+  ; the analysis
+  dominators dom_set
+  ; queries
+  dominates? strictly_dominates?
+  ; immediate dominators
+  idom idom_of
+  ; dominance frontier
+  dominance_frontier
+  ; id-set helpers (a client may reuse)
+  id_set_of id_set_has? id_set_items intersect)

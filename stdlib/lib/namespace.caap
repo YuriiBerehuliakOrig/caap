@@ -1,0 +1,25 @@
+; stdlib/lib/namespace.caap — first-class namespaces over plain maps
+; (module stdlib.lib.namespace).
+;
+; The public, normal-tier face of the namespace primitive the loader was built on:
+; a namespace is a `map` of name -> binding, and these are the reusable operations
+; over that value. Re-exported from the boot module `stdlib.namespace` (which the
+; module loader itself orchestrates), so a library composing its own named scopes —
+; sub-namespaces, facade re-exports, qualified dotted resolution — shares ONE
+; implementation with the loader instead of hand-rolling map juggling.
+;
+;   ns_of names values     build a namespace from parallel name + value lists
+;   ns_get / ns_has        lookup / membership
+;   ns_keys                the bound names
+;   ns_merge a b           last-wins union (b overrides a)
+;   ns_merge_keep a b      first-wins union (a wins on a clash — the prelude policy)
+;   ns_conflicts a b       the names bound by BOTH (collision detection)
+;   ns_subset ns names     keep only `names`
+;   ns_nest name sub       wrap as a sub-namespace under `name`  (p.name.x)
+;   ns_qualify prefix ns    keys become "prefix.<key>"
+;   ns_resolve ns "a.b.c"  qualified dotted lookup through nested namespaces
+(module stdlib.lib.namespace)
+
+(re_export stdlib.namespace
+  ns_of ns_get ns_has ns_keys ns_merge ns_merge_keep ns_conflicts
+  ns_subset ns_nest ns_qualify ns_resolve)

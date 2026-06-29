@@ -1,0 +1,19 @@
+[package]
+name = "caap-sys-runtime-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "Static/cdylib link unit for caap-sys-runtime's C ABI (native_exe linking)."
+license = "Apache-2.0"
+
+# The staticlib/cdylib crate-types live HERE, in a leaf shim, instead of on
+# caap-sys-runtime itself: emitting a staticlib alongside an rlib drops a
+# hash-less companion rlib into target/deps, which shadows the hashed unit
+# during rustdoc's transitive doctest resolution (E0460→E0463) for every crate
+# that depends on caap-core. Keeping the library crate a plain rlib and the
+# exotic crate-types on this dependency-free leaf removes that failure mode.
+[lib]
+name = "caap_sys_runtime_ffi"
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+caap-sys-runtime = { path = "../caap-sys-runtime" }

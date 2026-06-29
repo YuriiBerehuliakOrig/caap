@@ -1,0 +1,11 @@
+; tests/bad_facade_result.caap — a builtin-alias
+; facade (bind len size) inherits the kernel's declared result type; len's int
+; certainly contradicts the declared string result.
+(module stdlib.fixtures.bad_facade_result)
+
+(bind len size)
+
+(defn label ((s string)) string
+  (len s))
+
+(export label)

@@ -1,0 +1,87 @@
+; stdlib/lib/test_functional.caap — in-language tests for lib/functional.
+
+;; @area: core
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.core.functional compose compose_all pipe pipe_all partial1
+     curry2 curry3 uncurry2 juxt fnil
+     identity constantly flip complement memoize memoize2 memoize_n once tap)
+
+(do
+  (bind ((inc (lambda (x) (int_add x 1)))
+         (dbl (lambda (x) (int_mul x 2)))
+         (even_helper (lambda (x) (eq (int_mod x 2) 0))))
+    (do
+      (assert_eq ((compose inc dbl) 5) 11 "compose: inc(dbl(5))")
+      (assert_eq ((compose_all (list_of inc dbl inc)) 5) 13
+        "compose_all right-to-left: inc(dbl(inc(5)))")
+      ; pipe / pipe_all are the left-to-right mirror
+      (assert_eq ((pipe inc dbl) 5) 12 "pipe: dbl(inc(5))")
+      (assert_eq ((pipe_all (list_of inc dbl inc)) 5) 13
+        "pipe_all left-to-right: inc(dbl(inc(5)))")
+      (assert_eq ((compose_all (list_of)) 7) 7 "compose_all empty = identity")
+      (assert_eq ((pipe_all (list_of)) 7) 7 "pipe_all empty = identity")
+      (assert_eq ((partial1 int_sub 10) 3) 7 "partial1")
+      (assert_eq (identity 42) 42 "identity")
+      (assert_eq ((constantly 9) 100) 9 "constantly")
+      (assert_eq ((flip int_sub) 3 10) 7 "flip")
+      ; complement negates a predicate
+      (assert_eq ((complement even_helper) 4) false "complement of even on 4")
+      (assert_eq ((complement even_helper) 5) true "complement of even on 5")
+      ; curry2 / curry3 build a chain of 1-arg functions; uncurry2 reverses curry2
+      (assert_eq (((curry2 int_sub) 10) 3) 7 "curry2: (10 - 3)")
+      (assert_eq ((((curry3 (lambda (a b c) (int_add a (int_add b c)))) 1) 2) 3) 6
+        "curry3: 1 + 2 + 3")
+      (assert_eq ((uncurry2 (curry2 int_sub)) 10 3) 7 "uncurry2 . curry2 = id on int_sub")
+      ; juxt applies many fns to one arg -> a list of results (value_eq: list contents)
+      (assert_true (value_eq ((juxt (list_of inc dbl)) 5) (list_of 6 10))
+        "juxt collects inc(5) and dbl(5)")
+      (assert_true (value_eq ((juxt (list_of)) 5) (list_of))
+        "juxt of no fns = empty list")
+      ; fnil substitutes a default for a null argument, passes non-null through
+      (assert_eq ((fnil inc 0) null) 1 "fnil substitutes default for null")
+      (assert_eq ((fnil inc 0) 41) 42 "fnil passes a non-null argument through")))
+  ; memoize: the underlying fn runs once per distinct argument
+  (bind ((hits (ref 0)))
+    (bind ((slow (memoize (lambda (x)
+                   (do (set_ref hits (int_add (deref hits) 1))
+                       (int_mul x x))))))
+      (do
+        (assert_eq (slow 7) 49 "first call computes")
+        (assert_eq (slow 7) 49 "second call cached")
+        (assert_eq (slow 8) 64 "different arg computes")
+        (assert_eq (deref hits) 2 "exactly two computations"))))
+  ; memoize2: keyed on the (a b) argument pair — order matters
+  (bind ((hits (ref 0)))
+    (bind ((add (memoize2 (lambda (a b)
+                  (do (set_ref hits (int_add (deref hits) 1)) (int_add a b))))))
+      (do
+        (assert_eq (add 1 2) 3 "memoize2 first computes")
+        (assert_eq (add 1 2) 3 "memoize2 same args cached")
+        (assert_eq (add 2 1) 3 "memoize2 swapped args is a distinct key")
+        (assert_eq (deref hits) 2 "memoize2 exactly two computations"))))
+  ; memoize_n: an arbitrary-arity function keyed on the whole arg list
+  (bind ((hits (ref 0)))
+    (bind ((sum3 (memoize_n (lambda (a b c)
+                   (do (set_ref hits (int_add (deref hits) 1))
+                       (int_add a (int_add b c)))))))
+      (do
+        (assert_eq (sum3 1 2 3) 6 "memoize_n first computes")
+        (assert_eq (sum3 1 2 3) 6 "memoize_n cached")
+        (assert_eq (sum3 3 2 1) 6 "memoize_n distinct order recomputes")
+        (assert_eq (deref hits) 2 "memoize_n two computations"))))
+  ; once: a thunk that runs at most once, then returns the cached result
+  (bind ((runs (ref 0)))
+    (bind ((init (once (lambda ()
+                  (do (set_ref runs (int_add (deref runs) 1)) 99)))))
+      (do
+        (assert_eq (init) 99 "once first result")
+        (assert_eq (init) 99 "once cached result")
+        (assert_eq (deref runs) 1 "once ran the thunk exactly once"))))
+  ; tap: run a side effect on x, return x unchanged
+  (bind ((seen (ref 0)))
+    (do
+      (assert_eq ((tap (lambda (x) (set_ref seen x))) 42) 42 "tap returns its argument")
+      (assert_eq (deref seen) 42 "tap ran the side effect")))
+  true)

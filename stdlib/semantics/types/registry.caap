@@ -1,0 +1,635 @@
+; stdlib/semantics/types/registry.caap — the data-type registry (tier 4, first brick).
+;
+; Type references are name strings; descriptors are plain maps:
+;   primitive : {kind: "primitive", name}
+;   struct    : {kind: "struct", name, fields: [{name, type}…]}
+;   alias     : {kind: "alias", name, target}
+;
+; A type may be PARAMETERIZED (a constructor applied to argument types, spelled
+; "list<int>") and may carry type VARIABLES (a single uppercase letter, "T") in
+; generic signatures — those bind at the call site (see the A2 block below),
+; never in the registry. The structural readers (`ctor_of`/`type_args`/
+; `subst_type`) work on the spelling so a type OVER a variable still decomposes.
+;
+; Numerics: the kernel VALUE model has dynamic `int`/`float`; declarations may
+; use SIZED primitives (u8/i8/…/f64). Compatibility (`assignable?`) is
+; conservative: a dynamic int satisfies any sized int (no runtime width to
+; verify) — but a LITERAL gets a hard range check (`literal_fits?`), which is a
+; certain error the dynamic kernel cannot give.
+(module stdlib.semantics.types.registry)
+
+(use stdlib.lib.collections.sequence contains?)
+
+(bind registry (map_of))
+
+; kernel-dynamic primitives + declared sized numerics. `never` is the BOTTOM
+; type: the type of an expression that does not return (a `throw`/`leave`/
+; `runtime_error` reached by the type pass's reachability analysis). It is
+; assignable TO and FROM anything (a value that never arrives satisfies any
+; want, and any want absorbs it on a branch merge) — see `assignable?` and
+; infer's `join`. It names no runtime value, so it never appears in a signature.
+(for nm (list_of
+          "int" "float" "bool" "string" "bytes" "null" "list" "map"
+          "callable" "any" "never"
+          "i8" "u8" "i16" "u16" "i32" "u32" "i64" "u64" "f32" "f64"
+          "uptr")
+  (assoc registry nm (assoc (map_of) "kind" "primitive" "name" nm)))
+
+; uptr — a pointer-width unsigned integer (the numeric form of an address, like
+; C's uintptr_t). 64-bit unsigned, lowering to LLVM i64 — matching the uniform
+; i64 that `ptr_to_int` produces — so `(p as uptr)` is a no-op relabel and a
+; null pointer is just `uptr` 0. A sized_int so it joins/compares in the int
+; family and literals range-check against its 64-bit unsigned bound.
+(bind sized_ints   (list_of "i8" "u8" "i16" "u16" "i32" "u32" "i64" "u64" "uptr"))
+(bind sized_floats (list_of "f32" "f64"))
+
+; pointer types: `ptr` (opaque/byte) plus `ptr_<elem>` for each scalar — the
+; OS surface for typed memory (buffers, MMIO arrays, page tables). At the
+; LLVM level every pointer is the opaque `ptr`; the element rides for
+; load/store/getelementptr and type checking.
+(for nm (list_of
+          "int" "i8" "u8" "i16" "u16" "i32" "u32" "i64" "u64" "f32" "f64"
+          "bool")
+  (assoc registry (string_concat_many "ptr_" nm)
+    (assoc (map_of) "kind" "pointer"
+      "name" (string_concat_many "ptr_" nm) "elem" nm)))
+(assoc registry "ptr"
+  (assoc (map_of) "kind" "pointer" "name" "ptr" "elem" "u8"))
+
+; pointer? / ptr_elem — is `name` a pointer type, and its element type.
+(bind pointer?
+  (lambda (name)
+    (bind ((d (get registry name)))
+      (and (not (eq d null)) (eq (get d "kind") "pointer")))))
+(bind ptr_elem
+  (lambda (name)
+    (bind ((d (get registry name)))
+      (if (and (not (eq d null)) (eq (get d "kind") "pointer"))
+        (get d "elem") null))))
+
+; ── type constructors: COMPILE-TIME FUNCTIONS over descriptors ─────────────
+; A parameterized spelling — "list<int>", "map<string,list<u8>>" — names the
+; APPLICATION of a type constructor to argument types. The constructor is an
+; ordinary function (argument DESCRIPTORS in, one descriptor out), registered
+; here and run lazily the first time `resolve` meets the spelling; the result
+; is memoized under the canonical name. The same move the expander made for
+; forms ("a form is a compile-time function") applied to the type level —
+; generics without new machinery.
+(bind type_fns (map_of))
+
+; define_type_fn! — register a type constructor.
+;   name : the constructor ("list")
+;   f    : (arg_descriptors) -> descriptor | null (null = refuse: bad arity…)
+(bind define_type_fn!
+  (lambda (name f)
+    (do
+      (when (contains type_fns name)
+        (throw (string_concat_many
+          "type constructor `" name "` is already defined")))
+      (assoc type_fns name f))))
+
+; split_args — "int,list<u8>" -> ["int", "list<u8>"] (commas at depth 0).
+; `cur` holds a CHAR BUFFER (a list of the current arg's characters) joined
+; once when the arg closes, rather than a string regrown char-by-char via
+; string_concat_many (which copied the whole prefix on every character). A
+; depth-0 comma flushes the buffer (join) and swaps in a fresh list; the same
+; split and same trailing-arg handling as before.
+(bind split_args
+  (lambda (inner)
+    (bind (
+        (out (list_of)) (cur (ref (list_of))) (depth (ref 0)) (i (ref 0))
+        (cur_str (lambda () (sequence_join (deref cur) "")))
+      )
+      (do
+        (while (lt (deref i) (size inner))
+          (bind ((c (string_slice inner (deref i) (int_add (deref i) 1))))
+            (do
+              (when (eq c "<") (set_ref depth (int_add (deref depth) 1)))
+              (when (eq c ">") (set_ref depth (int_sub (deref depth) 1)))
+              (if (and (eq c ",") (eq (deref depth) 0))
+                (do (append out (cur_str)) (set_ref cur (list_of)))
+                (append (deref cur) c))
+              (set_ref i (int_add (deref i) 1)))))
+        (when (gt (size (deref cur)) 0) (append out (cur_str)))
+        out))))
+
+; instantiate — run the constructor behind a parameterized spelling; the
+; descriptor registers under the CANONICAL name (alias-free args) and the
+; queried spelling aliases to it. Null when the constructor or any argument
+; is unknown — a parameterized type over unknowns stays unknown (gradual).
+; instantiate and resolve are mutually recursive — the slot map carries
+; resolve down (the checker walks forms in order)
+(bind R (map_of))
+(bind instantiate
+  (lambda (name)
+    (bind (
+      (lt_at (string_find name "<"))
+    )
+      (if (or (eq lt_at null) (not (string_ends_with name ">")))
+        null
+        (bind (
+          (ctor (string_slice name 0 lt_at))
+          (raw_args (split_args
+                      (string_slice name (int_add lt_at 1)
+                                    (int_sub (size name) 1))))
+          (f (get type_fns ctor))
+          (descs (list_of))
+          (canon_args (list_of))
+          (bad (map_of))
+        )
+          (do
+            (for a raw_args
+              (bind ((d ((get R "resolve") a)))
+                (if (eq d null)
+                  (assoc bad "v" true)
+                  (do
+                    (append descs d)
+                    (append canon_args (get d "name" a))))))
+            (if (or (eq f null) (not (eq (get bad "v") null)))
+              null
+              (bind (
+                (canon_name (string_concat_many
+                              ctor "<" (sequence_join canon_args ",") ">"))
+              )
+                (bind ((existing (get registry canon_name)))
+                  (do
+                    (when (eq existing null)
+                      (bind ((d (f descs)))
+                        (when (not (eq d null))
+                          (do
+                            (assoc d "name" canon_name)
+                            (assoc registry canon_name d)))))
+                    (bind ((d2 (get registry canon_name)))
+                      (do
+                        (when (and (not (eq d2 null))
+                                   (not (eq name canon_name))
+                                   (not (contains registry name)))
+                          (assoc registry name
+                            (assoc (map_of) "kind" "alias"
+                              "name" name "target" canon_name)))
+                        d2))))))))))))
+
+; resolve — the descriptor for a type name, following aliases; a
+; parameterized spelling instantiates its constructor on first sight.
+(bind resolve
+  (lambda (name)
+    (bind ((d (get registry name)))
+      (cond
+        ((not (eq d null))
+          (if (eq (get d "kind") "alias")
+            (resolve (get d "target"))
+            d))
+        ((and (not (eq name null))
+              (not (eq (string_find name "<") null)))
+          (instantiate name))
+        (else null)))))
+(assoc R "resolve" resolve)
+
+; the stdlib's own constructors: typed containers. Their descriptors carry
+; the element types the checker reads back (elem_type / value_type_of).
+(define_type_fn! "list"
+  (lambda (args)
+    (if (eq (size args) 1)
+      (assoc (map_of) "kind" "list"
+        "elem" (get (get args 0) "name"))
+      null)))
+(define_type_fn! "map"
+  (lambda (args)
+    (if (eq (size args) 2)
+      (assoc (map_of) "kind" "map"
+        "key" (get (get args 0) "name")
+        "val" (get (get args 1) "name"))
+      null)))
+
+; ── arrow / function types: a STRUCTURAL callable signature ──────────────────
+; A function position spelled `(fn P1 … Pn R)` lowers (via type_text) to the
+; parameterized spelling "fn<P1,…,Pn,R>" — the LAST argument is the RESULT, the
+; rest are parameter types. So `(fn int int bool)` is `(int,int)->bool`. It rides
+; the SAME constructor machinery a typed container does: `instantiate` runs this
+; the first time the spelling resolves and memoizes the descriptor. A nullary
+; function is "fn<R>" (one argument, the result), so at least one argument is
+; required. The descriptor carries the param-type spellings and the result type;
+; the checker reads them back to check a higher-order call's callback instead of
+; treating every function value as the opaque `callable` primitive.
+(define_type_fn! "fn"
+  (lambda (args)
+    (if (ge (size args) 1)
+      (bind ((names (list_of)))
+        (do
+          (for a args (append names (get a "name")))
+          (assoc (map_of) "kind" "arrow"
+            "params" (sequence_take names (int_sub (size names) 1))
+            "result" (get names (int_sub (size names) 1)))))
+      null)))
+
+; elem_type — the element type of a typed container ("list<int>" -> "int",
+; a map's value type), or null for anything else.
+(bind elem_type
+  (lambda (name)
+    (bind ((d (resolve name)))
+      (cond
+        ((eq d null) null)
+        ((eq (get d "kind") "list") (get d "elem"))
+        ((eq (get d "kind") "map") (get d "val"))
+        (else null)))))
+
+; ── A2: type VARIABLES (parametric polymorphism at the call site) ───────────
+; A type variable is a placeholder a generic signature mentions in PARAMETER
+; and RESULT positions — `(defn map ((xs (list T)) (f callable)) (list T))`.
+; It is NOT a registered type: it binds at the CHECK OF A CALL, instantiating
+; the constructor in place (ROADMAP A2). Spelling convention: a SINGLE uppercase
+; ASCII letter (`T`, `K`, `V`, `E`, `A`, `B`…) that names no registered type —
+; the same letters HM uses, short enough never to collide with a CamelCase
+; struct (`Point`, `Round`). `type_text` already lowered the type position to a
+; string, so a bare `T` arrives here as "T" with no expander change.
+; The structural readers below work on the SPELLING ("list<T>"), not on a
+; resolved descriptor: a parameterized type OVER a variable cannot resolve
+; (instantiate refuses unknown args), yet unification must still decompose it.
+(bind upper_letters
+  (assoc (map_of)
+    "A" true "B" true "C" true "D" true "E" true "F" true "G" true "H" true
+    "I" true "J" true "K" true "L" true "M" true "N" true "O" true "P" true
+    "Q" true "R" true "S" true "T" true "U" true "V" true "W" true "X" true
+    "Y" true "Z" true))
+
+; ── fresh type-variable namespace (let-generalization, B5/P1) ───────────────
+; infer's counter mints fresh variables spelled `_T<n>` (`_T0`/`_T1`/…). That
+; namespace is DISJOINT from the single-letter A-Z one: a name two-plus chars
+; long can never be a single uppercase letter, so `_T<n>` never collides with
+; the `T`/`K`/`V`/`A` that A2 defn-generics use. Both kinds bind only at the
+; call site, never in the registry.
+(bind digit_set
+  (assoc (map_of)
+    "0" true "1" true "2" true "3" true "4" true
+    "5" true "6" true "7" true "8" true "9" true))
+
+; all_digits? — is every character of `s` an ASCII digit (and `s` non-empty)?
+(bind all_digits?
+  (lambda (s)
+    (if (eq (size s) 0)
+      false
+      (bind ((ok (ref true)))
+        (do
+          (for c (string_chars s)
+            (when (not (eq (get digit_set c false) true))
+              (set_ref ok false)))
+          (deref ok))))))
+
+; fresh_var? — is `name` a fresh type variable from infer's counter (`_T<n>`
+; with `n` a run of digits)? The digit requirement keeps an ordinary
+; identifier that merely starts "_T" from being read as a variable. No registry
+; guard is needed: `_T<n>` is never a registered type name.
+;   name : a type name string (null = no)
+;   ->   : bool
+(bind fresh_var?
+  (lambda (name)
+    (and (not (eq name null))
+         (and (string_starts_with name "_T")
+              (all_digits? (string_slice name 2 (size name)))))))
+
+; type_var? — is `name` a type variable? TWO namespaces, both binding only at
+; the call site, never in the registry:
+;   • a single uppercase letter that names no registered type (`T`/`K`/`V`/…)
+;     — A2 defn-generics. The registered-type guard keeps it ADDITIVE:
+;     declaring `(alias T …)` would turn `T` back into an ordinary concrete
+;     type.
+;   • a `_T<n>` fresh variable minted by infer's counter — let-generalization.
+; Everything downstream (`unify`/`subst_type`/`finalize_result`/
+; `type_mentions_var?`) routes through this predicate, so adding the `_T<n>`
+; namespace here propagates the new variable kind through the whole machinery.
+;   name : a type name string (null = no)
+;   ->   : bool
+(bind type_var?
+  (lambda (name)
+    (or (and (not (eq name null))
+             (and (eq (get upper_letters name false) true)
+                  (eq (get registry name) null)))
+        (fresh_var? name))))
+
+; ctor_of — the constructor of a parameterized spelling ("list<T>" -> "list"),
+; or null when `name` is not parameterized (no `<…>`).
+(bind ctor_of
+  (lambda (name)
+    (bind ((lt_at (if (eq name null) null (string_find name "<"))))
+      (if (or (eq lt_at null) (not (string_ends_with name ">")))
+        null
+        (string_slice name 0 lt_at)))))
+
+; type_args — the top-level argument spellings of a parameterized type
+; ("map<string,list<u8>>" -> ["string" "list<u8>"]), or null when not
+; parameterized. Splits at depth-0 commas — nested `<…>` stays intact.
+(bind type_args
+  (lambda (name)
+    (bind ((lt_at (if (eq name null) null (string_find name "<"))))
+      (if (or (eq lt_at null) (not (string_ends_with name ">")))
+        null
+        (split_args (string_slice name (int_add lt_at 1)
+                                  (int_sub (size name) 1)))))))
+
+; subst_type — replace every type variable in `name` with its binding from
+; `subst` (var name -> concrete type). A bare variable becomes its binding (or
+; stays itself when unbound — a still-open polymorphic result); a parameterized
+; spelling is rebuilt with each argument substituted RECURSIVELY, so the result
+; type `(list T)` re-emerges as the concrete "list<int>" once `T` is known.
+;   name  : a type name (may contain variables)
+;   subst : a {var -> type} map
+;   ->    : the substituted spelling
+(bind subst_type
+  (lambda (name subst)
+    (cond
+      ((eq name null) null)
+      ((not (eq (get subst name) null)) (get subst name))
+      (else
+        (bind ((ctor (ctor_of name)))
+          (if (eq ctor null)
+            name
+            (string_concat_many ctor "<"
+              (sequence_join
+                (sequence_map (type_args name)
+                  (lambda (a) (subst_type a subst)))
+                ",")
+              ">")))))))
+
+; canon — a type name with aliases resolved away (unknown names pass through),
+; so every comparison below treats `byte` and its target `u8` as one type.
+(bind canon
+  (lambda (name)
+    (bind ((d (resolve name)))
+      (if (eq d null) name (get d "name" name)))))
+
+; sized_int? / int_family? / float_family? — classification predicates.
+(bind sized_int?    (lambda (t) (contains? sized_ints (canon t))))
+(bind int_family?   (lambda (t) (or (eq (canon t) "int") (sized_int? t))))
+(bind float_family?
+  (lambda (t)
+    (or (eq (canon t) "float") (contains? sized_floats (canon t)))))
+
+; bounds — inclusive {min, max} for a sized integer type, or null.
+;   t  : a type name
+;   -> : {min, max} | null (i64/u64 upper bound is the kernel's i64 ceiling)
+(bind bounds
+  (lambda (t)
+    (case (canon t)
+      ("i8"  (assoc (map_of) "min" -128 "max" 127))
+      ("u8"  (assoc (map_of) "min" 0 "max" 255))
+      ("i16" (assoc (map_of) "min" -32768 "max" 32767))
+      ("u16" (assoc (map_of) "min" 0 "max" 65535))
+      ("i32" (assoc (map_of) "min" -2147483648 "max" 2147483647))
+      ("u32" (assoc (map_of) "min" 0 "max" 4294967295))
+      ("i64" (assoc (map_of) "min" -9223372036854775808 "max" 9223372036854775807))
+      ("u64" (assoc (map_of) "min" 0 "max" 9223372036854775807))
+      ("uptr" (assoc (map_of) "min" 0 "max" 9223372036854775807))
+      (else null))))
+
+; literal_fits? — does the integer literal `v` fit sized type `t`?
+;   v / t : an int value and a type name
+;   ->    : bool (true for non-sized types — nothing to violate)
+(bind literal_fits?
+  (lambda (v t)
+    (if_let (b (bounds t))
+      (and (le (get b "min" 0) v) (le v (get b "max" 0)))
+      true)))
+
+; struct? — is `name` a registered struct type (after aliasing)?
+(bind struct?
+  (lambda (name)
+    (bind ((d (resolve name)))
+      (and (not (eq d null)) (eq (get d "kind") "struct")))))
+
+; union? — is `name` a registered union type (after aliasing)? A union is
+; OVERLAPPING storage: every named member lives at offset 0, reinterpreting one
+; another. The descriptor lists the members, mirroring a struct's fields.
+(bind union?
+  (lambda (name)
+    (bind ((d (resolve name)))
+      (and (not (eq d null)) (eq (get d "kind") "union")))))
+
+; union_members — the [{name, type}…] of union `name`, or null if not a union.
+(bind union_members
+  (lambda (name)
+    (bind ((d (resolve name)))
+      (if (and (not (eq d null)) (eq (get d "kind") "union"))
+        (get d "members" (list_of))
+        null))))
+
+; arrow? — is `name` an arrow/function type ("fn<…,R>")?
+(bind arrow?
+  (lambda (name)
+    (bind ((d (resolve name)))
+      (and (not (eq d null)) (eq (get d "kind") "arrow")))))
+
+; arrow_params / arrow_result — a function type's parameter-type list and
+; result type, or null when `name` is not an arrow.
+(bind arrow_params
+  (lambda (name)
+    (bind ((d (resolve name)))
+      (if (and (not (eq d null)) (eq (get d "kind") "arrow"))
+        (get d "params" (list_of)) null))))
+(bind arrow_result
+  (lambda (name)
+    (bind ((d (resolve name)))
+      (if (and (not (eq d null)) (eq (get d "kind") "arrow"))
+        (get d "result") null))))
+
+; assignable? — may a value of inferred type `got` be passed where `want` is
+; declared? Conservative: unknown (null) and `any` always pass; the dynamic
+; kernel families (`int`, `float`) satisfy their sized declarations and vice
+; versa (no runtime width exists to check); a struct value IS a map at runtime,
+; so struct/map pass in either direction; otherwise names must match.
+;   want / got : declared and inferred type names
+;   ->         : bool
+(bind assignable?
+  (lambda (want got)
+    (cond
+      ((eq got null) true)
+      ((eq want null) true)
+      (else
+        ; resolve/canon ONCE — this runs for every argument of every call
+        ; the type pass walks
+        (bind (
+          (dw (resolve want)) (dg (resolve got))
+          (cw (canon want))   (cg (canon got))
+          (kw (if (eq dw null) null (get dw "kind")))
+          (kg (if (eq dg null) null (get dg "kind")))
+        )
+          (cond
+            ((eq cw "any") true)
+            ; `never` is bottom: a value that never arrives satisfies any want,
+            ; and a want of `never` (an unreachable position) absorbs anything
+            ((eq cg "never") true)
+            ((eq cw "never") true)
+            ((eq cw cg) true)
+            ; an UNREGISTERED spelling (host catalog unions like
+            ; "string|null") gives no certainty either way — never an error
+            ((eq dw null) true)
+            ((eq dg null) true)
+            ((and (int_family? want) (int_family? got)) true)
+            ((and (float_family? want) (float_family? got)) true)
+            ; a struct value IS a map at runtime
+            ((and (eq cw "map") (eq kg "struct")) true)
+            ((and (eq kw "struct") (eq cg "map")) true)
+            ; ── structural WIDTH subtyping between two distinct structs ──
+            ; A struct value is a map keyed by field name at runtime, so a
+            ; struct carrying a SUPERSET of the wanted fields (each at a
+            ; structurally-assignable type) may stand in for the narrower one:
+            ; the extra fields are simply unread. Identical names already
+            ; passed via `(eq cw cg)`, so this only fires for DIFFERENT structs.
+            ; Conservative — a CERTAIN miss (a missing field, or a present
+            ; field whose type cannot satisfy the wanted one) is rejected, and
+            ; the per-field check recurses through the same `assignable?` so a
+            ; nested struct/container field is judged structurally too.
+            ((and (eq kw "struct") (eq kg "struct"))
+              (bind ((ok (ref true)))
+                (do
+                  (for wf (get dw "fields" (list_of))
+                    (bind ((gf (sequence_find (get dg "fields" (list_of))
+                                 (lambda (f) (eq (get f "name") (get wf "name"))))))
+                      (if (eq gf null)
+                        ; the wanted field is absent from the got struct: a
+                        ; certain miss (the narrower type demands it)
+                        (set_ref ok false)
+                        (unless (assignable? (get wf "type") (get gf "type"))
+                          (set_ref ok false)))))
+                  (deref ok))))
+            ; typed containers: the bare kernel container satisfies any
+            ; typed one and vice versa (the bare side carries no element
+            ; certainty); two TYPED containers agree element-wise
+            ((and (eq kw "list") (eq cg "list")) true)
+            ((and (eq cw "list") (eq kg "list")) true)
+            ((and (eq kw "list") (eq kg "list"))
+              (assignable? (get dw "elem") (get dg "elem")))
+            ((and (eq kw "map") (eq cg "map")) true)
+            ((and (eq cw "map") (eq kg "map")) true)
+            ((and (eq kw "map") (eq kg "map"))
+              (and (assignable? (get dw "key") (get dg "key"))
+                   (assignable? (get dw "val") (get dg "val"))))
+            ; ── unions (overlapping storage; the descriptor lists members) ──
+            ; A union value IS a map at runtime, so union/map pass either way.
+            ((and (eq kw "union") (eq cg "map")) true)
+            ((and (eq cw "map") (eq kg "union")) true)
+            ; assigning INTO a union: any value whose type is assignable to one
+            ; of the union's member types may be reinterpreted as the union.
+            ((eq kw "union")
+              (not (eq (sequence_find (get dw "members" (list_of))
+                         (lambda (m) (assignable? (get m "type") got))) null)))
+            ; assigning OUT of a union to a non-union target: only certain when
+            ; EVERY member (every reinterpretation) satisfies the target.
+            ((eq kg "union")
+              (bind ((ok (ref true)))
+                (do
+                  (for m (get dg "members" (list_of))
+                    (unless (assignable? want (get m "type"))
+                      (set_ref ok false)))
+                  (deref ok))))
+            ; ── arrows (structural callable signatures) ──
+            ; a bare `callable` carries no signature certainty, so it satisfies
+            ; any arrow want and an arrow satisfies a `callable` want (gradual,
+            ; the same move a bare container makes for a typed one)
+            ((and (eq kw "arrow") (eq cg "callable")) true)
+            ((and (eq cw "callable") (eq kg "arrow")) true)
+            ; two arrows agree when the arity matches and each parameter +
+            ; the result are pairwise assignable (conservative covariance: a
+            ; mismatch here is a CERTAIN higher-order signature error)
+            ((and (eq kw "arrow") (eq kg "arrow"))
+              (bind ((wp (get dw "params" (list_of)))
+                     (gp (get dg "params" (list_of))))
+                (if (not (eq (size wp) (size gp)))
+                  false
+                  (bind ((ok (ref (assignable? (get dw "result") (get dg "result")))))
+                    (do
+                      (for k (sequence_range 0 (size wp))
+                        (unless (assignable? (get wp k) (get gp k))
+                          (set_ref ok false)))
+                      (deref ok))))))
+            (else false)))))))
+
+; define_struct! — register a struct type. Throws on a duplicate name.
+;   name / fields : the type name and a list of (field …) records
+(bind define_struct!
+  (lambda (name fields)
+    (do
+      (when (contains registry name)
+        (throw (string_concat_many "type `" name "` is already defined")))
+      (bind ((d (assoc (map_of) "kind" "struct" "name" name "fields" fields)))
+        (do (assoc registry name d) d)))))
+
+; field — one struct field: (field "age" "u8") -> {name, type}
+(bind field
+  (lambda (name type) (assoc (map_of) "name" name "type" type)))
+
+; define_alias! — register `name` as another spelling of `target`.
+(bind define_alias!
+  (lambda (name target)
+    (do
+      (when (contains registry name)
+        (throw (string_concat_many "type `" name "` is already defined")))
+      (bind ((d (assoc (map_of) "kind" "alias" "name" name "target" target)))
+        (do (assoc registry name d) d)))))
+
+; define_enum! — register `name` as an alias for its backing int type AND record
+; its variants (for exhaustiveness checks). Stored as an alias (so resolve /
+; known_type? treat it like its backing) carrying the variant list.
+(bind define_enum!
+  (lambda (name backing variants)
+    (do
+      (when (contains registry name)
+        (throw (string_concat_many "type `" name "` is already defined")))
+      (bind ((d (assoc (map_of) "kind" "alias" "name" name
+                  "target" backing "variants" variants)))
+        (do (assoc registry name d) d)))))
+
+; define_union! — register a union type recording its members (overlapping
+; storage: each member is a {name, type} reinterpreting the same bytes). Stored
+; under its own "union" kind, so resolve / known_type? recognise it and the
+; checker reads the members back for assignability + match exhaustiveness.
+;   name / members : the type name and a list of {name, type} member records
+(bind define_union!
+  (lambda (name members)
+    (do
+      (when (contains registry name)
+        (throw (string_concat_many "type `" name "` is already defined")))
+      (bind ((d (assoc (map_of) "kind" "union" "name" name "members" members)))
+        (do (assoc registry name d) d)))))
+
+; enum_variants — the [{name, value}…] of enum `name`, or null if not an enum.
+(bind enum_variants
+  (lambda (name)
+    (bind ((d (get registry name)))
+      (if (and (not (eq d null)) (not (eq (get d "variants") null)))
+        (get d "variants")
+        null))))
+
+; enum? — is `name` a registered enum (carries recorded variants)?
+(bind enum?
+  (lambda (name) (not (eq (enum_variants name) null))))
+
+; enum_backing — the underlying int type NAME an enum lowers to (its one-step alias
+; target, e.g. "i32"), or null for a non-enum. A direct lookup, NOT `resolve`:
+; `resolve` recurses past the target to a non-registered primitive and returns null.
+(bind enum_backing
+  (lambda (name)
+    (bind ((d (get registry name)))
+      (if (and (not (eq d null)) (not (eq (get d "variants") null)))
+        (get d "target")
+        null))))
+
+; known_type? — is `name` a registered type (after aliasing)?
+(bind known_type?
+  (lambda (name) (not (eq (resolve name) null))))
+
+; field_type — the declared type of `field_name` in struct `name`, or null.
+(bind field_type
+  (lambda (name field_name)
+    (if_let (d (resolve name))
+      (bind ((hit (sequence_find (get d "fields" (list_of))
+                    (lambda (f) (eq (get f "name") field_name)))))
+        (if (eq hit null) null (get hit "type")))
+      null)))
+
+(export define_struct! define_alias! define_enum! enum_variants enum? enum_backing
+        define_union! union? union_members
+        arrow? arrow_params arrow_result
+        define_type_fn! elem_type field resolve known_type? field_type
+        struct? sized_int? int_family? float_family? bounds literal_fits?
+        assignable? pointer? ptr_elem
+        type_var? ctor_of type_args subst_type)

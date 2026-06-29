@@ -1,0 +1,60 @@
+; stdlib/sys/os.caap — facade for the host "os" library.
+;
+; Two layers, one file (the boilerplate lives in stdlib.sys.wrap):
+;   1. The visible, TYPED surface (`ops`): each function with its parameters
+;      (name + type) and return type. verify_facade checks this against the
+;      catalog, so the declaration cannot drift.
+;   2. CALLABLE wrappers: dual-phase callables from boot/sys_grants.caap, with
+;      the capability handle partially applied. Each phase's sandbox policy
+;      gates behaviour. Without the grant the module still loads — wrappers are
+;      self-describing throwing stubs that raise "requires a sys grant" when
+;      called (declaration-only mode).
+; `make_facade` files the typed surface AND builds the wrapper bundle in one
+; step; each export reads its wrapper from that bundle.
+(module stdlib.sys.os)
+
+(use stdlib.sys.verify op p)
+(use stdlib.sys.wrap make_facade)
+
+(bind ops
+  (list_of
+    (op "arch" (list_of) "string" "pure")
+    (op "available_parallelism" (list_of) "int" "impure")
+    (op "current_exe" (list_of) "string" "impure")
+    (op "env_get" (list_of (p "name" "string")) "string|null" "impure")
+    (op "env_has" (list_of (p "name" "string")) "bool" "impure")
+    (op "env_keys" (list_of) "list<string>" "impure")
+    (op "env_vars" (list_of) "map<string,string>" "impure")
+    (op "family" (list_of) "string" "pure")
+    (op "getcwd" (list_of) "string" "impure")
+    (op "hostname" (list_of) "string" "impure")
+    (op "platform" (list_of) "string" "pure")
+    (op "remove_env" (list_of (p "name" "string")) "null" "impure")
+    (op "set_current_dir" (list_of (p "path" "string")) "null" "impure")
+    (op "set_env" (list_of (p "name" "string") (p "value" "string")) "null" "impure")
+    (op "temp_dir" (list_of) "string" "impure")))
+
+; one call: file the typed surface AND build the wrapper bundle. Each export
+; below reads its (capability-applied, or null) callable from this bundle.
+(bind sys (make_facade "os" ops))
+
+(bind arch                  (get sys "arch"))
+(bind available_parallelism (get sys "available_parallelism"))
+(bind current_exe           (get sys "current_exe"))
+(bind env_get               (get sys "env_get"))
+(bind env_has               (get sys "env_has"))
+(bind env_keys              (get sys "env_keys"))
+(bind env_vars              (get sys "env_vars"))
+(bind family                (get sys "family"))
+(bind getcwd                (get sys "getcwd"))
+(bind hostname              (get sys "hostname"))
+(bind platform              (get sys "platform"))
+(bind remove_env            (get sys "remove_env"))
+(bind set_current_dir       (get sys "set_current_dir"))
+(bind set_env               (get sys "set_env"))
+(bind temp_dir              (get sys "temp_dir"))
+
+(export ops
+        arch available_parallelism current_exe env_get env_has env_keys
+        env_vars family getcwd hostname platform remove_env
+        set_current_dir set_env temp_dir)

@@ -1,0 +1,196 @@
+; stdlib/lib/gen.caap — composable random generators (module stdlib.lib.gen).
+;
+; A small combinator library for building random VALUE GENERATORS on top of
+; stdlib.lib.random's pure, seedable, functional LCG. A generator is just
+;
+;     (lambda (rng) {"value" …, "rng" <next rng>})
+;
+; — the exact shape random's primitive draws return — so generators thread the
+; rng state functionally and a fixed seed always replays the same values. That
+; makes every generator deterministic and composable: run one, read its "rng"
+; out, feed it to the next.
+;
+; Naming: combinators that take CONFIGURATION (bounds, a value, a list of
+; generators…) are FACTORIES — they return a generator. `gen_bool` takes no
+; configuration, so it is a bare generator value (a (rng)->result lambda) you
+; can pass directly wherever a generator is expected.
+;
+; This module DEPENDS ON random only; prop may later build on it, but nothing
+; here requires prop (prop stays self-contained on random).
+(module stdlib.lib.gen)
+
+(use stdlib.lib.random make_rng next_int next_range next_bool)
+
+; ── leaf generators ──────────────────────────────────────────────────────────
+
+; gen_const — a generator that always yields `v` (the rng only advances by one
+; step so a const draw still threads forward like any other).
+;   v  : the fixed value
+;   -> : a generator yielding {"value" v, "rng" next}
+(bind gen_const
+  (lambda (v)
+    (lambda (rng)
+      ; advance the rng once (via a discarded draw) so a const composes like any
+      ; other generator — callers can rely on the state moving forward.
+      (bind ((r (next_int rng 1)))
+        (assoc (map_of) "value" v "rng" (get r "rng"))))))
+
+; gen_int — a generator of ints uniformly in the HALF-OPEN range [lo, hi)
+; (random's next_range convention). An empty/degenerate range (hi <= lo) yields
+; `lo`.
+;   lo / hi : the inclusive-lo / exclusive-hi bounds
+;   ->      : a generator yielding {"value" in [lo, hi), "rng" next}
+(bind gen_int
+  (lambda (lo hi)
+    (lambda (rng)
+      (next_range rng lo hi))))
+
+; gen_bool — a bare generator (NOT a factory): a fair coin flip. Just random's
+; next_bool, exposed under the gen_* name so it composes with the combinators.
+;   rng : the rng state
+;   ->  : {"value" <bool>, "rng" next}
+(bind gen_bool
+  (lambda (rng)
+    (next_bool rng)))
+
+; gen_choose — a generator picking a value uniformly from a non-empty list of
+; `values`. An empty list yields null (and only advances the rng once).
+;   values : the candidate values
+;   ->     : a generator yielding {"value" <a value or null>, "rng" next}
+(bind gen_choose
+  (lambda (values)
+    (lambda (rng)
+      (if (eq (size values) 0)
+        (bind ((r (next_int rng 1)))
+          (assoc (map_of) "value" null "rng" (get r "rng")))
+        (bind ((r (next_int rng (size values))))
+          (assoc (map_of)
+            "value" (get values (get r "value"))
+            "rng" (get r "rng")))))))
+
+; ── higher-order combinators ─────────────────────────────────────────────────
+
+; gen_map — fmap: transform a generator's value through `f`, leaving the rng
+; threading untouched. f is a pure value->value function.
+;   gen / f : a generator, and a value transform
+;   ->      : a generator yielding {"value" (f <value>), "rng" next}
+(bind gen_map
+  (lambda (gen f)
+    (lambda (rng)
+      (bind ((r (gen rng)))
+        (assoc (map_of)
+          "value" (f (get r "value"))
+          "rng" (get r "rng"))))))
+
+; gen_bind — monadic bind: run `gen`, then feed its value to `f` (which returns
+; a NEW generator) and run that with the threaded rng. The dependent generator
+; the second draw uses is chosen by the first draw's value.
+;   gen / f : a generator, and a value->generator continuation
+;   ->      : a generator yielding the second generator's {"value", "rng"}
+(bind gen_bind
+  (lambda (gen f)
+    (lambda (rng)
+      (bind ((r (gen rng))
+             (next_gen (f (get r "value"))))
+        (next_gen (get r "rng"))))))
+
+; gen_one_of — pick one of `gens` uniformly at random and run it. An empty list
+; yields null (and only advances the rng once).
+;   gens : a non-empty list of generators
+;   ->   : a generator delegating to a uniformly-chosen member generator
+(bind gen_one_of
+  (lambda (gens)
+    (lambda (rng)
+      (if (eq (size gens) 0)
+        (bind ((r (next_int rng 1)))
+          (assoc (map_of) "value" null "rng" (get r "rng")))
+        (bind ((pick (next_int rng (size gens)))
+               (chosen (get gens (get pick "value"))))
+          (chosen (get pick "rng")))))))
+
+; gen_frequency — a weighted choice among generators: `pairs` is a list of
+; [weight gen] 2-element lists (INTEGER, non-negative weights). A generator is
+; chosen with probability proportional to its weight, then run. A draw in
+; [0, total) walks the cumulative weights and runs the first generator whose
+; running total exceeds it. An empty list or a non-positive total yields null
+; (and only advances the rng once). A negative weight is a contract error: it
+; would make the cumulative walk non-monotonic and bias the choice silently.
+;   pairs : a list of [weight generator] pairs
+;   ->    : a generator delegating to a weight-chosen member generator
+(bind gen_frequency
+  (lambda (pairs)
+    (lambda (rng)
+      (if (eq (size pairs) 0)
+        (bind ((r (next_int rng 1)))
+          (assoc (map_of) "value" null "rng" (get r "rng")))
+        (bind ((total (ref 0)))
+          (do
+            (sequence_each pairs
+              (lambda (p)
+                (bind ((w (get p 0)))
+                  (if (lt w 0)
+                    (throw "gen_frequency: negative weight")
+                    (set_ref total (int_add (deref total) w))))))
+            (if (le (deref total) 0)
+              (bind ((r (next_int rng 1)))
+                (assoc (map_of) "value" null "rng" (get r "rng")))
+              (bind ((pick (next_int rng (deref total)))
+                     (target (get pick "value"))
+                     (acc (ref 0))
+                     (chosen (ref null))
+                     (idx (ref 0)))
+                (do
+                  (while (and (eq (deref chosen) null) (lt (deref idx) (size pairs)))
+                    (do
+                      (set_ref acc (int_add (deref acc) (get (get pairs (deref idx)) 0)))
+                      (if (lt target (deref acc))
+                        (set_ref chosen (get (get pairs (deref idx)) 1))
+                        (set_ref idx (int_add (deref idx) 1)))))
+                  ; With non-negative weights and target in [0,total), the walk
+                  ; must choose exactly once. Missing here means this module's
+                  ; invariant is broken; fail loudly rather than bias to a tail.
+                  (bind ((g (if (eq (deref chosen) null)
+                              (throw "gen_frequency: internal selection missed")
+                              (deref chosen))))
+                    (g (get pick "rng"))))))))))))
+
+; ── structural generators ────────────────────────────────────────────────────
+
+; gen_tuple — run each generator in `gens` in order, threading the rng through
+; all of them, and collect their values into a fixed-length list (a "tuple").
+;   gens : a list of generators
+;   ->   : a generator yielding {"value" <list of each gen's value>, "rng" next}
+(bind gen_tuple
+  (lambda (gens)
+    (lambda (rng)
+      (bind ((st (ref rng)) (out (list_of)))
+        (do
+          (sequence_each gens
+            (lambda (g)
+              (bind ((r (g (deref st))))
+                (do
+                  (set_ref st (get r "rng"))
+                  (append out (get r "value"))))))
+          (assoc (map_of) "value" out "rng" (deref st)))))))
+
+; gen_list — run `elem_gen` exactly `len` times, threading the rng, and collect
+; the values into a list of length `len`. A non-positive `len` yields [].
+;   elem_gen / len : the per-element generator, the (fixed) length
+;   ->             : a generator yielding {"value" <list of len values>, "rng" next}
+(bind gen_list
+  (lambda (elem_gen len)
+    (lambda (rng)
+      (bind ((st (ref rng)) (out (list_of)) (i (ref 0)))
+        (do
+          (while (lt (deref i) len)
+            (bind ((r (elem_gen (deref st))))
+              (do
+                (set_ref st (get r "rng"))
+                (append out (get r "value"))
+                (set_ref i (int_add (deref i) 1)))))
+          (assoc (map_of) "value" out "rng" (deref st)))))))
+
+(export
+  gen_const gen_int gen_bool gen_choose
+  gen_map gen_bind gen_one_of gen_frequency
+  gen_tuple gen_list)

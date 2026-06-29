@@ -1,0 +1,204 @@
+; stdlib/semantics/passes/algebra.caap — algebraic / peephole simplification as a
+; whole-module TRANSFORM (module stdlib.semantics.passes.algebra).
+;
+; Bottom-up identity rewrites over every loaded module: the classic strength-
+; reducing identities of integer / bitwise / boolean algebra applied as a
+; peephole, with the SAME correctness discipline as constfold — a rewrite that
+; changes behaviour is a MISCOMPILE, so every rule is behaviour-preserving by
+; construction and any rule that would drop a subexpression is gated on that
+; subexpression being provably effect-free AND total.
+;
+; Two FAMILIES of rule, distinguished by what they do to operands:
+;
+;   KEEP-operand  the dropped operand is a LITERAL constant with no effect, so
+;                 removing it is unconditionally safe — the kept operand is the
+;                 whole value:
+;                   (int_add x 0) (int_add 0 x) (int_sub x 0)  -> x
+;                   (int_mul x 1) (int_mul 1 x)                 -> x
+;                   (int_or  x 0) (int_xor x 0)                 -> x
+;                   (not (not x))                              -> x
+;
+;   DROP-operand  the rewrite DISCARDS a non-literal operand `x` (the result no
+;                 longer evaluates it). That is only sound when `x` is
+;                 `droppable?` — pure AND total — because evaluating `x` could
+;                 otherwise have an effect or THROW (e.g. div-by-zero), and the
+;                 program must still observe that. When `x` is not droppable the
+;                 node is left intact (null):
+;                   (int_mul x 0) (int_mul 0 x) -> 0   (drops x)
+;                   (int_and x 0)               -> 0   (drops x)
+;                   (int_sub x x) (int_xor x x) -> 0   (x repeated; drops one x)
+;
+; The x-x / x^x identities use node_eq to confirm BOTH operands are the same
+; tree (structural, span-insensitive). All heads used here are confirmed members
+; of the kernel's closed integer/bitwise/boolean set; runs after expansion and
+; before the check gate, like constfold/simplify (its natural companions).
+(module stdlib.semantics.passes.algebra)
+
+(use stdlib.syntax.ast
+  call? literal? name? head_of head_is? args_of arg literal_of lit)
+(use stdlib.syntax.ir transform node_eq)
+(use stdlib.lib.collections.sequence all?)
+(use stdlib.semantics.passes.registry install_transform!)
+
+; ── droppable? — may this subexpression be removed from evaluation? ──────────
+; A node is droppable when evaluating it can have NO observable consequence:
+; no effect AND no possibility of throwing (total). Then a rewrite that discards
+; it (x*0 -> 0, x-x -> 0) is behaviour-preserving.
+;   - a LITERAL or a NAME (a pure, total variable read) or a LAMBDA (a value, its
+;     body is not run) is always droppable;
+;   - a CALL is droppable iff its head is one of the pure-AND-total heads below
+;     AND every argument is itself droppable.
+; This is deliberately CONSERVATIVE: a head not in the whitelist is treated as
+; NOT droppable, so the worst case is a missed rewrite, never a wrong one.
+; EXCLUDED on purpose, because each can THROW (dropping it would erase the
+; throw — a miscompile):
+;   - effects:            println / set_ref / ref / deref / sys.*
+;   - partial arithmetic: int_div / int_mod / int_rem (zero divisor),
+;                         int_shl / int_shr (out-of-range shift amount)
+;   - CHECKED arithmetic: int_add / int_sub / int_mul / int_abs — the kernel
+;                         uses checked_* and RAISES on i64 overflow (verified
+;                         in caap/src/builtins/arithmetic.rs), so they are
+;                         partial, not total. (There is no `int_neg` head.)
+; Only heads that are pure AND total for EVERY input survive here.
+(bind drop_safe_heads
+  (bind ((m (map_of)))
+    (do
+      (for h (list_of
+               ; bitwise: AND/OR/XOR/NOT are total over all i64 (no overflow
+               ; check, no zero-divisor; shifts are excluded — amount may throw)
+               "int_and" "int_or" "int_xor" "int_not"
+               ; comparison + boolean (total, pure, work on strings too)
+               "eq" "ne" "lt" "gt" "le" "ge" "not"
+               ; string queries that yield an immutable scalar without throwing
+               "string_concat" "string_concat_many" "int_to_string"
+               "string_starts_with" "string_ends_with" "string_contains"
+               "size")
+        (assoc m h true))
+      m)))
+
+(bind droppable_walk
+  (lambda (self node)
+    (cond
+      ((literal? node) true)
+      ((name? node) true)
+      ; a lambda is a value: building the closure runs nothing in its body
+      ((head_is? node "lambda") true)
+      ((call? node)
+        (and (eq (get drop_safe_heads (head_of node) false) true)
+             (all? (args_of node) (lambda (a) (self self a)))))
+      (else false))))
+(bind droppable? (lambda (node) (droppable_walk droppable_walk node)))
+
+; ── operand classifiers ─────────────────────────────────────────────────────
+
+; int_lit? — a literal whose value is exactly the integer `k`.
+(bind int_lit?
+  (lambda (n k)
+    (and (literal? n)
+         (and (eq (value_type (literal_of n)) "int") (eq (literal_of n) k)))))
+
+; ── the rewrite rules, one helper per algebraic identity ────────────────────
+; Each takes a (rebuilt) call node and returns its replacement, or null to keep
+; it. They assume the node is a call of the right head and arity (the dispatch
+; in simplify_algebra checks head + that there are exactly two args before
+; calling the int_* ones; not/not-not handles its own shape).
+
+; add: x+0 -> x, 0+x -> x  (KEEP — the dropped operand is the literal 0)
+(bind rule_add
+  (lambda (n)
+    (bind ((a (arg n 0)) (b (arg n 1)))
+      (cond
+        ((int_lit? b 0) a)
+        ((int_lit? a 0) b)
+        (else null)))))
+
+; sub: x-0 -> x  (KEEP — drops literal 0);  x-x -> 0  (DROP — needs droppable? x)
+(bind rule_sub
+  (lambda (n)
+    (bind ((a (arg n 0)) (b (arg n 1)))
+      (cond
+        ((int_lit? b 0) a)
+        ((and (node_eq a b) (droppable? a)) (lit 0))
+        (else null)))))
+
+; mul: x*1 -> x, 1*x -> x  (KEEP);  x*0 -> 0, 0*x -> 0  (DROP — needs droppable?)
+(bind rule_mul
+  (lambda (n)
+    (bind ((a (arg n 0)) (b (arg n 1)))
+      (cond
+        ((int_lit? b 1) a)
+        ((int_lit? a 1) b)
+        ((and (int_lit? b 0) (droppable? a)) (lit 0))
+        ((and (int_lit? a 0) (droppable? b)) (lit 0))
+        (else null)))))
+
+; or: x|0 -> x, 0|x -> x  (KEEP — the dropped operand is the literal 0)
+(bind rule_or
+  (lambda (n)
+    (bind ((a (arg n 0)) (b (arg n 1)))
+      (cond
+        ((int_lit? b 0) a)
+        ((int_lit? a 0) b)
+        (else null)))))
+
+; and: x&0 -> 0, 0&x -> 0  (DROP — needs droppable? of the dropped operand)
+(bind rule_and
+  (lambda (n)
+    (bind ((a (arg n 0)) (b (arg n 1)))
+      (cond
+        ((and (int_lit? b 0) (droppable? a)) (lit 0))
+        ((and (int_lit? a 0) (droppable? b)) (lit 0))
+        (else null)))))
+
+; xor: x^0 -> x, 0^x -> x  (KEEP);  x^x -> 0  (DROP — needs droppable? x)
+(bind rule_xor
+  (lambda (n)
+    (bind ((a (arg n 0)) (b (arg n 1)))
+      (cond
+        ((int_lit? b 0) a)
+        ((int_lit? a 0) b)
+        ((and (node_eq a b) (droppable? a)) (lit 0))
+        (else null)))))
+
+; not: (not (not x)) -> x  (KEEP — double logical negation; total, no operand
+; is dropped, both `not`s evaluated their single arg exactly once each).
+(bind rule_not
+  (lambda (n)
+    (bind ((inner (arg n 0)))
+      (if (and (head_is? inner "not") (eq (size (args_of inner)) 1))
+        (arg inner 0)
+        null))))
+
+; ── simplify_algebra — bottom-up peephole over a tree ───────────────────────
+; transform rebuilds children FIRST, so a parent observes already-simplified
+; arguments and chained identities collapse in one pass; the span is donated to
+; rebuilt calls (located diagnostics survive). Only 2-arg int_* calls and 1-arg
+; `not` calls are dispatched; everything else is kept (null).
+(bind simplify_algebra
+  (lambda (node)
+    (transform node
+      (lambda (n)
+        (if (not (call? n))
+          null
+          (bind ((h (head_of n)) (k (size (args_of n))))
+            (cond
+              ((and (eq h "int_add") (eq k 2)) (rule_add n))
+              ((and (eq h "int_sub") (eq k 2)) (rule_sub n))
+              ((and (eq h "int_mul") (eq k 2)) (rule_mul n))
+              ((and (eq h "int_or")  (eq k 2)) (rule_or  n))
+              ((and (eq h "int_and") (eq k 2)) (rule_and n))
+              ((and (eq h "int_xor") (eq k 2)) (rule_xor n))
+              ((and (eq h "not")     (eq k 1)) (rule_not n))
+              (else null))))))))
+
+; run — the transform entry: rewrite every located form IN PLACE.
+(bind run
+  (lambda (located)
+    (for f located
+      (assoc f "node" (simplify_algebra (get f "node"))))))
+
+; register! — install algebraic simplification as a load-time TRANSFORM
+; (idempotent).
+(bind register! (lambda () (install_transform! "algebra" run)))
+
+(export droppable? simplify_algebra run register!)

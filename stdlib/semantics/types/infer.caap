@@ -1,0 +1,1016 @@
+; stdlib/semantics/types/infer.caap — type inference + the loader's type pass.
+;
+; One walker (`tc`) does both: it INFERS an expression's type where it can, and
+; CHECKS call arguments where a declaration exists. Signatures come from THREE
+; stories, in order of authority:
+;   1. the kernel param/result TABLES (`result_types`/`param_types`) — read
+;      straight from the vocabulary (stdlib policy; the kernel declares no
+;      result types of its own). No hand-kept lists: every ~341 builtins
+;      auto-participate.
+;   2. `defn` SIGNATURES — read from the sig-marker literal the defn form leaves
+;      RIGHT NEXT TO the binding (the signature lives at the name, nowhere
+;      else). Paired in `tc` during the walk, with effects settled.
+;   3. INFERRED signatures for a plain `(bind f (lambda …))` or a builtin-alias
+;      facade (`value_record`) — result flows into checks; untyped params never
+;      flag.
+;
+; JOIN: an `if`/`match` whose value comes from either branch joins the branch
+; types (equal stays precise, mixed numerics widen to the family, else unknown).
+; HARVEST: `current_harvest` collects every TOP-LEVEL (scan_depth 0) paired
+; signature of the walk — these carry SETTLED effects a marker alone cannot —
+; and `check_module_types` returns it for register_sigs!, so signatures travel
+; with `use`-imported names.
+; A2: a generic signature mentions type VARIABLES (`(list T)`); `check_call_sig`
+; UNIFIES them per call (binding T from the argument, substituting it into the
+; result). See the call-site-unification block below and types/README.md.
+;
+; Partial by design: the answer is a type name when certain, null when not, and
+; only CERTAIN mismatches are reported (assignable? handles the dynamic-int vs
+; sized-int relationship; integer literals additionally get a hard range check
+; against sized declarations — an error the dynamic kernel can never give).
+; Marker/record parsing lives in types/records.caap; effect inference in
+; types/effects.caap — this module is the WALKER and the per-module store.
+(module stdlib.semantics.types.infer)
+
+(use stdlib.syntax.ast call? name? literal? head_of callee args_of arg name_of literal_of items_of loc_or)
+(use stdlib.lib.collections.map clone)
+(use stdlib.semantics.types.registry assignable? literal_fits? sized_int? elem_type
+     resolve field_type define_struct!
+     define_alias! define_enum! enum_variants enum? known_type?
+     define_union! union? union_members)
+(use stdlib.semantics.types.records sig_marker struct_marker alias_marker enum_marker
+     union_marker ctor_record
+     fn_record? lambda_param_names)
+(use stdlib.semantics.types.effects vocab effect_state effect_scan inferred_tags
+     derive_effect settle_effect!)
+; the type-pass leaves split out of this walker: the shared sink emitter +
+; fallback-location cell (report), and the per-call argument/signature checks
+; (constraint, which itself consumes the A2 type-variable unify leaf). The
+; facade keeps the walker, the per-module store, and the public API; the leaves
+; are pure over their arguments + the sink.
+(use stdlib.semantics.types.infer.report report! set_floc!)
+(use stdlib.semantics.types.infer.constraint guard_types check_one_arg check_call_sig)
+(use stdlib.semantics.types.infer.store register_sigs! declare_sigs! sig_of)
+(use stdlib.semantics.types.infer.result tc_t tc_div? diverge join)
+; the unified compile-session (audit #1) — infer reads the OPT-IN native-strict flag
+; (audit #15) through the shared session cell. The flag is OWNED by backend/prep
+; (set_strict!/clear_strict!), which is a HIGHER tier than infer, so infer cannot
+; import it directly; the rank-4 session is the tier-legal bridge — both prep and
+; infer ask session_cell! for the SAME "backend.prep.strict_mode" cell, so prep's
+; set_strict! is visible here. Default false -> a normal build is byte-identical.
+(use stdlib.semantics.session session_cell!)
+
+; native_strict? — is the opt-in strict native profile active for this pass? Reads
+; the shared session cell (see above). Default-off; only a tool that pins
+; set_strict! around a native emit turns the strict gates below on.
+(bind native_strict_cell (session_cell! "backend.prep.strict_mode" (lambda () false)))
+(bind native_strict? (lambda () (deref native_strict_cell)))
+
+; ── kernel type tables ──────────────────────────────────────────────────────
+; result + param types of EVERY kernel builtin, read straight from the
+; vocabulary (the kernel declares them alongside arity/effects). No hand-kept
+; tables: a new builtin auto-participates, and the type pass is EXHAUSTIVE
+; over all ~341 builtins instead of the ~40 we used to maintain. A result of
+; "any" (or null) is dropped so it stays UNKNOWN — only certain result types
+; flow into checks; param "any"/"*any" is permissive (assignable? passes it).
+(bind result_types (map_of))
+(bind param_types (map_of))
+(bind _build_kernel_tables
+  (bind ((vc (ctfe_kernel_vocabulary)))
+    (do
+      (for nm (map_keys vc)
+        (bind ((e (get vc nm)))
+          (do
+            (bind ((rt (get e "result")))
+              (when (and (not (eq rt null)) (not (eq rt "any")))
+                (assoc result_types nm rt)))
+            (when (not (eq (get e "params") null))
+              (assoc param_types nm (get e "params"))))))
+      null)))
+
+; Comparisons (eq/ne/lt/gt/le/ge) genuinely return Bool (the kernel's
+; canonical_type_tag yields "bool"), but their kernel-vocabulary entry declares no
+; result type, so inference would leave them UNKNOWN. Declare it here in the type
+; layer (stdlib policy) so a comparison flows as `bool` — a real bool type, no
+; kernel change. clike `==`/`<`/… desugar to these heads.
+(bind _declare_cmp_results
+  (do
+    (for h (list_of "eq" "ne" "lt" "gt" "le" "ge")
+      (assoc result_types h "bool"))
+    null))
+
+; ── per-module walk state ───────────────────────────────────────────────────
+; the records PAIRED during the current check_module_types walk — these carry
+; settled effects, which a marker alone cannot (markers only hold the declared
+; one). One module is checked at a time (single-threaded CTFE, and the loader
+; resolves imports before checking the importer), so a single cell suffices;
+; check_module_types resets it and returns its final contents to the loader.
+(bind current_harvest (ref (map_of)))
+
+; lambda-nesting depth of the current walk: only TOP-LEVEL bindings (depth 0)
+; are harvested as module signatures — locals inside function bodies are not
+; module exports and must not leak into the per-module store
+(bind scan_depth (ref 0))
+
+; the defn currently awaiting its bind (set when a sig/struct marker is seen,
+; cleared after pairing): the flat-bind walk SKIPS that lambda entirely —
+; pairing walks it once with TYPED params (check_fn_body + settle_effect!),
+; so the untyped pre-walk would only duplicate work and diagnostics
+(bind pending_fname (ref null))
+
+; the per-form fallback location (`current_floc`) + the `report!`/`loc_of` sink
+; emitter that reads it live in the infer.report leaf, shared with the
+; argument-checking leaves; check_module_types sets it through `set_floc!`.
+
+; ── fresh type-variable supply (let-generalization, B5/P1) ──────────────────
+; A monotone counter minting fresh variable names `_T0`/`_T1`/… for the
+; untyped params of an inferred lambda signature (value_record). The `_T<n>`
+; namespace is DISJOINT from the A-Z one registry.type_var? already knows, so a
+; fresh variable never collides with the `T`/`K`/`V`/`A` that A2 defn-generics
+; spell. Reset per module by check_module_types so names stay small and a
+; module's variables never reference another module's (each call instantiates
+; them locally anyway — the name is just a within-signature placeholder).
+(bind fresh_counter (ref 0))
+(bind fresh_var!
+  (lambda ()
+    (bind ((n (deref fresh_counter)))
+      (do
+        (set_ref fresh_counter (int_add n 1))
+        (string_concat_many "_T" (int_to_string n))))))
+
+; ── reachability / divergence (P-I) ─────────────────────────────────────────
+; `tc` returns EITHER a bare type-name string (the common case — a value that
+; returns normally) OR a DIVERGENCE MAP `{type, diverges:true}` for a form that
+; does not return (a `throw`/`leave`/`runtime_error`, or a block of forms all of
+; whose live paths diverge). The map's "type" is the form's would-be value type
+; (`never` for a raw diverging form), kept so a caller that only wants the type
+; reads it uniformly. Two tiny unpackers normalise every `tc` result:
+;   • `tc_t`    — the bare type, unwrapping the map (the type CONSUMERS use)
+;   • `tc_div?` — does this result signal divergence?
+; and one packer:
+;   • `diverge` — wrap a type as a divergence result.
+; A non-map result is a plain string, so `tc_t` on it is the identity — the
+; existing call sites keep their meaning once wrapped. This is PURE ANALYSIS:
+; the flag is computed and propagated, but NOTHING sharpens on it. The body-usage
+; result-sharpening that once consumed it (constraint collection + solving) was
+; proven sound over 8 adversarial rounds yet a base-rate scan showed it fires 0x
+; in real code, so it was DROPPED (see types/README.md B5); this reachability /
+; `never` analysis is kept as generally-useful infrastructure. Diagnostics stay
+; byte-identical because divergence only ANNOTATES the result, never cuts a walk.
+; ── cross-pass fact channel (typed) ─────────────────────────────────────────
+; registry_facts! — late-bind the user-pass registry kit and return its handle,
+; DECLARING the two typed-fact schemas this pass produces (idempotent, so a
+; per-write call costs nothing after the first). The pass must NOT hard-depend
+; on the registry — a session that never loads it pays nothing — so the lookup
+; is by name and yields null when the kit is absent (the write sites guard it).
+;   "fn_effect"  — loc (string) -> the def's settled effect ("pure"/"impure"),
+;                  read by naming's `!`-suffix rule.
+;   "match_enum" — loc (string) -> the scrutinee enum's variant VALUES (a list),
+;                  read by match_check for exhaustiveness.
+;   "match_union" — loc (string) -> the scrutinee union's member NAMES (a list),
+;                  read by match_check for union-member exhaustiveness.
+;   "diverges"   — loc (string) -> true for a form whose live paths all diverge
+;                  (a `throw`/`leave`/`runtime_error`, an exhaustive all-diverging
+;                  match, or a call to a diverging function). Read by the lint
+;                  pass to flag code AFTER such a form as unreachable. The
+;                  reachability analysis (P-I, above) computes this for every node;
+;                  the publish makes it the FIRST consumer of that analysis.
+; Switching the writes from soft `fact!` to schema-checked `fact_typed!` makes
+; a wrong-typed or off-namespace publish a hard throw, while soft `fact_of`
+; readers still see the values (one shared store): backward-compatible.
+; A by-name lookup can also return the TWO-PHASE PLACEHOLDER (an empty map
+; published while the kit is still loading — e.g. when the type pass runs OVER
+; passes/registry.caap itself, which `throw`s and so now reaches a publish). Its
+; entries are null, so guard on `fact_schema!` being a real function and treat a
+; placeholder exactly like "not loaded" (null): the write sites already no-op on
+; null, and a fact published before the kit finishes loading would be lost anyway.
+;   -> the registry handle, or null when the kit is absent / still loading
+(bind registry_facts!
+  (lambda ()
+    (bind ((reg (ctfe_compiler_lookup_value compiler
+                  "stdlib.semantics.passes.registry" null)))
+      (if (or (eq reg null) (eq (get reg "fact_schema!") null))
+        null
+        (do
+          ((get reg "fact_schema!") "fn_effect" "string" "string")
+          ((get reg "fact_schema!") "match_enum" "string" "list")
+          ((get reg "fact_schema!") "match_union" "string" "list")
+          ((get reg "fact_schema!") "diverges" "string" "bool")
+          reg)))))
+
+; publish_diverges! — record on the fact channel that `node` diverges (keyed by
+; its source loc, the same stable cross-pass key match_enum/match_union use). The
+; ONE write site for the reachability analysis: `tc`'s outer wrapper calls it for
+; every form whose result signals divergence. Guarded the same way the other
+; publishes are — a session without the registry kit, or a detached node with no
+; span, simply records nothing (a soft reader treats absence as "not known to
+; diverge", the conservative default).
+(bind publish_diverges!
+  (lambda (node)
+    (bind ((reg (registry_facts!)) (at (loc_or node "")))
+      (when (and (not (eq reg null)) (not (eq at "")))
+        ((get reg "fact_typed!") "diverges" at true)))))
+
+; loc_of + report! (the sink emitter) live in the infer.report leaf, shared
+; with the argument-checking leaves so there is ONE sink and ONE fallback cell.
+
+; ── join + match guards ─────────────────────────────────────────────────────
+; join — the type of an expression whose value comes from EITHER branch.
+; Conservative: equal names stay precise, mixed dynamic/sized numerics widen
+; to the dynamic family, anything else is unknown (never an error — dynamic
+; code may legitimately mix branch types).
+;   a / b : two inferred type names (null = unknown)
+;   ->    : the joined type name, or null
+; guard_types (the kernel match-guard predicate table) and check_one_arg (the
+; single argument-mismatch sink) live in the infer.constraint leaf.
+
+; ── A2: call-site unification of type variables ─────────────────────────────
+; The A2 type-variable machinery — `unify`/`bind_var!` (witness binding),
+; `type_mentions_var?`/`sig_has_vars?` (the generic-vs-plain gate), and
+; `finalize_result` (collapse still-open variables) — lives in the infer.unify
+; leaf. The per-call signature check (`check_call_sig`, driving unify across an
+; argument list) lives in the infer.constraint leaf alongside `check_one_arg`.
+; The facade keeps the walker; the leaves are pure over their arguments + sink.
+
+; ── body + container checks, inferred signatures ────────────────────────────
+; check_fn_body — walk a defn's lambda body with typed params, then check the
+; LAST body form (the function's value) against the DECLARED result type.
+; Certain mismatches only: an unknown body type stays silent; a literal body
+; additionally gets the sized range check.
+;   tcf  : the tc walker (passed in — tc is defined below)
+;   rec  : the function's sig record ({fname, result, params, …})
+;   lam  : the (lambda (params) body…) node
+;   env  : the body env (params already typed by the caller)
+;   sink : diagnostics list
+(bind check_fn_body
+  (lambda (tcf rec lam env sink)
+    (bind ((state (map_of)))
+      (do
+        (set_ref scan_depth (int_add (deref scan_depth) 1))
+        (for k (sequence_range 1 (size (args_of lam)))
+          (bind ((cr (tcf tcf (arg lam k) env sink)))
+            (do
+              (assoc state "t" (tc_t cr))
+              (assoc state "last" (arg lam k))
+              ; the body is a SEQUENCE evaluated in order; it diverges if any
+              ; (live) form does — sticky, set on first divergence. Recorded on
+              ; the fn record so a CALL to this function propagates it (the
+              ; call-site reachability the lint pass reads back).
+              (when (tc_div? cr) (assoc rec "diverges" true)))))
+        (set_ref scan_depth (int_sub (deref scan_depth) 1))
+        (bind (
+          (rt (get rec "result"))
+          (bt (get state "t"))
+          (lv (if (eq (get state "last") null) null
+                (literal_of (get state "last"))))
+        )
+          (cond
+            ((and (sized_int? rt)
+                  (and (not (eq lv null)) (eq (value_type lv) "int")))
+              (unless (literal_fits? lv rt)
+                (report! sink
+                  (string_concat_many
+                    "`" (get rec "fname") "`: literal result "
+                    (int_to_string lv) " out of range for " rt)
+                  (get state "last"))))
+            ((and (not (eq bt null)) (not (assignable? rt bt)))
+              (report! sink
+                (string_concat_many
+                  "`" (get rec "fname") "`: body returns " bt
+                  ", declared result " rt)
+                (get state "last")))
+            (else null)))))))
+
+; container_call — the typed-container refinements of an ordinary call:
+;   list_of with element types agreeing -> "list<T>" (the constructor RESULT
+;   is computed, the same way a type constructor itself is a compile-time
+;   function); append onto "list<T>" checks the element and keeps the
+;   subject's type. Falls back to the kernel-table result otherwise.
+;   head / args / got / sink / fallback : the call, its arg types, the sink
+(bind container_call
+  (lambda (head args got sink fallback)
+    (cond
+      ((and (eq head "list_of") (gt (size got) 0))
+        (bind ((t0 (get got 0)) (same (map_of)))
+          (do
+            (assoc same "v" true)
+            (for t got
+              (when (or (eq t null) (not (eq t t0)))
+                (assoc same "v" false)))
+            (if (eq (get same "v") true)
+              (string_concat_many "list<" t0 ">")
+              fallback))))
+      ((and (eq head "append") (gt (size got) 1))
+        (bind ((et (elem_type (get got 0))))
+          (do
+            (when (and (not (eq et null))
+                       (and (not (eq (get got 1) null))
+                            (not (assignable? et (get got 1)))))
+              (report! sink
+                (string_concat_many
+                  "`append` onto " (get got 0)
+                  ": expected element " et ", got " (get got 1))
+                (get args 1)))
+            (get got 0))))
+      (else fallback))))
+
+; value_record — a lightweight INFERRED signature for a plain `bind`:
+;   (bind f (lambda …))      — params (names only, untyped — never used to
+;                              flag calls) + the result inferred from the body
+;   (bind alias kernel_name) — a facade over a kernel builtin inherits the
+;                              kernel's declared result type
+; Returns null for any other value shape (the caller walks the value
+; normally). For lambdas this WALKS THE BODY (the caller must not walk it
+; again) so calls inside are still checked.
+;   tcf / fname / value / env / sink : the walker, the bound name, the value
+;                                      node, the enclosing env, diagnostics
+(bind value_record
+  (lambda (tcf fname value env sink)
+    (cond
+      ((eq (head_of value) "lambda")
+        (bind (
+          (child (clone env))
+          (state (map_of))
+          (est (effect_state))
+          (params (list_of))
+          (pnames (lambda_param_names (arg value 0)))
+        )
+          (do
+            ; B5 let-generalization (P2): EACH untyped FIXED param of the lambda
+            ; gets its OWN distinct fresh type variable (`_T0`/`_T1`/…), so the
+            ; body walk runs with each param at a separate variable and the
+            ; inferred result mentions whichever ones flow out. Every call
+            ; instantiates them through the SAME call-site unification
+            ; (check_call_sig → unify → finalize_result) the defn-generics use,
+            ; with a FRESH subst per call — so `(pick2 "s" 1)` and `(pick2 9
+            ; "t")` never conflict. A REST param (`&xs`, which collects a LIST
+            ; of args, not one instantiable value) is excluded: it stays
+            ; untyped (null). Distinct generic locals never share a variable
+            ; name because the counter is monotone within the module.
+            (for pn pnames
+              (bind ((pv (if (string_starts_with pn "&") null (fresh_var!))))
+                (do
+                  (append params (assoc (map_of) "name" pn "type" pv))
+                  (assoc child pn pv))))
+            (assoc state "t" "null")
+            (assoc state "div" false)
+            (set_ref scan_depth (int_add (deref scan_depth) 1))
+            (for k (sequence_range 1 (size (args_of value)))
+              (bind ((cr (tcf tcf (arg value k) child sink)))
+                (do
+                  (assoc state "t" (tc_t cr))
+                  ; sticky body divergence (same contract as check_fn_body), so a
+                  ; call to this inferred-signature lambda propagates divergence
+                  (when (tc_div? cr) (assoc state "div" true))
+                  (effect_scan effect_scan (arg value k) child fname est))))
+            (set_ref scan_depth (int_sub (deref scan_depth) 1))
+            (bind ((tags (inferred_tags est)))
+              (assoc (map_of)
+                "kind" "fn"
+                "fname" fname
+                "result" (get state "t")
+                "declared_effect" null
+                "effects" tags
+                "effect" (derive_effect tags (get est "unknown"))
+                "diverges" (get state "div" false)
+                "params" params)))))
+      ((and (name? value)
+            (and (not (contains env (name_of value)))
+                 (contains vocab (name_of value))))
+        ; a facade over a kernel builtin: result AND effects come from the
+        ; kernel's own declarations
+        (bind (
+          (entry (get vocab (name_of value)))
+          (tags (get entry "effects" (list_of)))
+        )
+          (assoc (map_of)
+            "kind" "fn"
+            "fname" fname
+            "result" (get result_types (name_of value))
+            "declared_effect" null
+            "effects" tags
+            "effect"
+              (cond
+                ((gt (size tags) 0) "impure")
+                ((eq (get entry "pure" true) false) "impure")
+                (else "pure"))
+            "builtin" (name_of value)
+            "params" (list_of))))
+      (else null))))
+
+; ── tc — the walker ─────────────────────────────────────────────────────────
+; tc — THE walker: infer the node's type, checking declared calls on the way.
+;   self : itself
+;   node : an expanded kernel AST node
+;   env  : name -> type string | fn record | null (mutated by flat binds, as
+;          the kernel's `do`/flat-`bind` share one env)
+;   sink : diagnostics list
+;   ->   : a type name, or null when unknown
+; `tc` itself is the thin OUTER wrapper (below) that publishes the divergence
+; fact; `tc_dispatch` is the dispatch body. The two are split so the publish
+; happens ONCE per node, at exactly the spot every branch's result funnels
+; through, without threading a publish call into each of the ~20 branches. The
+; recursion stays through `tc` (callers pass `self`=`tc`, and `(self self …)`
+; re-enters the wrapper), so a NESTED diverging form publishes too.
+(bind tc_dispatch
+  (lambda (self node env sink)
+    (cond
+      ((literal? node)
+        (case (value_type (literal_of node))
+          ("int" "int") ("float" "float") ("bool" "bool")
+          ("string" "string") ("null" "null") (else null)))
+      ((name? node)
+        (bind ((e (get env (name_of node))))
+          (if (fn_record? e) "callable" e)))
+      (else
+        (bind ((head (head_of node)) (args (args_of node)))
+          (case head
+            ("do"
+              ; kernel do shares the env; thread it, watching for sig/struct
+              ; markers that type the very next flat bind
+              (bind ((state (map_of)))
+                (do
+                  (assoc state "t" "null")
+                  (for child args
+                    (bind ((m (sig_marker child))
+                           (sm (struct_marker child))
+                           (am (alias_marker child))
+                           (em (enum_marker child))
+                           (um (union_marker child)))
+                      (cond
+                        ((not (eq m null))
+                          (do
+                            (assoc state "pending" m)
+                            (set_ref pending_fname (get m "fname"))))
+                        ((not (eq um null))
+                          ; a union: register Name as a "union" type recording
+                          ; its members (the `union` form leaves only the marker
+                          ; — no following bind, like alias/enum)
+                          (if (known_type? (get um "name"))
+                            (report! sink
+                              (string_concat_many
+                                "type `" (get um "name")
+                                "` is already defined")
+                              child)
+                            (define_union! (get um "name")
+                                           (get um "members" (list_of)))))
+                        ((not (eq am null))
+                          ; an alias declaration: register it (the target may
+                          ; even be declared later — resolve follows lazily)
+                          (if (known_type? (get am "name"))
+                            (report! sink
+                              (string_concat_many
+                                "type `" (get am "name")
+                                "` is already defined")
+                              child)
+                            (define_alias! (get am "name")
+                                           (get am "target"))))
+                        ((not (eq em null))
+                          ; an enum: register Name as an alias for its backing
+                          ; integer type (the variant binds that follow are
+                          ; ordinary int binds the do-walker types normally)
+                          (if (known_type? (get em "name"))
+                            (report! sink
+                              (string_concat_many
+                                "type `" (get em "name")
+                                "` is already defined")
+                              child)
+                            (define_enum! (get em "name")
+                                          (get em "backing")
+                                          (get em "variants" (list_of)))))
+                        ((not (eq sm null))
+                          ; a struct declaration: register the type NOW, then
+                          ; treat the constructor bind that follows like a defn
+                          ; carrying the constructor's signature
+                          (do
+                            (if (known_type? (get sm "name"))
+                              (report! sink
+                                (string_concat_many
+                                  "type `" (get sm "name")
+                                  "` is already defined")
+                                child)
+                              (define_struct! (get sm "name")
+                                              (get sm "fields" (list_of))))
+                            (bind ((c (ctor_record sm)))
+                              (do
+                                (assoc state "pending" c)
+                                (set_ref pending_fname (get c "fname"))))))
+                        (else
+                          (do
+                            ; walk the child; record both its bare type AND
+                            ; whether it diverges. P-I keeps walking EVERY child
+                            ; (so diagnostics stay byte-identical) but once a
+                            ; live form has diverged the block's value becomes
+                            ; `never` and everything after is DEAD — tracked here
+                            ; for P-II/P-III, which gate constraints + sharpening
+                            ; by reachability. The kernel `do` evaluates each
+                            ; child in order, so a divergence in the FIRST live
+                            ; child makes the block diverge.
+                            (bind ((cr (self self child env sink)))
+                              (do
+                                (assoc state "t" (tc_t cr))
+                                (when (tc_div? cr) (assoc state "div" true))))
+                            ; flat (bind name λ) right after its marker: record
+                            ; the signature ON THE NAME and type the body params
+                            (when_let (m2 (get state "pending"))
+                              (do
+                                (when (and (eq (head_of child) "bind")
+                                           (and (name? (arg child 0))
+                                                (eq (name_of (arg child 0))
+                                                    (get m2 "fname"))))
+                                  (do
+                                    (assoc env (get m2 "fname") m2)
+                                    ; re-walk the lambda body with typed params
+                                    (bind ((lam (arg child 1))
+                                           (child_env (clone env)))
+                                      (do
+                                        (for pr (get m2 "params" (list_of))
+                                          (assoc child_env
+                                            (get pr "name") (get pr "type")))
+                                        (when (eq (head_of lam) "lambda")
+                                          (do
+                                            (check_fn_body self m2 lam child_env sink)
+                                            (settle_effect! m2 lam child_env sink report!)
+                                            ; strict native profile (audit #15): a
+                                            ; function whose effect could NOT be
+                                            ; settled (still null) is flagged in the
+                                            ; OPT-IN strict profile — a native build
+                                            ; wants every function's effect known, not
+                                            ; silently unknown (the same "silent null"
+                                            ; class as the unknown-type gate in
+                                            ; prep/gate_strict_types!). Default-off, so
+                                            ; a normal build is byte-identical.
+                                            (when (and (native_strict?)
+                                                       (eq (get m2 "effect") null))
+                                              (report! sink
+                                                "strict native profile: function effect is unresolved"
+                                                child))
+                                            ; publish the settled per-fn effect on
+                                            ; the typed fact channel (keyed by the
+                                            ; def's loc) for naming's `!`-suffix
+                                            ; rule. The schema is string-valued, so
+                                            ; a still-UNKNOWN effect (null) is left
+                                            ; unpublished — indistinguishable from
+                                            ; no-fact to the soft reader anyway.
+                                            (bind ((reg (registry_facts!))
+                                                   (at (loc_or child ""))
+                                                   (eff (get m2 "effect")))
+                                              (when (and (not (eq reg null))
+                                                         (not (eq at ""))
+                                                         (not (eq eff null)))
+                                                ((get reg "fact_typed!") "fn_effect" at eff)))))))
+                                    (when (eq (deref scan_depth) 0)
+                                      (assoc (deref current_harvest)
+                                             (get m2 "fname") m2))))
+                                (assoc state "pending" null)
+                                (set_ref pending_fname null))))))))
+                  ; the block diverges iff one of its (live) children did
+                  (if (eq (get state "div" false) true)
+                    (diverge (get state "t"))
+                    (get state "t")))))
+            ("lambda"
+              (bind ((child (clone env)))
+                (do
+                  ; untyped params: unknown (no false positives in the body)
+                  (set_ref scan_depth (int_add (deref scan_depth) 1))
+                  (for k (sequence_range 1 (size args))
+                    (self self (get args k) child sink))
+                  (set_ref scan_depth (int_sub (deref scan_depth) 1))
+                  "callable")))
+            ; ── reachability-aware control forms (P-I) ──────────────────────
+            ; These fell through to the ordinary-call branch before, which never
+            ; modelled their divergence. Each walks EVERY arg (diagnostics stay
+            ; byte-identical with the old fall-through) and returns the correct
+            ; divergence: `throw`/`leave` ALWAYS diverge; `and`/`or`/`while` only
+            ; when their UNCONDITIONAL first/cond arg does; `block` and `try`
+            ; never (a `leave`/`throw` inside them is a LOCAL exit the form
+            ; catches, not a divergence of the enclosing function).
+            ("throw"
+              ; raises and never returns — walk the value (arg 0), then diverge.
+              ; `args` excludes the callee, so index 0 IS the thrown expression:
+              ; walk from 0 (the old fall-through walked every arg).
+              (do
+                (for k (sequence_range 0 (size args))
+                  (self self (get args k) env sink))
+                (diverge "never")))
+            ("leave"
+              ; non-local exit to an enclosing block — never returns to here.
+              ; arg 0 is the resolved target-block id (inert), arg 1 the value;
+              ; walk all args (matching the old fall-through) then diverge.
+              (do
+                (for k (sequence_range 0 (size args))
+                  (self self (get args k) env sink))
+                (diverge "never")))
+            ("block"
+              ; a `leave` TARGET: it RETURNS (the leave is a local exit), so the
+              ; block itself never diverges. Every arg is a BODY form (the label
+              ; is consumed by lowering, not an arg), so walk from 0 for
+              ; diagnostics, SWALLOWING any inner divergence; the type stays null
+              ; (as the old fall-through produced — block declares no result).
+              (do
+                (for k (sequence_range 0 (size args))
+                  (self self (get args k) env sink))
+                null))
+            ("and"
+              ; short-circuit: arg 0 (index 0) runs unconditionally, the rest
+              ; only if the prior args were truthy. Diverges only when arg 0 does
+              ; (a later arg's divergence is conditional — conservatively not
+              ; propagated). The value type stays null (the old fall-through
+              ; result — and/or yield the last/short-circuited value, not a bool).
+              (bind ((cstate (map_of)))
+                (do
+                  (assoc cstate "div" false)
+                  (for k (sequence_range 0 (size args))
+                    (bind ((r (self self (get args k) env sink)))
+                      (when (and (eq k 0) (tc_div? r)) (assoc cstate "div" true))))
+                  (if (eq (get cstate "div" false) true) (diverge "never") null))))
+            ("or"
+              (bind ((cstate (map_of)))
+                (do
+                  (assoc cstate "div" false)
+                  (for k (sequence_range 0 (size args))
+                    (bind ((r (self self (get args k) env sink)))
+                      (when (and (eq k 0) (tc_div? r)) (assoc cstate "div" true))))
+                  (if (eq (get cstate "div" false) true) (diverge "never") null))))
+            ("while"
+              ; cond (arg 0) runs unconditionally; the body is conditional (the
+              ; loop may run zero times). Diverges only when the cond does; the
+              ; loop's own value is null.
+              (bind ((cr (if (gt (size args) 0)
+                           (self self (get args 0) env sink) "null")))
+                (do
+                  (for k (sequence_range 1 (size args))
+                    (self self (get args k) env sink))
+                  (if (tc_div? cr) (diverge "null") "null"))))
+            ("try"
+              ; the body (arg 0) may be CUT by a thrown error that the catch
+              ; swallows, so a divergence inside the body does NOT diverge the try
+              ; (the catch recovers). Walk body + catch (from index 0) for
+              ; diagnostics, swallowing inner divergence; the type stays null
+              ; (the old fall-through result).
+              (do
+                (for k (sequence_range 0 (size args))
+                  (self self (get args k) env sink))
+                null))
+            ("bind"
+              (bind ((first (get args 0)))
+                (cond
+                  ; flat (bind name value): value's type sticks to the name in
+                  ; THIS env (kernel defines in the current env); a lambda or
+                  ; builtin-alias value gets an inferred fn RECORD instead
+                  ; (value_record walks the lambda body itself)
+                  ((name? first)
+                    (bind ((value (get args 1)))
+                      (do
+                        (if (and (eq (name_of first) (deref pending_fname))
+                                 (eq (head_of value) "lambda"))
+                          ; the defn pairing right after this walk does the
+                          ; one TYPED walk of this lambda — don't pre-walk it
+                          (assoc env (name_of first) "callable")
+                          (bind ((rec (value_record self (name_of first) value env sink)))
+                            (do
+                              (assoc env (name_of first)
+                                (if (eq rec null)
+                                  (tc_t (self self value env sink))
+                                  rec))
+                              ; a top-level inferred signature travels with the
+                              ; name across modules, like a defn's would
+                              (when (and (not (eq rec null))
+                                         (eq (deref scan_depth) 0))
+                                (assoc (deref current_harvest)
+                                       (name_of first) rec)))))
+                        (bind ((state (map_of)))
+                          (do
+                            (assoc state "t" "null")
+                            (for k (sequence_range 2 (size args))
+                              (bind ((cr (self self (get args k) env sink)))
+                                (do
+                                  (assoc state "t" (tc_t cr))
+                                  (when (tc_div? cr) (assoc state "div" true)))))
+                            (if (gt (size args) 2)
+                              (if (eq (get state "div" false) true)
+                                (diverge (get state "t"))
+                                (get state "t"))
+                              "null"))))))
+                  ; canonical ["n1" v1 … body…]: child env, names typed as we go
+                  ((and (literal? first)
+                        (eq (value_type (literal_of first)) "string"))
+                    (bind ((child (clone env)) (state (map_of)))
+                      (do
+                        (assoc state "i" 0)
+                        (while (and (lt (int_add (get state "i" 0) 1) (size args))
+                                    (and (literal? (get args (get state "i" 0)))
+                                         (eq (value_type (literal_of (get args (get state "i" 0)))) "string")))
+                          (bind (
+                            (nm (literal_of (get args (get state "i" 0))))
+                            (v (get args (int_add (get state "i" 0) 1)))
+                          )
+                            (do
+                              ; same record treatment as the flat shape — the
+                              ; frontend merges consecutive top-level binds
+                              ; into this canonical form
+                              (bind ((rec (value_record self nm v child sink)))
+                                (do
+                                  (assoc child nm
+                                    (if (eq rec null)
+                                      (tc_t (self self v child sink))
+                                      rec))
+                                  (when (and (not (eq rec null))
+                                             (eq (deref scan_depth) 0))
+                                    (assoc (deref current_harvest) nm rec))))
+                              (assoc state "i" (int_add (get state "i" 0) 2)))))
+                        (assoc state "t" "null")
+                        (for k (sequence_range (get state "i" 0) (size args))
+                          (bind ((cr (self self (get args k) child sink)))
+                            (do
+                              (assoc state "t" (tc_t cr))
+                              (when (tc_div? cr) (assoc state "div" true)))))
+                        (if (eq (get state "div" false) true)
+                          (diverge (get state "t"))
+                          (get state "t")))))
+                  ; multi ((n v)…): child env, letrec-ish sequential
+                  (else
+                    (bind ((child (clone env)) (state (map_of)))
+                      (do
+                        (when (call? first)
+                          (for pair (items_of first)
+                            (when (call? pair)
+                              (assoc child
+                                (head_of pair)
+                                (tc_t (self self (arg pair 0) child sink))))))
+                        (assoc state "t" "null")
+                        (for k (sequence_range 1 (size args))
+                          (bind ((cr (self self (get args k) child sink)))
+                            (do
+                              (assoc state "t" (tc_t cr))
+                              (when (tc_div? cr) (assoc state "div" true)))))
+                        (if (eq (get state "div" false) true)
+                          (diverge (get state "t"))
+                          (get state "t"))))))))
+            ("if"
+              ; the value comes from either branch: JOIN their types (equal
+              ; stays precise, mixed numerics widen to the family); a missing
+              ; else-branch yields null at runtime, so it joins as "null".
+              ; Divergence: the cond runs UNCONDITIONALLY, so a cond that
+              ; diverges diverges the whole `if`. The branches are conditional —
+              ; the `if` diverges only when EVERY reachable branch diverges (an
+              ; absent else returns null, so a two-arg `if` never diverges). The
+              ; type join absorbs a diverging branch's `never` (never ⊔ T = T).
+              (bind (
+                (cr (self self (get args 0) env sink))
+                (tr (if (gt (size args) 1) (self self (get args 1) env sink) null))
+                (er (if (gt (size args) 2) (self self (get args 2) env sink) "null"))
+                (have_else (gt (size args) 2))
+              )
+                (if (tc_div? cr)
+                  (diverge "never")
+                  (bind ((jt (join (tc_t tr) (tc_t er))))
+                    (if (and have_else
+                             (and (tc_div? tr) (tc_div? er)))
+                      (diverge jt)
+                      jt)))))
+            ("match"
+              ; type the scrutinee once; each clause body is walked with the
+              ; pattern binding TYPED — a name pattern carries the scrutinee's
+              ; type, a guard pattern ((int? n) …) proves its predicate's
+              ; type. The match's own type is the join of all clause bodies.
+              (bind (
+                (sr (self self (get args 0) env sink))
+                (st (tc_t sr))
+                (state (map_of))
+              )
+                (do
+                  ; if the scrutinee is an enum, publish its variant VALUES on the
+                  ; fact channel keyed by the match's source location, so the
+                  ; match_check pass can test exhaustiveness. (Expanded specs are
+                  ; detached — no arbitrary annotations or node ids — but their
+                  ; source spans survive, so `loc` is the stable cross-pass key.)
+                  (bind ((reg (registry_facts!))
+                         (at (loc_or node "")))
+                    (do
+                      (when (and (enum? st) (not (eq reg null)) (not (eq at "")))
+                        (bind ((vals (list_of)))
+                          (do
+                            (for v (enum_variants st) (append vals (get v "value")))
+                            ((get reg "fact_typed!") "match_enum" at vals))))
+                      ; a union scrutinee: publish its MEMBER NAMES so match_check
+                      ; can test member exhaustiveness (every member or a catch-all)
+                      (when (and (union? st) (not (eq reg null)) (not (eq at "")))
+                        (bind ((mnames (list_of)))
+                          (do
+                            (for mm (union_members st) (append mnames (get mm "name")))
+                            ((get reg "fact_typed!") "match_union" at mnames))))))
+                  (assoc state "first" true)
+                  ; track for divergence: does a catch-all (else/_) clause exist
+                  ; (so the match is exhaustive) AND does EVERY clause body
+                  ; diverge? Only then does the match itself diverge.
+                  (assoc state "all_div" true)
+                  (assoc state "has_else" false)
+                  (for i (sequence_range 1 (size args))
+                    (bind ((clause (get args i)))
+                      (when (call? clause)
+                        (bind (
+                          (pattern (callee clause))
+                          (child (clone env))
+                          (bstate (map_of))
+                        )
+                          (do
+                            (cond
+                              ((name? pattern)
+                                (do
+                                  (when (or (eq (name_of pattern) "else")
+                                            (eq (name_of pattern) "_"))
+                                    (assoc state "has_else" true))
+                                  (unless (or (eq (name_of pattern) "else")
+                                              (eq (name_of pattern) "_"))
+                                    (assoc child (name_of pattern) st))))
+                              ((call? pattern)
+                                (bind (
+                                  (pt (get guard_types (head_of pattern)))
+                                  (pn (arg pattern 0))
+                                )
+                                  (when (and (not (eq pt null)) (name? pn))
+                                    (assoc child (name_of pn) pt))))
+                              (else null))
+                            (assoc bstate "t" "null")
+                            (assoc bstate "div" false)
+                            ; a clause body is a SEQUENCE: it diverges if ANY of
+                            ; its forms does (a `throw` mid-body makes the rest
+                            ; dead), so the flag is STICKY — set on first
+                            ; divergence, never cleared by a later (dead) form.
+                            (for b (args_of clause)
+                              (bind ((cr (self self b child sink)))
+                                (do
+                                  (assoc bstate "t" (tc_t cr))
+                                  (when (tc_div? cr) (assoc bstate "div" true)))))
+                            (unless (eq (get bstate "div" false) true)
+                              (assoc state "all_div" false))
+                            (assoc state "joined"
+                              (if (get state "first" true)
+                                (get bstate "t")
+                                (join (get state "joined")
+                                      (get bstate "t"))))
+                            (assoc state "first" false))))))
+                  ; the match diverges iff the scrutinee did (it runs
+                  ; unconditionally) or it is exhaustive (has an else/_) AND every
+                  ; clause body diverges. Without a catch-all, a non-matching
+                  ; scrutinee returns null — so the match returns normally.
+                  (if (or (tc_div? sr)
+                          (and (eq (get state "has_else" false) true)
+                               (eq (get state "all_div" false) true)))
+                    (diverge (get state "joined"))
+                    (get state "joined")))))
+            ("quote" null)
+            ("set!"
+              ; the assigned value (arg 1) runs unconditionally; if it diverges
+              ; the set! never completes, so the form diverges
+              (bind ((vr (if (gt (size args) 1)
+                           (self self (get args 1) env sink) "null")))
+                (if (tc_div? vr) (diverge "null") "null")))
+            ("get"
+              ; field access: when the subject's type is a known struct and the
+              ; key is a string literal, the result is the field's declared
+              ; type — and a key naming no field is a certain error.
+              (bind ((sr (self self (get args 0) env sink))
+                     (subject_t (tc_t sr)))
+                (do
+                  (for k (sequence_range 1 (size args))
+                    (self self (get args k) env sink))
+                  (bind (
+                    (d (if (eq subject_t null) null (resolve subject_t)))
+                    (kv (if (gt (size args) 1)
+                          (literal_of (get args 1)) null))
+                    (gt_result
+                      (cond
+                        ((and (not (eq d null))
+                              (and (eq (get d "kind") "struct")
+                                   (and (not (eq kv null))
+                                        (eq (value_type kv) "string"))))
+                          (if (eq kv "__type")
+                            "string"   ; the constructor's type tag
+                            (bind ((ft (field_type subject_t kv)))
+                              (if (eq ft null)
+                                (do
+                                  (report! sink
+                                    (string_concat_many
+                                      "struct `" subject_t
+                                      "` has no field `" kv "`")
+                                    (get args 1))
+                                  null)
+                                ft))))
+                        ; a TYPED container: the element type flows out
+                        ((not (eq (elem_type subject_t) null))
+                          (elem_type subject_t))
+                        (else null)))
+                  )
+                    ; arg 0 runs unconditionally — a diverging subject diverges
+                    ; the whole access
+                    (if (tc_div? sr) (diverge gt_result) gt_result)))))
+            (else
+              ; ordinary call: type-check against a known signature, infer args.
+              ; A call evaluates the callee AND every argument UNCONDITIONALLY
+              ; (left-to-right), so a divergence in any of them diverges the call
+              ; (the call body never runs). `runtime_error` is the kernel's own
+              ; diverging form (it raises and never returns) — flagged directly.
+              (bind (
+                (sig (if (eq head null) null
+                       (bind ((e (get env head)))
+                         (if (fn_record? e) e null))))
+                (kparams (if (eq head null) null (get param_types head)))
+                (got (list_of))
+                (cstate (map_of))
+              )
+                (do
+                  ; `runtime_error` is the kernel's own diverging form; a call to
+                  ; a USER function whose body always diverges propagates too (the
+                  ; fn record carries `diverges`, set by check_fn_body/value_record
+                  ; when the body's live paths all diverge — e.g. an always-throwing
+                  ; helper). This is what makes the lint pass flag the code after
+                  ; such a call unreachable.
+                  (assoc cstate "div"
+                    (or (eq head "runtime_error")
+                        (and (not (eq sig null))
+                             (eq (get sig "diverges" false) true))))
+                  (when (not (eq head null))
+                    (bind ((cr (self self (callee node) env sink)))
+                      (when (tc_div? cr) (assoc cstate "div" true))))
+                  ; unwrap each arg's type into `got` and note any diverging arg
+                  (for a args
+                    (bind ((ar (self self a env sink)))
+                      (do
+                        (append got (tc_t ar))
+                        (when (tc_div? ar) (assoc cstate "div" true)))))
+                  (bind ((call_t
+                    (cond
+                      ((not (eq sig null))
+                        ; a known signature: check the arguments (unifying any
+                        ; type variables) and return the instantiated result
+                        (check_call_sig head args got
+                          (get sig "params" (list_of)) (get sig "result") sink))
+                      ((not (eq kparams null))
+                        (bind ((star (sequence_find kparams
+                                       (lambda (e2) (string_starts_with e2 "*")))))
+                          (do
+                            (for i (sequence_range 0 (size args))
+                              (bind (
+                                (want_raw
+                                  (if (lt i (size kparams)) (get kparams i) star))
+                                (want (if (eq want_raw null) null
+                                        (if (string_starts_with want_raw "*")
+                                          (string_slice want_raw 1) want_raw)))
+                              )
+                                (when (not (eq want null))
+                                  (check_one_arg head i want
+                                    (get args i) (get got i) sink))))
+                            (container_call head args got sink
+                              (get result_types head)))))
+                      (else
+                        (if (eq head null) null
+                          (container_call head args got sink
+                            (get result_types head)))))))
+                    (if (eq (get cstate "div" false) true)
+                      (diverge call_t)
+                      call_t)))))))))))
+
+; tc — the public walker: run `tc_dispatch`, then publish the divergence fact
+; when the result signals divergence (the FIRST consumer of the reachability
+; analysis — the lint pass reads it back to flag unreachable code). Behaviour-
+; preserving: the returned result is untouched, so every existing type-consumer
+; (`tc_t`/`tc_div?`, the join, the checks) sees exactly what it saw before — only
+; the side-channel fact is new.
+(bind tc
+  (lambda (self node env sink)
+    (bind ((r (tc_dispatch self node env sink)))
+      (do
+        (when (tc_div? r) (publish_diverges! node))
+        r))))
+
+; ── check entry point (loader) ──────────────────────────────────────────────
+; check_module_types — the loader entry: walk a module's top-level forms with
+; a seeded env. The env is shared across forms (top-level flat binds stick,
+; matching kernel `do` scoping) and each form's findings are prefixed with its
+; "path:line:col" location. Returns the harvest — every sig record paired
+; during the walk, with settled effects — for register_sigs!.
+;   located : list of {node: expanded form, loc} in source order
+;   env0    : initial name->type env (loader seeds it from use-imports)
+;   sink    : the module's diagnostics list
+(bind check_module_types
+  (lambda (located env0 sink)
+    (do
+      (set_ref current_harvest (map_of))
+      ; a previous module's walk may have aborted mid-lambda (raised error)
+      (set_ref scan_depth 0)
+      (set_ref pending_fname null)
+      ; fresh variables are within-signature placeholders; reset per module so
+      ; names stay small and never reference another module's counter state
+      (set_ref fresh_counter 0)
+      (bind ((env (clone env0)))
+        (for f located
+          (do
+            ; the form's loc is the FALLBACK for findings whose node has no span
+            (set_floc! (get f "loc" "<unknown>"))
+            (tc tc (get f "node") env sink))))
+      (deref current_harvest))))
+
+(export result_types param_types check_module_types register_sigs!
+        declare_sigs! sig_of sig_marker)

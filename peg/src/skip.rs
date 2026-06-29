@@ -1,3 +1,7 @@
+//! Trivia skipping — the [`SkipStrategy`] trait and built-in strategies
+//! (whitespace, line comments, regex, and the full [`DefaultSkipStrategy`]),
+//! selected from grammar metadata by `skip_strategy_from_metadata`.
+
 use regex::Regex;
 use std::collections::HashSet;
 
@@ -6,21 +10,21 @@ use std::collections::HashSet;
 /// Failure while skipping trivia (e.g. unterminated block comment).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SkipError {
+    /// The failure message.
     pub message: String,
+    /// Byte position where skipping failed.
     pub pos: usize,
 }
 
 /// Callable that advances `pos` past trivia (whitespace / comments).
 pub trait SkipStrategy: SkipStrategyClone + Send + Sync {
+    /// Advance past trivia at `pos`, returning the new position.
     fn try_skip(&self, text: &str, pos: usize) -> Result<usize, SkipError>;
-
-    fn skip(&self, text: &str, pos: usize) -> usize {
-        self.try_skip(text, pos).unwrap_or(pos)
-    }
 }
 
 /// Blanket cloning support for boxed skip strategies.
 pub trait SkipStrategyClone {
+    /// Clone into a fresh boxed strategy.
     fn clone_box(&self) -> Box<dyn SkipStrategy>;
 }
 
@@ -39,9 +43,10 @@ impl Clone for Box<dyn SkipStrategy> {
     }
 }
 
-/// Optional extension point mirroring parser protocol hooks from the Python
-/// implementation. It is currently unused by the Rust parser cache key.
+/// Optional extension point for parser protocol hooks. It is currently unused
+/// by the parser cache key.
 pub trait StatefulSkipStrategy: SkipStrategy {
+    /// Project the layout state into a cache key (identity by default).
     fn layout_state_key(&self, _layout_state: usize) -> usize {
         _layout_state
     }
@@ -49,8 +54,11 @@ pub trait StatefulSkipStrategy: SkipStrategy {
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
+/// Default whitespace characters skipped as trivia.
 pub const DEFAULT_WHITESPACE: &str = " \t\r\n";
+/// Default line-comment prefixes.
 pub const DEFAULT_LINE_COMMENTS: [&str; 1] = [";"];
+/// Default block-comment delimiter pairs.
 pub const DEFAULT_BLOCK_COMMENTS: [(&str, &str); 2] = [("#|", "|#"), ("/*", "*/")];
 
 // ── Patterns ─────────────────────────────────────────────────────────────
@@ -103,16 +111,11 @@ fn is_whitespace(whitespace: &HashSet<u8>, text: &str, pos: usize) -> bool {
     whitespace.contains(&text.as_bytes()[pos])
 }
 
-fn parse_regex_or_literal(raw: &str) -> SkipMatch {
-    // Keep behavior permissive: values starting with "regex:" are parsed as regex;
-    // everything else is treated as a literal token. This allows ergonomic API use
-    // while still supporting explicit regex creation through dedicated helper.
+fn parse_regex_or_literal(raw: &str) -> Result<SkipMatch, regex::Error> {
     if let Some(pattern) = raw.strip_prefix("regex:") {
-        if let Ok(regex) = SkipMatch::regex(pattern) {
-            return regex;
-        }
+        return SkipMatch::regex(pattern);
     }
-    SkipMatch::literal(raw)
+    Ok(SkipMatch::literal(raw))
 }
 
 // ── No-op skipper ────────────────────────────────────────────────────────
@@ -137,11 +140,13 @@ pub const NO_SKIPPER: NoSkipStrategy = NoSkipStrategy;
 /// A regex-driven strategy that advances while a regex continues to match at the
 /// current position.
 #[derive(Debug, Clone)]
+/// Skips runs matching a regex anchored at the current position.
 pub struct RegexSkipStrategy {
     pattern: Regex,
 }
 
 impl RegexSkipStrategy {
+    /// Build a regex skipper from `pattern`.
     pub fn new(pattern: &str) -> Result<Self, regex::Error> {
         Ok(Self {
             pattern: Regex::new(pattern)?,
@@ -167,6 +172,7 @@ impl StatefulSkipStrategy for RegexSkipStrategy {}
 // ── ASCII whitespace and line-comment skipper ────────────────────────────
 
 #[derive(Debug, Default, Clone)]
+/// Skips ASCII whitespace only.
 pub struct WhitespaceSkipStrategy;
 
 impl SkipStrategy for WhitespaceSkipStrategy {
@@ -181,21 +187,25 @@ impl SkipStrategy for WhitespaceSkipStrategy {
 impl StatefulSkipStrategy for WhitespaceSkipStrategy {}
 
 #[derive(Debug, Clone)]
+/// Skips whitespace and single-character-prefixed line comments.
 pub struct LineCommentSkipStrategy {
     comment_prefix: u8,
 }
 
 impl LineCommentSkipStrategy {
+    /// Build a skipper for line comments starting with `comment_char`.
     pub fn new(comment_char: char) -> Self {
         Self {
             comment_prefix: comment_char as u8,
         }
     }
 
+    /// A `#`-comment skipper.
     pub fn hash_comments() -> Self {
         Self::new('#')
     }
 
+    /// A `;`-comment skipper.
     pub fn semicolon_comments() -> Self {
         Self::new(';')
     }
@@ -259,6 +269,7 @@ impl DefaultSkipStrategy {
         }
     }
 
+    /// Build a default skipper from raw whitespace/comment pattern strings.
     pub fn new_with_raw_patterns(
         whitespace: &str,
         line_comments: impl IntoIterator<Item = String>,
@@ -266,12 +277,13 @@ impl DefaultSkipStrategy {
     ) -> Result<Self, regex::Error> {
         let line_patterns = line_comments
             .into_iter()
-            .map(|pattern| parse_regex_or_literal(&pattern));
+            .map(|pattern| parse_regex_or_literal(&pattern))
+            .collect::<Result<Vec<_>, _>>()?;
         let block_patterns = block_comments
             .into_iter()
             .map(|(start, end)| {
-                let parsed_start = parse_regex_or_literal(&start);
-                let parsed_end = parse_regex_or_literal(&end);
+                let parsed_start = parse_regex_or_literal(&start)?;
+                let parsed_end = parse_regex_or_literal(&end)?;
                 Ok((parsed_start, parsed_end))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -281,14 +293,13 @@ impl DefaultSkipStrategy {
 
     fn skip_line_comment(&self, text: &str, pos: usize) -> Option<usize> {
         for pattern in &self.line_comments {
-            if let Some(_end) = pattern.end_at(text, pos) {
-                let mut search_pos = pos;
-                if search_pos < text.len() {
-                    while search_pos < text.len() && text.as_bytes()[search_pos] != b'\n' {
-                        search_pos += 1;
-                    }
-                }
-                return Some(search_pos.saturating_add(1).min(text.len()));
+            if pattern.end_at(text, pos).is_some() {
+                // Jump straight to the line's newline (memchr-backed) instead of
+                // scanning byte by byte; consume it, or run to end-of-input.
+                return Some(match text[pos..].find('\n') {
+                    Some(off) => (pos + off + 1).min(text.len()),
+                    None => text.len(),
+                });
             }
         }
         None
@@ -300,6 +311,32 @@ impl DefaultSkipStrategy {
                 continue;
             };
             let start_pos = pos;
+            // Fast path: literal delimiters → jump to the earliest next open/close
+            // marker (memchr/Two-Way-backed `str::find`) instead of testing every
+            // byte position. Preserves the original "open checked first" priority.
+            if let (SkipMatch::Literal(s), SkipMatch::Literal(e)) = (start, end) {
+                let mut depth = 1usize;
+                let mut cursor = first;
+                loop {
+                    let ns = text[cursor..].find(s.as_str()).map(|o| cursor + o);
+                    let ne = text[cursor..].find(e.as_str()).map(|o| cursor + o);
+                    match (ns, ne) {
+                        (_, None) => return Some(Err(start_pos)),
+                        (Some(o), Some(c)) if o <= c => {
+                            depth = depth.saturating_add(1);
+                            cursor = o + s.len();
+                        }
+                        (_, Some(c)) => {
+                            depth = depth.saturating_sub(1);
+                            cursor = c + e.len();
+                            if depth == 0 {
+                                return Some(Ok(cursor));
+                            }
+                        }
+                    }
+                }
+            }
+            // Fallback (regex delimiters): scan position by position.
             let mut depth = 1usize;
             let mut cursor = first;
             while cursor < text.len() {
@@ -371,28 +408,29 @@ impl SkipStrategy for DefaultSkipStrategy {
 impl StatefulSkipStrategy for DefaultSkipStrategy {}
 
 // Boxed helper and metadata-based factory.
+/// A boxed, dynamically-dispatched [`SkipStrategy`].
 pub type BoxedSkipStrategy = Box<dyn SkipStrategy>;
 
 /// Build a concrete strategy from a metadata token:
 /// - `None`/`""`/`"none"` => no skipping
 /// - `"whitespace"` => whitespace-only skipping
 /// - `"default"` => default trivia skipping with comment styles
-/// - any other pattern => regex-based skipper using that pattern
-pub fn skip_strategy_from_config(trivia: Option<&str>) -> Option<BoxedSkipStrategy> {
-    match trivia? {
-        "" | "none" => None,
-        "whitespace" => Some(Box::new(WhitespaceSkipStrategy)),
-        "default" => Some(Box::new(DefaultSkipStrategy::default())),
-        pattern => Some(Box::new(RegexSkipStrategy::new(pattern).unwrap_or_else(
-            |_| {
-                RegexSkipStrategy::new(r"[ \t\r\n]+")
-                    .unwrap_or_else(|_| RegexSkipStrategy::new("[ \\t\\r\\n]+").unwrap())
-            },
-        ))),
+/// - any other pattern => regex-based skipper using that pattern.
+///
+/// Invalid regex patterns are reported to the caller; parser metadata must not
+/// silently change the grammar's trivia semantics.
+pub fn skip_strategy_from_config(
+    trivia: Option<&str>,
+) -> Result<Option<BoxedSkipStrategy>, regex::Error> {
+    match trivia {
+        None | Some("") | Some("none") => Ok(None),
+        Some("whitespace") => Ok(Some(Box::new(WhitespaceSkipStrategy))),
+        Some("default") => Ok(Some(Box::new(DefaultSkipStrategy::default()))),
+        Some(pattern) => Ok(Some(Box::new(RegexSkipStrategy::new(pattern)?))),
     }
 }
 
-/// Public constructor mirroring Python signature defaults.
+/// Public constructor using the default skip strategy configuration.
 pub fn make_skipper() -> DefaultSkipStrategy {
     DefaultSkipStrategy::default()
 }
@@ -419,77 +457,122 @@ mod tests {
     #[test]
     fn no_skip_strategy_is_identity() {
         let s = NoSkipStrategy;
-        assert_eq!(s.skip("  hello", 0), 0);
-        assert_eq!(s.skip("hello", 5), 5);
+        assert_eq!(s.try_skip("  hello", 0).unwrap(), 0);
+        assert_eq!(s.try_skip("hello", 5).unwrap(), 5);
     }
 
     #[test]
     fn whitespace_skip_strategy_advances_past_spaces() {
         let s = WhitespaceSkipStrategy;
-        assert_eq!(s.skip("   hello", 0), 3);
-        assert_eq!(s.skip("\t\nhello", 0), 2);
-        assert_eq!(s.skip("hello", 0), 0);
+        assert_eq!(s.try_skip("   hello", 0).unwrap(), 3);
+        assert_eq!(s.try_skip("\t\nhello", 0).unwrap(), 2);
+        assert_eq!(s.try_skip("hello", 0).unwrap(), 0);
     }
 
     #[test]
     fn whitespace_skip_strategy_stops_at_non_whitespace() {
         let s = WhitespaceSkipStrategy;
-        assert_eq!(s.skip("  x  ", 0), 2);
+        assert_eq!(s.try_skip("  x  ", 0).unwrap(), 2);
     }
 
     #[test]
     fn default_skip_strategy_skips_comments_and_whitespace() {
         let s = DefaultSkipStrategy::default();
-        assert_eq!(s.skip("  ;x\nabc", 0), 5);
+        assert_eq!(s.try_skip("  ;x\nabc", 0).unwrap(), 5);
     }
 
     #[test]
     fn default_skip_strategy_skips_nested_comments() {
         let s = DefaultSkipStrategy::default();
-        assert_eq!(s.skip("#| outer #| inner |# done |#abc", 0), 28);
+        assert_eq!(
+            s.try_skip("#| outer #| inner |# done |#abc", 0).unwrap(),
+            28
+        );
+    }
+
+    #[test]
+    fn block_comment_fast_path_handles_long_and_nested_bodies() {
+        let s = DefaultSkipStrategy::default();
+        // Long body — exercises the jump (vs byte-by-byte) path.
+        let body = "x".repeat(5000);
+        let text = format!("#| {body} |#tail");
+        let pos = s.try_skip(&text, 0).unwrap();
+        assert_eq!(&text[pos..], "tail");
+        // Deeply nested.
+        let nested = "#|a#|b#|c|#d|#e|#z";
+        let p = s.try_skip(nested, 0).unwrap();
+        assert_eq!(&nested[p..], "z");
+        // Unterminated → error at the opening delimiter.
+        let err = s.try_skip("#| never closed", 0).unwrap_err();
+        assert_eq!(err.pos, 0);
+    }
+
+    #[test]
+    fn line_comment_fast_path_runs_to_newline_or_eof() {
+        let s = DefaultSkipStrategy::default();
+        let text = format!("; {}\nrest", "c".repeat(4000));
+        let pos = s.try_skip(&text, 0).unwrap();
+        assert_eq!(&text[pos..], "rest");
+        // Comment with no trailing newline consumes to end-of-input.
+        let eof = "; trailing comment";
+        assert_eq!(s.try_skip(eof, 0).unwrap(), eof.len());
     }
 
     #[test]
     fn regex_skip_strategy_advances_past_matches() {
         let s = RegexSkipStrategy::new(r"[ \t]+").unwrap();
-        assert_eq!(s.skip("   hello", 0), 3);
-        assert_eq!(s.skip("hello", 0), 0);
+        assert_eq!(s.try_skip("   hello", 0).unwrap(), 3);
+        assert_eq!(s.try_skip("hello", 0).unwrap(), 0);
     }
 
     #[test]
     fn regex_skip_strategy_loops_until_no_match() {
         let s = RegexSkipStrategy::new(r" ").unwrap();
-        assert_eq!(s.skip("    x", 0), 4);
+        assert_eq!(s.try_skip("    x", 0).unwrap(), 4);
     }
 
     #[test]
     fn line_comment_skip_strategy_skips_hash_comments() {
         let s = LineCommentSkipStrategy::hash_comments();
         let text = "   # this is a comment\nhello";
-        let pos = s.skip(text, 0);
+        let pos = s.try_skip(text, 0).unwrap();
         assert_eq!(&text[pos..], "hello");
     }
 
     #[test]
     fn make_skipper_defaults_are_available() {
         let s = make_skipper();
-        assert_eq!(s.skip("  ;x\nx", 0), 5);
+        assert_eq!(s.try_skip("  ;x\nx", 0).unwrap(), 5);
     }
 
     #[test]
     fn no_skipper_constant_is_identity() {
-        assert_eq!(NO_SKIPPER.skip(" abc", 2), 2);
+        assert_eq!(NO_SKIPPER.try_skip(" abc", 2).unwrap(), 2);
     }
 
     #[test]
     fn skip_strategy_from_config_default() {
-        let s = skip_strategy_from_config(Some("default")).expect("default should compile");
-        assert_eq!(s.skip(" ;x\nabc", 0), 4);
+        let s = skip_strategy_from_config(Some("default"))
+            .expect("default should compile")
+            .expect("default skipper is present");
+        assert_eq!(s.try_skip(" ;x\nabc", 0).unwrap(), 4);
     }
 
     #[test]
     fn skip_strategy_from_config_none() {
-        assert!(skip_strategy_from_config(Some("none")).is_none());
+        assert!(skip_strategy_from_config(Some("none")).unwrap().is_none());
+    }
+
+    #[test]
+    fn skip_strategy_from_config_rejects_invalid_regex() {
+        assert!(skip_strategy_from_config(Some("[")).is_err());
+    }
+
+    #[test]
+    fn raw_pattern_constructor_rejects_invalid_explicit_regex() {
+        assert!(make_skipper_with_patterns(" ", &["regex:["], &[]).is_err());
+        assert!(make_skipper_with_patterns(" ", &[], &[("regex:[", "|#")]).is_err());
+        assert!(make_skipper_with_patterns(" ", &[], &[("#|", "regex:[")]).is_err());
     }
 
     #[test]

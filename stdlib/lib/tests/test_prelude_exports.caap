@@ -1,0 +1,131 @@
+; stdlib/lib/tests/test_prelude_exports.caap — EXPORT SNAPSHOT for the prelude.
+;
+; The prelude (stdlib.lib.core.prelude) is a curated re-export facade: every name
+; it lists must still resolve to a real binding in its home module. This is a pure
+; existence / identity snapshot — it imports EVERY name the prelude re-exports and
+; asserts each one resolves to a bound, callable value. It does NOT assert any
+; behavior (that is test_prelude.caap's job). A broken re-export — a typo, a
+; deleted home definition, a renamed symbol — fails the import or this snapshot
+; instead of silently shrinking the import surface.
+;
+; The name list below mirrors prelude.caap's re_export set exactly; keep them in
+; lock-step. See docs/mechanisms/stdlib-prelude-policy.md for the inclusion and
+; collision policy.
+
+;; @area: semantics
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_true)
+(use stdlib.lib.core.prelude
+  ; collections.sequence
+  map filter fold each range find any? all? take drop join
+  first last sum contains? flat_map unique partition
+  ; collections.map
+  keys values merge clone entries get_in
+  ; text.string
+  split trim concat chars parse_int
+  ; collections.option
+  some none some? none? option_of option_map option_and_then option_or
+  option_unwrap_or
+  ; collections.result
+  ok err ok? err? error_of error_code error_message
+  unwrap unwrap_or map_ok and_then map_err or_else
+  ; core.equal
+  deep_eq deep_ne
+  ; core.math
+  abs sign min max clamp pow gcd even? odd?
+  ; core.functional
+  compose pipe identity
+  ; core.float (collision-resolved: approx_eq only, not float clamp/pow)
+  approx_eq
+  ; diag.error (collision-resolved: non-Result names only)
+  make_error error? raise! as_error)
+
+; bound? — the snapshot predicate: a re-exported name must resolve to a callable
+; value (every prelude name is a function). value_type tags all function kinds
+; "callable", so this is a pure existence/identity check with no behavior call.
+(bind bound?
+  (lambda (name v) (assert_true (eq (value_type v) "callable") name)))
+
+(do
+  ; collections.sequence
+  (bound? "map" map)
+  (bound? "filter" filter)
+  (bound? "fold" fold)
+  (bound? "each" each)
+  (bound? "range" range)
+  (bound? "find" find)
+  (bound? "any?" any?)
+  (bound? "all?" all?)
+  (bound? "take" take)
+  (bound? "drop" drop)
+  (bound? "join" join)
+  (bound? "first" first)
+  (bound? "last" last)
+  (bound? "sum" sum)
+  (bound? "contains?" contains?)
+  (bound? "flat_map" flat_map)
+  (bound? "unique" unique)
+  (bound? "partition" partition)
+  ; collections.map
+  (bound? "keys" keys)
+  (bound? "values" values)
+  (bound? "merge" merge)
+  (bound? "clone" clone)
+  (bound? "entries" entries)
+  (bound? "get_in" get_in)
+  ; text.string
+  (bound? "split" split)
+  (bound? "trim" trim)
+  (bound? "concat" concat)
+  (bound? "chars" chars)
+  (bound? "parse_int" parse_int)
+  ; collections.option
+  (bound? "some" some)
+  (bound? "none" none)
+  (bound? "some?" some?)
+  (bound? "none?" none?)
+  (bound? "option_of" option_of)
+  (bound? "option_map" option_map)
+  (bound? "option_and_then" option_and_then)
+  (bound? "option_or" option_or)
+  (bound? "option_unwrap_or" option_unwrap_or)
+  ; collections.result
+  (bound? "ok" ok)
+  (bound? "err" err)
+  (bound? "ok?" ok?)
+  (bound? "err?" err?)
+  (bound? "error_of" error_of)
+  (bound? "error_code" error_code)
+  (bound? "error_message" error_message)
+  (bound? "unwrap" unwrap)
+  (bound? "unwrap_or" unwrap_or)
+  (bound? "map_ok" map_ok)
+  (bound? "and_then" and_then)
+  (bound? "map_err" map_err)
+  (bound? "or_else" or_else)
+  ; core.equal
+  (bound? "deep_eq" deep_eq)
+  (bound? "deep_ne" deep_ne)
+  ; core.math
+  (bound? "abs" abs)
+  (bound? "sign" sign)
+  (bound? "min" min)
+  (bound? "max" max)
+  (bound? "clamp" clamp)
+  (bound? "pow" pow)
+  (bound? "gcd" gcd)
+  (bound? "even?" even?)
+  (bound? "odd?" odd?)
+  ; core.functional
+  (bound? "compose" compose)
+  (bound? "pipe" pipe)
+  (bound? "identity" identity)
+  ; core.float
+  (bound? "approx_eq" approx_eq)
+  ; diag.error
+  (bound? "make_error" make_error)
+  (bound? "error?" error?)
+  (bound? "raise!" raise!)
+  (bound? "as_error" as_error)
+  true)

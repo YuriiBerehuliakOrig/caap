@@ -1,0 +1,82 @@
+;; examples/urun/ur_build.caap — build the URun vertical slice from its
+;; clike MODULES, in ONE call to the surface-freestanding driver helper.
+;;
+;;   caap stdlib/bootstrap.caap examples/urun/ur_build.caap DIR /tmp/urun.elf [TARGET] [ENTRY]
+;;
+;; The bare stdlib/bootstrap.caap is enough — the driver load_module's the native
+;; backend (stdlib.backend.driver -> stdlib.backend.emit.llvm) and the clike
+;; SURFACE by name on demand, so no native_emit / compose_native leg is required.
+;; DIR is this directory, OUTPUT is the ELF to produce (use an absolute path when
+;; running from the repository root), TARGET defaults to cortex-m3, and ENTRY
+;; defaults to sample_urun.caap.
+;;
+;; The kernel is a set of clike stdlib modules (ur_status / ur_port / ur_scheduler /
+;; ur_thread / ur_timer / ur_semaphore / ur_queue) plus the application program
+;; (sample_urun). `compile_surface_freestanding` does the whole pipeline now:
+;; lower each clike module to kernel source and DECLARE it (so the loader resolves
+;; the entry's `use` graph), lower the entry, look the board up in the driver's
+;; `targets` table, and emit it FREESTANDING into one Cortex-M3 image — cleaning up
+;; every generated file on success AND failure. caap-sys-runtime is NOT linked.
+;; This is a bare-kernel script (only kernel forms: if/do/bind).
+(bind (
+  (args  (ctfe_compiler_lookup_value compiler "cli.args"))
+  (lm    (get (ctfe_compiler_lookup_value compiler "stdlib.load") "load_module"))
+  (build (lm "stdlib.backend.driver"))
+)
+  (do
+    (if (lt (size args) 2)
+      (runtime_error
+        "usage: caap stdlib/bootstrap.caap ur_build.caap DIR OUTPUT [TARGET] [ENTRY]")
+      null)
+    (bind (
+      (dir   (get args 0 null))
+      (out   (get args 1 null))
+      (tname (get args 2 "cortex-m3"))
+      (entry (get args 3 "sample_urun.caap"))    ;; the entry program (default = the demo)
+      (j     (lambda (name) (string_concat_many dir "/" name)))
+    )
+      (do
+        ;; ── STATIC-SAFETY GATE ──────────────────────────────────────────────
+        ;; Install the urun analysis passes into the pass registry BEFORE the
+        ;; build, so the native gate (backend/prep gate! -> run_passes) runs them
+        ;; over the whole assembled program and a violation ABORTS codegen. Each
+        ;; pass decodes the native marker-led forms itself (the loader's def_of /
+        ;; callgraph do not see them), so the passes are self-contained.
+        ((get (lm "stdlib.semantics.passes.ur_norec") "register!"))
+        ((get (lm "stdlib.semantics.passes.ur_crit")  "register!"))
+        ((get (lm "stdlib.semantics.passes.ur_isr")   "register!"))
+        ((get (lm "stdlib.semantics.passes.ur_intrusive") "register!"))
+        ((get (lm "stdlib.semantics.passes.ur_create") "register!"))
+        ((get (lm "stdlib.semantics.passes.ur_suspend") "register!"))
+        ((get (lm "stdlib.semantics.passes.ur_fastpath") "register!"))
+      (bind ((r ((get build "compile_surface_freestanding")
+                  dir entry
+                  (list_of
+                    (assoc (map_of) "name" "stdlib.urun.ur_status"    "file" "ur_status.caap")
+                    (assoc (map_of) "name" "stdlib.urun.ur_port"      "file" "ur_port.caap")
+                    (assoc (map_of) "name" "stdlib.urun.ur_scheduler" "file" "ur_scheduler.caap")
+                    (assoc (map_of) "name" "stdlib.urun.ur_thread"    "file" "ur_thread.caap")
+                    (assoc (map_of) "name" "stdlib.urun.ur_timer"     "file" "ur_timer.caap")
+                    (assoc (map_of) "name" "stdlib.urun.ur_list"      "file" "ur_list.caap")
+                    (assoc (map_of) "name" "stdlib.urun.ur_semaphore" "file" "ur_semaphore.caap")
+                    (assoc (map_of) "name" "stdlib.urun.ur_queue"     "file" "ur_queue.caap")
+                    (assoc (map_of) "name" "stdlib.urun.ur_mutex"     "file" "ur_mutex.caap")
+                    (assoc (map_of) "name" "stdlib.urun.ur_event_flags" "file" "ur_event_flags.caap")
+                    (assoc (map_of) "name" "stdlib.urun.ur_block_pool" "file" "ur_block_pool.caap"))
+                  tname out
+                  ;; The board addresses the asm shim needs live HERE (one source) and
+                  ;; flow to the assembler as `--defsym NAME=val`, so ur_port_cortexm3.s
+                  ;; uses symbols (`ldr =UART0_DATA`) instead of hardcoded literals that
+                  ;; could drift from ur_port.caap's consts.
+                  (assoc (map_of) "shim" (j "ur_port_cortexm3.s") "ld" (j "ur.ld")
+                    "defsyms" (list_of
+                      "UART0_DATA=0x40004000"
+                      "ICSR=0xE000ED04"
+                      "PENDSVSET=0x10000000")))))
+        (if (get r "ok" false)
+          0
+          (runtime_error
+            (string_concat_many "ur_build failed: "
+              (if (eq (get r "error" null) null)
+                (value_to_string (get r "diagnostics" null))
+                (get r "error" ""))))))))))

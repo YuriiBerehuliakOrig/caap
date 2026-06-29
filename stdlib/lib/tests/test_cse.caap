@@ -1,0 +1,192 @@
+; stdlib/lib/tests/test_cse.caap — common-subexpression elimination, with the
+; BEHAVIOR-PRESERVATION proof a transform owes (a wrong rewrite is a miscompile).
+;
+; The positive case asserts both the STRUCTURE (the common subexpr is bound once
+; and reused) and that eval_ir gives the SAME value before and after over the
+; same inputs. The negative cases assert the tree is left UNCHANGED when CSE
+; would not be safe: a deref (mutable read, value can change between uses) and a
+; subexpression inside a nested lambda that reads the lambda's own param.
+
+;; @area: passes
+;; @kind: regression
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.cse cse_node)
+(use stdlib.syntax.ast
+  sym lit calln call lam call? head_is? bind_pairs args_of arg name_of name?
+  literal? eval_ir eval_with)
+(use stdlib.syntax.ir node_eq)
+
+(do
+  ; ── POSITIVE: (int_add (int_mul a b) (int_mul a b)) ──────────────────────────
+  ; The common (int_mul a b) must be bound once and used twice.
+  (bind ((common (calln "int_mul" (list_of (sym "a") (sym "b"))))
+         (expr   (calln "int_add" (list_of common common)))
+         (out    (cse_node expr)))
+    (do
+      ; result is a (bind …) hoisting one pair
+      (assert_true (head_is? out "bind")
+        "CSE wraps the expression in a (bind …)")
+      (bind ((bp (bind_pairs out)))
+        (do
+          (assert_eq (size (get bp "pairs")) 1
+            "exactly one common subexpression is hoisted")
+          (bind ((p0 (get (get bp "pairs") 0)) (body (get (get bp "body") 0)))
+            (do
+              ; the hoisted value is structurally the common (int_mul a b)
+              (assert_true (node_eq (get p0 "value") common)
+                "the hoisted value is (int_mul a b)")
+              ; the body is (int_add X X) where X is the fresh name, used twice
+              (assert_true (head_is? body "int_add")
+                "the rewritten body is still an int_add")
+              (assert_true (and (name? (arg body 0)) (name? (arg body 1)))
+                "both int_add operands are now name references")
+              (assert_eq (name_of (arg body 0)) (get p0 "name")
+                "first operand is the hoisted name")
+              (assert_eq (name_of (arg body 1)) (get p0 "name")
+                "second operand is the hoisted name (reused, not recomputed)")))))
+
+      ; ── BEHAVIOR PRESERVATION: same value before and after, a=3 b=4 ──────────
+      ; (int_mul 3 4) + (int_mul 3 4) = 24, and the rewritten tree must agree.
+      (bind ((inputs (assoc (map_of) "a" 3 "b" 4))
+             (before (eval_with expr inputs))
+             (after  (eval_with out  inputs)))
+        (do
+          (assert_eq before 24 "(int_add (int_mul 3 4) (int_mul 3 4)) = 24")
+          (assert_eq after before
+            "CSE preserves the value (before == after)")))))
+
+  ; ── POSITIVE (closed): nested common subexpr, evaluated with no free vars ────
+  ; (int_add (int_add (int_mul 5 6) 1) (int_add (int_mul 5 6) 1)): the repeated
+  ; (int_add (int_mul 5 6) 1) is hoisted; the literal tree is closed so eval_ir
+  ; runs both directly.
+  (bind ((inner (calln "int_add" (list_of (calln "int_mul" (list_of (lit 5) (lit 6))) (lit 1))))
+         (expr2  (calln "int_add" (list_of inner inner)))
+         (out2   (cse_node expr2)))
+    (do
+      (assert_true (head_is? out2 "bind") "nested repeated subexpr is hoisted")
+      (assert_eq (eval_ir out2) (eval_ir expr2)
+        "CSE preserves the value of the closed nested expression")
+      (assert_eq (eval_ir out2) 62
+        "(31)+(31) = 62 after CSE")))
+
+  ; ── NEGATIVE: two (deref r) must NOT be CSE'd (deref isn't pure-for-CSE) ──────
+  ; A deref reads MUTABLE state; its value can change between the two reads, so
+  ; binding it once and reusing would change behavior. The tree is left intact.
+  (bind ((dref (calln "deref" (list_of (sym "r"))))
+         (dexpr (calln "int_add" (list_of dref dref)))
+         (dout  (cse_node dexpr)))
+    (assert_true (node_eq dout dexpr)
+      "two (deref r) are NOT CSE'd — tree unchanged"))
+
+  ; ── NEGATIVE: ref allocation is not CSE'd either (fresh cell each call) ───────
+  (bind ((rexpr (calln "list_of"
+                  (list_of (calln "ref" (list_of (lit 0)))
+                           (calln "ref" (list_of (lit 0))))))
+         (rout  (cse_node rexpr)))
+    (assert_true (node_eq rout rexpr)
+      "two (ref 0) are NOT CSE'd — fresh allocations, tree unchanged"))
+
+  ; ── NEGATIVE: a repeated subexpr inside a nested lambda using the lambda's ───
+  ; param must NOT be hoisted out (its free var `p` is the lambda's param, not in
+  ; scope at the outer wrap point). The whole expression is left UNCHANGED.
+  (bind ((body  (calln "int_add"
+                  (list_of (calln "int_mul" (list_of (sym "p") (sym "p")))
+                           (calln "int_mul" (list_of (sym "p") (sym "p"))))))
+         (lexpr (lam (list_of "p") body))
+         (lout  (cse_node lexpr)))
+    (assert_true (node_eq lout lexpr)
+      "a repeated subexpr inside a lambda (over its param) is NOT hoisted out"))
+
+  ; ── NEGATIVE: an impure call mixed in stays put ──────────────────────────────
+  ; (int_add (deref r) (deref r)) already covered; here a pure subexpr that ALSO
+  ; appears inside a lambda must not be unified across the boundary.
+  (bind ((shared (calln "int_mul" (list_of (sym "a") (sym "b"))))
+         ; shared occurs once outside and once inside a lambda over an unrelated
+         ; param — only one outside, so it does NOT repeat outside → no hoist.
+         (mixed (calln "int_add"
+                  (list_of shared
+                           (lam (list_of "q") shared))))
+         (mout  (cse_node mixed)))
+    (assert_true (node_eq mout mixed)
+      "a subexpr that occurs once outside and once inside a lambda is not hoisted"))
+
+  ; ── NEGATIVE (capture): inner (bind) shadows a free name of the candidate ────
+  ; (int_add (int_mul a b) (bind "a" 100 (int_mul a b))): the two (int_mul a b)
+  ; are STRUCTURALLY equal but the inner one reads a=100. node_eq is scope-blind,
+  ; so a naive CSE would unify them and DROP the shadow — a miscompile. The
+  ; pure-builtin-spine restriction stops the descent at the `bind` head, so the
+  ; inner occurrence is never collected and the tree is left UNCHANGED.
+  (bind ((shadowed (call (sym "bind")
+                     (list_of (lit "a") (lit 100)
+                              (calln "int_mul" (list_of (sym "a") (sym "b"))))))
+         (capexpr (calln "int_add"
+                    (list_of (calln "int_mul" (list_of (sym "a") (sym "b")))
+                             shadowed)))
+         (capout (cse_node capexpr)))
+    (do
+      (assert_true (node_eq capout capexpr)
+        "a candidate shadowed by an inner (bind) is NOT unified — tree unchanged")
+      ; prove behavior preservation directly: same value with a,b bound
+      (bind ((inp (assoc (map_of) "a" 2 "b" 3)))
+        (assert_eq (eval_with capout inp) (eval_with capexpr inp)
+          "bind-shadow case: before == after (= (2*3)+(100*3) = 306)"))
+      (assert_eq (eval_with capexpr (assoc (map_of) "a" 2 "b" 3)) 306
+        "bind-shadow original evaluates to 306")))
+
+  ; ── NEGATIVE (escape): candidate reads a name bound ONLY by an inner bind ─────
+  ; (bind "x" 7 (int_add (int_mul x 2) (int_mul x 2))): hoisting (int_mul x 2) to
+  ; wrap the whole expression would put `x` (bound only inside) out of scope. The
+  ; root head is `bind` (not a safe builtin) so nothing is collected → unchanged.
+  (bind ((escexpr (call (sym "bind")
+                    (list_of (lit "x") (lit 7)
+                             (calln "int_add"
+                               (list_of (calln "int_mul" (list_of (sym "x") (lit 2)))
+                                        (calln "int_mul" (list_of (sym "x") (lit 2))))))))
+         (escout (cse_node escexpr)))
+    (do
+      (assert_true (node_eq escout escexpr)
+        "a candidate whose free name is inner-bound is NOT hoisted out — unchanged")
+      (assert_eq (eval_ir escout) (eval_ir escexpr)
+        "escape case: before == after (closed expr, = (7*2)+(7*2) = 28)")
+      (assert_eq (eval_ir escexpr) 28 "escape original evaluates to 28")))
+
+  ; ── NEGATIVE (speculative trap): repeated op inside a conditional arm ─────────
+  ; (if (eq d 0) 0 (int_add (int_div n d) (int_div n d))): (int_div n d) repeats,
+  ; but only in the ELSE arm, guarded against d=0. Hoisting it before the `if`
+  ; would evaluate (int_div n 0) unconditionally and THROW when d=0 — where the
+  ; original returns 0. The `if` head ends the pure spine, so nothing is hoisted.
+  (bind ((trapexpr (call (sym "if")
+                     (list_of (calln "eq" (list_of (sym "d") (lit 0)))
+                              (lit 0)
+                              (calln "int_add"
+                                (list_of (calln "int_div" (list_of (sym "n") (sym "d")))
+                                         (calln "int_div" (list_of (sym "n") (sym "d"))))))))
+         (trapout (cse_node trapexpr)))
+    (do
+      (assert_true (node_eq trapout trapexpr)
+        "a partial op guarded by an `if` is NOT hoisted past the guard — unchanged")
+      ; behavior preservation at the DANGEROUS input d=0 (original returns 0,
+      ; must not throw): eval both with n=10 d=0.
+      (assert_eq (eval_with trapout (assoc (map_of) "n" 10 "d" 0)) 0
+        "trap case d=0: result is 0 (no division-by-zero introduced)")
+      (assert_eq (eval_with trapout (assoc (map_of) "n" 10 "d" 0))
+                 (eval_with trapexpr (assoc (map_of) "n" 10 "d" 0))
+        "trap case: before == after at d=0")))
+
+  ; ── NEGATIVE (off-spine twin blocks hoist): a twin hides in an `if` arm ───────
+  ; (int_add (int_mul a b) (if c (int_mul a b) 0)): one (int_mul a b) is on the
+  ; pure spine, one is inside an `if` arm (conditional). count_all sees 2 but the
+  ; spine has only 1 occurrence (count 1, never >= 2) AND a twin is off-spine, so
+  ; no hoist fires. Unchanged — and value-preserving by inspection.
+  (bind ((twinexpr (calln "int_add"
+                     (list_of (calln "int_mul" (list_of (sym "a") (sym "b")))
+                              (call (sym "if")
+                                (list_of (sym "c")
+                                         (calln "int_mul" (list_of (sym "a") (sym "b")))
+                                         (lit 0))))))
+         (twinout (cse_node twinexpr)))
+    (assert_true (node_eq twinout twinexpr)
+      "a twin inside an `if` arm blocks the hoist — tree unchanged"))
+
+  (assert_true true "test_cse: all CSE assertions passed"))

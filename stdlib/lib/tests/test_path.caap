@@ -1,0 +1,49 @@
+; stdlib/lib/tests/test_path.caap — in-language tests for lib/text/path.
+
+;; @area: text
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq)
+(use stdlib.lib.text.path absolute? is_relative? path_join normalize dirname basename
+     extension stem with_extension)
+
+(do
+  (assert_eq (absolute? "/a/b") true "absolute? yes")
+  (assert_eq (absolute? "a/b") false "absolute? no")
+  ; is_relative? is the exact complement of absolute?
+  (assert_eq (is_relative? "a/b") true "is_relative? yes")
+  (assert_eq (is_relative? "/a/b") false "is_relative? no (absolute)")
+  (assert_eq (is_relative? "") true "is_relative? empty is relative")
+  (assert_eq (path_join "/a/b" "c.caap") "/a/b/c.caap" "join rel")
+  (assert_eq (path_join "/a/b/" "c") "/a/b/c" "join trailing slash")
+  (assert_eq (path_join "/a" "/x/y") "/x/y" "join absolute b wins")
+  (assert_eq (path_join "" "x") "x" "join empty a")
+  (assert_eq (normalize "a/./b/../c") "a/c" "normalize dots")
+  (assert_eq (normalize "/a/b/../../c") "/c" "normalize to root")
+  (assert_eq (normalize "../x") "../x" "normalize keeps leading .. (relative)")
+  (assert_eq (normalize "") "." "normalize empty")
+  (assert_eq (dirname "/a/b/c.caap") "/a/b" "dirname")
+  (assert_eq (dirname "c.caap") "." "dirname bare")
+  (assert_eq (dirname "/a") "/" "dirname at root")
+  (assert_eq (basename "/a/b/c.caap") "c.caap" "basename")
+  ; extension — text after the last dot in the basename (leading dot excluded)
+  (assert_eq (extension "a.txt") "txt" "extension simple")
+  (assert_eq (extension "archive.tar.gz") "gz" "extension last only")
+  (assert_eq (extension "/a/b/c.caap") "caap" "extension on a path")
+  (assert_eq (extension "README") "" "extension none")
+  (assert_eq (extension ".gitignore") "" "extension dotfile has none")
+  (assert_eq (extension "a.") "" "extension trailing dot is empty")
+  ; stem — basename minus the final extension (a leading dotfile dot is kept)
+  (assert_eq (stem "a/b.tar.gz") "b.tar" "stem strips only the final extension")
+  (assert_eq (stem "a.txt") "a" "stem simple")
+  (assert_eq (stem "/a/b/c.caap") "c" "stem on a path")
+  (assert_eq (stem "README") "README" "stem no extension")
+  (assert_eq (stem ".gitignore") ".gitignore" "stem keeps dotfile name")
+  (assert_eq (stem "a.") "a" "stem of trailing dot")
+  ; with_extension — replace / add / drop the extension, keeping the directory
+  (assert_eq (with_extension "a.txt" "md") "a.md" "with_extension replace")
+  (assert_eq (with_extension "a" "txt") "a.txt" "with_extension add")
+  (assert_eq (with_extension "a.txt" "") "a" "with_extension drop")
+  (assert_eq (with_extension "/a/b/c.caap" "ll") "/a/b/c.ll" "with_extension on a path")
+  (assert_eq (with_extension ".bashrc" "bak") ".bashrc.bak" "with_extension on a dotfile appends")
+  true)

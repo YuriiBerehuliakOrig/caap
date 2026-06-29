@@ -1,0 +1,239 @@
+; stdlib/lib/numeric/rational.caap — exact rational arithmetic.
+;
+; A rational is an EXACT fraction over bignums, ALWAYS kept in canonical form:
+;
+;   { "num" <bignum>          ; the signed numerator
+;     "den" <bignum> }        ; the denominator, STRICTLY POSITIVE
+;
+; Canonical means three invariants hold for every value this module produces:
+;   1. den > 0                 — the sign lives entirely in num.
+;   2. gcd(|num|, den) = 1      — the fraction is fully reduced.
+;   3. zero is 0/1             — the unique representation of zero.
+;
+; Every constructor and operation re-establishes these invariants on its result,
+; so equality is just structural (num and den match) and comparison/format are
+; trivial. All functions are PURE — they build fresh values and never mutate an
+; input. Arithmetic delegates to the bignum substrate, so numerators and
+; denominators may grow without bound (no i64 limit on exact results).
+(module stdlib.lib.numeric.rational)
+
+(use stdlib.lib.diag.error raise!)
+(use stdlib.lib.numeric.bignum
+  bn_from_int bn_to_int bn_parse bn_format
+  bn_add bn_sub bn_mul bn_div bn_gcd
+  bn_cmp bn_neg bn_abs bn_sign bn_is_zero? bn?)
+
+; ── canonicalization ─────────────────────────────────────────────────────────
+; rat_of_bn — build a canonical rational from a numerator/denominator bignum.
+; Throws on a zero denominator. Otherwise: force den > 0 (flip both signs when
+; den is negative), then divide both by gcd(|num|, den) so the fraction is fully
+; reduced. Zero collapses to the canonical 0/1.
+;   num_bn : the numerator bignum
+;   den_bn : the denominator bignum (must be non-zero)
+;   ->     : { "num" bignum, "den" bignum } in canonical form
+(bind rat_of_bn
+  (lambda (num_bn den_bn)
+    (do
+      (if (bn_is_zero? den_bn)
+        (raise! "stdlib.numeric.rational.divzero"
+          "rational denominator is zero" null)
+        null)
+      ; normalize sign so the denominator is strictly positive
+      (bind ((neg? (lt (bn_sign den_bn) 0))
+             (n (if neg? (bn_neg num_bn) num_bn))
+             (d (if neg? (bn_neg den_bn) den_bn)))
+        (if (bn_is_zero? n)
+          ; canonical zero is exactly 0/1
+          (assoc (map_of) "num" (bn_from_int 0) "den" (bn_from_int 1))
+          (bind ((g (bn_gcd (bn_abs n) d)))
+            (assoc (map_of)
+              "num" (bn_div n g)
+              "den" (bn_div d g))))))))
+
+; rat — build a canonical rational from kernel-int numerator/denominator.
+;   num_int : the numerator as a kernel int
+;   den_int : the denominator as a kernel int (must be non-zero)
+;   ->      : the reduced rational num_int/den_int
+(bind rat
+  (lambda (num_int den_int)
+    (rat_of_bn (bn_from_int num_int) (bn_from_int den_int))))
+
+; rat_from_int — the integer `n` as the rational n/1.
+(bind rat_from_int
+  (lambda (n)
+    (assoc (map_of) "num" (bn_from_int n) "den" (bn_from_int 1))))
+
+; ── accessors / constants ────────────────────────────────────────────────────
+; rat_num — the numerator bignum (carries the sign).
+(bind rat_num (lambda (r) (get r "num")))
+; rat_den — the denominator bignum (always strictly positive).
+(bind rat_den (lambda (r) (get r "den")))
+
+; rat_zero — the canonical zero, 0/1.
+(bind rat_zero (lambda () (rat_from_int 0)))
+; rat_one — the canonical one, 1/1.
+(bind rat_one (lambda () (rat_from_int 1)))
+
+; rat_is_zero? — is `r` exactly zero? (Canonical form makes this a num check.)
+(bind rat_is_zero? (lambda (r) (bn_is_zero? (rat_num r))))
+
+; rat_sign — the sign of `r`: -1, 0, or 1 (den is always positive, so it is the
+; numerator's sign).
+(bind rat_sign (lambda (r) (bn_sign (rat_num r))))
+
+; ── arithmetic ───────────────────────────────────────────────────────────────
+; rat_add — a + b = (a.num*b.den + b.num*a.den) / (a.den*b.den), then reduced.
+(bind rat_add
+  (lambda (a b)
+    (rat_of_bn
+      (bn_add (bn_mul (rat_num a) (rat_den b))
+              (bn_mul (rat_num b) (rat_den a)))
+      (bn_mul (rat_den a) (rat_den b)))))
+
+; rat_sub — a - b = (a.num*b.den - b.num*a.den) / (a.den*b.den), then reduced.
+(bind rat_sub
+  (lambda (a b)
+    (rat_of_bn
+      (bn_sub (bn_mul (rat_num a) (rat_den b))
+              (bn_mul (rat_num b) (rat_den a)))
+      (bn_mul (rat_den a) (rat_den b)))))
+
+; rat_mul — a * b = (a.num*b.num) / (a.den*b.den), then reduced.
+(bind rat_mul
+  (lambda (a b)
+    (rat_of_bn
+      (bn_mul (rat_num a) (rat_num b))
+      (bn_mul (rat_den a) (rat_den b)))))
+
+; rat_div — a / b = (a.num*b.den) / (a.den*b.num), then reduced. Dividing by a
+; zero `b` is rejected up front with a clear diagnostic.
+(bind rat_div
+  (lambda (a b)
+    (do
+      (if (rat_is_zero? b)
+        (raise! "stdlib.numeric.rational.divzero"
+          "rational division by zero" null)
+        null)
+      (rat_of_bn
+        (bn_mul (rat_num a) (rat_den b))
+        (bn_mul (rat_den a) (rat_num b))))))
+
+; rat_neg — additive inverse: negate the numerator (den stays positive).
+(bind rat_neg
+  (lambda (a)
+    (assoc (map_of) "num" (bn_neg (rat_num a)) "den" (rat_den a))))
+
+; rat_abs — magnitude: |num| over den (already canonical, no reduction needed).
+(bind rat_abs
+  (lambda (a)
+    (assoc (map_of) "num" (bn_abs (rat_num a)) "den" (rat_den a))))
+
+; rat_recip — multiplicative inverse den/num, then re-canonicalized so the sign
+; lands on the new numerator. Reciprocal of zero is undefined and throws.
+(bind rat_recip
+  (lambda (a)
+    (do
+      (if (rat_is_zero? a)
+        (raise! "stdlib.numeric.rational.divzero"
+          "reciprocal of zero" null)
+        null)
+      (rat_of_bn (rat_den a) (rat_num a)))))
+
+; ── comparison ───────────────────────────────────────────────────────────────
+; rat_cmp — total order on rationals: -1 if a<b, 0 if equal, 1 if a>b. Both
+; denominators are positive, so cross-multiplying preserves the inequality and
+; we just compare a.num*b.den against b.num*a.den.
+(bind rat_cmp
+  (lambda (a b)
+    (bn_cmp (bn_mul (rat_num a) (rat_den b))
+            (bn_mul (rat_num b) (rat_den a)))))
+
+; rat_eq? — exact equality. Canonical form means structural num/den equality,
+; which is exactly cmp = 0.
+(bind rat_eq? (lambda (a b) (eq (rat_cmp a b) 0)))
+
+; ── conversions ──────────────────────────────────────────────────────────────
+; rat_to_float — nearest f64 to `r`, as bn_to_int(num) / bn_to_int(den) in
+; floating point. The numerator/denominator must each fit in a kernel int; an
+; overflow surfaces as a clear diagnostic rather than a bignum-internal raise.
+(bind rat_to_float
+  (lambda (r)
+    ; Only the bn_to_int conversions can overflow i64; wrap just those so the
+    ; overflow diagnostic is never mistaken for an error from the division, and
+    ; carry the underlying error as context. den is always > 0 (canonical form),
+    ; so the subsequent float_div can never hit float division by zero.
+    (bind ((nf (try (int_to_float (bn_to_int (rat_num r)))
+                 (catch e
+                   (raise! "stdlib.numeric.rational.overflow"
+                     "rational numerator does not fit in a float (too large)"
+                     (assoc (map_of) "cause" e)))))
+           (df (try (int_to_float (bn_to_int (rat_den r)))
+                 (catch e
+                   (raise! "stdlib.numeric.rational.overflow"
+                     "rational denominator does not fit in a float (too large)"
+                     (assoc (map_of) "cause" e))))))
+      (float_div nf df))))
+
+; rat_format — render `r` as "num/den", or just "num" when the denominator is 1.
+(bind rat_format
+  (lambda (r)
+    (bind ((ns (bn_format (rat_num r) 10))
+           (d  (rat_den r)))
+      (if (eq (bn_cmp d (bn_from_int 1)) 0)
+        ns
+        (string_concat_many ns "/" (bn_format d 10))))))
+
+; rat_parse — parse "a/b" (or a bare integer "a") into a canonical rational.
+; A single '/' separates numerator and denominator; each side is a base-10
+; bignum literal (optional leading sign). A bare integer means denominator 1.
+; A malformed string (no parts, more than one '/', or an empty side) is a
+; protocol error.
+;   s  : the string, e.g. "5/6", "-3/4", or "7"
+;   -> : the reduced rational value of `s`
+(bind rat_parse
+  (lambda (s)
+    (bind ((slash (string_find s "/")))
+      ; string_find returns the index or null when '/' is absent
+      (if (eq slash null)
+        ; no slash: a bare integer numerator over denominator 1
+        (rat_of_bn (bn_parse s 10) (bn_from_int 1))
+        (bind ((num_str (string_slice s 0 slash))
+               (den_str (string_slice s (int_add slash 1) (size s))))
+          (do
+            (if (not (eq (string_find den_str "/") null))
+              (raise! "stdlib.numeric.rational.parse"
+                (string_concat_many "more than one '/' in rational `" s "`")
+                (assoc (map_of) "string" s))
+              null)
+            (if (or (eq (size num_str) 0) (eq (size den_str) 0))
+              (raise! "stdlib.numeric.rational.parse"
+                (string_concat_many "empty numerator or denominator in `" s "`")
+                (assoc (map_of) "string" s))
+              null)
+            (rat_of_bn (bn_parse num_str 10) (bn_parse den_str 10))))))))
+
+; ── structural validation ────────────────────────────────────────────────────
+; rat? — is `r` a structurally well-formed rational? A pure predicate (never
+; throws): true exactly when `r` is a map whose "num" and "den" are both valid
+; bignums (per `bn?`) and whose denominator is strictly positive (sign > 0). It
+; is a shape/invariant guard: it does NOT verify the fraction is fully reduced.
+(bind rat?
+  (lambda (r)
+    (and (eq (value_type r) "map")
+         (bn? (get r "num" null))
+         (bn? (get r "den" null))
+         (gt (bn_sign (get r "den" null)) 0))))
+
+; rat_validate — return `r` unchanged when `(rat? r)`, else throw. Use at trust
+; boundaries to reject malformed input before arithmetic relies on the invariant.
+(bind rat_validate
+  (lambda (r)
+    (if (rat? r) r (throw "rat_validate: not a rational"))))
+
+(export
+  rat rat_of_bn rat_from_int
+  rat? rat_validate
+  rat_num rat_den rat_zero rat_one rat_is_zero? rat_sign
+  rat_add rat_sub rat_mul rat_div rat_neg rat_abs rat_recip
+  rat_cmp rat_eq?
+  rat_to_float rat_format rat_parse)

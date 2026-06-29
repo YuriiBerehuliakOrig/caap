@@ -1,0 +1,300 @@
+; stdlib/boot/registry_contract.caap — the compiler-registry key ABI (audit #13).
+;
+; THE PROBLEM (audit #13): boot/codegen modules find their dependencies through
+; STRING KEYS in the compiler registry (`stdlib.load`, `stdlib.expand`,
+; `stdlib.backend.emit.llvm`, `caap.session.commands`, …) via
+; ctfe_compiler_lookup_value. That gives a flexible lazy bootstrap, but the
+; dependency graph is hidden from the module system, a missing key silently
+; degrades to an optional skip instead of a contract failure, and an embedder must
+; KNOW the hidden keys to compose a session.
+;
+; THE CONTRACT: this module is the ONE formal description of those keys — a data
+; table (`registry_abi`) naming each key's owner / producer / consumers / required-
+; ness, named constants so call sites stop spelling raw literals, and accessors
+; that turn "missing key" into a NAMED contract error instead of a silent null:
+;   key_*            — named constants for the keys.
+;   registry_abi     — the table (pure data; introspect without looking anything up).
+;   abi_keys         — every documented key (used by the governance drift-guard).
+;   lookup_required  — lookup that RAISES (with the key + its owner) if absent.
+;   validate_keys!   — assert a list of keys is present after a chosen boot profile.
+; The boot-phase keys here are the SAME keys the bootstrap manifest (#9) asserts
+; per phase; a governance test pins `abi_keys` to the keys actually used in the
+; tree, so a new registry key must be documented here or the build fails.
+(module stdlib.boot.registry_contract)
+
+; ── named key constants (stop spelling raw literals at call sites) ────────────
+(bind key_expand          "stdlib.expand")
+(bind key_expand_builders "stdlib.expand.builders")
+(bind key_check           "stdlib.check")
+(bind key_namespace       "stdlib.namespace")
+(bind key_resolve         "stdlib.resolve")
+(bind key_gate            "stdlib.gate")
+(bind key_reader          "stdlib.reader")
+(bind key_unit_build      "stdlib.unit_build")
+(bind key_load            "stdlib.load")
+(bind key_types           "stdlib.semantics.types.infer")
+(bind key_passes          "stdlib.semantics.passes.registry")
+(bind key_bare_gate       "stdlib.semantics.passes.bare_gate")
+(bind key_prep            "stdlib.backend.prep")
+(bind key_emit_llvm       "stdlib.backend.emit.llvm")
+(bind key_emit_wasm       "stdlib.backend.emit.wasm")
+(bind key_commands        "caap.session.commands")
+
+; ── required-tier enum (validated, so the categories can't silently drift) ────
+; required_tiers — the CANONICAL set of `required` categories. Every registry_abi
+; row's `required` MUST be one of these; a governance test pins it so the comment,
+; the table, and the validator can never drift apart again (audit #32).
+;   "core"     : present in every session (the base bootstrap registers it)
+;   "codegen"  : only the native/emit profile (lazily loaded; absent at base boot)
+;   "command"  : a session module-command key (analyze/run helpers)
+;   "optional" : may be absent; a consumer null-checks rather than requires it
+(bind required_tiers (list_of "core" "codegen" "command" "optional"))
+
+; required_tier? — true iff `t` is one of the canonical required tiers.
+(bind required_tier?
+  (lambda (t)
+    (bind ((ok (ref false)))
+      (do (sequence_each required_tiers
+            (lambda (x) (if (eq x t) (set_ref ok true) null)))
+          (deref ok)))))
+
+; ── shape-kind enum (enforceable, split from the prose note) ──────────────────
+; shape_kinds — the CANONICAL set of `shape_kind` values. A row's shape is now a
+; MACHINE-CHECKABLE kind (validated against the live value by validate_shape!),
+; alongside a human `shape_note`:
+;   "map_of_functions" : the value is a map; `expected_members` names entries that
+;                        MUST be present (non-null) in it.
+;   "single_callable"  : the value is a single callable (a function/thunk).
+;   "prose_only"       : no machine contract (documentation-only).
+(bind shape_kinds (list_of "map_of_functions" "single_callable" "prose_only"))
+
+; shape_kind? — true iff `k` is one of the canonical shape kinds.
+(bind shape_kind?
+  (lambda (k)
+    (bind ((ok (ref false)))
+      (do (sequence_each shape_kinds
+            (lambda (x) (if (eq x k) (set_ref ok true) null)))
+          (deref ok)))))
+
+; entry — one ABI row.
+;   key             : the registry string
+;   owner           : the module that PRODUCES (registers) it
+;   required        : a `required_tiers` member (core/codegen/command/optional)
+;   shape_kind      : a `shape_kinds` member — the enforceable shape
+;   expected_members: for "map_of_functions", the names that MUST be present in
+;                     the registered map (a list; empty/ignored for other kinds)
+;   shape_note      : a one-line prose note on the registered value's shape
+(bind entry
+  (lambda (key owner required shape_kind expected_members shape_note)
+    (assoc (map_of)
+      "key" key "owner" owner "required" required
+      "shape_kind" shape_kind "expected_members" expected_members
+      "shape_note" shape_note)))
+
+; registry_abi — the documented keys. Pure data: tooling/tests introspect it
+; WITHOUT looking anything up.
+(bind registry_abi
+  (list_of
+    (entry key_expand          "boot/expander.caap"      "core"
+           "map_of_functions"
+           (list_of "expand" "expand_with" "expand_collect"
+                    "expand_with_diagnostics" "define_form" "forms")
+           "{expand, …} — the macro expander api")
+    (entry key_expand_builders "boot/expander.caap"      "core"
+           "map_of_functions"
+           (list_of "kname" "kcall" "body_spec" "call_items")
+           "ast builder helpers shared by the expander")
+    (entry key_check           "boot/check.caap"         "core"
+           "map_of_functions"
+           (list_of "check_node" "check_forms")
+           "the semantic checker api")
+    (entry key_namespace       "boot/namespace.caap"     "core"
+           "map_of_functions"
+           (list_of "form_head" "ident" "export_map_spec" "check_directive"
+                    "get_export" "ns_of" "ns_get" "ns_keys")
+           "namespace ops (declare/resolve roots)")
+    (entry key_resolve         "boot/resolve.caap"       "core"
+           "map_of_functions" (list_of "make")
+           "name<->path resolution")
+    (entry key_gate            "boot/gate.caap"          "core"
+           "map_of_functions" (list_of "make" "gate_phases")
+           "the load-time phase pipeline")
+    (entry key_reader          "boot/reader.caap"        "core"
+           "map_of_functions" (list_of "make")
+           "the surface-kit segmental reader")
+    (entry key_unit_build      "boot/unit_build.caap"    "core"
+           "map_of_functions" (list_of "make")
+           "compilation-unit assembly")
+    (entry key_load            "boot/loader.caap"        "core"
+           "map_of_functions"
+           (list_of "load" "load_module" "declare" "declare_root" "module_path"
+                    "surface_of" "dep_graph" "cycles" "backfill_types")
+           "{load, load_module, declare, declare_root, module_path, backfill_types}")
+    (entry key_types           "semantics/types/infer.caap" "core"
+           "map_of_functions"
+           (list_of "check_module_types" "register_sigs!" "result_types"
+                    "param_types")
+           "the type pass: {check_module_types, …}")
+    (entry key_passes          "semantics/passes/registry.caap" "core"
+           "map_of_functions"
+           (list_of "run_passes" "register_pass!" "run_transforms"
+                    "register_transform!" "fact!" "fact_of")
+           "the pass/transform/fact registry")
+    ; the DEFAULT bare-import gate (audit #26): eager-loaded by the base bootstrap,
+    ; the loader looks it up BY NAME (optional late-bind, like the passes registry)
+    ; and runs its check_forms over each module's RAW directives — flagging a plain
+    ; eval load that reaches a native-only stdlib.bare.* wrapper. Skips in the native
+    ; backend's bare-inlining context (the shared backend.prep.native_context cell).
+    (entry key_bare_gate       "semantics/passes/bare_gate.caap" "core"
+           "map_of_functions"
+           (list_of "check_forms" "check_file" "bare_module?" "bare_imports?")
+           "the native-only bare-import gate {check_forms, …}")
+    (entry key_prep            "backend/prep.caap"       "codegen"
+           "map_of_functions"
+           (list_of "prep_program" "prep_units")
+           "the shared codegen front-end (prep_units)")
+    (entry key_emit_llvm       "backend/emit/llvm.caap"  "codegen"
+           "map_of_functions"
+           (list_of "emit_program" "emit_program_debug"
+                    "emit_freestanding" "emit_freestanding_debug")
+           "the LLVM emitter facade")
+    (entry key_emit_wasm       "backend/emit/wasm.caap"  "codegen"
+           "map_of_functions"
+           (list_of "emit_program" "emit_program_debug"
+                    "emit_module" "emit_module_debug")
+           "the WASM emitter facade")
+    (entry key_commands        "boot/commands.caap"      "core"
+           "map_of_functions"
+           (list_of "version" "analyze_source" "analyze_source_with_root"
+                    "run_source" "run_from_root")
+           "the session command map (LSP/DAP/CLI surface)")
+    ; codegen CONVENIENCE entrypoints — boot/native_emit.caap registers these
+    ; ready-to-call emit functions (over the emitter facades above) when the native
+    ; profile loads. The dependency the audit's #13 evidence specifically named.
+    (entry "stdlib.native.emit"            "boot/native_emit.caap" "codegen"
+           "single_callable" (list_of)
+           "native emit dispatch (target -> llvm/wasm)")
+    (entry "stdlib.llvm.emit"              "boot/native_emit.caap" "codegen"
+           "single_callable" (list_of)
+           "emit_program over the llvm facade")
+    (entry "stdlib.llvm.emit_freestanding" "boot/native_emit.caap" "codegen"
+           "single_callable" (list_of)
+           "emit_freestanding over the llvm facade")
+    (entry "stdlib.wasm.emit"              "boot/native_emit.caap" "codegen"
+           "single_callable" (list_of)
+           "emit_program over the wasm facade")
+    (entry "stdlib.wasm.emit_module"       "boot/native_emit.caap" "codegen"
+           "single_callable" (list_of)
+           "emit_module over the wasm facade")
+    ; session MODULE commands — analyze/run helpers registered by boot/analyze.caap
+    ; and boot/run.caap, consumed by boot/commands.caap (the LSP/DAP/CLI surface).
+    (entry "stdlib.module.analyze_source"           "boot/analyze.caap" "command"
+           "single_callable" (list_of)
+           "analyze a source string -> diagnostics")
+    (entry "stdlib.module.analyze_source_with_root" "boot/analyze.caap" "command"
+           "single_callable" (list_of)
+           "analyze a source string under a project root")
+    (entry "stdlib.module.run_source"               "boot/run.caap"     "command"
+           "single_callable" (list_of)
+           "run a source string")
+    (entry "stdlib.module.run_from_root"            "boot/run.caap"     "command"
+           "single_callable" (list_of)
+           "run a module by name from a project root")))
+
+; abi_keys — every documented key, in table order (the governance drift-guard
+; checks the keys actually used in the tree against this).
+(bind abi_keys
+  (bind ((out (list_of)))
+    (do (sequence_each registry_abi (lambda (e) (append out (get e "key")))) out)))
+
+; abi_entry — the ABI row for `key`, or null if undocumented.
+(bind abi_entry
+  (lambda (key)
+    (bind ((hit (ref null)))
+      (do
+        (sequence_each registry_abi
+          (lambda (e) (if (eq (get e "key") key) (set_ref hit e) null)))
+        (deref hit)))))
+
+; ── accessors over the live compiler registry ────────────────────────────────
+; lookup_required — look up `key`; RAISE a named contract error (with the key and
+; its documented owner) if it is absent, instead of returning a silent null that a
+; caller might treat as "feature off". Use for keys a profile MUST have provided.
+(bind lookup_required
+  (lambda (key)
+    (bind ((v (ctfe_compiler_lookup_value compiler key null)))
+      (if (eq v null)
+        (bind ((e (abi_entry key)))
+          (runtime_error
+            (string_concat_many
+              "registry contract: required key \"" key "\" is absent"
+              (if (eq e null) ""
+                (string_concat_many " (produced by " (get e "owner") ")"))
+              " — the boot profile did not register it")))
+        v))))
+
+; validate_keys! — assert every key in `keys` is present in the live registry,
+; raising on the first missing one. For an embedder to check, after composing a
+; profile, that the registry satisfies the contract it depends on.
+(bind validate_keys!
+  (lambda (keys)
+    (do (sequence_each keys (lambda (k) (lookup_required k))) null)))
+
+; validate_shape! — assert the LIVE registry value for `key` matches the SHAPE the
+; ABI documents for it (not just presence). RAISES a named contract error on a
+; mismatch (the symptom #32 wants surfaced HERE, not later at the consumer):
+;   "map_of_functions" : the value is a map AND every `expected_members` name is
+;                        present (non-null) in it.
+;   "single_callable"  : the value is a single callable (a function/thunk).
+;   "prose_only"       : no machine contract — accepted as-is.
+; The key must be present (this calls lookup_required first, so an absent required
+; key raises the absence error) and documented (an undocumented key raises too).
+(bind validate_shape!
+  (lambda (key)
+    (bind ((e (abi_entry key)))
+      (if (eq e null)
+        (runtime_error
+          (string_concat_many
+            "registry contract: key \"" key "\" is not documented in registry_abi"))
+        (bind (
+          (v    (lookup_required key))
+          (kind (get e "shape_kind"))
+        )
+          (if (eq kind "map_of_functions")
+            (if (not (eq (value_type v) "map"))
+              (runtime_error
+                (string_concat_many
+                  "registry contract: key \"" key
+                  "\" should be a map_of_functions but the live value is not a map"))
+              (do
+                (sequence_each (get e "expected_members")
+                  (lambda (m)
+                    (when (eq (get v m null) null)
+                      (runtime_error
+                        (string_concat_many
+                          "registry contract: key \"" key "\" is missing expected member \""
+                          m "\" (its registered map does not satisfy the documented shape)")))))
+                null))
+            (if (eq kind "single_callable")
+              (if (not (eq (value_type v) "callable"))
+                (runtime_error
+                  (string_concat_many
+                    "registry contract: key \"" key
+                    "\" should be a single_callable but the live value is not callable"))
+                null)
+              ; "prose_only" (and any other documentation-only kind): no contract.
+              null)))))))
+
+; validate_registry_contract! — for each key in `keys`, assert it is PRESENT and
+; its live value matches the documented shape. The strong sibling of validate_keys!
+; (presence-only): use after composing a profile to check shapes too.
+(bind validate_registry_contract!
+  (lambda (keys)
+    (do (sequence_each keys (lambda (k) (validate_shape! k))) null)))
+
+(export key_expand key_expand_builders key_check key_namespace key_resolve
+        key_gate key_reader key_unit_build key_load key_types key_passes
+        key_bare_gate key_prep key_emit_llvm key_emit_wasm key_commands
+        required_tiers required_tier? shape_kinds shape_kind?
+        registry_abi abi_keys abi_entry lookup_required validate_keys!
+        validate_shape! validate_registry_contract!)

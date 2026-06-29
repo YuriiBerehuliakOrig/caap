@@ -1,0 +1,9 @@
+; tests/bad_declared_tags.caap — a declared tag
+; LIST must cover every certain effect: the body's escaping mutation is not
+; among the declared (emit_diagnostics).
+(module stdlib.fixtures.bad_declared_tags)
+
+(defn push_bad ((xs list) (x int)) list (emit_diagnostics)
+  (do (append xs x) xs))
+
+(export push_bad)

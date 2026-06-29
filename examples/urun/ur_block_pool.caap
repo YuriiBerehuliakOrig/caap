@@ -1,0 +1,178 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  ur_block_pool — a HEAPLESS fixed-block memory pool (module
+//  stdlib.urun.ur_block_pool). The canonical embedded allocator: a fixed number
+//  of equal-size blocks with O(1) alloc/free and zero fragmentation, the only
+//  dynamic-memory shape a no-heap RTOS allows. URun's analogue is ur_block_pool_*.
+//
+//  Storage is carved (bump-allocated, once at create) from a shared static word
+//  arena, exactly like ur_queue's backing store. Free blocks form an intrusive
+//  LIFO free list threaded THROUGH the blocks themselves: each free block's first
+//  word holds the 1-based index of the next free block (0 = end of list), so the
+//  pool needs no side table. alloc pops the head in O(1); free first validates
+//  the address and scans the bounded free list to reject double-free, then pushes
+//  in O(1). The first word is the caller's once a block is allocated; the link
+//  only lives there while the block is free.
+(surface stdlib.frontend.clike stdlib.urun.ur_block_pool)
+
+use stdlib.urun.ur_status (UR_SUCCESS, UR_NO_INSTANCE)
+use stdlib.urun.ur_port (ur_interrupt_save, ur_interrupt_restore)
+
+// shared backing for all pools (PRIVATE to this module), + a bump cursor.
+ur_block_store u32[64]
+ur_block_store_next mut u32 = 0
+
+UR_BLOCK_POOL struct export = {
+  ur_pool_base u32,          // word offset of block 0 in ur_block_store
+  ur_pool_block_words u32,   // words per block (>= 1, to hold the free-link)
+  ur_pool_count u32,         // total blocks
+  ur_pool_free u32           // 1-based index of the first free block (0 = exhausted)
+}
+
+// A created pool has nonzero dimensions, and its free-list head (if any) names a
+// real 1-based block. These small helpers keep the public operations readable.
+_ur_block_pool_shape_valid (p UR_BLOCK_POOL*) u32 = {
+  if p->ur_pool_block_words == 0 || p->ur_pool_count == 0 {
+    0
+  } else {
+    1
+  }
+}
+_ur_block_pool_head_valid (p UR_BLOCK_POOL*) u32 = {
+  if p->ur_pool_free == 0 {
+    1
+  } else {
+    if p->ur_pool_free <= p->ur_pool_count { 1 } else { 0 }
+  }
+}
+_ur_block_pool_slot (p UR_BLOCK_POOL*, idx u32) u32 = {
+  p->ur_pool_base + idx * p->ur_pool_block_words
+}
+
+// carve `count` blocks of `block_words` words and thread the free list. Validates
+// against the shared arena the SAME way ur_queue does — by DIVISION, never by
+// computing block_words*count first (that product can overflow and slip the check).
+// The shared bump cursor is protected so pools can be created after the scheduler
+// starts without racing an interrupt or another thread.
+ur_block_pool_create (p UR_BLOCK_POOL*, block_words u32, count u32) i32 export = {
+  prev u32 = ur_interrupt_save()
+  rc mut i32 = UR_SUCCESS
+  if block_words == 0 || count == 0 {
+    rc = UR_NO_INSTANCE
+  } else {
+    if block_words > 64 {
+      rc = UR_NO_INSTANCE
+    } else {
+      if count > (64 - ur_block_store_next) / block_words {
+        rc = UR_NO_INSTANCE
+      } else {
+        p->ur_pool_base = ur_block_store_next
+        ur_block_store_next = ur_block_store_next + block_words * count
+        p->ur_pool_block_words = block_words
+        p->ur_pool_count = count
+        // link block 0 -> 1 -> ... -> count-1 -> end, storing each NEXT 1-based index.
+        i mut u32 = 0
+        while i < count {
+          slot u32 = p->ur_pool_base + i * block_words
+          if i + 1 < count {
+            ur_block_store[slot] = i + 2          // next block's 1-based index
+          } else {
+            ur_block_store[slot] = 0              // last block ends the list
+          }
+          i = i + 1
+        }
+        p->ur_pool_free = 1                        // free head = block 0
+      }
+    }
+  }
+  ur_interrupt_restore(prev)
+  rc
+}
+
+// pop a free block; return its word ADDRESS, or 0 if the pool is exhausted.
+ur_block_pool_alloc (p UR_BLOCK_POOL*) u32 export = {
+  prev u32 = ur_interrupt_save()
+  addr mut u32 = 0
+  shape_ok u32 = _ur_block_pool_shape_valid(p)
+  head_ok u32 = _ur_block_pool_head_valid(p)
+  if p->ur_pool_free != 0 && shape_ok == 1 && head_ok == 1 {
+    idx u32 = p->ur_pool_free - 1            // 0-based
+    slot u32 = _ur_block_pool_slot(p, idx)
+    p->ur_pool_free = ur_block_store[slot]   // next free (1-based, 0 = end)
+    addr = cast(ptr_to_int(&ur_block_store[slot]), u32)
+  } else {
+    if p->ur_pool_free != 0 {
+      p->ur_pool_free = 0                    // corrupted head: fail closed
+    } else {
+      0
+    }
+  }
+  ur_interrupt_restore(prev)
+  addr
+}
+
+// Is this 1-based block index already on the free list? A true answer means a
+// caller is trying to free the same block twice. The walk is bounded by count so
+// even a corrupted free list cannot spin forever.
+_ur_block_pool_free_contains (p UR_BLOCK_POOL*, target u32) u32 = {
+  cur mut u32 = p->ur_pool_free
+  hops mut u32 = 0
+  found mut u32 = 0
+  while cur != 0 && hops < p->ur_pool_count && found == 0 {
+    if cur == target {
+      found = 1
+    } else {
+      if cur > p->ur_pool_count {
+        cur = 0
+      } else {
+        slot u32 = _ur_block_pool_slot(p, cur - 1)
+        cur = ur_block_store[slot]
+        hops = hops + 1
+      }
+    }
+  }
+  found
+}
+
+// return a block (by the address alloc gave) to the free list — O(1) LIFO push
+// after validation. Rejects null, out-of-pool, misaligned, middle-of-block, and
+// already-free addresses before touching the free list.
+ur_block_pool_free (p UR_BLOCK_POOL*, addr u32) i32 export = {
+  prev u32 = ur_interrupt_save()
+  rc mut i32 = UR_SUCCESS
+  if addr == 0 || _ur_block_pool_shape_valid(p) == 0 {
+    rc = UR_NO_INSTANCE
+  } else {
+    base_addr u32 = cast(ptr_to_int(&ur_block_store[p->ur_pool_base]), u32)
+    span_bytes u32 = p->ur_pool_block_words * p->ur_pool_count * 4
+    end_addr u32 = base_addr + span_bytes
+    if addr < base_addr || addr >= end_addr {
+      rc = UR_NO_INSTANCE
+    } else {
+      delta u32 = addr - base_addr
+      word_off u32 = delta / 4                         // words from the pool base
+      if word_off * 4 != delta {
+        rc = UR_NO_INSTANCE
+      } else {
+        idx u32 = word_off / p->ur_pool_block_words     // 0-based block index
+        if idx >= p->ur_pool_count {
+          rc = UR_NO_INSTANCE
+        } else {
+          if idx * p->ur_pool_block_words != word_off {
+            rc = UR_NO_INSTANCE
+          } else {
+            target u32 = idx + 1
+            if _ur_block_pool_free_contains(p, target) == 1 {
+              rc = UR_NO_INSTANCE
+            } else {
+              slot u32 = _ur_block_pool_slot(p, idx)
+              ur_block_store[slot] = p->ur_pool_free    // link the old head
+              p->ur_pool_free = target                  // new head (1-based)
+            }
+          }
+        }
+      }
+    }
+  }
+  ur_interrupt_restore(prev)
+  rc
+}

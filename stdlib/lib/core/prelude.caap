@@ -1,0 +1,38 @@
+; stdlib/lib/core/prelude.caap — ONE import surface over the everyday set
+; (module stdlib.lib.core.prelude).
+;
+;   (use stdlib.lib.core.prelude map filter fold some none ok err deep_eq …)
+;
+; Pure re-exports — each name stays defined in (and documented by) its home
+; module; the prelude only saves the import boilerplate. It is a CURATED
+; everyday subset, not every export: where a bare name is exported by more than
+; one module (`empty?`, `concat`, `min`/`max`), only one home wins here, and
+; the rest stay reachable via their module. Import a module directly when you
+; need a name the prelude deliberately leaves out.
+(module stdlib.lib.core.prelude)
+
+(re_export stdlib.lib.collections.sequence
+  map filter fold each range find any? all? take drop join
+  first last sum contains? flat_map unique partition)
+(re_export stdlib.lib.collections.map keys values merge clone entries get_in)
+(re_export stdlib.lib.text.string split trim concat chars parse_int)
+(re_export stdlib.lib.collections.option
+  some none some? none? option_of option_map option_and_then option_or
+  option_unwrap_or)
+(re_export stdlib.lib.collections.result
+  ok err ok? err? error_of error_code error_message
+  unwrap unwrap_or map_ok and_then map_err or_else)
+(re_export stdlib.lib.core.equal deep_eq deep_ne)
+(re_export stdlib.lib.core.math abs sign min max clamp pow gcd even? odd?)
+; everyday higher-order combinators (functional's full set stays in its module).
+(re_export stdlib.lib.core.functional compose pipe identity)
+; float `approx_eq` — the right way to compare floats. NOT re-exporting float
+; `clamp`/`pow` here: both names are already curated toward the int (math)
+; home above, and the prelude resolves a name collision toward a single home
+; (import stdlib.lib.core.float directly for the f64 variants).
+(re_export stdlib.lib.core.float approx_eq)
+; error_code / error_message are the Result accessors (re-exported above); the
+; diag.error module keeps its own same-named accessors, reachable by importing
+; it directly (a curated prelude resolves the name collision toward Result).
+(re_export stdlib.lib.diag.error
+  make_error error? raise! as_error)

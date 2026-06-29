@@ -1,0 +1,178 @@
+; stdlib/lib/tests/test_dict.caap — in-language tests for lib/collections/dict:
+; a hash map + hash set over ARBITRARY structural keys (int/list/map), keyed by
+; the kernel value_hash and resolved by value_eq.
+
+;; @area: collections
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.core.equal deep_eq)
+(use stdlib.lib.collections.sequence any?)
+(use stdlib.lib.collections.dict
+     dict_new dict_put dict_get dict_has? dict_del
+     dict_keys dict_values dict_size dict_empty? dict_entries
+     dict_of_pairs to_map of_map
+     dict_update dict_merge dict_map_vals dict_filter dict_fold
+     hset_new hset_of hset_add hset_has? hset_del
+     hset_items hset_size hset_empty?
+     hset_union hset_intersection hset_difference hset_subset?)
+
+(do
+  ; ── put/get with LIST and MAP keys (not legal kernel-map keys) ──────────────
+  (bind ((lk (list_of 1 2))
+         (mk (assoc (map_of) "a" 1))
+         (d (dict_put (dict_put (dict_put (dict_new) lk "list-val") mk "map-val") 7 "int-val")))
+    (do
+      (assert_eq (dict_get d lk "MISS") "list-val" "get under a LIST key")
+      (assert_eq (dict_get d mk "MISS") "map-val" "get under a MAP key")
+      (assert_eq (dict_get d 7 "MISS") "int-val" "get under an INT key")
+      (assert_eq (dict_get d (list_of 9 9) "MISS") "MISS" "absent key -> default")
+      (assert_true (dict_has? d lk) "has? a present list key")
+      (assert_eq (dict_has? d (list_of 1 3)) false "has? a structurally-different list key")
+      (assert_eq (dict_size d) 3 "three entries")
+      (assert_eq (dict_empty? (dict_new)) true "fresh dict is empty")
+      (assert_eq (dict_empty? d) false "populated dict is not empty")))
+
+  ; ── two DISTINCT but structurally-equal list keys collide to ONE slot ───────
+  (bind ((k1 (list_of 1 2))
+         (k2 (list_of 1 2))                 ; a separate list object, value_eq to k1
+         (d (dict_put (dict_put (dict_new) k1 "first") k2 "second")))
+    (do
+      (assert_eq (eq k1 k2) false "k1 and k2 are DISTINCT objects (identity differs)")
+      (assert_true (deep_eq k1 k2) "but value_eq / structurally equal")
+      (assert_eq (dict_size d) 1 "equal keys collapse to one entry")
+      (assert_eq (dict_get d k1 "MISS") "second" "second put replaced the first under k1")
+      (assert_eq (dict_get d k2 "MISS") "second" "and is reachable via k2 too")))
+
+  ; ── del + purity (input dict untouched) ─────────────────────────────────────
+  (bind ((d0 (dict_put (dict_put (dict_new) (list_of 1 2) "x") 5 "y"))
+         (d1 (dict_del d0 (list_of 1 2))))
+    (do
+      (assert_eq (dict_size d1) 1 "del drops one entry")
+      (assert_eq (dict_has? d1 (list_of 1 2)) false "deleted key is gone")
+      (assert_eq (dict_has? d1 5) true "the other entry survives del")
+      (assert_eq (dict_size d0) 2 "del did NOT mutate the source dict")
+      (assert_eq (dict_get d0 (list_of 1 2) "MISS") "x" "source still has the deleted key")
+      ; del of an absent key is a no-op
+      (assert_eq (dict_size (dict_del d1 (list_of 9 9))) 1 "del of absent key is a no-op")))
+
+  ; ── keys / values / entries enumerate all structural entries ────────────────
+  (bind ((d (dict_put (dict_put (dict_new) (list_of 1 2) 10) (list_of 3 4) 20)))
+    (do
+      (assert_eq (size (dict_keys d)) 2 "two keys enumerated")
+      (assert_eq (size (dict_values d)) 2 "two values enumerated")
+      (assert_eq (size (dict_entries d)) 2 "two entries enumerated")
+      ; the values list should contain both 10 and 20 (order unspecified)
+      (assert_true (any? (dict_values d) (lambda (v) (eq v 10))) "values include 10")
+      (assert_true (any? (dict_values d) (lambda (v) (eq v 20))) "values include 20")))
+
+  ; ── put replaces, not appends, under an equal key (size stays put) ──────────
+  (bind ((d (dict_put (dict_put (dict_new) 1 "a") 1 "b")))
+    (do
+      (assert_eq (dict_size d) 1 "re-put under same key replaces")
+      (assert_eq (dict_get d 1 "MISS") "b" "replacement value wins")))
+
+  ; ── dict_of_pairs / to_map / of_map interop ─────────────────────────────────
+  (bind ((d (dict_of_pairs (list_of (list_of "x" 1) (list_of "y" 2) (list_of "x" 9)))))
+    (do
+      (assert_eq (dict_size d) 2 "of_pairs: later pair wins on equal key")
+      (assert_eq (dict_get d "x" "MISS") 9 "of_pairs: x -> last value 9")
+      (bind ((m (to_map d)))
+        (do
+          (assert_eq (eq (value_type m) "map") true "to_map yields a kernel map")
+          (assert_eq (get m "x" "MISS") 9 "to_map carries x")
+          (assert_eq (get m "y" "MISS") 2 "to_map carries y")
+          (assert_eq (dict_get (of_map m) "y" "MISS") 2 "of_map round-trips string keys")))))
+
+  ; ── hash-set membership over a LIST element + a MAP element ─────────────────
+  (bind ((s (hset_of (list_of (list_of 1 2) (assoc (map_of) "k" "v") 3 (list_of 1 2)))))
+    (do
+      (assert_eq (hset_size s) 3 "hset: structurally-equal list element collapses")
+      (assert_true (hset_has? s (list_of 1 2)) "hset membership of a LIST element")
+      (assert_true (hset_has? s (assoc (map_of) "k" "v")) "hset membership of a MAP element")
+      (assert_true (hset_has? s 3) "hset membership of an int element")
+      (assert_eq (hset_has? s (list_of 9 9)) false "hset non-membership")
+      (assert_eq (hset_empty? (hset_new)) true "fresh hset is empty")
+      (assert_eq (size (hset_items s)) 3 "hset_items lists all elements")
+      ; add (fresh) + del (fresh; source untouched)
+      (bind ((s2 (hset_add s (list_of 7 8))))
+        (do
+          (assert_eq (hset_size s2) 4 "hset_add is fresh and adds")
+          (assert_eq (hset_size s) 3 "hset_add did not mutate the source")))
+      (bind ((s3 (hset_del s (list_of 1 2))))
+        (do
+          (assert_eq (hset_size s3) 2 "hset_del drops an element")
+          (assert_eq (hset_has? s3 (list_of 1 2)) false "deleted element is gone")
+          (assert_eq (hset_size s) 3 "hset_del did not mutate the source")))))
+
+  ; ── dict_update: present key applies f, absent key uses default ─────────────
+  (bind ((d0 (dict_put (dict_new) (list_of 1 2) 10))
+         (d1 (dict_update d0 (list_of 1 2) (lambda (v) (int_add v 5)) 0))
+         (d2 (dict_update d0 (list_of 8 9) (lambda (v) (int_add v 5)) 100)))
+    (do
+      (assert_eq (dict_get d1 (list_of 1 2) "MISS") 15 "dict_update on present key applies f to current")
+      (assert_eq (dict_get d2 (list_of 8 9) "MISS") 105 "dict_update on MISSING key applies f to default")
+      (assert_eq (dict_size d2) 2 "dict_update on absent key inserts an entry")
+      (assert_eq (dict_get d0 (list_of 1 2) "MISS") 10 "dict_update did not mutate the source")))
+
+  ; ── dict_merge: b wins on a value_eq key clash ──────────────────────────────
+  (bind ((a (dict_put (dict_put (dict_new) (list_of 1 2) "a-shared") "only-a" 1))
+         (b (dict_put (dict_put (dict_new) (list_of 1 2) "b-shared") "only-b" 2))
+         (m (dict_merge a b)))
+    (do
+      (assert_eq (dict_size m) 3 "merge unions distinct keys")
+      (assert_eq (dict_get m (list_of 1 2) "MISS") "b-shared" "merge: b WINS on clash")
+      (assert_eq (dict_get m "only-a" "MISS") 1 "merge keeps a-only entry")
+      (assert_eq (dict_get m "only-b" "MISS") 2 "merge keeps b-only entry")
+      (assert_eq (dict_size a) 2 "merge did not mutate a")
+      (assert_eq (dict_get a (list_of 1 2) "MISS") "a-shared" "merge left a's value intact")))
+
+  ; ── dict_map_vals / dict_filter / dict_fold ─────────────────────────────────
+  (bind ((d (dict_put (dict_put (dict_put (dict_new) "x" 1) "y" 2) "z" 3)))
+    (do
+      (bind ((dm (dict_map_vals d (lambda (v) (int_mul v 10)))))
+        (do
+          (assert_eq (dict_get dm "x" "MISS") 10 "map_vals transforms x")
+          (assert_eq (dict_get dm "z" "MISS") 30 "map_vals transforms z")
+          (assert_eq (dict_size dm) 3 "map_vals keeps all keys")
+          (assert_eq (dict_get d "x" "MISS") 1 "map_vals did not mutate the source")))
+      (bind ((df (dict_filter d (lambda (k v) (gt v 1)))))
+        (do
+          (assert_eq (dict_size df) 2 "filter keeps values > 1")
+          (assert_eq (dict_has? df "x") false "filter dropped x (v=1)")
+          (assert_true (dict_has? df "y") "filter kept y (v=2)")
+          (assert_eq (dict_size d) 3 "filter did not mutate the source")))
+      ; dict_fold sums all values regardless of key order
+      (assert_eq (dict_fold d 0 (lambda (acc k v) (int_add acc v))) 6 "fold sums values")
+      (assert_eq (dict_fold (dict_new) 99 (lambda (acc k v) (int_add acc v))) 99 "fold on empty -> init")))
+
+  ; ── hash-set ALGEBRA over structural (list) elements ────────────────────────
+  (bind ((a (hset_of (list_of (list_of 1 2) (list_of 3 4) 5)))
+         (b (hset_of (list_of (list_of 3 4) (list_of 7 8) 5))))
+    (do
+      ; union: every element of a or b — {[1 2],[3 4],5,[7 8]}
+      (bind ((u (hset_union a b)))
+        (do
+          (assert_eq (hset_size u) 4 "hset_union collapses structural duplicates")
+          (assert_true (hset_has? u (list_of 1 2)) "union has a-only [1 2]")
+          (assert_true (hset_has? u (list_of 7 8)) "union has b-only [7 8]")
+          (assert_true (hset_has? u 5) "union has shared 5")
+          (assert_eq (hset_size a) 3 "union did not mutate a")))
+      ; intersection: in BOTH — {[3 4], 5}
+      (bind ((i (hset_intersection a b)))
+        (do
+          (assert_eq (hset_size i) 2 "hset_intersection keeps shared structural elements")
+          (assert_true (hset_has? i (list_of 3 4)) "intersection has shared [3 4]")
+          (assert_true (hset_has? i 5) "intersection has shared 5")
+          (assert_eq (hset_has? i (list_of 1 2)) false "intersection drops a-only [1 2]")))
+      ; difference: in a, not in b — {[1 2]}
+      (bind ((dd (hset_difference a b)))
+        (do
+          (assert_eq (hset_size dd) 1 "hset_difference keeps a-only elements")
+          (assert_true (hset_has? dd (list_of 1 2)) "difference has a-only [1 2]")
+          (assert_eq (hset_has? dd 5) false "difference drops shared 5")))
+      ; subset?
+      (assert_true (hset_subset? (hset_of (list_of (list_of 3 4) 5)) a) "subset? of shared elements")
+      (assert_eq (hset_subset? a b) false "a is not a subset of b")
+      (assert_true (hset_subset? (hset_new) a) "empty hset is a subset of anything")))
+  true)

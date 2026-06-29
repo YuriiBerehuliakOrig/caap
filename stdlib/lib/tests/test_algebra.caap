@@ -1,0 +1,209 @@
+; stdlib/lib/tests/test_algebra.caap — algebraic / peephole simplification.
+; Proves each identity REWRITES correctly AND that the rewrite is BEHAVIOUR-
+; PRESERVING (eval before == eval after on closed terms), including the critical
+; purity guard: a non-droppable operand is NEVER dropped.
+
+;; @area: numeric
+;; @kind: regression
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.algebra simplify_algebra droppable?)
+(use stdlib.syntax.ast
+  sym lit calln name_of literal_of head_of head_is? arg eval_ir)
+
+; same_eval? — eval a closed spec before AND after the transform; they must
+; agree. The behaviour-preservation contract in one helper.
+(bind same_eval?
+  (lambda (node)
+    (eq (eval_ir node) (eval_ir (simplify_algebra node)))))
+
+(do
+  ; ════ KEEP-operand identities (the dropped operand is a literal) ════════════
+
+  ; int_add: x+0 -> x, 0+x -> x
+  (assert_eq (head_of (simplify_algebra (calln "int_add" (list_of (sym "x") (lit 0))))) null
+    "(int_add x 0) -> x (a name, not a call)")
+  (assert_eq (name_of (simplify_algebra (calln "int_add" (list_of (sym "x") (lit 0))))) "x"
+    "(int_add x 0) -> x")
+  (assert_eq (name_of (simplify_algebra (calln "int_add" (list_of (lit 0) (sym "x"))))) "x"
+    "(int_add 0 x) -> x")
+
+  ; int_sub: x-0 -> x
+  (assert_eq (name_of (simplify_algebra (calln "int_sub" (list_of (sym "x") (lit 0))))) "x"
+    "(int_sub x 0) -> x")
+
+  ; int_mul: x*1 -> x, 1*x -> x
+  (assert_eq (name_of (simplify_algebra (calln "int_mul" (list_of (sym "x") (lit 1))))) "x"
+    "(int_mul x 1) -> x")
+  (assert_eq (name_of (simplify_algebra (calln "int_mul" (list_of (lit 1) (sym "x"))))) "x"
+    "(int_mul 1 x) -> x")
+
+  ; int_or: x|0 -> x, 0|x -> x
+  (assert_eq (name_of (simplify_algebra (calln "int_or" (list_of (sym "x") (lit 0))))) "x"
+    "(int_or x 0) -> x")
+  (assert_eq (name_of (simplify_algebra (calln "int_or" (list_of (lit 0) (sym "x"))))) "x"
+    "(int_or 0 x) -> x")
+
+  ; int_xor: x^0 -> x
+  (assert_eq (name_of (simplify_algebra (calln "int_xor" (list_of (sym "x") (lit 0))))) "x"
+    "(int_xor x 0) -> x")
+
+  ; not: (not (not x)) -> x
+  (assert_eq
+    (name_of (simplify_algebra (calln "not" (list_of (calln "not" (list_of (sym "x")))))))
+    "x"
+    "(not (not x)) -> x")
+
+  ; ════ DROP-operand identities — droppable operand IS dropped ════════════════
+
+  ; int_mul: x*0 -> 0, 0*x -> 0  (x = a name, droppable)
+  (assert_eq (literal_of (simplify_algebra (calln "int_mul" (list_of (sym "x") (lit 0))))) 0
+    "(int_mul x 0) -> 0 (x droppable)")
+  (assert_eq (literal_of (simplify_algebra (calln "int_mul" (list_of (lit 0) (sym "x"))))) 0
+    "(int_mul 0 x) -> 0 (x droppable)")
+
+  ; int_and: x&0 -> 0, 0&x -> 0
+  (assert_eq (literal_of (simplify_algebra (calln "int_and" (list_of (sym "x") (lit 0))))) 0
+    "(int_and x 0) -> 0 (x droppable)")
+  (assert_eq (literal_of (simplify_algebra (calln "int_and" (list_of (lit 0) (sym "x"))))) 0
+    "(int_and 0 x) -> 0 (x droppable)")
+
+  ; int_sub: x-x -> 0  (both operands the same droppable tree)
+  (assert_eq (literal_of (simplify_algebra (calln "int_sub" (list_of (sym "x") (sym "x"))))) 0
+    "(int_sub x x) -> 0 (x droppable)")
+
+  ; int_xor: x^x -> 0
+  (assert_eq (literal_of (simplify_algebra (calln "int_xor" (list_of (sym "x") (sym "x"))))) 0
+    "(int_xor x x) -> 0 (x droppable)")
+
+  ; ════ NON-applicable cases are left intact ══════════════════════════════════
+
+  ; x-x where the two x are DIFFERENT names is not the identity
+  (assert_true
+    (head_is? (simplify_algebra (calln "int_sub" (list_of (sym "x") (sym "y")))) "int_sub")
+    "(int_sub x y) is left intact (operands differ)")
+
+  ; a non-identity literal is untouched: x+5 stays a call
+  (assert_true
+    (head_is? (simplify_algebra (calln "int_add" (list_of (sym "x") (lit 5)))) "int_add")
+    "(int_add x 5) is left intact")
+
+  ; ════ BOTTOM-UP: an identity inside an argument is simplified ════════════════
+  (bind ((r (simplify_algebra
+              (calln "int_mul"
+                (list_of (calln "int_add" (list_of (sym "x") (lit 0))) (lit 7))))))
+    (assert_eq (name_of (arg r 0)) "x"
+      "inner (int_add x 0) -> x before the outer mul is examined"))
+
+  ; chained identity collapses in one bottom-up pass:
+  ; (int_add (int_mul x 1) 0) -> (int_add x 0) -> x
+  (assert_eq
+    (name_of (simplify_algebra
+      (calln "int_add" (list_of (calln "int_mul" (list_of (sym "x") (lit 1))) (lit 0)))))
+    "x"
+    "(int_add (int_mul x 1) 0) collapses to x")
+
+  ; ════ BEHAVIOUR PRESERVATION: eval before == eval after (closed terms) ═══════
+
+  ; (int_mul (int_add 3 4) 1) == (int_add 3 4) == 7 both before and after
+  (assert_true
+    (same_eval?
+      (calln "int_mul" (list_of (calln "int_add" (list_of (lit 3) (lit 4))) (lit 1))))
+    "(int_mul (int_add 3 4) 1) evaluates the same before and after")
+  (assert_eq
+    (eval_ir (simplify_algebra
+      (calln "int_mul" (list_of (calln "int_add" (list_of (lit 3) (lit 4))) (lit 1)))))
+    7
+    "(int_mul (int_add 3 4) 1) still evaluates to 7")
+
+  ; x*0 where x is a (droppable, TOTAL) bitwise expression: it folds to 0, and
+  ; the result is 0 both ways. (int_or is total over all i64 — droppable.)
+  (assert_eq
+    (literal_of (simplify_algebra
+      (calln "int_mul" (list_of (calln "int_or" (list_of (lit 6) (lit 3))) (lit 0)))))
+    0
+    "(int_mul (int_or 6 3) 0) folds to 0 (int_or operand is droppable)")
+  (assert_true
+    (same_eval?
+      (calln "int_mul" (list_of (calln "int_or" (list_of (lit 6) (lit 3))) (lit 0))))
+    "(int_mul (int_or 6 3) 0) evaluates the same (to 0) before and after")
+
+  ; (int_sub e e) on a droppable e: it folds to 0, and both evaluate to 0
+  (assert_eq
+    (literal_of (simplify_algebra
+      (calln "int_sub"
+        (list_of (calln "int_xor" (list_of (lit 2) (lit 5)))
+                 (calln "int_xor" (list_of (lit 2) (lit 5)))))))
+    0
+    "(int_sub (int_xor 2 5) (int_xor 2 5)) folds to 0 (operand droppable)")
+  (assert_true
+    (same_eval?
+      (calln "int_sub"
+        (list_of (calln "int_xor" (list_of (lit 2) (lit 5)))
+                 (calln "int_xor" (list_of (lit 2) (lit 5))))))
+    "(int_sub (int_xor 2 5) (int_xor 2 5)) evaluates the same (to 0) before and after")
+
+  ; ════ PURITY GUARD (the critical correctness test) ══════════════════════════
+  ; x = (int_div 1 0) is NOT droppable (it THROWS). (int_mul x 0) must NOT fold
+  ; to 0 — folding it would erase a division-by-zero the program must observe.
+  (assert_true
+    (not (droppable? (calln "int_div" (list_of (lit 1) (lit 0)))))
+    "(int_div 1 0) is NOT droppable")
+  (bind ((guarded
+           (simplify_algebra
+             (calln "int_mul"
+               (list_of (calln "int_div" (list_of (lit 1) (lit 0))) (lit 0))))))
+    (do
+      (assert_true (head_is? guarded "int_mul")
+        "(int_mul (int_div 1 0) 0) is LEFT INTACT — must not fold (div-by-zero must throw)")
+      (assert_true (head_is? (arg guarded 0) "int_div")
+        "the (int_div 1 0) operand survives unchanged")))
+
+  ; same guard, operand on the LEFT: (int_mul 0 (int_div 1 0)) must not fold
+  (assert_true
+    (head_is?
+      (simplify_algebra
+        (calln "int_mul" (list_of (lit 0) (calln "int_div" (list_of (lit 1) (lit 0))))))
+      "int_mul")
+    "(int_mul 0 (int_div 1 0)) is LEFT INTACT — must not fold")
+
+  ; same guard for AND: (int_and (int_div 1 0) 0) must not fold to 0
+  (assert_true
+    (head_is?
+      (simplify_algebra
+        (calln "int_and" (list_of (calln "int_div" (list_of (lit 1) (lit 0))) (lit 0))))
+      "int_and")
+    "(int_and (int_div 1 0) 0) is LEFT INTACT — must not fold")
+
+  ; a shift is also partial → not droppable; (int_mul (int_shl 1 99) 0) stays
+  (assert_true
+    (not (droppable? (calln "int_shl" (list_of (lit 1) (lit 99)))))
+    "(int_shl 1 99) is NOT droppable (out-of-range shift may throw)")
+
+  ; CHECKED arithmetic is PARTIAL (kernel raises on i64 overflow): int_add /
+  ; int_sub / int_mul / int_abs are NOT droppable, so an operand that could
+  ; overflow-throw is never dropped. (int_mul X X) at INT_MAX would overflow.
+  (assert_true
+    (not (droppable? (calln "int_mul" (list_of (lit 9223372036854775807) (lit 9223372036854775807)))))
+    "(int_mul INT_MAX INT_MAX) is NOT droppable (checked-overflow may throw)")
+  (assert_true
+    (not (droppable? (calln "int_add" (list_of (sym "x") (sym "y")))))
+    "(int_add x y) is NOT droppable (checked-overflow may throw)")
+  ; the guard in action: (int_mul (int_mul INT_MAX INT_MAX) 0) must NOT fold to 0
+  (assert_true
+    (head_is?
+      (simplify_algebra
+        (calln "int_mul"
+          (list_of (calln "int_mul" (list_of (lit 9223372036854775807) (lit 9223372036854775807)))
+                   (lit 0))))
+      "int_mul")
+    "(int_mul (int_mul INT_MAX INT_MAX) 0) is LEFT INTACT — overflow must be preserved")
+
+  ; droppable? sanity: a pure-TOTAL bitwise expression IS droppable
+  (assert_true
+    (droppable? (calln "int_or" (list_of (sym "x") (calln "int_and" (list_of (sym "y") (lit 2))))))
+    "(int_or x (int_and y 2)) is droppable (pure-total bitwise)")
+  ; an effectful call is NOT droppable
+  (assert_true
+    (not (droppable? (calln "println" (list_of (lit 1)))))
+    "(println 1) is NOT droppable (effect)"))

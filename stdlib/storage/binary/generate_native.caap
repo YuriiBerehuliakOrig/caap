@@ -1,0 +1,269 @@
+; stdlib/storage/binary/generate_native.caap — spec data -> native-subset source
+; (module stdlib.storage.binary.generate_native).
+;
+; The NATIVE codegen target. The eval target (generate_eval) lowers to dynamic
+; list/map IR so it runs on the kernel today (round-trip without a C toolchain).
+; This second target lowers the SAME spec to the TYPED native subset — `(struct
+; …)` aggregates + LE/BE byte writes via ptr/shift ops — which `backend/emit/llvm` turns
+; into real LLVM / machine code. One spec, two backends.
+;
+; Both backends build TREES with the syntax/ast + syntax/ir builders and
+; serialize ONCE via syntax/render — no hand-spliced source strings. Records
+; with `bytes[N]` fields are skipped (a native struct array field is a separate
+; slice); int/enum/bool/float records lower fully — a float field rides an LLVM
+; `bitcast` (float_to_bits/bits_to_float) so its disk bytes match the eval path.
+; The field sizing (`field_size`, `with_tail`) and the byte-order predicate
+; (`endian_be?`) are reused from generate_eval + parse so the two backends agree.
+(module stdlib.storage.binary.generate_native)
+
+(use stdlib.syntax.ast sym lit calln call)
+(use stdlib.syntax.ir subst)
+(use stdlib.syntax.render render_program)
+(use stdlib.lib.collections.sequence each any? drop range)
+(use stdlib.storage.binary.parse endian_be?)
+(use stdlib.storage.binary.generate_eval field_size with_tail)
+
+; native_type — the native struct field type for a field, or null if this record
+; can't lower natively (bytes[N] — a separate slice, not a struct field). Signed
+; ints carry their own spelling (i8…i64), so the LLVM kit picks ashr/sext. A bool
+; lowers to a full-byte `u8` (0/1): byte-exact on disk, and no sub-byte i1 traps.
+; A float lowers to `f64`/`f32` (NOT the raw `float` spelling, which is not a
+; native type token); the encode/decode below bit-cast it to/from an integer so
+; the LE byte writes (and the disk bytes) match the eval backend exactly.
+(bind native_type
+  (lambda (f)
+    (bind ((ty (get f "type")))
+      (cond
+        ((eq (get ty "kind") "int") (get ty "spelling"))
+        ((eq (get ty "kind") "bool") "u8")
+        ((eq (get ty "kind") "enum") (get ty "base"))
+        ((eq (get ty "kind") "float") (if (eq (get ty "size") 8) "f64" "f32"))
+        (else null)))))
+(bind native_ok?
+  (lambda (rec) (not (any? (get rec "fields") (lambda (f) (eq (native_type f) null))))))
+; native_skip_field — the FIRST field that makes a record non-native (its
+; native_type is null, e.g. a `(bytes N)` slice — a separate slice, not a struct
+; field), or null if every field lowers natively. render_native drops the whole
+; record when this is non-null; generate names it in a report line so a native
+; build's missing encode/decode is reported, not a silent drop.
+(bind native_skip_field
+  (lambda (rec)
+    (bind ((hit (ref null)))
+      (do
+        (each (get rec "fields")
+          (lambda (f)
+            (when (and (eq (deref hit) null) (eq (native_type f) null))
+              (set_ref hit f))))
+        (deref hit)))))
+(bind has_crc? (lambda (rec) (any? (get rec "fields") (lambda (f) (get f "crc" false)))))
+(bind acc_ty (lambda (sz) (if (gt sz 4) "u64" "u32")))
+
+; ── native-form spec builders (over lib/ast). The native subset is plain
+; s-exprs, so each form is an ordinary call node; only the `(bind ((n v)…) body)`
+; and `(defn name (params) ret body)` parameter-list shapes need shaping. ──
+(bind nderef (lambda (n)   (calln "deref"   (list_of (sym n)))))
+(bind nset   (lambda (n v) (calln "set_ref" (list_of (sym n) v))))
+(bind ndo    (lambda (stmts) (call (sym "do") stmts)))
+(bind npair  (lambda (n v) (call (sym n) (list_of v))))  ; one (n v) cluster
+; a clustered list `((a x) (b y) …)` is a call whose callee is the first cluster
+(bind ncluster (lambda (clusters) (call (get clusters 0) (drop clusters 1))))
+(bind nbind  (lambda (binds body) (calln "bind" (list_of (ncluster binds) body))))
+(bind ndefn  (lambda (name params ret body)
+  (calln "defn" (list_of (sym name) (ncluster params) (sym ret) body))))
+(bind nparam (lambda (pn pt) (call (sym pn) (list_of (sym pt)))))
+
+; nat_shift — the bit shift for the byte at position `i` (from `off`) of an `sz`-
+; wide field: i*8 little-endian (LSB first), (sz-1-i)*8 big-endian (MSB first).
+(bind nat_shift
+  (lambda (be? sz i) (int_mul (if be? (int_sub (int_sub sz 1) i) i) 8)))
+
+; nat_write_bytes — `sz` ptr_write statement SPECS of value-spec `vexpr` at `off`,
+; LSB- or MSB-first per `be?`: (ptr_write (ptr_add buf off+i)
+;   (cast (int_and (int_shr vexpr shift) 255) u8)).
+(bind nat_write_bytes
+  (lambda (be? vexpr sz off)
+    (bind ((stmts (list_of)))
+      (do
+        (each (range 0 sz)
+          (lambda (i)
+            (append stmts
+              (calln "ptr_write" (list_of
+                (calln "ptr_add" (list_of (sym "buf") (lit (int_add off i))))
+                (calln "cast" (list_of
+                  (calln "int_and" (list_of
+                    (calln "int_shr" (list_of vexpr (lit (nat_shift be? sz i)))) (lit 255)))
+                  (sym "u8"))))))))
+        stmts))))
+
+; nat_read_bytes — an `acc_ty(sz)` expr SPEC reading `sz` bytes at `off`, LSB- or
+; MSB-first per `be?`.
+(bind nat_byte_term
+  (lambda (off i ty sh)
+    (calln "int_shl" (list_of
+      (calln "cast" (list_of
+        (calln "ptr_read" (list_of
+          (calln "ptr_add" (list_of (sym "buf") (lit (int_add off i)))))) (sym ty)))
+      (lit sh)))))
+(bind nat_read_bytes
+  (lambda (be? sz off)
+    (bind ((ty (acc_ty sz)) (expr (ref (nat_byte_term off 0 ty (nat_shift be? sz 0)))))
+      (do
+        (each (range 1 sz)
+          (lambda (i)
+            (set_ref expr (calln "int_or" (list_of (deref expr)
+              (nat_byte_term off i ty (nat_shift be? sz i)))))))
+        (deref expr)))))
+
+; gen_native_struct — (struct R (f t) …) with each field's native int type.
+(bind gen_native_struct
+  (lambda (rec)
+    (bind ((items (list_of (sym (get rec "name")))))
+      (do
+        (each (get rec "fields")
+          (lambda (f) (append items (nparam (get f "name") (native_type f)))))
+        (call (sym "struct") items)))))
+
+; gen_native_encode — write each field at its baked offset (LSB/MSB-first per
+; `be?`); a crc field is computed once (crc32_native over the region before it)
+; since it is last, then its own 4 bytes are written in the spec's byte order.
+(bind gen_native_encode
+  (lambda (be? rec)
+    (bind ((stmts (list_of)) (off (ref 0)) (crc_off (ref -1))
+           (rn (get rec "name")) (params (list_of (nparam "s" rn) (nparam "buf" "ptr_u8"))))
+      (do
+        (each (get rec "fields")
+          (lambda (f)
+            (bind (
+              (sz (field_size f))
+              ; the field value as a native expression; a float is bit-cast to
+              ; an integer first (the byte writes then match the eval backend)
+              (raw (calln "get" (list_of (sym "s") (lit (get f "name")) (lit 0))))
+              (vexpr (if (eq (get (get f "type") "kind") "float")
+                       (calln (if (eq sz 8) "float_to_bits" "float_to_bits_f32")
+                         (list_of raw))
+                       raw))
+            )
+              (do
+                (if (get f "crc" false)
+                  (set_ref crc_off (deref off))
+                  (each (nat_write_bytes be? vexpr sz (deref off))
+                    (lambda (s) (append stmts s))))
+                (set_ref off (int_add (deref off) sz))))))
+        (if (ge (deref crc_off) 0)
+          ; bind crc_val, compute once, then write its 4 bytes in the spec order
+          (do
+            ; crc over the explicit region [0, crc_off): everything before the
+            ; (last) crc field — the same bytes the eval crc32 covers.
+            (append stmts (nset "crc_val"
+              (calln "crc32_native" (list_of (sym "buf") (lit 0) (lit (deref crc_off))))))
+            (each (nat_write_bytes be? (nderef "crc_val") 4 (deref crc_off))
+              (lambda (s) (append stmts s)))
+            (ndefn (string_concat_many "encode_" rn) params "i32"
+              (nbind (list_of (npair "crc_val" (calln "ref" (list_of (lit 0)))))
+                (ndo (with_tail stmts (lit (deref off)))))))
+          (ndefn (string_concat_many "encode_" rn) params "i32"
+            (ndo (with_tail stmts (lit (deref off))))))))))
+
+; gen_native_decode — read each field (LSB/MSB-first per `be?`), build the struct
+; via make_R.
+(bind gen_native_decode
+  (lambda (be? rec)
+    (bind ((margs (list_of)) (off (ref 0)) (rn (get rec "name")))
+      (do
+        (each (get rec "fields")
+          (lambda (f)
+            (bind ((sz (field_size f)))
+              (do
+                ; a float field bit-casts the read integer back to a float (the
+                ; exact inverse of the encode side); everything else width-casts
+                (append margs
+                  (if (eq (get (get f "type") "kind") "float")
+                    (calln (if (eq sz 8) "bits_to_float" "bits_to_float_f32")
+                      (list_of (nat_read_bytes be? sz (deref off))))
+                    (calln "cast" (list_of (nat_read_bytes be? sz (deref off)) (sym (native_type f))))))
+                (set_ref off (int_add (deref off) sz))))))
+        (ndefn (string_concat_many "decode_" rn)
+          (list_of (nparam "buf" "ptr_u8")) rn
+          (calln (string_concat_many "make_" rn) margs))))))
+
+; gen_native_validate — where-clauses as a nested-if chain (1 ok / 0 fail), each
+; `where` with field names rewritten to (get s "name" 0) via ir.subst: real icmp.
+(bind gen_native_validate
+  (lambda (rec)
+    (bind ((sub (map_of)) (expr (ref (lit 1))) (rn (get rec "name")))
+      (do
+        (each (get rec "fields")
+          (lambda (f) (assoc sub (get f "name")
+            (calln "get" (list_of (sym "s") (lit (get f "name")) (lit 0))))))
+        (each (get rec "fields")
+          (lambda (f)
+            (when (not (eq (get f "where") null))
+              (set_ref expr
+                (calln "if" (list_of (subst (get f "where") sub) (deref expr) (lit 0)))))))
+        (ndefn (string_concat_many "validate_" rn)
+          (list_of (nparam "s" rn)) "i32" (deref expr))))))
+
+; the native crc32 (poly 0xEDB88320) — emitted once if any record carries a crc.
+; Signature mirrors the eval `crc32`: a half-open byte region [start,end) of buf
+; (i runs start..end), so the native CRC covers the SAME bytes as the eval path.
+; (Previously the param was a bare `len` and the encode site passed the crc field
+; OFFSET as that length — correct only because the region always starts at 0; the
+; [start,end) form removes that offset-as-length coupling and the two backends
+; now compute crc32 over an identical, explicit region.)
+(bind gen_native_crc
+  (lambda ()
+    (ndefn "crc32_native"
+      (list_of (nparam "buf" "ptr_u8") (nparam "start" "i32") (nparam "end" "i32")) "u32"
+      (nbind
+        (list_of (npair "crc" (calln "ref" (list_of (lit 4294967295))))
+                 (npair "i"   (calln "ref" (list_of (sym "start"))))
+                 (npair "b"   (calln "ref" (list_of (lit 0)))))
+        (ndo (list_of
+          (calln "while" (list_of
+            (calln "lt" (list_of (nderef "i") (sym "end")))
+            (ndo (list_of
+              (nset "crc" (calln "int_xor" (list_of (nderef "crc")
+                (calln "cast" (list_of
+                  (calln "ptr_read" (list_of
+                    (calln "ptr_add" (list_of (sym "buf") (nderef "i"))))) (sym "u32"))))))
+              (nset "b" (lit 0))
+              (calln "while" (list_of
+                (calln "lt" (list_of (nderef "b") (lit 8)))
+                (ndo (list_of
+                  (calln "if" (list_of
+                    (calln "eq" (list_of
+                      (calln "int_and" (list_of (nderef "crc") (lit 1))) (lit 1)))
+                    (nset "crc" (calln "int_xor" (list_of
+                      (calln "int_shr" (list_of (nderef "crc") (lit 1))) (lit 3988292384))))
+                    (nset "crc" (calln "int_shr" (list_of (nderef "crc") (lit 1))))))
+                  (nset "b" (calln "int_add" (list_of (nderef "b") (lit 1))))))))
+              (nset "i" (calln "int_add" (list_of (nderef "i") (lit 1))))))))
+          (calln "int_xor" (list_of (nderef "crc") (lit 4294967295)))))))))
+
+; render_native — spec -> native-subset CAAP source. Builds the program as a list
+; of top-level SPECS (struct + encode + decode + validate per int/enum record,
+; plus crc32_native if needed) and serializes them with render_program — the same
+; ast/ir -> render path the eval snapshot uses, no source-string splicing.
+(bind render_native
+  (lambda (spec)
+    (bind ((forms (list_of)) (need_crc (ref false))
+           ; same byte order as the eval backend (see endian_be? for the policy)
+           (be? (endian_be? spec)))
+      (do
+        (each (get spec "records")
+          (lambda (rec) (when (and (native_ok? rec) (has_crc? rec)) (set_ref need_crc true))))
+        (when (deref need_crc) (append forms (gen_native_crc)))
+        (each (get spec "records")
+          (lambda (rec)
+            (when (native_ok? rec)
+              (do
+                (append forms (gen_native_struct rec))
+                (append forms (gen_native_encode be? rec))
+                (append forms (gen_native_decode be? rec))
+                (append forms (gen_native_validate rec))))))
+        (string_concat_many
+          "; generated by stdlib.storage.binary (native target) for "
+          (get spec "name") "\n\n"
+          (render_program forms))))))
+
+(export render_native native_type native_ok? native_skip_field has_crc?)

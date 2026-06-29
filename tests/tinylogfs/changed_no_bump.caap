@@ -1,0 +1,5 @@
+; negative: the record changed but reused version 1 (no version bump).
+(use stdlib.storage.binary le_bytes)
+(storage Bad
+  (record R 1 (field a u32))
+  (record R 1 (field a u32) (field b u16)))

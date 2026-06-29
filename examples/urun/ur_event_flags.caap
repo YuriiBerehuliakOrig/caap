@@ -1,0 +1,107 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  ur_event_flags — an event-flags (signal bit-set) object a thread can block on
+//  (module stdlib.urun.ur_event_flags). The analogue of URun's ur_event_flags_*.
+//  Every other wait object in this slice blocks on ONE scalar condition (a count,
+//  a queue depth, a lock); event flags is the MULTI-condition primitive — a thread
+//  waits for ANY (OR) or ALL (AND) of a set of bits, and a setter ORs bits in and
+//  re-evaluates every waiter. It reuses the same machinery as the semaphore: the
+//  generic intrusive waiter list, the suspend/cleanup engine, and _ur_wake_all.
+//
+//  Wake model: set() ORs the bits and wakes ALL waiters; each re-checks its own
+//  condition in its get loop and either proceeds (optionally consuming bits) or
+//  re-blocks. This keeps the wake side from having to know each waiter's request —
+//  the request stays a local of get, no extra TCB state.
+(surface stdlib.frontend.clike stdlib.urun.ur_event_flags)
+
+use stdlib.urun.ur_scheduler (UR_THREAD, ur_thread_current, _ur_thread_suspend_timed, _ur_wake_all)
+use stdlib.urun.ur_port (ur_interrupt_save, ur_interrupt_restore, ur_pend_switch)
+use stdlib.urun.ur_status (UR_SUCCESS, UR_NO_INSTANCE, UR_NO_WAIT)
+use stdlib.urun.ur_list (List, ur_list_init, ur_list_push, ur_list_remove)
+
+UR_EVENT_FLAGS struct export = {
+  ur_event_bits u32,            // the current signalled bits
+  ur_event_waiters List<UR_THREAD, ur_thread_suspend_next>
+}
+
+// wait modes (the cross-module constant convention: nullary functions).
+UR_EVENT_OR ()  u32 export = { 0 }      // satisfied when ANY requested bit is set
+UR_EVENT_AND () u32 export = { 1 }      // satisfied when ALL requested bits are set
+
+ur_event_flags_create (ef UR_EVENT_FLAGS*) i32 export = {
+  ef->ur_event_bits = 0
+  ur_list_init(&ef->ur_event_waiters)
+  UR_SUCCESS
+}
+
+// does `bits` satisfy `requested` under `mode`? Returns 1 / 0.
+_event_met (bits u32, requested u32, mode u32) u32 = {
+  if mode == UR_EVENT_AND() {
+    if (bits & requested) == requested { 1 } else { 0 }
+  } else {
+    if (bits & requested) != 0 { 1 } else { 0 }
+  }
+}
+
+// suspend-cleanup: a timed-out / aborted waiter unlinks from THIS object.
+// unlink via a wrapper where `ef` is a PARAMETER (the generic-list deduction reads
+// parameter/field types, not the cleanup's LOCAL `ef` cast from suspend_control).
+_ef_unlink (ef UR_EVENT_FLAGS*, t UR_THREAD*) i32 = {
+  ur_list_remove(&ef->ur_event_waiters, t)
+}
+_ur_event_cleanup (t UR_THREAD*) i32 = {
+  ef UR_EVENT_FLAGS* = t->ur_thread_suspend_control as UR_EVENT_FLAGS*
+  _ef_unlink(ef, t)
+  t->ur_thread_suspend_status = UR_NO_INSTANCE
+  0
+}
+
+// set bits and re-evaluate every waiter (each rechecks in its get loop).
+ur_event_flags_set (ef UR_EVENT_FLAGS*, bits u32) i32 export = {
+  prev u32 = ur_interrupt_save()
+  ef->ur_event_bits = ef->ur_event_bits | bits
+  _ur_wake_all(&ef->ur_event_waiters, UR_SUCCESS)
+  ur_interrupt_restore(prev)
+  UR_SUCCESS
+}
+
+// wait until the requested bits are satisfied under `mode`; on success, optionally
+// CLEAR them. Loops, re-checking after each wake (set() wakes all waiters). The
+// interrupt mask is dropped only across the actual park and re-taken for the
+// recheck, so the save/restore stays balanced on every path (the ur-crit gate).
+ur_event_flags_get (ef UR_EVENT_FLAGS*, requested u32, mode u32, clear u32, wait u32) i32 export = {
+  prev mut u32 = ur_interrupt_save()
+  rc mut i32 = UR_SUCCESS
+  running mut u32 = 1
+  while running == 1 {
+    if _event_met(ef->ur_event_bits, requested, mode) == 1 {
+      if clear == 1 {
+        ef->ur_event_bits = ef->ur_event_bits & (~requested)
+      } else {
+        0
+      }
+      running = 0
+    } else {
+      if wait == UR_NO_WAIT() {
+        rc = UR_NO_INSTANCE
+        running = 0
+      } else {
+        cur UR_THREAD* = ur_thread_current()
+        ur_list_push(&ef->ur_event_waiters, cur)
+        _ur_thread_suspend_timed(cur,
+          fn_ptr(_ur_event_cleanup) as u32, cast(ptr_to_int(ef), u32), wait)
+        ur_pend_switch()
+        ur_interrupt_restore(prev)           // unmask: the switch is taken here
+        st u32 = cur->ur_thread_suspend_status
+        prev = ur_interrupt_save()           // re-mask for the recheck / exit
+        if st != 0 {
+          rc = cast(st, i32)                 // timed out / aborted
+          running = 0
+        } else {
+          0
+        }
+      }
+    }
+  }
+  ur_interrupt_restore(prev)
+  rc
+}

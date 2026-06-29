@@ -1,0 +1,99 @@
+; stdlib/lib/tests/test_lint.caap — the lint suite (unused/shadow/unreachable/
+; constant-condition), driven over hand-built AST like test_borrow.
+
+;; @area: passes
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.lint check)
+(use stdlib.syntax.ast sym lit calln lam)
+(use stdlib.lib.collections.sequence any?)
+
+(do
+  (bind ((has (lambda (findings needle)
+                (any? findings (lambda (f) (string_contains f needle))))))
+    (do
+      ; ── unused binding: (bind "tmp" 1 "y" 2 y) — tmp never read ──
+      (assert_true
+        (has (check (calln "bind"
+               (list_of (lit "tmp") (lit 1) (lit "y") (lit 2) (sym "y"))))
+             "unused binding `tmp`")
+        "unused local binding flagged")
+
+      ; clean: (bind "x" 1 x) — x is read in the body
+      (assert_eq
+        (size (check (calln "bind" (list_of (lit "x") (lit 1) (sym "x")))))
+        0
+        "used binding is clean")
+
+      ; top-level-style bind (NO body) is exempt: (bind "api" 1)
+      (assert_eq
+        (size (check (calln "bind" (list_of (lit "api") (lit 1)))))
+        0
+        "bodyless (module-scope) bind is not flagged")
+
+      ; ── unused parameter: (lambda (x y) x) — y never read ──
+      (assert_true
+        (has (check (lam (list_of "x" "y") (sym "x")))
+             "unused parameter `y`")
+        "unused parameter flagged")
+
+      ; underscore opts out: (lambda (_ignored) 0)
+      (assert_eq
+        (size (check (lam (list_of "_ignored") (lit 0))))
+        0
+        "underscore parameter is intentionally unused")
+
+      ; ── shadowing: (bind "x" 1 (bind "x" 2 x)) ──
+      (assert_true
+        (has (check (calln "bind"
+               (list_of (lit "x") (lit 1)
+                 (calln "bind" (list_of (lit "x") (lit 2) (sym "x"))))))
+             "shadows an enclosing name")
+        "shadowing flagged")
+
+      ; ── unreachable: (do (throw "e") 1) ──
+      (assert_true
+        (has (check (calln "do"
+               (list_of (calln "throw" (list_of (lit "e"))) (lit 1))))
+             "unreachable code")
+        "unreachable-after-throw flagged")
+
+      ; clean: a throw as the LAST form is fine
+      (assert_eq
+        (size (check (calln "do" (list_of (calln "throw" (list_of (lit "e")))))))
+        0
+        "trailing throw is not unreachable")
+
+      ; ── constant condition: (if true a b) ──
+      (assert_true
+        (has (check (calln "if" (list_of (lit true) (sym "a") (sym "b"))))
+             "constant condition")
+        "constant if-condition flagged")
+
+      ; (while false body) — body never runs
+      (assert_true
+        (has (check (calln "while" (list_of (lit false) (sym "body"))))
+             "while false")
+        "while-false flagged")
+
+      ; (while true body) is the idiomatic loop+leave — NOT flagged
+      (assert_eq
+        (size (check (calln "while" (list_of (lit true) (sym "body")))))
+        0
+        "`while true` (loop + leave idiom) is not flagged")
+
+      ; ── a duplicate name in ONE bind shadows the earlier one ──
+      ; (bind "x" 1 "x" 2 x): the second `x` hides the first.
+      (assert_true
+        (has (check (calln "bind" (list_of (lit "x") (lit 1) (lit "x") (lit 2) (sym "x"))))
+             "shadows an enclosing name")
+        "a duplicate name within one bind is flagged as shadowing")
+
+      ; a non-constant condition is clean
+      (assert_eq
+        (size (check (calln "if"
+                 (list_of (calln "gt" (list_of (sym "n") (lit 0)))
+                          (sym "a") (sym "b")))))
+        0
+        "dynamic condition is clean"))))

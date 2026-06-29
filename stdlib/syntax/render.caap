@@ -1,0 +1,139 @@
+; stdlib/syntax/render.caap — ExprSpec -> kernel source text.
+;
+; The inverse of parsing, for the COMPILE bridge: an expanded (sugar-free)
+; tree rendered here parses back into the identical kernel AST, so any
+; consumer of .caap files — eval, the native compile path — can take stdlib's
+; expansion output. Total for the kernel value set a source file can carry
+; (names, calls, int/string/bool/null literals); anything unrenderable
+; (tuples, maps, callables in literals) THROWS with the value's type.
+;
+; Closes the runtime-codegen arc, with lib/ast (build trees) and lib/ir (rewrite
+; them): build -> rewrite -> render here -> the text is a program any consumer
+; takes. Renders SHAPE only: spans (lib/ast's span6/loc, the C3 metadata ir
+; threads through rewrites) are dropped — they round-trip via re-parse, not text.
+(module stdlib.syntax.render)
+
+(use stdlib.syntax.ast name? literal? name_of literal_of args_of)
+(use stdlib.lib.text.buffer buf_new push_str to_string)
+
+; quote_string — a double-quoted source literal with escapes.
+;   s  : the raw string value
+;   -> : "\"…\"" with backslash, quote and newline escaped
+(bind quote_string
+  (lambda (s)
+    (string_concat_many
+      "\""
+      (string_replace
+        (string_replace (string_replace s "\\" "\\\\") "\"" "\\\"")
+        "\n" "\\n")
+      "\"")))
+
+; render_float — a Float value as a kernel float TOKEN that re-reads as a float.
+; value_to_string is the canonical f64 spelling (the same text the wasm backend
+; emits for float literals), but the reader only yields a Float when the token
+; carries a '.', 'e' or 'E' — a whole-valued float prints as e.g. "3", which
+; would re-read as an Int. Appending ".0" in exactly that case forces the float
+; interpretation, so the rendered token round-trips back to the same float.
+; Non-finite floats (inf / -inf / NaN — reachable via float_mul overflow,
+; sqrt(-1), bits_to_float, …) have NO kernel literal syntax: value_to_string
+; spells them "inf"/"NaN", and the digit-based number grammar would read those
+; (or an "inf.0" we wrongly appended) as a NAME, not a float — so they have no
+; source form and THROW, exactly like the unrenderable values render_value
+; rejects.
+;   v  : a finite float value
+;   -> : its source spelling (always a float-shaped token); throws on inf/nan
+(bind render_float
+  (lambda (v)
+    (if (or (float_nan? v) (float_inf? v))
+      (throw (string_concat_many
+               "render: the non-finite float " (value_to_string v)
+               " has no source form"))
+      (bind ((s (value_to_string v)))
+        (if (or (string_contains s ".")
+                (or (string_contains s "e") (string_contains s "E")))
+          s
+          (string_concat_many s ".0"))))))
+
+; render_value — a literal VALUE as source text. Throws on non-source types.
+;   v  : an int / float / string / bool / null
+;   -> : its source spelling (throws for tuple / map / callable)
+(bind render_value
+  (lambda (v)
+    (case (value_type v)
+      ("int" (int_to_string v))
+      ("float" (render_float v))
+      ("string" (quote_string v))
+      ("bool" (if v "true" "false"))
+      ("null" "null")
+      (else (throw (string_concat_many
+                     "render: a " (value_type v)
+                     " literal has no source form"))))))
+
+; literal_params — a LITERAL lambda/macro parameter list as source text.
+; Parsed source carries params as a tuple of strings ("(a b)"); generated
+; zero-parameter lambdas carry a null literal ("()").
+;   node : the first arg of a lambda/macro call (a tuple/null literal)
+;   ->   : "(p1 p2…)" — the bare-name parameter shape, NOT a quoted tuple
+(bind literal_params
+  (lambda (node)
+    (bind ((v (literal_of node)) (out (buf_new)))
+      (do
+        (push_str out "(")
+        (when (not (eq v null))
+          (bind ((first (ref true)))
+            (for s v
+              (do
+                (when (not (deref first)) (push_str out " "))
+                (push_str out s)
+                (set_ref first false)))))
+        (push_str out ")")
+        (to_string out)))))
+
+; render — a spec tree as kernel source text.
+;   node : name / literal / call spec
+;   ->   : parseable source; literal `(lambda …)` parameter lists get their
+;          special shape, every other call renders as "(item item…)"
+(bind render
+  (lambda (node)
+    (cond
+      ((name? node) (name_of node))
+      ((literal? node) (render_value (literal_of node)))
+      (else
+        (bind (
+          (callee (syntax_call_callee node))
+          (head (name_of callee))
+          (out (buf_new))
+          (params_special (or (eq head "lambda") (eq head "macro")))
+        )
+          (do
+            (push_str out "(")
+            (push_str out (render callee))
+            (for i (sequence_range 0 (size (args_of node)))
+              (bind ((a (get (args_of node) i)))
+                (do
+                  (push_str out " ")
+                  (push_str out
+                    (if (and params_special (and (eq i 0) (literal? a)))
+                      (literal_params a)
+                      (render a))))))
+            (push_str out ")")
+            (to_string out)))))))
+
+; render_program — a list of top-level specs as ONE ready-to-consume source
+; text (directive-free program shape: defns/binds, then the final expression).
+; The closing arc of runtime codegen: build trees from data (lib/ast +
+; lib/ir), render them here, and the text is a program any consumer takes —
+; the loader evaluates it, and the stdlib native tools can lower it to LLVM.
+;   specs : top-level forms in order
+;   ->    : the full program source (one form per line, trailing newline)
+(bind render_program
+  (lambda (specs)
+    (bind ((out (buf_new)))
+      (do
+        (for s specs
+          (do
+            (push_str out (render s))
+            (push_str out "\n")))
+        (to_string out)))))
+
+(export render render_program)

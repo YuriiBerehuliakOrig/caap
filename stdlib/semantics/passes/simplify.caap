@@ -1,0 +1,80 @@
+; stdlib/semantics/passes/simplify.caap — simplification TRANSFORM (module
+; stdlib.semantics.passes.simplify): dead-branch elimination + beta reduction.
+;
+; Two semantics-preserving rewrites, bottom-up, over every loaded module:
+;
+;   dead branch   (if <bool-literal> t e) -> t / e — the natural companion to
+;                 constfold (which turns a condition into a literal) and lint's
+;                 constant-condition finding: fold, then drop the dead arm.
+;   beta          ((lambda (p…) body) a…) -> (bind (p0 a0 …) body) — an
+;                 immediately-applied lambda becomes a let*, so the body inlines
+;                 with each argument evaluated EXACTLY ONCE (no effect
+;                 duplication, unlike naive substitution).
+;
+; Beta is applied only when it is capture-safe: no argument may reference a
+; parameter name (a parameter is not in scope at the call site, so such a name
+; would be a DIFFERENT outer binding that let* would wrongly capture). When
+; unsafe — or the arity does not match — the call is left intact. A step toward
+; partial evaluation (ROADMAP A1); pairs with constfold.
+(module stdlib.semantics.passes.simplify)
+
+(use stdlib.syntax.ast
+  call? literal? literal_of head_is? callee args_of arg bool_lit? sym lit call)
+(use stdlib.syntax.ir free_names transform)
+(use stdlib.lib.collections.sequence any?)
+(use stdlib.semantics.passes.registry install_transform!)
+
+; capture_safe? — no argument mentions any parameter name (else let* capture).
+(bind capture_safe?
+  (lambda (params args)
+    (not (any? args
+      (lambda (a)
+        (any? (free_names a)
+          (lambda (fn) (any? params (lambda (p) (eq p fn))))))))))
+
+; beta — rewrite ((lambda (p…) body) a…) to (bind (p0 a0 …) body), or null when
+; it cannot be done safely.
+(bind beta
+  (lambda (callee args)
+    (if (not (and (head_is? callee "lambda") (literal? (arg callee 0))))
+      null
+      (bind ((params (literal_of (arg callee 0))) (body (arg callee 1)))
+        (if (not (and (not (eq params null))
+                      (eq (size params) (size args))
+                      (capture_safe? params args)))
+          null
+          (bind ((parts (list_of)))
+            (do
+              (sequence_each (sequence_range 0 (size params))
+                (lambda (i)
+                  (do (append parts (lit (get params i)))
+                      (append parts (get args i)))))
+              (append parts body)
+              (call (sym "bind") parts))))))))
+
+; simplify_node — bottom-up rewrite via ir.transform (children rebuilt first,
+; span preserved): a canonical 3-arm `if` on a bool literal collapses to the live
+; arm; an immediately-applied lambda beta-reduces; anything else is kept (null).
+(bind simplify_node
+  (lambda (node)
+    (transform node
+      (lambda (n)
+        (cond
+          ((not (call? n)) null)
+          ((and (head_is? n "if") (eq (size (args_of n)) 3) (bool_lit? (arg n 0)))
+            (if (literal_of (arg n 0)) (arg n 1) (arg n 2)))
+          ; beta reduces an immediately-applied lambda; compute it ONCE (the test
+          ; that it applied and the rewritten node are the same value).
+          (else
+            (bind ((reduced (beta (callee n) (args_of n))))
+              (if (not (eq reduced null)) reduced null))))))))
+
+; run — the transform entry: rewrite every located form IN PLACE.
+(bind run
+  (lambda (located)
+    (for f located (assoc f "node" (simplify_node (get f "node"))))))
+
+; register! — install simplification as a load-time TRANSFORM (idempotent).
+(bind register! (lambda () (install_transform! "simplify" run)))
+
+(export simplify_node run register!)

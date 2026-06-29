@@ -1,0 +1,238 @@
+; stdlib/lib/collections/map.caap — map helpers.
+;
+; Clean-named facades over the kernel map builtins, plus derived helpers.
+; Reads are total: `get` (kernel) already takes a default; has? never throws.
+; Mutators carry `!` (delete!/update!) — they change the map in place.
+; The derived helpers are written as `defn` with GENERIC signatures (`map<K,V>`,
+; A2): key/value types ride as variables `K`/`V` bound at the call site. The
+; facades stay bare renames — the kernel `map_*` builtins carry no type
+; variables, so a wrapper would only add indirection without type gain (the
+; kernel-blocked boundary is documented in types/README.md).
+(module stdlib.lib.collections.map)
+
+; ── facades over kernel map_* ───────────────────────────────────────────────
+; Builtins are first-class values, so a facade is just a rename.
+(bind keys       map_keys)        ; (m) -> list of keys
+; values — the map's values as a list (one per entry).
+(bind values     map_values)      ; (m) -> list of values
+; merge — a fresh map combining its arguments; on key clashes, later maps win.
+(bind merge      map_merge)       ; (m…) -> a FRESH map; later maps win
+(bind delete!    map_delete)      ; (m k) -> m, with k removed IN PLACE
+(bind update!    map_update)      ; (m k f [default]) -> m, k -> (f old) IN PLACE
+(bind of_entries map_of_entries)  ; ([(k v)…]) -> map
+(bind has?       contains)        ; (m k) -> bool
+; delete!/update! mirror the kernel builtins, which MUTATE the map — hence the
+; `!`. merge is the non-mutating way to derive a changed map.
+
+; clone — a fresh shallow copy (merge of one map). Every scope/env-style
+; extension wants this: copy, then assoc freely without touching the source.
+; Generic over key/value types (A2): `(clone (map string u8))` is itself a
+; `(map string u8)`. The facades above stay untyped — the kernel `map_*`
+; builtins carry no type variables (see types/README.md).
+;   m  : the source map
+;   -> : a new map with the same entries
+(defn clone ((m (map K V))) (map K V) (merge m))
+
+; ── derived helpers ─────────────────────────────────────────────────────────
+(defn map_size ((m (map K V))) int (size m))         ; entry count
+(defn empty?   ((m (map K V))) bool (eq (size m) 0))
+
+; entries — the map as a list of (k v) pairs. The pair holds a key and a value
+; of distinct types, so the result is a bare `list` rather than a one-variable
+; container.
+;   m  : the map
+;   -> : a fresh list of 2-element lists, one per entry
+(defn entries ((m (map K V))) list
+  (bind ((out (list_of)))
+    (do
+      (for k (map_keys m)
+        (append out (list_of k (get m k))))
+      out)))
+
+; pick — the sub-map with only the requested keys.
+;   m  : the source map
+;   ks : list of keys to keep (absent keys are skipped, not nulled)
+;   -> : a fresh map with at most those entries
+(defn pick ((m (map K V)) (ks (list K))) (map K V)
+  (bind ((out (map_of)))
+    (do
+      (for k ks
+        (when (contains m k)
+          (assoc out k (get m k))))
+      out)))
+
+; map_vals — transform every value, keep the keys. The new value type comes
+; from `f`, so the result is a bare `map`.
+;   m  : the source map
+;   f  : (value) -> new value
+;   -> : a fresh map {k -> (f v)}
+(defn map_vals ((m (map K V)) (f callable)) map
+  (bind ((out (map_of)))
+    (do
+      (for k (map_keys m)
+        (assoc out k (f (get m k))))
+      out)))
+
+; get_in / assoc_in stay untyped lambdas: a key PATH walks heterogeneous
+; nesting (each level a different map/value type), which a single element
+; variable cannot describe — so a `(list T)`-style signature would lose, not
+; add, information. The tractable boundary of A2 ends here.
+
+; get_in — read a value at a nested key PATH, or a default when any step is
+; missing or not a map. Total: never throws.
+;   m / path / default : the map, a list of keys, the fallback
+;   ->                 : the nested value, or `default`
+(bind get_in
+  (lambda (m path default)
+    (bind ((cur (ref m)) (ok (ref true)))
+      (do
+        (for k path
+          (when (deref ok)
+            (if (and (eq (value_type (deref cur)) "map") (contains (deref cur) k))
+              (set_ref cur (get (deref cur) k))
+              (set_ref ok false))))
+        (if (deref ok) (deref cur) default)))))
+
+; assoc_in — a fresh map with the value at a nested key PATH set, building
+; intermediate maps as needed (clones along the path; the input is untouched).
+;   m / path / value : the map, a non-empty list of keys, the value to set
+;   ->               : a fresh map
+(bind assoc_in
+  (lambda (m path value)
+    (if (eq (size path) 0)
+      value
+      (bind (
+        (k (get path 0))
+        (base (if (eq (value_type m) "map") (clone m) (map_of)))
+        (child (if (contains base k) (get base k) (map_of)))
+      )
+        (assoc base k (assoc_in child (sequence_drop path 1) value))))))
+
+; keys_where — the keys whose VALUE satisfies a predicate.
+;   m / pred : the map and (value) -> bool
+;   ->       : a fresh list of matching keys (the map's key type)
+(defn keys_where ((m (map K V)) (pred callable)) (list K)
+  (bind ((out (list_of)))
+    (do
+      (for k (map_keys m)
+        (when (pred (get m k)) (append out k)))
+      out)))
+
+; fold_entries — reduce over every (key, value) pair, left to right in key
+; order. `f` is (acc key value) -> acc; the accumulator threads through.
+;   m / init / f : the map, the seed, the combiner
+;   ->           : the final accumulator
+(defn fold_entries ((m (map K V)) (init A) (f callable)) A
+  (bind ((acc (ref init)))
+    (do
+      (for k (map_keys m)
+        (set_ref acc (f (deref acc) k (get m k))))
+      (deref acc))))
+
+; map_entries — rebuild the map, transforming each entry to a fresh [k' v']
+; pair. `f` is (key value) -> [new_key new_value]; later pairs win on a key
+; clash. The new key/value types come from `f`, so the result is a bare `map`.
+; Each `new_key` must be a hashable scalar (string/int/bool/null) — the kernel
+; rejects a list/map used as a map key.
+;   m / f : the map and the entry transformer
+;   ->    : a fresh map of the transformed entries
+(defn map_entries ((m (map K V)) (f callable)) map
+  (bind ((out (map_of)))
+    (do
+      (for k (map_keys m)
+        (bind ((kv (f k (get m k))))
+          (assoc out (get kv 0) (get kv 1))))
+      out)))
+
+; omit — a fresh map with the requested keys removed (the complement of pick).
+;   m  : the source map
+;   ks : list of keys to drop (absent keys are simply ignored)
+;   -> : a fresh map without those keys (m untouched)
+(defn omit ((m (map K V)) (ks (list K))) (map K V)
+  (bind ((drop_set (map_of)) (out (map_of)))
+    (do
+      (for k ks (assoc drop_set k true))
+      (for k (map_keys m)
+        (unless (contains drop_set k) (assoc out k (get m k))))
+      out)))
+
+; invert — swap keys and values: {k -> v} becomes {v -> k}. Values become the
+; new keys, so the result is a bare `map`; on duplicate values, a later key
+; (in key order) wins. Every value must be a hashable scalar (string/int/bool/
+; null) to serve as a key — the kernel rejects a list/map used as a map key.
+;   m  : the source map
+;   -> : a fresh map keyed by the original values
+(defn invert ((m (map K V))) map
+  (bind ((out (map_of)))
+    (do
+      (for k (map_keys m)
+        (assoc out (get m k) k))
+      out)))
+
+; filter_entries — the sub-map whose entries satisfy `pred`.
+;   m / pred : the map and (key value) -> bool
+;   ->       : a fresh map of the kept entries (m untouched)
+(defn filter_entries ((m (map K V)) (pred callable)) (map K V)
+  (bind ((out (map_of)))
+    (do
+      (for k (map_keys m)
+        (when (pred k (get m k)) (assoc out k (get m k))))
+      out)))
+
+; merge_with — merge two maps, combining clashing keys via `(f val_a val_b)`
+; (vs `merge`, which is last-wins). A key present in only one map keeps that
+; map's value untouched; a key in both is set to `(f a_value b_value)`. Both
+; inputs are left untouched. The combined value type comes from `f`, so the
+; result is a bare `map`.
+;   a / b : the two maps (a's value is the first arg to `f`)
+;   f     : (val_a val_b) -> combined value
+;   ->    : a fresh map of the union of keys
+(defn merge_with ((a (map K V)) (b (map K V)) (f callable)) map
+  (bind ((out (clone a)))
+    (do
+      (for k (map_keys b)
+        (if (contains out k)
+          (assoc out k (f (get out k) (get b k)))
+          (assoc out k (get b k))))
+      out)))
+
+; update_in — a fresh map with the value at a nested key PATH transformed by
+; `(f old)`, building intermediate maps as needed (the SET sibling is
+; `assoc_in`). `old` is the current value at the path, or `null` when any step
+; is missing — `f` decides the default. Clones along the path; the input is
+; untouched. An empty path applies `f` to the whole map.
+;   m / path / f : the map, a list of keys, the (old) -> new transformer
+;   ->           : a fresh map
+(defn update_in ((m (map K V)) (path (list K)) (f callable)) (map K V)
+  (assoc_in m path (f (get_in m path null))))
+
+; from_keys — build a map mapping every key in `keys` to the SAME value `v`.
+; Later duplicate keys simply overwrite (the value is identical, so order is
+; immaterial). The value type comes from `v`, so the result is a bare `map`.
+;   keys : the list of keys
+;   v    : the common value for every key
+;   ->   : a fresh map {k -> v} for each k in keys
+(defn from_keys ((keys (list K)) (v V)) map
+  (bind ((out (map_of)))
+    (do
+      (for k keys (assoc out k v))
+      out)))
+
+; map_keys_fn — transform every KEY via `(f key)`, keeping each value. (Named
+; `_fn` to avoid clashing with the kernel `map_keys`, which returns the KEY
+; LIST.) Later pairs win on a key clash. Each new key must be a hashable scalar
+; (string/int/bool/null) — the kernel rejects a list/map used as a map key. The
+; new key type comes from `f`, so the result is a bare `map`.
+;   m / f : the map and the key transformer (key) -> new key
+;   ->    : a fresh map keyed by the transformed keys
+(defn map_keys_fn ((m (map K V)) (f callable)) map
+  (bind ((out (map_of)))
+    (do
+      (for k (map_keys m)
+        (assoc out (f k) (get m k)))
+      out)))
+
+(export keys values merge clone delete! update! of_entries has?
+        map_size empty? entries pick map_vals get_in assoc_in keys_where
+        fold_entries map_entries omit invert filter_entries
+        merge_with update_in from_keys map_keys_fn)

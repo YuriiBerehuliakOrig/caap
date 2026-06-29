@@ -1,0 +1,269 @@
+; stdlib/syntax/ast.caap — readable accessors over syntax nodes (ExprSpec).
+;
+; The raw kernel surface ((eq (syntax_kind n) "call"), nested callee unwraps)
+; turns any AST-walking code into noise — the checker and a future type system
+; live on exactly these questions. This module gives them names.
+(module stdlib.syntax.ast)
+
+; ── predicates ──────────────────────────────────────────────────────────────
+(bind call?    (lambda (n) (eq (syntax_kind n) "call")))     ; (n) -> bool
+(bind name?    (lambda (n) (eq (syntax_kind n) "name")))     ; (n) -> bool
+(bind literal? (lambda (n) (eq (syntax_kind n) "literal")))  ; (n) -> bool
+
+; string_lit? — a literal whose value is a string (e.g. canonical bind names).
+;   n  : a node
+;   -> : bool
+(bind string_lit?
+  (lambda (n)
+    (and (literal? n) (eq (value_type (syntax_literal_value n)) "string"))))
+
+; bool_lit? — a literal whose value is a boolean (e.g. a constant `if` test).
+(bind bool_lit?
+  (lambda (n)
+    (and (literal? n) (eq (value_type (syntax_literal_value n)) "bool"))))
+
+; int_lit? — a literal whose value is an int (e.g. a constant arithmetic operand).
+(bind int_lit?
+  (lambda (n)
+    (and (literal? n) (eq (value_type (syntax_literal_value n)) "int"))))
+
+; float_lit? — a literal whose value is a float (the wasm/native-emit constant case).
+(bind float_lit?
+  (lambda (n)
+    (and (literal? n) (eq (value_type (syntax_literal_value n)) "float"))))
+
+; lit_null? — a literal whose value is null (e.g. a zero-parameter lambda's param
+; slot). NOT spelled `null_lit?`: the reader matches the `null` keyword greedily, so
+; an identifier with a `null` prefix (`null_lit?`) tokenizes as the null literal
+; followed by `_lit?` — `lit_null?` is the only clean, single-token spelling.
+(bind lit_null?
+  (lambda (n)
+    (and (literal? n) (eq (value_type (syntax_literal_value n)) "null"))))
+
+; ── accessors (total: null on the wrong kind, never throw) ──────────────────
+
+; name_of — the identifier of a name node, else null.
+(bind name_of
+  (lambda (n) (if (name? n) (syntax_name_identifier n) null)))
+
+; literal_of — the value of a literal node, else null.
+(bind literal_of
+  (lambda (n) (if (literal? n) (syntax_literal_value n) null)))
+
+; head_of — the head identifier of a name-headed call, else null.
+;   (head_of <(foo a b)>) -> "foo";  (head_of <((f) a)>) -> null
+(bind head_of
+  (lambda (n)
+    (if (call? n) (name_of (syntax_call_callee n)) null)))
+
+; callee — a call's callee NODE (head_of gives its name; this gives the node, for
+; transforms that rebuild/recurse on the head), else null.
+(bind callee
+  (lambda (n) (if (call? n) (syntax_call_callee n) null)))
+
+; head_is? — is `n` a call headed by the name `head`?
+(bind head_is?
+  (lambda (n head) (eq (head_of n) head)))
+
+; args_of — a call's arguments, else the empty list.
+(bind args_of
+  (lambda (n) (if (call? n) (syntax_call_args n) (list_of))))
+
+; arg — a call's i-th argument, else null.
+(bind arg
+  (lambda (n i) (get (args_of n) i)))
+
+; items_of — a call's flat parts [callee, arg…] (clause lists like ((a 1) (b 2))
+; read naturally as the list of their item nodes), else the empty list.
+(bind items_of
+  (lambda (n)
+    (if (call? n)
+      (bind ((out (list_of (syntax_call_callee n))))
+        (do (for a (syntax_call_args n) (append out a)) out))
+      (list_of))))
+
+; bind_pairs — the canonical merged bind, decomposed. The frontend lowers
+; every multi-bind to (bind "n1" v1 "n2" v2 … body…); this is the ONE reader
+; of that shape (codegen, scope walkers and rewriters all consume it here
+; instead of each re-spelling the string-literal pair walk).
+;   node : any node
+;   ->   : {pairs: [{name, value}…], body: [spec…]} | null when not that shape
+(bind bind_pairs
+  (lambda (node)
+    (if (not (and (head_is? node "bind") (string_lit? (arg node 0))))
+      null
+      (bind (
+        (args (args_of node))
+        (pairs (list_of))
+        (body (list_of))
+        (i (ref 0))
+      )
+        (do
+          (while (and (lt (int_add (deref i) 1) (size args))
+                      (string_lit? (get args (deref i))))
+            (do
+              (append pairs
+                (assoc (map_of)
+                  "name" (literal_of (get args (deref i)))
+                  "value" (get args (int_add (deref i) 1))))
+              (set_ref i (int_add (deref i) 2))))
+          (sequence_each (sequence_range (deref i) (size args))
+            (lambda (k) (append body (get args k))))
+          (assoc (map_of) "pairs" pairs "body" body))))))
+
+; def_of — the FIRST binding of a `(bind …)` form as {name, value}, or null.
+; Reads BOTH binder spellings: the kernel-native flat bind `(bind <name> v …)`
+; (a name-node binder — how the loader leaves top-level module definitions) and
+; the canonical string-literal form `(bind "n" v …)` (multi-bind lowering). The
+; one reader of a top-level DEFINITION (callgraph / naming consume it); body-
+; level multi-binds with their pairs+body stay with `bind_pairs`.
+; A top-level definition is a 2-arg `(bind <binder> value)` — the scope-threaded
+; form the loader leaves per module def. A bind WITH a body (3+ args, e.g.
+; `(bind ((x …)) body)`) is a local-scoped expression, not a module definition,
+; so def_of returns null for it (its inner names are locals, not dead-code
+; candidates).
+(bind def_of
+  (lambda (node)
+    (if (not (and (head_is? node "bind") (eq (size (args_of node)) 2)))
+      null
+      (bind ((b0 (arg node 0)))
+        (cond
+          ((name? b0) (assoc (map_of) "name" (name_of b0) "value" (arg node 1)))
+          ((string_lit? b0)
+            (assoc (map_of) "name" (literal_of b0) "value" (arg node 1)))
+          (else null))))))
+
+; walk — depth-first visitor over a node tree.
+;   n : the root node
+;   f : (node) -> any; called on every node (root first, then callee, then args)
+;   -> : null
+(bind walk
+  (lambda (n f)
+    (do
+      (f n)
+      (when (call? n)
+        (do
+          (walk (syntax_call_callee n) f)
+          (for a (syntax_call_args n) (walk a f)))))))
+
+; ── source location (the ONE reader of a node's span) ───────────────────────
+; Every diagnostic-emitting layer (checker, type pass, passes, borrow,
+; analyze) needs "where is this node" — lib/ast owns node shape, so it owns
+; this too. (boot/check + boot/loader keep private copies: they are tier-0,
+; below lib.)
+
+; span6 — a node's span as the LSP's exact 6-int map, or null (synthetic).
+(bind span6
+  (lambda (node)
+    (bind ((sp (if (eq node null) null (ctfe_spec_span node))))
+      (if (eq sp null) null
+        (assoc (map_of)
+          "start" (get sp "start" 0) "end" (get sp "end" 0)
+          "start_line" (get sp "start_line" 0)
+          "start_col" (get sp "start_col" 0)
+          "end_line" (get sp "end_line" 0)
+          "end_col" (get sp "end_col" 0))))))
+
+; loc_or — a node's "path:line:col", or `fallback` when it has no span.
+(bind loc_or
+  (lambda (node fallback)
+    (bind ((sp (if (eq node null) null (ctfe_spec_span node))))
+      (if (eq sp null) fallback
+        (string_concat_many
+          (get sp "path" "?") ":"
+          (int_to_string (get sp "start_line" 0)) ":"
+          (int_to_string (get sp "start_col" 0)))))))
+
+; loc — a node's "path:line:col", or "" when synthetic.
+(bind loc (lambda (node) (loc_or node "")))
+
+; ── builders (syntax construction) ──────────────────────────────────────────
+; The mirror of the accessors: build syntax nodes from values, evaluate them
+; with eval_ir or render them with lib/render. lib/ast is the ONE place node
+; SHAPE knowledge lives (read + build); the OPERATIONS over whole trees —
+; traversal with rebuild, node replacement, substitution — live in lib/ir.
+
+(bind sym syntax_name)      ; (s) -> a name node
+(bind lit syntax_literal)   ; (v) -> a literal node carrying any value
+
+; call — a call node from a HEAD SPEC and an argument list.
+;   head : an already-built spec (a sym, or a nested call for ((f) x))
+;   args : list of argument specs
+(bind call syntax_call)
+
+; calln — the common case: a call headed by a NAME.
+;   head : the head identifier string
+;   args : list of argument specs
+(bind calln
+  (lambda (head args) (syntax_call (syntax_name head) args)))
+
+; lam — a lambda spec from parameter NAMES and one body spec.
+;   params : list of parameter name strings (the kernel's literal-tuple shape)
+;   body   : the body spec
+(bind lam
+  (lambda (params body)
+    (syntax_call (syntax_name "lambda")
+      (list_of (syntax_literal params) body))))
+
+; seq — a (do …) over a list of specs.
+(bind seq
+  (lambda (specs) (syntax_call (syntax_name "do") specs)))
+
+; if3 — a 3-arm if.
+(bind if3
+  (lambda (c t e)
+    (syntax_call (syntax_name "if") (list_of c t e))))
+
+; mkbind — the canonical merged multi-bind `(bind "n1" v1 … body…)`, the exact
+; inverse of bind_pairs (and the builder twin of dce's private rebuild_bind):
+; each pair becomes a string-literal NAME node followed by its value spec, then
+; the body specs are appended. Round-trips: `(bind_pairs (mkbind pairs body))`
+; yields back the same pairs + body. The string-literal first arg is what makes
+; bind_pairs accept it as the merged shape (a name-node binder is the kernel's
+; flat 2-arg def form, read by def_of, not bind_pairs).
+; With NO pairs there is no string-literal head to anchor a bind, so — exactly
+; like rebuild_bind — the result COLLAPSES to the body: the lone body spec, or a
+; `(do …)` over several. (A `(bind <non-string>…)` would be malformed: neither a
+; merged bind nor the kernel's name-headed flat bind.) An empty body with empty
+; pairs yields `(do)`.
+;   pairs : list of { "name": string, "value": spec } (as bind_pairs returns)
+;   body  : list of body specs (the tail after the bindings)
+;   ->    : a `(bind …)` call node, or the collapsed body when pairs is empty
+(bind mkbind
+  (lambda (pairs body)
+    (if (eq (size pairs) 0)
+      (if (eq (size body) 1) (get body 0) (call (sym "do") body))
+      (bind ((parts (list_of)))
+        (do
+          (for p pairs
+            (do
+              (append parts (lit (get p "name")))
+              (append parts (get p "value"))))
+          (for b body (append parts b))
+          (call (sym "bind") parts))))))
+
+; eval_ir — evaluate a built spec to its VALUE (a built lambda evaluates to a
+; callable function). The bridge that makes runtime codegen real: build IR
+; from data, eval it, call the result.
+(bind eval_ir ctfe_eval_node)
+
+; eval_with — evaluate a built spec with free NAMES bound from a map (the
+; sandboxed sibling of eval_ir: a tree with holes for inputs runs without
+; polluting any ambient scope — via lambda + apply, no new mechanism).
+;   node     : the spec to evaluate
+;   bindings : map of name -> VALUE (plain runtime values, not specs)
+(bind eval_with
+  (lambda (node bindings)
+    (bind ((names (map_keys bindings)) (vals (list_of)))
+      (do
+        (for k names (append vals (get bindings k)))
+        (apply
+          (ctfe_eval_node
+            (syntax_call (syntax_name "lambda")
+              (list_of (syntax_literal names) node)))
+          vals)))))
+
+(export call? name? literal? string_lit? bool_lit? int_lit? float_lit? lit_null?
+        name_of literal_of head_of callee head_is? args_of arg items_of bind_pairs def_of walk
+        span6 loc loc_or
+        sym lit call calln lam seq if3 mkbind eval_ir eval_with)

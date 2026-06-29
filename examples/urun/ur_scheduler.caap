@@ -1,0 +1,388 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  ur_scheduler — the PRIORITY-PREEMPTIVE SCHEDULER CORE (module
+//  stdlib.urun.ur_scheduler). This module owns the thread control block and ALL
+//  scheduler state: the running thread, the priority-ordered READY list, and the
+//  timed-suspension DELAYED list. Only this module touches those globals
+//  directly; everything else goes through the exported operations below.
+//
+//  It holds three layers, bottom-up:
+//   - the intrusive READY / DELAYED list primitives;
+//   - the low-level state-transition ENGINE every blocking object leans on
+//     (`_ur_thread_resume`, `_ur_thread_suspend_current`, `_ur_thread_suspend_timed`,
+//     `_ur_thread_timer_tick`, and the suspension-list `_ur_list_prioritize`);
+//   - the context-switch DISPATCH (`_ur_thread_schedule`, called from PendSV) and
+//     the first-task LAUNCH (`ur_thread_first_psp`).
+//
+//  The thread-management API (create + the public services) lives one layer up in
+//  stdlib.urun.ur_thread, which calls into this module under critical sections.
+//  The analogue of the scheduler/ready-list half of URun's ur_thread_*.c.
+// ═══════════════════════════════════════════════════════════════════════════
+(surface stdlib.frontend.clike stdlib.urun.ur_scheduler)
+
+use stdlib.urun.ur_port (ur_pend_switch, putc)
+use stdlib.urun.ur_status (UR_WAIT_FOREVER)
+use stdlib.urun.ur_list (List, Node, ur_list_empty, ur_list_head, ur_list_set_head, ur_list_push_front, ur_list_remove, ur_list_pop)
+
+// Thread states (a subset of URun's), as a named enum instead of magic
+// numbers. The scheduler only distinguishes UR_READY (0) from not-ready (any
+// nonzero); the rest are informational. Exported so ur_thread can name them;
+// other modules read state through ur_thread_state_get.
+UR_STATE enum export = {
+  UR_READY,        // 0 — on the ready list
+  UR_COMPLETED,    // 1 — returned from its entry
+  UR_TERMINATED,   // 2 — terminated / deleted
+  UR_SUSPENDED,    // 3 — blocked (object wait or explicit suspend)
+  UR_SLEEP         // 4 — sleeping on a tick delay
+}
+
+// A thread control block — linked into the priority ready list through
+// ur_thread_ready_next, into an object's FIFO wait list through
+// ur_thread_suspend_next, and into the kernel's timed-suspension list through
+// ur_thread_delayed_next (three pointer-based intrusive lists, as URun).
+UR_THREAD struct export = {
+  ur_thread_stack_ptr u32,
+  ur_thread_state UR_STATE,                // a real enum type (lowers to its i32
+                                           // backing) — state compares are now
+                                           // type-checked, not magic u32 numbers
+  ur_thread_priority u32,
+  ur_thread_ready_next Node<UR_THREAD>,    // intrusive hooks: a thread is in the
+  ur_thread_suspend_next Node<UR_THREAD>,  // ready, an object-wait, and the delayed
+  ur_thread_delayed_next Node<UR_THREAD>,  // list at once, so THREE distinct Node<T> hooks
+  ur_thread_timeout u32,            // remaining ticks while on the delayed list
+  ur_thread_suspend_status u32,     // outcome handed back to the blocking call
+  ur_thread_cleanup u32,            // suspend-cleanup fn address (0 = none)
+  ur_thread_suspend_control u32,    // the object the thread is blocked on (addr)
+  ur_thread_run_count u32,          // times dispatched (perf stat; ur_thread_performance_get)
+  ur_thread_stack_base u32          // low end of the stack; holds the overflow canary
+}
+
+// The stack-overflow canary: a known word written at the LOW end of every thread
+// stack at create, and checked when the thread is switched OUT. The stack grows
+// down toward this word, so an overflow clobbers it first; a mismatch means the
+// thread overran its stack and corrupted whatever sits below. A nullary function
+// (the cross-module constant convention here, like UR_NO_WAIT) so it is importable.
+UR_STACK_CANARY () u32 export = { 0xC5C5C5C5 }
+
+// ── kernel scheduler state (PRIVATE to this module) ──────────────────────────
+// The two scheduler lists are generic STRUCT-containers held as module globals:
+// the element type AND the link field ride in the `List<…>` TYPE, so each list
+// operation takes just `&list` and DEDUCES both (the global's declared type) — no
+// type, no field at the call. Each is layout-identical to the old raw head
+// pointer (a single embedded pointer), so the intrusive walks are unchanged.
+ur_thread_current_ptr mut UR_THREAD* = 0                          // the running thread
+ur_ready_head mut List<UR_THREAD, ur_thread_ready_next> = 0      // priority-ordered ready list
+ur_delayed_head mut List<UR_THREAD, ur_thread_delayed_next> = 0  // timed-suspension list
+
+// ── null-pointer helpers (a 0 address typed as a thread pointer) ─────────────
+ur_null_thread () UR_THREAD* export = {
+  0 as UR_THREAD*
+}
+is_null (t UR_THREAD*) bool export = {
+  t as uptr == 0
+}
+
+// the running thread, for other modules (they cannot see our globals).
+ur_thread_current () UR_THREAD* export = {
+  ur_thread_current_ptr
+}
+// ur_thread_identify: URun's name for "the running thread".
+ur_thread_identify () UR_THREAD* export = {
+  ur_thread_current_ptr
+}
+
+// ── the priority ready list (intrusive, via ur_thread_ready_next) ────────────
+// Sorted ascending by priority number (0 = highest). Within equal priority,
+// FIFO — a new entry goes to the TAIL of its priority group, so equal-priority
+// threads round-robin. (Native codegen has no short-circuit `and`, so a `done`
+// flag drives each walk rather than `break`.)
+_ur_ready_insert (t UR_THREAD*) i32 export = {
+  (&t->ur_thread_ready_next)->next = ur_null_thread()
+  if ur_list_empty(&ur_ready_head) {
+    ur_list_set_head(&ur_ready_head, t)
+  } else {
+    if t->ur_thread_priority < ur_list_head(&ur_ready_head)->ur_thread_priority {
+      (&t->ur_thread_ready_next)->next = ur_list_head(&ur_ready_head)
+      ur_list_set_head(&ur_ready_head, t)
+    } else {
+      p mut UR_THREAD* = ur_list_head(&ur_ready_head)
+      while scan !is_null((&p->ur_thread_ready_next)->next) {
+        if (&p->ur_thread_ready_next)->next->ur_thread_priority > t->ur_thread_priority {
+          break scan                          // p is the insertion point
+        } else {
+          p = (&p->ur_thread_ready_next)->next
+        }
+      }
+      (&t->ur_thread_ready_next)->next = (&p->ur_thread_ready_next)->next
+      (&p->ur_thread_ready_next)->next = t
+    }
+  }
+  0
+}
+
+_ur_ready_remove (t UR_THREAD*) i32 export = {
+  ur_list_remove(&ur_ready_head, t)
+  0
+}
+
+// ── the delayed (timed-suspension) list, via ur_thread_delayed_next ──────────
+// A flat list of threads with a finite timeout; the timer ticks each one down.
+// _ur_delayed_insert stays private (only the suspend engine below prepends);
+// _ur_delayed_remove is exported because the thread services unlink there too.
+_ur_delayed_insert (t UR_THREAD*) i32 = {
+  ur_list_push_front(&ur_delayed_head, t)
+}
+_ur_delayed_remove (t UR_THREAD*) i32 export = {
+  ur_list_remove(&ur_delayed_head, t)
+  0
+}
+
+// ── suspend / resume engine (public: semaphore/queue/timer drive it) ─────────
+// Resume: mark ready, drop any timed-suspension, put back on the ready list, and
+// if the resumed thread outranks the running one, pend a context switch
+// (URun preempts at once).
+_ur_thread_resume (t UR_THREAD*) i32 export = {
+  // Only a BLOCKED thread is resumable. UR_STATE orders the blocked states last
+  // (UR_SUSPENDED=3, UR_SLEEP=4), so `>= UR_SUSPENDED` selects exactly them: a
+  // UR_READY thread is already queued (so this never double-inserts), and a
+  // UR_COMPLETED / UR_TERMINATED thread is dead and must never be re-inserted onto
+  // the run queue with its stale stack pointer.
+  if t->ur_thread_state >= UR_SUSPENDED {
+    _ur_delayed_remove(t)
+    t->ur_thread_timeout = 0
+    t->ur_thread_cleanup = 0
+    t->ur_thread_state = UR_READY
+    _ur_ready_insert(t)
+    if !is_null(ur_thread_current_ptr) {
+      if t->ur_thread_priority < ur_thread_current_ptr->ur_thread_priority {
+        ur_pend_switch()
+      } else {
+        0
+      }
+    } else {
+      0
+    }
+  } else {
+    0
+  }
+}
+
+// Suspend the CURRENT thread: take it off the ready list, mark suspended. The
+// caller pends the switch and unmasks; the actual switch is taken on unmask.
+_ur_thread_suspend_current () i32 export = {
+  _ur_ready_remove(ur_thread_current_ptr)
+  ur_thread_current_ptr->ur_thread_state = UR_SUSPENDED
+  0
+}
+
+// Suspend the CURRENT thread on an object WITH a wait option. `cleanup` is the
+// object's unlink-and-set-status callback address (0 for a plain sleep), `ctrl`
+// the object address it is blocked on, `wait` the URun wait option
+// (UR_WAIT_FOREVER = 0xFFFFFFFF never times out; any other value = ticks). The
+// status starts "pending" (0) and is set by the wakeup (success) or by the
+// cleanup on timeout. Public so the object modules call it.
+_ur_thread_suspend_timed (t UR_THREAD*, cleanup u32, ctrl u32, wait u32) i32 export = {
+  t->ur_thread_suspend_status = 0
+  t->ur_thread_cleanup = cleanup
+  t->ur_thread_suspend_control = ctrl
+  t->ur_thread_timeout = 0
+  if wait != UR_WAIT_FOREVER() {
+    t->ur_thread_timeout = wait
+    _ur_delayed_insert(t)
+  } else {
+    0
+  }
+  _ur_ready_remove(t)
+  t->ur_thread_state = UR_SUSPENDED
+  0
+}
+
+// One timer tick over the delayed list: decrement each timeout; when one hits 0,
+// unlink it, run its cleanup (which unlinks it from the object and records the
+// timeout status), and resume it. Driven by ur_timer's interrupt. Re-reads the
+// head each pass because resume mutates the list. (No short-circuit/break, so a
+// `done` flag and a single-step walk.)
+_ur_thread_timer_tick () i32 export = {
+  p mut UR_THREAD* = ur_list_head(&ur_delayed_head)
+  while !is_null(p) {
+    nxt UR_THREAD* = (&p->ur_thread_delayed_next)->next
+    if p->ur_thread_timeout > 0 {            // guard: a stray 0 never wraps to 4 billion
+      p->ur_thread_timeout = p->ur_thread_timeout - 1
+    } else {
+      0
+    }
+    if p->ur_thread_timeout == 0 {
+      _ur_delayed_remove(p)
+      if p->ur_thread_cleanup != 0 {
+        _ur_call_cleanup(p->ur_thread_cleanup, p)
+      } else {
+        0
+      }
+      _ur_thread_resume(p)
+    } else {
+      0
+    }
+    p = nxt
+  }
+  0
+}
+
+// Move the highest-priority (lowest number) thread in a FIFO suspension list to
+// its head and return the new head — the engine behind *_prioritize. Operates on
+// any ur_thread_suspend_next list. (Single linear scan for the minimum, then a
+// splice; small lists, so O(n) is fine.)
+_ur_list_prioritize (head UR_THREAD*) UR_THREAD* export = {
+  if is_null(head) {
+    head
+  } else {
+    // find the min-priority node and its predecessor
+    best mut UR_THREAD* = head
+    bestprev mut UR_THREAD* = ur_null_thread()
+    p mut UR_THREAD* = head
+    prev mut UR_THREAD* = ur_null_thread()
+    while !is_null(p) {
+      if p->ur_thread_priority < best->ur_thread_priority {
+        best = p
+        bestprev = prev
+      } else {
+        0
+      }
+      prev = p
+      p = (&p->ur_thread_suspend_next)->next
+    }
+    if is_null(bestprev) {
+      head                                   // already at front
+    } else {
+      (&bestprev->ur_thread_suspend_next)->next = (&best->ur_thread_suspend_next)->next
+      (&best->ur_thread_suspend_next)->next = head
+      best
+    }
+  }
+}
+
+// prioritize IN PLACE: the read-head / reorder / write-head sandwich behind one
+// call, so the semaphore/queue prioritize services no longer reach in to read and
+// replace a list's head themselves (closing that encapsulation leak). Specific to
+// the suspend-list hook — the reorder walks ur_thread_suspend_next and ranks by
+// ur_thread_priority — so the parameter names that exact List instantiation.
+_ur_list_prioritize_inplace (self List<UR_THREAD, ur_thread_suspend_next>*) i32 export = {
+  ur_list_set_head(self, _ur_list_prioritize(ur_list_head(self)))
+  0
+}
+
+// drain a waiter list: pop each blocked thread, stamp `status` on it, and resume
+// it. The pop/stamp/resume loop was copied in the semaphore and queue delete
+// paths; it lives once here, where the UR_THREAD field and _ur_thread_resume are.
+_ur_wake_all (self List<UR_THREAD, ur_thread_suspend_next>*, status u32) i32 export = {
+  while !ur_list_empty(self) {
+    p UR_THREAD* = ur_list_pop(self)
+    p->ur_thread_suspend_status = status
+    _ur_thread_resume(p)
+  }
+  0
+}
+
+// invoke a thread's stored suspend-cleanup callback (the timeout/wait-abort unlink
+// + status stamp). The address is kept as a u32; call_ptr needs a pointer type for
+// arg0, so the cast `as UR_THREAD*` (a function address, not really a thread) is
+// the irreducible call-a-stored-callback idiom — centralised here, behind one
+// honest name, instead of repeated at every timeout/abort site.
+_ur_call_cleanup (addr u32, t UR_THREAD*) i32 export = {
+  call_ptr(addr as UR_THREAD*, i32, t)
+}
+
+// MISCONFIG HALT: emit the four bytes of 0xDEADBEEF over UART0, then spin. Both
+// kernel entry points below reach an empty ready list only on a configuration
+// error (the application's permanently-ready idle thread is missing). Emitting a
+// known sentinel before halting lets a serial monitor / test harness tell this
+// apart from a genuine silicon hang — and replaces a silent null dereference on
+// the launch path. Never returns (the trailing 0 only satisfies the type).
+_ur_misconfig_halt () i32 export = {
+  putc(222)            // 0xDE
+  putc(173)            // 0xAD
+  putc(190)            // 0xBE
+  putc(239)            // 0xEF
+  while 0 == 0 { }
+  0
+}
+
+// STACK-OVERFLOW HALT: a distinct sentinel (the bytes of 0xBAADF00D) so a clobbered
+// canary is told apart from the no-idle-thread misconfig (0xDEADBEEF) and a true
+// hang. The corrupting thread can't safely continue, so spin.
+_ur_stack_overflow_halt () i32 export = {
+  putc(186)            // 0xBA
+  putc(173)            // 0xAD
+  putc(240)            // 0xF0
+  putc(13)             // 0x0D
+  while 0 == 0 { }
+  0
+}
+
+// ── the scheduler — invoked from PendSV (ur_port_cortexm3.s) ─────────────────
+// r0 = the preempted thread's PSP; returns the next thread's PSP. Public so the
+// asm port's symbol resolves. Saves the outgoing context, rotates it to the tail
+// of its priority group if still ready, then runs the highest-priority ready
+// thread.
+_ur_thread_schedule (saved u32) u32 export = {
+  if !is_null(ur_thread_current_ptr) {
+    ur_thread_current_ptr->ur_thread_stack_ptr = saved
+    // the outgoing thread just finished a run: if its low-end canary is clobbered,
+    // it overran its stack — halt diagnosably rather than ship corrupt state.
+    if (ur_thread_current_ptr->ur_thread_stack_base as u32*)[0] != UR_STACK_CANARY() {
+      _ur_stack_overflow_halt()
+    } else {
+      0
+    }
+    if ur_thread_current_ptr->ur_thread_state == UR_READY {
+      // Round-robin: rotate the outgoing thread to the tail of its priority group
+      // so an equal-priority peer runs next. But if it is already the LAST of its
+      // group (its ready-list successor is null or a lower-priority thread),
+      // remove+reinsert returns it to the identical slot — a no-op. Skip it, so
+      // the common one-thread-per-priority case costs an O(1) check, not two O(n)
+      // list walks under masked interrupts.
+      nxt UR_THREAD* = (&ur_thread_current_ptr->ur_thread_ready_next)->next
+      if is_null(nxt) {
+        0
+      } else {
+        if nxt->ur_thread_priority == ur_thread_current_ptr->ur_thread_priority {
+          _ur_ready_remove(ur_thread_current_ptr)
+          _ur_ready_insert(ur_thread_current_ptr)
+        } else {
+          0
+        }
+      }
+    } else {
+      0
+    }
+  } else {
+    0
+  }
+  ur_thread_current_ptr = ur_list_head(&ur_ready_head)
+  if is_null(ur_thread_current_ptr) {
+    // Invariant: the application keeps a lowest-priority idle thread permanently
+    // ready (see sample_urun.caap's ur_idle), so the ready list is never empty
+    // here. Reaching this point means that idle thread is missing — a kernel
+    // configuration error. Halt diagnosably rather than unsoundly continuing the
+    // thread that just blocked (returning `saved` would resume a thread no longer
+    // ready, so a blocking call would appear to complete with no wakeup).
+    _ur_misconfig_halt()
+    saved
+  } else {
+    ur_thread_current_ptr->ur_thread_run_count = ur_thread_current_ptr->ur_thread_run_count + 1
+    ur_thread_current_ptr->ur_thread_stack_ptr
+  }
+}
+
+// pick the first thread to run (highest priority ready) and return its PSP —
+// used once by the kernel entry to launch.
+ur_thread_first_psp () u32 export = {
+  ur_thread_current_ptr = ur_list_head(&ur_ready_head)
+  if is_null(ur_thread_current_ptr) {
+    // no ready thread at launch — same misconfig as the dispatch path, but here a
+    // bare deref would fault on address 0. Halt diagnosably instead.
+    _ur_misconfig_halt()
+    0
+  } else {
+    ur_thread_current_ptr->ur_thread_run_count = ur_thread_current_ptr->ur_thread_run_count + 1
+    ur_thread_current_ptr->ur_thread_stack_ptr
+  }
+}

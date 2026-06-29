@@ -1,0 +1,478 @@
+; stdlib/backend/driver.caap — native build on stdlib's OWN backend
+; (module stdlib.backend.driver). Zero stdlib-v1.
+;
+;   compile_ir   specs out   built trees (lib/ast/ir/surface) -> binary
+;   compile_file path  out   a stdlib native source file      -> binary
+;
+; Both lower through backend/emit/llvm (emit_program) and drive clang — the same
+; toolchain plumbing v1's tools/build had (LLVM IR -> object -> link), but
+; here it is stdlib-native: it links the caap-sys-runtime staticlib when a
+; program references runtime symbols (println/strings across the ABI),
+; discovering it via $CAAP_SYS_RUNTIME_LIB / the cargo target dir (built on
+; demand). Pure-compute programs link without it. Failures are DATA
+; ({ok:false, error|diagnostics}); nothing is left half-written.
+;
+; Host services (fs/os/process) resolve LAZILY — a session that never builds
+; pays nothing and needs no grants.
+(module stdlib.backend.driver)
+
+(use stdlib.syntax.render render_program)
+; the unified diagnostic normalizer (audit #16) — compile_file_with_diags reports
+; ALL failure modes (caught error string OR emitter ad-hoc maps) through one
+; canonical bag shape, instead of compile_file's two-shaped {error|diagnostics}.
+(use stdlib.lib.diag.convert diagnostics_to_bag)
+(use stdlib.lib.diag.bag entries)
+(import stdlib.backend.emit.llvm llvm)
+; the strict native profile (audit #5) is pinned in backend/prep; reach its
+; set_strict!/clear_strict! to honor an opt-in `mode: "strict"` in a build's opts.
+(import stdlib.backend.prep prep)
+
+; svc — resolve ONE host service op (fs/os/process), LAZILY and at
+; compile_time grant level. This is the only door to the host here, so a
+; session that never builds neither resolves nor needs the grant.
+;   service : the service name ("fs" | "os" | "process")
+;   name    : the op within it ("write_text", "env_get", "run", …)
+;   ->      : the callable op
+(bind svc
+  (lambda (service name)
+    (host_service_export service name "compile_time")))
+
+; ── clang toolchain plumbing (shared; native-only, no v1) ────────────────────
+
+; platform_libs — the system libs the caap-sys-runtime staticlib (Rust std)
+; needs at final link (clang supplies -lc itself).
+(bind platform_libs
+  (lambda ()
+    (bind ((p ((svc "os" "platform"))))
+      (cond
+        ((eq p "linux") (list_of "-lgcc_s" "-lutil" "-lrt" "-lpthread" "-lm" "-ldl"))
+        ((eq p "macos") (list_of "-lSystem" "-lresolv" "-lm"))
+        (else (list_of))))))
+
+; find_runtime_lib — the caap-sys-runtime staticlib path, or null. Tries
+; $CAAP_SYS_RUNTIME_LIB, $CARGO_TARGET_DIR, target/ and ../target/. When the
+; staticlib is missing it returns null (so link_ir!'s diagnostic — "set
+; CAAP_SYS_RUNTIME_LIB" — fires) UNLESS $CAAP_SYS_RUNTIME_AUTOBUILD is set to an
+; explicit opt-in ("1"/"true"/"yes"/"on"), the dev-only escape hatch that shells
+; out to `cargo build -p caap-sys-runtime-ffi`. The auto-build is OFF by
+; default: no hidden side effect — a missing lib surfaces as a clear diagnostic,
+; never a silent cargo invocation.
+(bind find_runtime_lib
+  (lambda ()
+    (bind (
+      (env_get (svc "os" "env_get"))
+      (fs_exists (svc "fs" "exists"))
+      (proc_run (svc "process" "run"))
+      (candidates (list_of))
+      (from_env (env_get "CAAP_SYS_RUNTIME_LIB"))
+      (target_dir (env_get "CARGO_TARGET_DIR"))
+      (autobuild (env_get "CAAP_SYS_RUNTIME_AUTOBUILD"))
+      (autobuild_on
+        (and (not (eq autobuild null))
+             (or (eq autobuild "1") (eq autobuild "true")
+                 (eq autobuild "yes") (eq autobuild "on"))))
+      (first_existing
+        (lambda (paths) (sequence_find paths (lambda (p) (fs_exists p)))))
+    )
+      (do
+        (when (not (eq from_env null)) (append candidates from_env))
+        (when (not (eq target_dir null))
+          (append candidates
+            (string_concat_many target_dir "/debug/libcaap_sys_runtime_ffi.a")))
+        (append candidates "target/debug/libcaap_sys_runtime_ffi.a")
+        (append candidates "../target/debug/libcaap_sys_runtime_ffi.a")
+        (bind ((found (first_existing candidates)))
+          (cond
+            ((not (eq found null)) found)
+            ; explicit opt-in dev escape hatch: build the staticlib, then rescan
+            (autobuild_on
+              (bind ((build (proc_run
+                              (assoc (map_of)
+                                "argv" (list_of "cargo" "build" "-p"
+                                                "caap-sys-runtime-ffi" "--lib")
+                                "capture_stdout" true "capture_stderr" true))))
+                (if (get build "success" false)
+                  (first_existing candidates)
+                  null)))
+            ; no hidden build: return null so link_ir!'s diagnostic fires
+            (else null)))))))
+
+; link_ir! — IR TEXT -> a native binary at `out`: write .ll, clang -c, clang
+; link (with the runtime staticlib + platform libs when found), clean up.
+; Two clang steps, like any C toolchain (`-x ir` on the archive would make
+; clang read the staticlib as IR). Returns {ok, output} | {ok:false, error}.
+(bind link_ir!
+  (lambda (ir out)
+    (bind (
+      (write_text (svc "fs" "write_text"))
+      (remove_file (svc "fs" "remove_file"))
+      (proc_run (svc "process" "run"))
+      (ir_path (string_concat_many out ".ll"))
+      (obj_path (string_concat_many out ".o"))
+      (runtime_lib (find_runtime_lib))
+      (clean! (lambda ()
+                (do (try (remove_file ir_path) (catch e null))
+                    (try (remove_file obj_path) (catch e null)))))
+    )
+      (do
+        (write_text ir_path ir)
+        (bind ((compile (proc_run
+                          (assoc (map_of)
+                            "argv" (list_of "clang" "-Wno-error=override-module"
+                                            "-x" "ir" "-c" ir_path "-o" obj_path)
+                            "capture_stdout" true "capture_stderr" true))))
+          (if (not (get compile "success" false))
+            (do (clean!)
+                (assoc (map_of) "ok" false
+                  "error" (string_concat_many "clang compile: "
+                            (get compile "stderr" ""))))
+            (bind ((argv (list_of "clang" obj_path)))
+              (do
+                (when (not (eq runtime_lib null))
+                  (do (append argv runtime_lib)
+                      (for lib (platform_libs) (append argv lib))))
+                (append argv "-o") (append argv out)
+                (bind ((link (proc_run
+                               (assoc (map_of) "argv" argv
+                                 "capture_stdout" true "capture_stderr" true))))
+                  (do
+                    (clean!)
+                    (if (get link "success" false)
+                      (assoc (map_of) "ok" true "output" out)
+                      (assoc (map_of) "ok" false
+                        "error" (string_concat_many
+                          "clang link"
+                          (if (eq runtime_lib null)
+                            " (no caap-sys-runtime staticlib; set CAAP_SYS_RUNTIME_LIB)"
+                            "")
+                          ": " (get link "stderr" ""))))))))))))))
+
+; debug_level normalization. The tools parse a `debug[=…]` positional into one
+; of "none" | "line-tables" | "full"; null means "none". An unknown spelling is
+; a configuration error, not a silent no-debug build.
+(bind norm_debug
+  (lambda (level)
+    (cond
+      ((eq level null) "none")
+      ((eq level "none") "none")
+      ((eq level "full") "full")
+      ((eq level "line-tables") "line-tables")
+      (else
+        (throw (string_concat_many
+          "native build: unknown debug level `" (value_to_string level)
+          "` (expected none, line-tables, or full)"))))))
+
+; emit! — lower a loaded unit to LLVM IR TEXT through the own backend
+; (backend/emit/llvm emit_program_debug). Diagnostics (front-end or codegen)
+; short-circuit the build: nothing is written, the caller surfaces them.
+;   unit        : the loaded (sugared) root unit
+;   debug_level : "none" | "line-tables" | "full" (DWARF debug info; "none" is
+;                 byte-identical to a non-debug build)
+;   ->   : {ok:true, ir} | {ok:false, diagnostics}
+(bind emit!
+  (lambda (unit debug_level)
+    (bind ((res ((get llvm "emit_program_debug") unit (norm_debug debug_level))))
+      (if (gt (size (get res "diagnostics" (list_of))) 0)
+        (assoc (map_of) "ok" false "diagnostics" (get res "diagnostics"))
+        (assoc (map_of) "ok" true "ir" (get res "text" ""))))))
+
+; compile_file — a stdlib NATIVE source file -> a binary at `out` (load ->
+; emit -> link). The ONE end-to-end entry for the in-workspace native build.
+;   path : a directive-free stdlib program (defn… + (bind main …) + (main));
+;          its value (main's result) becomes the binary's exit code
+;   out  : the output binary path
+;   debug_level : "none" | "line-tables" | "full" — opt-in DWARF debug info
+;          (clang -x ir preserves the .ll metadata into .debug_info; no -g)
+;   ->   : {ok:true, output} | {ok:false, error|diagnostics}. Any thrown load
+;          error is caught and returned as DATA (never propagates).
+(bind compile_file
+  (lambda (path out debug_level)
+    (try
+      (bind ((e (emit! (ctfe_compiler_load_surface_file_template compiler path)
+                       debug_level)))
+        (if (not (get e "ok" false))
+          e
+          (link_ir! (get e "ir" "") out)))
+      (catch err
+        (assoc (map_of) "ok" false
+          "error" (if (eq (value_type err) "map")
+                    (get err "message" (value_to_string err))
+                    (value_to_string err)))))))
+
+; compile_file_with_diags — like compile_file, but on ANY failure returns a UNIFIED
+; list of canonical diagnostics (audit #16). compile_file reports two shapes — a
+; string `error` (a caught throw) OR a `diagnostics` list (the emitter's ad-hoc
+; maps); this variant normalizes BOTH through diagnostics_to_bag, so a caller reads
+; ONE shape regardless of which producer failed. The success path is identical.
+; Additive: compile_file is unchanged (so the byte-identical emitter path stays).
+;   -> : {ok:true, output} | {ok:false, diagnostics:[canonical diag…]}
+(bind compile_file_with_diags
+  (lambda (path out debug_level)
+    (bind ((r (compile_file path out debug_level)))
+      (if (get r "ok" false)
+        r
+        (assoc (map_of) "ok" false
+          "diagnostics"
+          (entries
+            (diagnostics_to_bag
+              (if (eq (get r "diagnostics" null) null)
+                (list_of (get r "error" ""))   ; a caught error string -> one diag
+                (get r "diagnostics")))))))))   ; emitter ad-hoc maps -> normalized
+
+; compile_ir — BUILT specs (lib/ast/ir trees) -> a binary at `out`: render the
+; specs to a temp source file, then the same emit -> link as compile_file. The
+; runtime-codegen entry — build a program as DATA and compile it. The temp
+; file is always removed, even on failure.
+;   specs : a list of top-level specs (the program, as trees)
+;   out   : the output binary path
+;   debug_level : "none" | "line-tables" | "full". NOTE: specs rendered to a
+;          temp file carry FRESH spans for that temp path, so line info points
+;          at the generated file (the in-source spans of the original built
+;          trees are not preserved by render_program).
+;   ->    : {ok:true, output} | {ok:false, error|diagnostics}
+(bind compile_ir
+  (lambda (specs out debug_level)
+    (bind (
+      (write_text (svc "fs" "write_text"))
+      (remove_file (svc "fs" "remove_file"))
+      (tmp (string_concat_many out ".gen.caap"))
+    )
+      (try
+        (do
+          (write_text tmp (render_program specs))
+          (bind ((e (emit! (ctfe_compiler_load_surface_file_template compiler tmp)
+                           debug_level)))
+            (do
+              (try (remove_file tmp) (catch err null))
+              (if (not (get e "ok" false))
+                e
+                (link_ir! (get e "ir" "") out)))))
+        (catch err
+          (do
+            (try (remove_file tmp) (catch e2 null))
+            (assoc (map_of) "ok" false
+              "error" (if (eq (value_type err) "map")
+                        (get err "message" (value_to_string err))
+                        (value_to_string err)))))))))
+
+; ── freestanding / cross build (bare-metal: Cortex-M, …) ────────────────────
+; A SEPARATE toolchain from link_ir!: cross clang with NO host runtime and NO
+; platform libs (those are the hosted path). The IR carries its own
+; target triple/datalayout (set via backend/emit/llvm set_target!); here we add the
+; matching `-target`/`-mcpu`, freestanding flags, an optional ARM asm shim, and
+; a custom linker script. Output is an ELF; failures are DATA.
+
+; targets — the single source of cross-target truth: a registry keyed by a
+; short name, each entry the {triple, cpu, datalayout} the freestanding path
+; needs (the triple/datalayout pin backend/emit/llvm via set_target!, the cpu becomes
+; clang's -mcpu). A tool looks one up and passes the entry down to
+; compile_freestanding, so the CLI itself stays flagless. Add a board here to
+; support it; nothing else changes.
+(bind targets
+  (assoc (map_of)
+    "cortex-m3"
+    (assoc (map_of)
+      "triple" "thumbv7m-none-eabi"
+      "cpu" "cortex-m3"
+      ; force the LLVM linker: the host default (`ld.bfd`) rejects the ARM ELF
+      ; with "unrecognised emulation mode: armelf". `link_bare!` passes this as
+      ; -fuse-ld=lld, which clang resolves to ld.lld.
+      "linker" "lld"
+      ; optimize the freestanding image (the kernel is otherwise a -O0 debug
+      ; build); -Os inlines the one-pointer list helpers and shrinks code size.
+      "opt" "-Os"
+      "datalayout" "e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64")))
+
+; link_bare! — IR TEXT -> a freestanding ELF at `out`. opts: {triple, cpu,
+; shim?, ld?, linker?}. Compile the IR, assemble the asm shim (if any), link with
+; the linker script (if any), and always pass `-fuse-ld=<linker>` (default `lld`),
+; -nostdlib -ffreestanding. No caap-sys-runtime.
+(bind link_bare!
+  (lambda (ir out opts)
+    (bind (
+      (write_text (svc "fs" "write_text"))
+      (remove_file (svc "fs" "remove_file"))
+      (proc_run (svc "process" "run"))
+      (triple (get opts "triple" "thumbv7m-none-eabi"))
+      (mcpu (string_concat_many "-mcpu=" (get opts "cpu" "cortex-m3")))
+      (shim (get opts "shim" null))
+      (ld (get opts "ld" null))
+      (raw_linker (get opts "linker" "lld"))
+      (linker (if (eq raw_linker null) "lld" raw_linker))
+      (opt (get opts "opt" null))
+      (defsyms (get opts "defsyms" null))
+      (ir_path (string_concat_many out ".ll"))
+      (obj_path (string_concat_many out ".o"))
+      (shim_obj (string_concat_many out ".shim.o"))
+      (clean! (lambda ()
+                (do (try (remove_file ir_path) (catch e null))
+                    (try (remove_file obj_path) (catch e null))
+                    (try (remove_file shim_obj) (catch e null)))))
+      (run! (lambda (label argv)
+              (bind ((r (proc_run (assoc (map_of) "argv" argv
+                          "capture_stdout" true "capture_stderr" true))))
+                (unless (get r "success" false)
+                  (throw (string_concat_many label ": " (get r "stderr" "")))))))
+    )
+      (try
+        (do
+          (write_text ir_path ir)
+          (bind ((compile_argv (list_of "clang" "-target" triple mcpu
+                                 "-ffreestanding" "-nostdlib" "-Wno-override-module"
+                                 "-fno-unwind-tables" "-fno-asynchronous-unwind-tables")))
+            (do
+              (when (not (eq opt null)) (append compile_argv opt))
+              (append compile_argv "-x") (append compile_argv "ir")
+              (append compile_argv "-c") (append compile_argv ir_path)
+              (append compile_argv "-o") (append compile_argv obj_path)
+              (run! "clang compile" compile_argv)))
+          (bind ((link_argv (list_of "clang" "-target" triple mcpu
+                              "-ffreestanding" "-nostdlib")))
+            (do
+              ; pick an ARM-capable linker (the host `ld.bfd` cannot emit ARM ELF)
+              (append link_argv (string_concat_many "-fuse-ld=" linker))
+              (when (not (eq ld null))
+                (do (append link_argv "-T") (append link_argv ld)))
+              (append link_argv obj_path)
+              (when (not (eq shim null))
+                (do
+                  ; the shim assembles with any `--defsym NAME=val` the caller supplies
+                  ; (board addresses sourced from CAAP instead of hardcoded in the .s)
+                  (bind ((asm_argv (list_of "clang" "-target" triple mcpu
+                                     "-c" shim "-o" shim_obj)))
+                    (do
+                      (when (not (eq defsyms null))
+                        (sequence_each defsyms
+                          (lambda (ds) (append asm_argv (string_concat_many "-Wa,--defsym," ds)))))
+                      (run! "clang assemble shim" asm_argv)))
+                  (append link_argv shim_obj)))
+              (append link_argv "-o") (append link_argv out)
+              (run! "clang link" link_argv)
+              (clean!)
+              (assoc (map_of) "ok" true "output" out))))
+        (catch err
+          (do
+            (clean!)
+            (assoc (map_of) "ok" false
+              "error" (if (eq (value_type err) "map")
+                        (get err "message" (value_to_string err))
+                        (value_to_string err)))))))))
+
+; compile_freestanding — a (pure-kernel native) source FILE -> a bare ELF.
+;   path : a directive-free native program (defn/extern/global…, no `main`
+;          exit-code contract); a surface file must be lowered to kernel
+;          source first (the tool does this).
+;   opts : {triple, cpu, datalayout, shim?, ld?, mode?} — `mode: "strict"` opts
+;          into the strict native profile (audit #5); default is permissive.
+(bind compile_freestanding
+  (lambda (path out opts)
+    (try
+      (do
+        ((get llvm "set_target!")
+          (get opts "triple" "thumbv7m-none-eabi")
+          (get opts "datalayout" ""))
+        (if (eq (get opts "mode" "permissive") "strict") ((get prep "set_strict!")) null)
+        (bind ((res ((get llvm "emit_freestanding")
+                      (ctfe_compiler_load_surface_file_template compiler path))))
+          (do
+            ((get llvm "clear_target!"))
+            ((get prep "clear_strict!"))
+            (if (gt (size (get res "diagnostics" (list_of))) 0)
+              (assoc (map_of) "ok" false "diagnostics" (get res "diagnostics"))
+              (link_bare! (get res "text" "") out opts)))))
+      (catch err
+        (do
+          (try ((get llvm "clear_target!")) (catch e null))
+          (try ((get prep "clear_strict!")) (catch e null))
+          (assoc (map_of) "ok" false
+            "error" (if (eq (value_type err) "map")
+                      (get err "message" (value_to_string err))
+                      (value_to_string err))))))))
+
+; compile_surface_freestanding — a SURFACE program -> a bare ELF, in ONE call.
+; Folds the boilerplate a freestanding surface build used to hand-roll inline
+; (examples/urun/ur_build did exactly this): lower each clike module to kernel
+; source, DECLARE it so the loader resolves the entry's (use …) deps, lower the
+; entry, look the board up in `targets`, and hand the kernel entry to
+; compile_freestanding — cleaning up every generated kernel file on BOTH the
+; success and the failure path. The clike frontend is loaded on demand, so the
+; driver keeps no static dependency on a surface language.
+;   dir     : base directory of the .caap sources
+;   entry   : the entry surface file name (relative to dir; a directive-free
+;             native program once lowered — no `main` exit-code contract)
+;   modules : [{name, file}] surface DEPENDENCY modules to pre-lower + declare,
+;             each `name` the full module path the entry's (use …) names; may be ()
+;   target  : a key in `targets` (e.g. "cortex-m3")
+;   out     : the output ELF path
+;   opts    : extra opts forwarded to compile_freestanding (shim?, ld?, mode?);
+;             triple/cpu/datalayout/linker come from the target entry
+;   ->      : {ok:true, output} | {ok:false, error|diagnostics}
+(bind compile_surface_freestanding
+  (lambda (dir entry modules target out opts)
+    (bind ((tgt   (get targets target null))
+           (opts2 (if (eq opts null) (map_of) opts)))
+      (if (eq tgt null)
+        (assoc (map_of) "ok" false
+          "error" (string_concat_many
+            "compile_surface_freestanding: unknown target `" target
+            "` (not in the targets table)"))
+        (bind (
+          (api     (ctfe_compiler_lookup_value compiler "stdlib.load"))
+          (declare (get api "declare"))
+          (clike   ((get api "load_module") "stdlib.frontend.clike"))
+          (read_text   (svc "fs" "read_text"))
+          (write_text  (svc "fs" "write_text"))
+          (remove_file (svc "fs" "remove_file"))
+          (j        (lambda (n) (string_concat_many dir "/" n)))
+          (gen_path (lambda (n) (string_concat_many out "." n ".gen.caap")))
+          (gens     (list_of))
+          ; lower one clike file to kernel SOURCE text (or throw, located).
+          (lower1 (lambda (file)
+            (bind ((lr ((get clike "lower_program_at") (read_text (j file)) (j file))))
+              (if (get lr "ok" false)
+                (render_program (get lr "forms"))
+                (throw (string_concat_many "compile_surface_freestanding: lowering "
+                  file ": " (get lr "error" "")))))))
+          ; best-effort removal of every generated kernel file (success + failure).
+          (cleanup! (lambda () (for g gens (try (remove_file g) (catch e null)))))
+        )
+          (try
+            (do
+              ; 1. pre-lower + declare each dependency module (order irrelevant —
+              ;    the loader resolves the real dep graph at emit time).
+              (for m modules
+                (bind ((gp (gen_path (get m "name"))))
+                  (do
+                    (write_text gp (lower1 (get m "file")))
+                    (append gens gp)
+                    (declare (get m "name") gp))))
+              ; 2. lower the entry program to a temp kernel file.
+              (bind ((tmp (string_concat_many out ".gen.caap")))
+                (do
+                  (append gens tmp)
+                  (write_text tmp (lower1 entry))
+                  ; 3. the target's triple/cpu/datalayout/linker + the caller's
+                  ;    link/profile opts -> compile_freestanding.
+                  (bind ((merged (assoc (map_of)
+                                   "triple"     (get tgt "triple")
+                                   "cpu"        (get tgt "cpu")
+                                   "datalayout" (get tgt "datalayout")
+                                   "linker"     (get tgt "linker" "lld")
+                                   "opt"        (get tgt "opt" null)
+                                   "defsyms"    (get opts2 "defsyms" null)
+                                   "shim"       (get opts2 "shim" null)
+                                   "ld"         (get opts2 "ld" null)
+                                   "mode"       (get opts2 "mode" "permissive"))))
+                    (bind ((r (compile_freestanding tmp out merged)))
+                      (do (cleanup!) r))))))
+            (catch err
+              (do
+                (cleanup!)
+                (assoc (map_of) "ok" false
+                  "error" (if (eq (value_type err) "map")
+                            (get err "message" (value_to_string err))
+                            (value_to_string err)))))))))))
+
+(export compile_ir compile_file compile_file_with_diags link_ir!
+        compile_freestanding link_bare! targets
+        compile_surface_freestanding find_runtime_lib)

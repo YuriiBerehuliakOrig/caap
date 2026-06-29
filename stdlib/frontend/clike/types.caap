@@ -1,0 +1,218 @@
+; stdlib/frontend/clike/types.caap - type parsing helpers for stdlib.frontend.clike.
+;
+; This is an internal leaf behind the public stdlib.frontend.clike facade. The
+; facade passes a small service map for parser instrumentation and diagnostics:
+;   {st_emit!, oops}
+(module stdlib.frontend.clike.types)
+
+(use stdlib.frontend.clike.tokens
+     tval titems tsym? tnum? tlist?
+     chars_all_in? tsym_run_all? tsym_leading_count tsym_suffix_after_prefix)
+(use stdlib.semantics.types.registry known_type? type_var?)
+(use stdlib.frontend.clike.state local_types local_imports)
+(use stdlib.frontend.clike.meta scan_meta_range meta_merge!)
+
+(bind svc_emit_type!
+  (lambda (svc tok)
+    (bind ((emit (get svc "st_emit!" null)))
+      (when (not (eq emit null)) (emit tok "type" (list_of))))))
+
+(bind svc_emit_meta!
+  (lambda (svc tok)
+    (bind ((emit (get svc "st_emit!" null)))
+      (when (not (eq emit null)) (emit tok "keyword" (list_of))))))
+
+(bind svc_oops
+  (lambda (svc msg tok)
+    ((get svc "oops") msg tok)))
+
+; append_dim - push N onto a dims list without mutating the previous value.
+(bind append_dim
+  (lambda (dims n)
+    (bind ((out (list_of)))
+      (do (for d dims (append out d)) (append out n) out))))
+
+(bind ptr_type
+  (lambda (cur)
+    (assoc (map_of) "array" false
+      "name" (string_concat_many "ptr_"
+               (if (get cur "array" false)
+                 (get cur "elem")
+                 (get cur "name"))))))
+
+(bind apply_ptr_suffix!
+  (lambda (svc cur suffix at)
+    (do
+      (unless (chars_all_in? suffix "*")
+        (svc_oops svc "expected pointer suffix `*` in type spelling" at))
+      (for ch (string_chars suffix)
+        (set_ref cur (ptr_type (deref cur)))))))
+
+(bind apply_generic_close_suffix!
+  (lambda (svc cur suffix at)
+    (when (gt (size suffix) 0)
+      (do
+        (unless (chars_all_in? suffix "*")
+          (svc_oops svc "expected `*` after `>` in type spelling" at))
+        (apply_ptr_suffix! svc cur suffix at)))))
+
+; read_type - parse a C-style type spelling at toks[i].
+(bind read_type
+  (lambda (svc toks i)
+    (bind (
+      (cur (ref (assoc (map_of) "array" false "name" (tval (get toks i)))))
+      (j (ref (int_add i 1)))
+      (go (ref true))
+    )
+      (do
+        (svc_emit_type! svc (get toks i))
+        (while (deref go)
+          (bind ((nx (get toks (deref j))))
+            (cond
+              ((tsym_run_all? nx "*")
+                (do
+                  (apply_ptr_suffix! svc cur (tval nx) nx)
+                  (set_ref j (int_add (deref j) 1))))
+              ((tlist? nx "bracket")
+                (do
+                  (bind ((items (titems nx)))
+                    (do
+                      (unless (and (eq (size items) 1) (tnum? (get items 0)))
+                        (svc_oops svc "expected `[N]` with a literal length" nx))
+                      (bind ((n (tval (get items 0))))
+                        (do
+                          (when (le n 0)
+                            (svc_oops svc "array length must be a positive integer" nx))
+                          (if (get (deref cur) "array" false)
+                            (set_ref cur
+                              (assoc (deref cur)
+                                "count" (int_mul (get (deref cur) "count") n)
+                                "dims" (append_dim (get (deref cur) "dims") n)))
+                            (set_ref cur
+                              (assoc (map_of) "array" true
+                                "count" n
+                                "dims" (list_of n)
+                                "elem" (get (deref cur) "name")
+                                "name" (string_concat_many "ptr_"
+                                         (get (deref cur) "name")))))))))
+                  (set_ref j (int_add (deref j) 1))))
+              ((tsym? nx "<")
+                (bind ((spell (ref (string_concat_many (get (deref cur) "name") "<")))
+                       (k (ref (int_add (deref j) 1)))
+                       (n (ref 0)) (go2 (ref true))
+                       (close_suffix (ref "")) (close_token (ref null)))
+                  (do
+                    (while (deref go2)
+                      (bind ((a (read_type svc toks (deref k))))
+                        (do
+                          (when (gt (deref n) 0)
+                            (set_ref spell (string_concat_many (deref spell) "&")))
+                          (set_ref spell (string_concat_many (deref spell) (get a "name")))
+                          (set_ref n (int_add (deref n) 1))
+                          (set_ref k (get a "i"))
+                          (cond
+                            ((tsym? (get toks (deref k)) ",")
+                              (set_ref k (int_add (deref k) 1)))
+                            ((gt (tsym_leading_count (get toks (deref k)) ">") 0)
+                              (do
+                                (set_ref close_token (get toks (deref k)))
+                                (set_ref close_suffix
+                                  (tsym_suffix_after_prefix
+                                    (get toks (deref k)) ">"))
+                                (set_ref go2 false)))
+                            (else (svc_oops svc "expected `,` or `>` in generic type arguments"
+                                            (get toks (deref k))))))))
+                    (set_ref cur (assoc (deref cur) "name"
+                      (string_concat_many (deref spell) ">")))
+                    (apply_generic_close_suffix! svc cur (deref close_suffix)
+                                                 (deref close_token))
+                    (set_ref j (int_add (deref k) 1)))))
+              (else (set_ref go false)))))
+        (assoc (deref cur) "i" (deref j))))))
+
+(bind type_admit?
+  (lambda (nm)
+    (or (known_type? nm)
+        (contains (local_types) nm)
+        (contains (local_imports) nm)
+        (type_var? nm)
+        (eq nm "type")
+        (eq nm "field")
+        (not (eq (string_find nm "<") null)))))
+
+(bind type_known?
+  (lambda (nm)
+    (or (type_admit? nm)
+        (and (string_starts_with nm "ptr_")
+             (type_admit? (string_slice nm 4))))))
+
+(bind type_head_known?
+  (lambda (tyi)
+    (if (get tyi "array" false)
+      (type_known? (get tyi "elem"))
+      (type_known? (get tyi "name")))))
+
+(bind meta_words_only?
+  (lambda (toks start end)
+    (bind ((p (ref start)) (ok (ref true)))
+      (do
+        (while (and (deref ok) (lt (deref p) end))
+          (do
+            (unless (tsym? (get toks (deref p)) null)
+              (set_ref ok false))
+            (set_ref p (int_add (deref p) 1))))
+        (deref ok)))))
+
+; resolve_type_head - split a generic declaration/param head into:
+;   metadata... TYPE metadata...
+; The lexer/parser does not know which words are "types" or "modifiers". This
+; resolver prefers a semantically known type when one exists, but still returns a
+; structural spelling when it does not; unknown-type and unknown-metadata errors
+; stay in later validation/lowering phases.
+(bind resolve_type_head
+  (lambda (svc toks start end)
+    (bind ((best (ref null)) (best_pos (ref start)) (best_known (ref false))
+           (quiet (assoc (map_of) "st_emit!" null "oops" (get svc "oops")))
+           (p (ref start)))
+      (do
+        (while (lt (deref p) end)
+          (do
+            (when (tsym? (get toks (deref p)) null)
+              (bind ((try_ty (read_type quiet toks (deref p))))
+                (when (and (le (get try_ty "i") end)
+                           (and (meta_words_only? toks start (deref p))
+                                (meta_words_only? toks (get try_ty "i") end)))
+                  (bind ((known (type_head_known? try_ty)))
+                    (when (or (eq (deref best) null)
+                              (and known (not (deref best_known))))
+                      (do
+                        (set_ref best try_ty)
+                        (set_ref best_pos (deref p))
+                        (set_ref best_known known)))))))
+            (set_ref p (int_add (deref p) 1))))
+        (when (eq (deref best) null)
+          (svc_oops svc "expected a type spelling in declaration head" (get toks start)))
+        (bind ((prefix (scan_meta_range toks start (deref best_pos)
+                         (lambda (tk) (svc_emit_meta! svc tk))))
+               (tyi (read_type svc toks (deref best_pos))))
+          (bind ((postfix (scan_meta_range toks (get tyi "i") end
+                            (lambda (tk) (svc_emit_meta! svc tk))))
+                 (attrs (meta_merge! postfix prefix)))
+            (assoc (map_of) "type" tyi "attrs" attrs "i" end)))))))
+
+; param_spec - one `name type` parameter group, where metadata may appear on
+; either side of the structural type atom.
+(bind param_spec
+  (lambda (svc pr)
+    (do
+      (unless (and (ge (size pr) 2) (tsym? (get pr 0) null))
+        (svc_oops svc "expected `name type` parameter" (get pr 0)))
+      (bind ((head (resolve_type_head svc pr 1 (size pr)))
+             (rt (get head "type")))
+        (assoc (map_of)
+          "name" (tval (get pr 0))
+          "token" (get pr 0)
+          "type" (get rt "name")
+          "attrs" (get head "attrs"))))))
+
+(export read_type param_spec type_known? resolve_type_head)

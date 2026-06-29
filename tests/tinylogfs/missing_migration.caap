@@ -1,0 +1,5 @@
+; negative: DirEntry has v1 and v2 but no `migrate` between them.
+(use stdlib.storage.binary le_bytes)
+(storage Bad
+  (record DirEntry 1 (field inode u32))
+  (record DirEntry 2 (field inode u32) (field flags u16)))

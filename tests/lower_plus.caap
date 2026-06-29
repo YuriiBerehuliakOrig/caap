@@ -1,0 +1,18 @@
+; lower_plus — a USER-DEFINED whole-module TRANSFORM: lowers the project
+; vocabulary `plus` into kernel int_add in every module loaded after this
+; one. Runs before the check gate, so `plus` never reaches the checker.
+(module stdlib.fixtures.lower_plus)
+(use stdlib.semantics.passes.registry register_transform!)
+(use stdlib.syntax.ir replace_heads)
+(use stdlib.syntax.ast calln args_of)
+
+(bind registered
+  (register_transform! "lower_plus"
+    (lambda (located)
+      (for f located
+        (assoc f "node"
+          (replace_heads (get f "node" null)
+            (assoc (map_of) "plus"
+              (lambda (n) (calln "int_add" (args_of n))))))))))
+
+(export registered)

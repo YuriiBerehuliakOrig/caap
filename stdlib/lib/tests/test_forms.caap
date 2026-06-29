@@ -1,0 +1,185 @@
+; stdlib/lib/tests/test_forms.caap — the form set's expansions (boot/forms.caap),
+; driven through the expander's public surface (stdlib.expand).
+;
+; Each form reduces a sugar head to kernel heads; here we feed a sugared tree to
+; `expand` and assert the kernel tree it lowers to. Gensym-free forms are checked
+; by rendering to canonical source text; forms that mint a temp (case, with_map)
+; are checked structurally via lib/ast accessors so a hygienic gensym name does
+; not make the test brittle. This doubles as executable documentation of what
+; each form means.
+
+;; @area: syntax
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.syntax.ast sym lit calln call head_of head_is? arg args_of
+     callee name_of literal_of)
+(use stdlib.syntax.render render)
+
+(do
+  (bind (
+    ; expand — the strict public entry (raises on any error diagnostic).
+    (expand (get (ctfe_compiler_lookup_value compiler "stdlib.expand") "expand"))
+    ; src — a form's kernel expansion as canonical source text.
+    (src (lambda (node) (render (expand node))))
+  )
+    (do
+      ; ── when / unless ──────────────────────────────────────────────────────
+      (assert_eq (src (calln "when" (list_of (sym "p") (calln "f" (list_of)))))
+        "(if p (do (f)) null)"
+        "(when p (f)) -> (if p (do (f)) null)")
+
+      (assert_eq (src (calln "unless" (list_of (sym "p") (calln "f" (list_of)))))
+        "(if p null (do (f)))"
+        "(unless p (f)) -> (if p null (do (f)))")
+
+      ; ── cond ── right-folds into nested if; else is the tail ────────────────
+      (assert_eq
+        (src (calln "cond" (list_of
+               (call (sym "a") (list_of (lit 1)))
+               (call (sym "else") (list_of (lit 2))))))
+        "(if a (do 1) (do 2))"
+        "(cond (a 1) (else 2)) -> (if a (do 1) (do 2))")
+
+      ; ── -> / ->> ── thread first vs last ────────────────────────────────────
+      (assert_eq
+        (src (calln "->" (list_of (sym "x")
+               (calln "f" (list_of (sym "a")))
+               (calln "g" (list_of (sym "b"))))))
+        "(g (f x a) b)"
+        "(-> x (f a) (g b)) -> (g (f x a) b)")
+
+      (assert_eq
+        (src (calln "->>" (list_of (sym "x")
+               (calln "f" (list_of (sym "a")))
+               (calln "g" (list_of (sym "b"))))))
+        "(g b (f a x))"
+        "(->> x (f a) (g b)) -> (g b (f a x))")
+
+      ; a bare-name step threads as a 1-arg call
+      (assert_eq
+        (src (calln "->" (list_of (sym "x") (sym "f") (sym "g"))))
+        "(g (f x))"
+        "(-> x f g) -> (g (f x)) (bare steps)")
+
+      ; ── for ── side-effecting iteration over a sequence ─────────────────────
+      (assert_eq
+        (src (calln "for" (list_of (sym "e") (sym "xs")
+               (calln "use" (list_of (sym "e"))))))
+        "(sequence_each xs (lambda (e) (do (use e))))"
+        "(for e xs (use e)) -> (sequence_each xs (lambda (e) …))")
+
+      ; ── if_let / when_let ── bind once, branch on non-null ──────────────────
+      (assert_eq
+        (src (calln "if_let" (list_of
+               (call (sym "v") (list_of (sym "e")))
+               (sym "t") (sym "f"))))
+        "(bind ((v e)) (if (not (eq v null)) t f))"
+        "(if_let (v e) t f) -> bind + non-null if")
+
+      (assert_eq
+        (src (calln "when_let" (list_of
+               (call (sym "v") (list_of (sym "e")))
+               (calln "use" (list_of (sym "v"))))))
+        "(bind ((v e)) (if (not (eq v null)) (do (use v)) null))"
+        "(when_let (v e) (use v)) -> bind + non-null if, null else")
+
+      ; ── case ── one eval into a temp, then dispatch by eq.
+      ; expand runs to fixpoint, so the emitted `cond` is itself re-lowered to a
+      ; nested `if`. Final tree of (case x (1 lo) (else hi)):
+      ;   (bind ((<g> x)) (if (eq <g> 1) (do lo) (do hi)))
+      ; The temp is a gensym, so this is checked structurally (and we assert the
+      ; SAME temp is bound and compared).
+      (bind ((c (expand (calln "case" (list_of (sym "x")
+                   (call (lit 1) (list_of (sym "lo")))
+                   (call (sym "else") (list_of (sym "hi"))))))))
+        (do
+          (assert_true (head_is? c "bind") "case lowers to a bind")
+          (bind (
+            (pair0 (callee (arg c 0)))  ; the sole pair (<g> x), as the pairs callee
+            (g (name_of (callee pair0))) ; the minted temp's identifier
+            (body (arg c 1))            ; (if (eq <g> 1) (do lo) (do hi))
+            (test (arg body 0))         ; (eq <g> 1)
+          )
+            (do
+              (assert_eq (name_of (arg pair0 0)) "x"
+                "case binds the scrutinee unchanged")
+              (assert_true (head_is? body "if")
+                "case body lowers (cond re-expanded) to a nested if")
+              (assert_eq (head_of test) "eq" "case dispatches by eq")
+              (assert_eq (name_of (arg test 0)) g
+                "case compares the SAME temp it bound")
+              (assert_eq (literal_of (arg test 1)) 1
+                "case compares against the clause value")
+              ; the else body is the final if's else arm
+              (assert_eq (head_of (arg body 2)) "do" "case else body is the tail arm")
+              (assert_eq (name_of (arg (arg body 2) 0)) "hi"
+                "case else body content preserved")))))
+
+      ; ── with_map ── eval the map once into a temp; locals are keyed gets.
+      ; Final tree of (with_map m ((a "k") (b "j" 0)) (use a b)):
+      ;   (bind ((<g> m) (a (get <g> "k" null)) (b (get <g> "j" 0))) (use a b))
+      ; The pairs node carries the temp pair as its callee; each local pair is an
+      ; arg. Gensym-bearing, so checked structurally.
+      (bind ((w (expand (calln "with_map" (list_of
+                   (sym "m")
+                   (call (call (sym "a") (list_of (lit "k")))    ; (a "k")
+                         (list_of (call (sym "b")                ; (b "j" 0)
+                                    (list_of (lit "j") (lit 0)))))
+                   (calln "use" (list_of (sym "a") (sym "b"))))))))
+        (do
+          (assert_true (head_is? w "bind") "with_map lowers to a bind")
+          (bind (
+            (pairs (arg w 0))           ; ((<g> m) (a …) (b …))
+            (tmp_pair (callee pairs))   ; the temp pair (<g> m), as the pairs callee
+            (g (name_of (callee tmp_pair)))  ; the minted temp's identifier
+            (locals (args_of pairs))    ; [(a (get <g> "k" null)), (b (get <g> "j" 0))]
+            (pa (get locals 0))         ; (a (get <g> "k" null))
+            (pb (get locals 1))         ; (b (get <g> "j" 0))
+            (ga (arg pa 0))             ; (get <g> "k" null)
+            (gb (arg pb 0))             ; (get <g> "j" 0)
+          )
+            (do
+              (assert_eq (name_of (arg tmp_pair 0)) "m"
+                "with_map binds the map expression into the temp first")
+              (assert_eq (name_of (callee pa)) "a" "first local is `a`")
+              (assert_eq (head_of ga) "get" "with_map local is a get on the temp")
+              (assert_eq (name_of (arg ga 0)) g
+                "with_map local reads from the SAME temp")
+              (assert_eq (literal_of (arg ga 1)) "k" "with_map local a reads key \"k\"")
+              (assert_eq (literal_of (arg ga 2)) null
+                "with_map elided default is null")
+              (assert_eq (literal_of (arg gb 2)) 0
+                "with_map explicit default is kept")))))
+
+      ; ── alias ── inert "::alias" marker, target resolved lazily ─────────────
+      ; (kernel `eq` is reference-y on compound values, so marker contents are
+      ; checked element-wise rather than as a whole-list eq.)
+      (bind ((a (expand (calln "alias" (list_of (sym "byte") (sym "u8"))))))
+        (bind ((m (literal_of (arg a 0))))
+          (do
+            (assert_true (head_is? a "do") "alias is an inert do-marker")
+            (assert_eq (get m 0 "?") "::alias" "alias marker tag")
+            (assert_eq (get m 1 "?") "byte" "alias marker name")
+            (assert_eq (get m 2 "?") "u8" "alias marker target"))))
+
+      ; ── enum ── named int constants; bare variant auto-numbers ──────────────
+      (bind ((e (expand (calln "enum" (list_of (sym "Vec")
+                   (call (sym "timer") (list_of (lit 32)))   ; (timer 32)
+                   (sym "kbd"))))))                          ; bare -> 33
+        (bind ((m (literal_of (arg e 0))))
+          (do
+            (assert_true (head_is? e "do") "enum lowers to a do")
+            ; arg 0 is the marker literal (type alias + variant values)
+            (assert_eq (get m 0 "?") "::enum" "enum marker tag")
+            (assert_eq (get m 1 "?") "Vec" "enum marker type name")
+            (assert_eq (get m 2 "?") "i32" "enum is an i32 alias")
+            (assert_eq (get m 4 0) 32 "explicit value recorded")
+            (assert_eq (get m 5 "?") "kbd" "bare variant present")
+            (assert_eq (get m 6 0) 33 "bare variant auto-numbers from 32+1")
+            ; the binds give the constants to eval
+            (assert_true (head_is? (arg e 1) "bind") "enum emits a const bind")
+            (assert_eq (name_of (arg (arg e 1) 0)) "timer" "first const is timer")
+            (assert_eq (literal_of (arg (arg e 1) 1)) 32 "timer = 32"))))
+
+      null)))

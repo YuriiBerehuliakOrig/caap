@@ -1,0 +1,63 @@
+; stdlib/lib/tests/test_digest.caap — known-answer vectors for the cryptographic
+; digests in stdlib.lib.crypto.digest. The hex vectors are the canonical ones
+; published with each spec; an exact string match catches any 32-bit masking,
+; endianness, or round-constant bug.
+
+;; @area: crypto
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq)
+(use stdlib.lib.crypto.digest sha256 sha1 md5 hmac)
+
+(do
+  ; ── SHA-256 (FIPS 180-4 examples + the empty string) ──
+  (assert_eq (sha256 "")
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    "sha256 empty")
+  (assert_eq (sha256 "abc")
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    "sha256 abc")
+  ; a multi-block input (> 55 bytes forces a second padded block)
+  (assert_eq (sha256 "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")
+    "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+    "sha256 two-block message")
+
+  ; ── SHA-1 (RFC 3174 / FIPS 180 examples) ──
+  (assert_eq (sha1 "")
+    "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+    "sha1 empty")
+  (assert_eq (sha1 "abc")
+    "a9993e364706816aba3e25717850c26c9cd0d89d"
+    "sha1 abc")
+
+  ; ── MD5 (RFC 1321 test suite) ──
+  (assert_eq (md5 "")
+    "d41d8cd98f00b204e9800998ecf8427e"
+    "md5 empty")
+  (assert_eq (md5 "abc")
+    "900150983cd24fb0d6963f7d28e17f72"
+    "md5 abc")
+  (assert_eq (md5 "message digest")
+    "f96b697d7cb7938d525a2f31aaf161d0"
+    "md5 message digest")
+
+  ; ── byte-list input mirrors the string spelling ──
+  (assert_eq (sha256 (list_of 97 98 99))
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    "sha256 accepts a byte list")
+
+  ; ── HMAC (RFC 2202 / RFC 4231 test vectors) ──
+  ; HMAC-MD5, key "Jefe", data "what do ya want for nothing?"  (RFC 2202)
+  (assert_eq (hmac md5 "Jefe" "what do ya want for nothing?")
+    "750c783e6ab0b503eaa86e310a5db738"
+    "hmac-md5 Jefe")
+  ; HMAC-SHA1 same key/data (RFC 2202)
+  (assert_eq (hmac sha1 "Jefe" "what do ya want for nothing?")
+    "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79"
+    "hmac-sha1 Jefe")
+  ; HMAC-SHA256 same key/data (RFC 4231 test case 2)
+  (assert_eq (hmac sha256 "Jefe" "what do ya want for nothing?")
+    "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+    "hmac-sha256 Jefe")
+
+  true)

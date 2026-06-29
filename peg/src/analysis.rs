@@ -1,15 +1,21 @@
+//! Static grammar analysis: the rule-reference graph, reachability, left-
+//! recursion SCCs, and arity checks, cached on the grammar via
+//! [`analyze_and_store`] / [`analyze_cached_grammar`].
+
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
+use crate::analysis_rule::{RuleIssueSummary, RuleScanSummary};
+use crate::expr::PegExpr;
 use crate::grammar::Grammar;
 use crate::graph_ops::{build_reverse_graph, find_left_recursive_sccs};
-use crate::parser::{
-    collect_dead_choice_alts_from_source, collect_nullable_repetitions_from_source,
-    collect_overlapping_prefixes_from_source, collect_prefix_shadowed_alts_from_source,
-    extract_calls_from_source, extract_left_refs_from_source, extract_params_used_from_source,
-    extract_refs_from_source, has_bare_commit_from_source, is_source_nullable,
-    is_source_nullable_with_rules, is_source_productive_with_rules, source_fixed_text,
+use crate::parser_analysis::{
+    collect_dead_choice_alts_from_expr, collect_nullable_repetitions_from_expr,
+    collect_overlapping_prefixes_from_expr, collect_prefix_shadowed_alts_from_expr,
+    extract_calls_from_expr, extract_left_refs_from_expr, extract_params_used_from_expr,
+    extract_refs_from_expr, fixed_text_in_expr, has_bare_commit_in_expr, is_nullable_in_expr,
+    is_nullable_with_rules_in_expr, is_productive_with_rules_in_expr,
 };
 
 // ── Analysis result ────────────────────────────────────────────────────────
@@ -30,8 +36,11 @@ pub struct ParamArityMismatch {
 /// Full static analysis of a grammar's rule graph.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GrammarAnalysis {
+    /// Number of rules in the grammar.
     pub rule_count: usize,
+    /// Whether the configured start rule exists.
     pub has_start_rule: bool,
+    /// Whether two rules share a name.
     pub has_duplicate_rule_names: bool,
 
     /// Outgoing rule references for each rule: `refs[rule] = {referenced_names}`.
@@ -93,49 +102,31 @@ pub struct GrammarAnalysis {
     #[serde(default)]
     pub unproductive: Vec<String>,
 
+    /// `(rule, message)` pairs for rules whose stored expression could not be
+    /// parsed from source.
+    #[serde(default)]
+    pub invalid_rules: Vec<(String, String)>,
+
     /// Strongly connected components that form left-recursive cycles.
     /// Each inner `Vec` is a sorted list of rule names in the same SCC.
     /// Computed from the left-refs graph (only refs reachable from the left edge).
     #[serde(default)]
     pub left_recursive_sccs: Vec<Vec<String>>,
 
+    /// Non-fatal analysis warnings.
     pub warnings: Vec<String>,
+    /// Analysis errors that make the grammar invalid.
     pub errors: Vec<String>,
-}
-
-// ── Per-rule scan / issue summaries ───────────────────────────────────────
-
-/// Structural information extracted from a single rule body.
-/// Cached so unchanged rules need not be re-parsed on every analysis.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RuleScanSummary {
-    /// All rule names referenced in the body.
-    pub refs: Vec<String>,
-    /// `(caller, callee)` pairs where `callee` is not defined in the grammar.
-    pub missing_refs: Vec<(String, String)>,
-    /// `(caller, callee, expected, got)` param-arity mismatches.
-    pub param_arity_mismatches: Vec<(String, String, usize, usize)>,
-    /// `(rule, param)` pairs: param used in body but not declared.
-    pub undeclared_params: Vec<(String, String)>,
-    /// `(rule, param)` pairs: declared param never used.
-    pub unused_params: Vec<(String, String)>,
-}
-
-/// Analysis issues detected in a single rule body.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RuleIssueSummary {
-    pub nullable_repetition: Vec<(String, String)>,
-    pub dead_choice_alternatives: Vec<(String, usize, usize)>,
-    pub prefix_shadowed_choice_alternatives: Vec<(String, usize, usize, String)>,
-    pub non_choice_commits: Vec<(String, String)>,
-    pub overlapping_prefixes: Vec<(String, usize, usize, String)>,
 }
 
 // ── Cached analysis state ──────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Cached analysis plus the signatures used to detect when it is stale.
 pub struct GrammarAnalysisState {
+    /// The cached analysis.
     pub analysis: GrammarAnalysis,
+    /// Grammar version the analysis was computed at.
     pub analysis_version: u64,
     /// FNV-1a hash of each rule's source text at analysis time.
     #[serde(default)]
@@ -176,13 +167,16 @@ pub struct GrammarAnalysisState {
 
 /// Build the outgoing-reference map for `grammar`.
 ///
-/// Deduplicates rules by name (first occurrence wins, matching parse behaviour).
+/// When a grammar contains duplicate rule names (which `GrammarRule::try_from_source`
+/// allows but the parser compile step rejects at runtime), analysis silently uses
+/// the first occurrence so that static checks can still report all other issues
+/// in the grammar.
 fn build_refs_map(grammar: &Grammar) -> HashMap<String, Vec<String>> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut refs: HashMap<String, Vec<String>> = HashMap::new();
     for rule in &grammar.rules {
         if seen.insert(rule.name.clone()) {
-            refs.insert(rule.name.clone(), extract_refs_from_source(&rule.source));
+            refs.insert(rule.name.clone(), extract_refs_from_expr(rule.expr()));
         }
     }
     refs
@@ -246,7 +240,7 @@ fn analyze_grammar_with_refs(
     let mut non_choice_commits: Vec<(String, String)> = Vec::new();
 
     for rule in &grammar.rules {
-        let calls = extract_calls_from_source(&rule.source);
+        let calls = extract_calls_from_expr(rule.expr());
         for (callee, got) in calls {
             if let Some(&expected) = rule_param_counts.get(&callee) {
                 if got != expected {
@@ -261,7 +255,7 @@ fn analyze_grammar_with_refs(
         }
 
         if !rule.params.is_empty() {
-            let used_params = extract_params_used_from_source(&rule.source);
+            let used_params = extract_params_used_from_expr(rule.expr());
             let declared: HashSet<&str> = rule.params.iter().map(|s| s.as_str()).collect();
             let used: HashSet<&str> = used_params.iter().map(|s| s.as_str()).collect();
             for p in &used_params {
@@ -276,7 +270,7 @@ fn analyze_grammar_with_refs(
             }
         }
 
-        if let Some(kind) = has_bare_commit_from_source(&rule.source) {
+        if let Some(kind) = has_bare_commit_in_expr(rule.expr()) {
             non_choice_commits.push((rule.name.clone(), kind.to_string()));
         }
     }
@@ -297,7 +291,7 @@ fn analyze_grammar_with_refs(
             if fixed_rules.contains_key(&rule.name) {
                 continue;
             }
-            if let Some(text) = source_fixed_text(&rule.source, &fixed_rules) {
+            if let Some(text) = fixed_text_in_expr(rule.expr(), &fixed_rules) {
                 fixed_rules.insert(rule.name.clone(), Some(text));
                 changed = true;
             }
@@ -316,7 +310,7 @@ fn analyze_grammar_with_refs(
             if productive_rules.get(&rule.name).copied() == Some(true) {
                 continue;
             }
-            if is_source_productive_with_rules(&rule.source, &productive_rules) {
+            if is_productive_with_rules_in_expr(rule.expr(), &productive_rules) {
                 productive_rules.insert(rule.name.clone(), true);
                 changed = true;
             }
@@ -334,7 +328,7 @@ fn analyze_grammar_with_refs(
             if nullable_set.contains(&rule.name) {
                 continue;
             }
-            if is_source_nullable_with_rules(&rule.source, &nullable_set) {
+            if is_nullable_with_rules_in_expr(rule.expr(), &nullable_set) {
                 nullable_set.insert(rule.name.clone());
                 changed = true;
             }
@@ -349,7 +343,7 @@ fn analyze_grammar_with_refs(
     // precise than the full refs graph used by `detect_cycles`).
     let mut left_refs_graph: HashMap<String, HashSet<String>> = HashMap::new();
     for rule in &grammar.rules {
-        let lr: HashSet<String> = extract_left_refs_from_source(&rule.source, &nullable_set)
+        let lr: HashSet<String> = extract_left_refs_from_expr(rule.expr(), &nullable_set)
             .into_iter()
             .filter(|r| rule_names.contains(r))
             .collect();
@@ -364,19 +358,19 @@ fn analyze_grammar_with_refs(
     let mut overlapping_prefixes: Vec<(String, usize, usize, String)> = Vec::new();
 
     for rule in &grammar.rules {
-        for kind in collect_nullable_repetitions_from_source(&rule.source, &nullable_set) {
+        for kind in collect_nullable_repetitions_from_expr(rule.expr(), &nullable_set) {
             nullable_repetition.push((rule.name.clone(), kind));
         }
-        for (dead, live) in collect_dead_choice_alts_from_source(&rule.source, &fixed_rules) {
+        for (dead, live) in collect_dead_choice_alts_from_expr(rule.expr(), &fixed_rules) {
             dead_choice_alternatives.push((rule.name.clone(), dead, live));
         }
         for (dead, live, prefix) in
-            collect_prefix_shadowed_alts_from_source(&rule.source, &fixed_rules)
+            collect_prefix_shadowed_alts_from_expr(rule.expr(), &fixed_rules)
         {
             prefix_shadowed_choice_alternatives.push((rule.name.clone(), dead, live, prefix));
         }
         for (alt1, alt2, prefix) in
-            collect_overlapping_prefixes_from_source(&rule.source, &fixed_rules)
+            collect_overlapping_prefixes_from_expr(rule.expr(), &fixed_rules)
         {
             overlapping_prefixes.push((rule.name.clone(), alt1, alt2, prefix));
         }
@@ -395,6 +389,16 @@ fn analyze_grammar_with_refs(
         .map(|r| r.name.clone())
         .collect();
     unproductive.sort_unstable();
+
+    let mut invalid_rules: Vec<(String, String)> = grammar
+        .rules
+        .iter()
+        .filter_map(|rule| match rule.expr() {
+            PegExpr::Invalid(message) => Some((rule.name.clone(), message.clone())),
+            _ => None,
+        })
+        .collect();
+    invalid_rules.sort_unstable();
 
     // ── Errors & warnings ─────────────────────────────────────────────────
     let mut errors: Vec<String> = Vec::new();
@@ -459,6 +463,9 @@ fn analyze_grammar_with_refs(
             "rule '{rule}' is unproductive (cannot match any input)"
         ));
     }
+    for (rule, message) in &invalid_rules {
+        errors.push(format!("rule '{rule}' has invalid source: {message}"));
+    }
 
     GrammarAnalysis {
         rule_count: grammar.rules.len(),
@@ -480,6 +487,7 @@ fn analyze_grammar_with_refs(
         prefix_shadowed_choice_alternatives,
         overlapping_prefixes,
         unproductive,
+        invalid_rules,
         warnings,
         errors,
     }
@@ -541,6 +549,8 @@ fn transitive_dependents(
 
 // ── Cache-aware analysis ───────────────────────────────────────────────────
 
+/// Analyse `grammar`, reusing `previous` results for rules whose source is
+/// unchanged.
 pub fn analyze_cached_grammar(
     grammar: &Grammar,
     previous: Option<&GrammarAnalysisState>,
@@ -549,7 +559,7 @@ pub fn analyze_cached_grammar(
 
     // Short-circuit: same version AND same per-rule signatures → nothing changed.
     if let Some(prev) = previous {
-        if prev.analysis_version == grammar.version as u64 && prev.rule_signatures == current_sigs {
+        if prev.analysis_version == grammar.version && prev.rule_signatures == current_sigs {
             return prev.clone();
         }
     }
@@ -595,11 +605,11 @@ pub fn analyze_cached_grammar(
                 continue; // duplicate rule — first occurrence wins
             }
             if affected.contains(&rule.name) {
-                r.insert(rule.name.clone(), extract_refs_from_source(&rule.source));
+                r.insert(rule.name.clone(), extract_refs_from_expr(rule.expr()));
             } else if let Some(cached) = prev_refs.and_then(|pr| pr.get(&rule.name)) {
                 r.insert(rule.name.clone(), cached.clone());
             } else {
-                r.insert(rule.name.clone(), extract_refs_from_source(&rule.source));
+                r.insert(rule.name.clone(), extract_refs_from_expr(rule.expr()));
             }
         }
         r
@@ -617,7 +627,7 @@ pub fn analyze_cached_grammar(
             if nullable_for_lr.contains(&rule.name) {
                 continue;
             }
-            if is_source_nullable_with_rules(&rule.source, &nullable_for_lr) {
+            if is_nullable_with_rules_in_expr(rule.expr(), &nullable_for_lr) {
                 nullable_for_lr.insert(rule.name.clone());
                 changed = true;
             }
@@ -635,7 +645,7 @@ pub fn analyze_cached_grammar(
             .iter()
             .filter(|r| seen.insert(r.name.clone()))
             .map(|rule| {
-                let lr = extract_left_refs_from_source(&rule.source, &nullable_for_lr)
+                let lr = extract_left_refs_from_expr(rule.expr(), &nullable_for_lr)
                     .into_iter()
                     .filter(|r| defined_rule_names.contains(r))
                     .collect();
@@ -659,7 +669,7 @@ pub fn analyze_cached_grammar(
 
     GrammarAnalysisState {
         analysis,
-        analysis_version: grammar.version as u64,
+        analysis_version: grammar.version,
         rule_signatures: current_sigs,
         param_signatures: grammar
             .rules
@@ -678,11 +688,12 @@ pub fn analyze_cached_grammar(
     }
 }
 
+/// Analyse `grammar` and store the result in its cached analysis state.
 pub fn analyze_and_store(grammar: &mut Grammar) -> GrammarAnalysis {
     let state = analyze_cached_grammar(grammar, grammar.state.analysis_state.as_ref());
     let analysis = state.analysis.clone();
     grammar.state.analysis_state = Some(state);
-    grammar.state.version = grammar.version as u64;
+    grammar.state.version = grammar.version;
     analysis
 }
 
@@ -697,7 +708,7 @@ pub fn compute_nullable_rules(grammar: &Grammar) -> HashSet<String> {
     let mut nullable: HashSet<String> = grammar
         .rules
         .iter()
-        .filter(|r| is_source_nullable(&r.source))
+        .filter(|r| is_nullable_in_expr(r.expr()))
         .map(|r| r.name.clone())
         .collect();
 
@@ -709,7 +720,7 @@ pub fn compute_nullable_rules(grammar: &Grammar) -> HashSet<String> {
             if nullable.contains(&rule.name) {
                 continue;
             }
-            if source_nullable_with_ctx(&rule.source, &nullable) {
+            if is_nullable_with_rules_in_expr(rule.expr(), &nullable) {
                 nullable.insert(rule.name.clone());
                 changed = true;
             }
@@ -859,27 +870,6 @@ fn detect_cycles(refs: &HashMap<String, Vec<String>>) -> Vec<String> {
     result
 }
 
-/// Nullability check that follows `Ref` nodes via the supplied nullable set.
-///
-/// This is a simplified approach: we look for patterns `rule_name` in the source
-/// and treat a Ref as nullable if the rule is already in `nullable`.  A proper
-/// implementation would parse the full expression; for now we reuse the parser's
-/// structural check as a base.
-fn source_nullable_with_ctx(source: &str, nullable: &HashSet<String>) -> bool {
-    // Parse source and check nullability, treating Ref as nullable iff it's in `nullable`.
-    use crate::parser::is_source_nullable;
-    // First quick check: structurally nullable without refs?
-    if is_source_nullable(source) {
-        return true;
-    }
-    // Look for rule refs in the source; if any referenced rule is nullable we
-    // cannot immediately conclude the rule is nullable without a full expression
-    // parser, so we conservatively return false here.  The fixed-point iteration
-    // will eventually stabilise once we have a proper recursive descent check.
-    let _ = nullable;
-    false
-}
-
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -894,14 +884,14 @@ mod tests {
             .map(|(n, s)| format!("{n} <- {s}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let mut g = Grammar::new(&text).with_start_rule(start);
+        let mut g = Grammar::trusted_new(&text).with_start_rule(start);
         g.start_rule = start.to_string();
         g
     }
 
     #[test]
     fn detects_missing_start_rule() {
-        let g = Grammar::new("a <- [a]\nb <- [b]");
+        let g = Grammar::trusted_new("a <- [a]\nb <- [b]");
         let a = analyze_grammar(&g);
         assert!(!a.has_start_rule);
         assert!(a.errors.iter().any(|e| e.contains("missing start rule")));
@@ -915,8 +905,8 @@ mod tests {
             metadata: HashMap::new(),
             imports: HashMap::new(),
             rules: vec![
-                GrammarRule::from_source("a", "x", Vec::new()),
-                GrammarRule::from_source("a", "y", Vec::new()),
+                GrammarRule::trusted_from_source("a", "x", Vec::new()),
+                GrammarRule::trusted_from_source("a", "y", Vec::new()),
             ],
             version: 1,
             state: GrammarState {
@@ -924,6 +914,7 @@ mod tests {
                 analysis_state: None,
                 version: 0,
             },
+            compiled: Default::default(),
         };
         let a = analyze_grammar(&g);
         assert!(a.has_duplicate_rule_names);
@@ -953,6 +944,12 @@ mod tests {
         let a = analyze_grammar(&g);
         assert!(a.has_start_rule);
         assert!(a.errors.is_empty());
+    }
+
+    #[test]
+    fn grammar_try_new_rejects_invalid_rule_source_before_analysis() {
+        let err = Grammar::try_new("root <- [a").unwrap_err();
+        assert!(err.to_string().contains("unterminated character class"));
     }
 
     #[test]
@@ -1022,8 +1019,8 @@ mod tests {
         let mut g = make_grammar("root", &[("root", "'x'"), ("helper", "'y'")]);
         let state1 = analyze_cached_grammar(&g, None);
         // Change only the "helper" rule source.
-        g.rules[1].set_source("'z'");
-        g.version += 1;
+        g.rules[1].trusted_set_source("'z'");
+        g.bump_version().unwrap();
         let state2 = analyze_cached_grammar(&g, Some(&state1));
         // "root" signature should be preserved in state2 and equal state1's.
         assert_eq!(

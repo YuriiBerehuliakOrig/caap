@@ -1,0 +1,9 @@
+; tests/bad_if_result.caap — branch JOIN: the if
+; mixes an i32 param with an int literal; the join widens to the int family,
+; which certainly contradicts the declared string result.
+(module stdlib.fixtures.bad_if_result)
+
+(defn pick ((c bool) (a i32)) string
+  (if c a 2))
+
+(export pick)

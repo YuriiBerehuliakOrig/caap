@@ -1,0 +1,147 @@
+; stdlib/semantics/passes/bare_gate.caap — native-only import gate for the bare
+; layer (module stdlib.semantics.passes.bare_gate).
+;
+; The `stdlib.bare.*` modules (mmio / cpu / critical / atomic / sync) are
+; NATIVE-ONLY wrappers: their bodies bottom out in `volatile_*` / `asm` /
+; `atomic_*` heads the kernel evaluator and the plain module loader do NOT know
+; — those heads are seeded into scope ONLY in the backend pre-codegen gate
+; (stdlib/backend/prep.caap). Reaching a bare module through the plain eval
+; loader / CTFE therefore fails, but with a GENERIC "unknown head" failure
+; pointing deep inside the wrapper, not at the real cause (the import).
+;
+; This is the TARGETED diagnostic for that case: given a unit's raw top-level
+; directives, it reports each module-LOADING directive that names a bare module
+; — `(use stdlib.bare.…)`, `(import stdlib.bare.… a)`, or `(re_export
+; stdlib.bare.… …)` — as "bare.* is native-only — reach it only through the
+; native backend path", so the failure is located at the import and names the
+; fix. (re_export loads its module like `use`, with no prior import, so it is
+; gated too — see loads_module? below.)
+;
+; SCOPE — the DEFAULT eval-load gate (audit #26). It is NOT an `install_pass!`
+; pass: the loader CONSUMES `use`/`import`/`re_export` into scope BEFORE user
+; passes run, so a directive gate must work on the RAW top-level forms, not the
+; post-consumption `located` list the passes registry sees. Instead the loader
+; (boot/loader.caap) looks this module up BY NAME after its directive scan and runs
+; `check_forms` over the raw directive specs — so a plain eval load that reaches a
+; native-only `stdlib.bare.*` wrapper fails loudly at the import, not deep inside.
+; The reader of raw directives mirrors stdlib.semantics.passes.imports.
+;
+; The native backend path (stdlib.backend.prep) LEGITIMATELY inlines bare modules
+; via `(use …)` — the LLVM/WASM backend knows the volatile_*/asm/atomic_* heads —
+; so it must NOT be flagged. Two guards keep that path clear: (1) prep loads its
+; root + inlines its dependencies via the surface-template loader builtin directly,
+; BYPASSING the loader's hook, and (2) belt-and-suspenders, prep sets the
+; shared `backend.prep.native_context` cell true around its gate, and `check_forms`
+; reads that cell and SKIPS — so if this gate is ever ALSO reached on the native
+; path (e.g. registered into the passes registry), it still defers there.
+;
+; Pure analysis over directive SPECS as data — it imports no bare module, so it
+; stays at the semantics/passes tier (rank 4) and never trips the tier check.
+(module stdlib.semantics.passes.bare_gate)
+
+(use stdlib.syntax.ast name_of head_is? arg loc)
+(use stdlib.semantics.passes.registry finding_at)
+(use stdlib.semantics.passes.source_read read_leading_forms)
+; the unified compile-session context (audit #1) — the native-context flag below
+; is a SHARED session cell (audit #15 tier-bridge pattern): backend/prep WRITES it
+; true while it inlines a native program's bare imports (legit), and this gate
+; READS the SAME cell to SKIP its check there (see native_context? / check_forms).
+(use stdlib.semantics.session session_cell!)
+
+; bare_prefix — the module-name prefix every native-only bare module shares.
+; A `.` follows the segment so a hypothetical sibling like `stdlib.barely` (no
+; such module today) could never match by accident.
+(bind bare_prefix "stdlib.bare.")
+
+; bare_module? — is `modname` (a dotted module-name string, or null) one of the
+; native-only `stdlib.bare.*` modules?
+;   modname : the imported module name, or null (a malformed directive)
+;   ->      : bool
+(bind bare_module?
+  (lambda (modname)
+    (and (not (eq modname null))
+         (string_starts_with modname bare_prefix))))
+
+; bare_finding — the located diagnostic for one offending directive.
+;   node    : the use/import/re_export directive node (its loc anchors the finding)
+;   modname : the bare module being imported
+;   ->      : the finding string ("bare_gate: loc: message")
+(bind bare_finding
+  (lambda (node modname)
+    (finding_at "bare_gate" (loc node)
+      (string_concat_many
+        "`" modname "` is native-only (its body uses volatile_*/asm/atomic_* heads"
+        " the eval loader / CTFE do not know); reach it only through the native"
+        " backend path (a native program's `(use …)`, compiled via the LLVM"
+        " backend), never via the plain eval loader"))))
+
+; loads_module? — is `f` one of the three directives that LOAD a module (so it
+; would pull a native-only bare module through the eval loader)? All three carry
+; the module name as arg 0, so one reader covers them:
+;   (use       MODULE name…)   — imports names, loads MODULE
+;   (import    MODULE alias)    — aliases MODULE, loads it
+;   (re_export MODULE name…)    — like `use` AND re-publishes; loads MODULE even
+;                                with no prior use/import (see boot/loader.caap)
+; `export` is NOT here — it republishes names already in scope, loading nothing.
+(bind loads_module?
+  (lambda (f)
+    (or (head_is? f "use")
+        (or (head_is? f "import") (head_is? f "re_export")))))
+
+; native_context — the SHARED session cell that says "we are inlining a NATIVE
+; program's bare imports right now" (audit #26, the #15 tier-bridge pattern). The
+; native backend (backend/prep.caap) sets it TRUE around its pre-codegen gate,
+; because a native program LEGITIMATELY `(use stdlib.bare.…)`s the wrappers — the
+; LLVM/WASM backend understands the volatile_*/asm/atomic_* heads the eval loader
+; does not. Two modules SHARE one cell by agreeing on this name: prep WRITES it,
+; this gate READS it. It is a plain session_cell! (intentionally namespace-shared,
+; like backend.prep.strict_mode — see session.caap), so no owner is declared.
+; Default false, so an ordinary eval load is gated exactly as before.
+(bind native_context (session_cell! "backend.prep.native_context" (lambda () false)))
+
+; native_context? — are we inside the native backend's bare-import inlining (so a
+; `(use stdlib.bare.…)` is legitimate and must NOT be flagged)? The reader prep's
+; gate flips around its run.
+(bind native_context? (lambda () (eq (deref native_context) true)))
+
+; check_forms — bare-import findings over a module's RAW top-level forms. Reports
+; one finding per module-LOADING directive (use / import / re_export) that names
+; a `stdlib.bare.*` module — every shape that would reach the wrapper through the
+; eval loader, not just `use`/`import` (a `re_export` loads its module too, with
+; no prior use, so it must be gated as well).
+;
+; SKIPS entirely (returns []) when the native-context flag is set: the native
+; backend (prep) inlines a native program's bare imports through this gate, and
+; those ARE legitimate (the LLVM/WASM backend knows the bare heads). Only an EVAL
+; load — where the bare wrapper would bottom out in an unknown head — is flagged.
+;   forms : [spec…] the module's raw top-level form specs
+;   ->    : [finding…] (empty when no bare module is loaded, or in native context)
+(bind check_forms
+  (lambda (forms)
+    (bind ((findings (list_of)))
+      (do
+        (when (not (native_context?))
+          (for f forms
+            (when (loads_module? f)
+              (bind ((modname (name_of (arg f 0))))
+                (when (bare_module? modname)
+                  (append findings (bare_finding f modname)))))))
+        findings))))
+
+; bare_imports? — the boolean predicate behind check_forms: does any top-level
+; directive import a native-only bare module? (A convenience for a caller that
+; only needs the yes/no, not the located findings.)
+;   forms : [spec…] the module's raw top-level form specs
+;   ->    : bool
+(bind bare_imports?
+  (lambda (forms) (gt (size (check_forms forms)) 0)))
+
+; check_file — read a module file's raw top-level forms and check them. Mirrors
+; stdlib.semantics.passes.imports/check_file: read the raw forms (the shared
+; sanctioned loader-bypass, source_read), run check_forms.
+;   path : the module file's path
+;   ->   : [finding…]
+(bind check_file
+  (lambda (path) (check_forms (read_leading_forms path))))
+
+(export bare_module? bare_imports? check_forms check_file)

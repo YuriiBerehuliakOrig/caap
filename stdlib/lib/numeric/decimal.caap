@@ -1,0 +1,336 @@
+; stdlib/lib/numeric/decimal.caap — exact fixed-point decimals for money.
+;
+; A decimal is an EXACT base-10 fixed-point value over the bignum substrate:
+;
+;   { "mantissa" <bignum>          ; the signed integer coefficient
+;     "scale"    <int >= 0 }        ; number of fractional digits
+;
+; The value is mantissa * 10^(-scale). For example 123.45 is stored as
+; mantissa 12345, scale 2; the integer 7 is mantissa 7, scale 0. The scale is
+; ALWAYS a non-negative kernel int (negative scales — i.e. trailing implicit
+; zeros to the left of the point — are not representable; multiply the mantissa
+; instead). Because the mantissa is a full bignum, a decimal carries unbounded
+; precision: 0.1 + 0.2 is exactly 0.3, not the binary-float 0.30000000000000004.
+;
+; WHY this exists (and what it deliberately is NOT): IEEE f64 cannot represent
+; most terminating decimal fractions (0.1, 0.01, …), so money arithmetic in
+; floats silently accumulates error. A scaled-integer decimal makes every value
+; with a finite decimal expansion EXACT, and makes rounding an explicit, named
+; decision rather than an accident of binary representation.
+;
+; ROUNDING MODE — ROUND-HALF-EVEN (banker's rounding) everywhere a result must
+; lose precision (dec_div to a target scale, dec_round, dec_rescale to a smaller
+; scale). Round-half-even rounds a value sitting exactly on the midpoint toward
+; the nearest EVEN last digit (2.5 -> 2, 3.5 -> 4, 0.125 @ scale 2 -> 0.12). This
+; is the IEEE-754 default and the standard for financial settlement because,
+; unlike round-half-up, it has no systematic bias across many roundings. A value
+; NOT on the midpoint always rounds to the nearer representable value.
+;
+; Decimals are NOT auto-normalized to a minimal scale: 1.50 keeps scale 2 and
+; 1.5 keeps scale 1 (so dec_add/dec_sub can preserve a chosen money scale). That
+; means two equal values may have different scales, so equality/ordering ALIGN
+; to a common scale first (dec_cmp), never compare the raw structs. All functions
+; are PURE — they build fresh values and never mutate an input.
+(module stdlib.lib.numeric.decimal)
+
+(use stdlib.lib.diag.error raise!)
+(use stdlib.lib.numeric.bignum
+  bn_from_int bn_to_int bn_parse bn_format
+  bn_add bn_sub bn_mul bn_divmod bn_div bn_mod
+  bn_cmp bn_neg bn_abs bn_sign bn_is_zero? bn_pow bn?)
+
+; ── internal helpers ─────────────────────────────────────────────────────────
+; dec_mantissa — the coefficient bignum (carries the sign).
+(bind dec_mantissa (lambda (d) (get d "mantissa")))
+; dec_scale — the fractional-digit count (a non-negative kernel int).
+(bind dec_scale (lambda (d) (get d "scale" 0)))
+
+; dec_make — assemble a decimal from a mantissa bignum and a scale. The scale
+; must be a non-negative int; a negative scale is a protocol error (the caller
+; should scale the mantissa instead). No normalization of trailing zeros.
+;   m     : the mantissa bignum
+;   scale : the fractional-digit count (>= 0)
+;   ->    : { "mantissa" bignum, "scale" int }
+(bind dec_make
+  (lambda (m scale)
+    (do
+      (if (lt scale 0)
+        (raise! "stdlib.numeric.decimal.scale"
+          "decimal scale must be non-negative"
+          (assoc (map_of) "scale" scale))
+        null)
+      (assoc (map_of) "mantissa" m "scale" scale))))
+
+; pow10 — 10^k as a bignum, for a non-negative kernel int k (k = 0 gives 1).
+(bind pow10 (lambda (k) (bn_pow (bn_from_int 10) k)))
+
+; scale_up — multiply mantissa `m` by 10^delta (delta >= 0). Used to raise a
+; mantissa to a larger scale WITHOUT changing its value.
+(bind scale_up
+  (lambda (m delta)
+    (if (eq delta 0) m (bn_mul m (pow10 delta)))))
+
+; ── constructors / parse ─────────────────────────────────────────────────────
+; dec_from_int — the integer `n` as a decimal with scale 0.
+(bind dec_from_int
+  (lambda (n) (dec_make (bn_from_int n) 0)))
+
+; dec_zero — the canonical zero at scale 0 (mantissa 0).
+(bind dec_zero (lambda () (dec_make (bn_from_int 0) 0)))
+
+; dec_parse — parse a decimal string "[+/-]int[.frac]" into mantissa/scale.
+; The integer part and the optional fractional part are concatenated into one
+; signed integer mantissa; the scale is the number of fractional digits. So
+; "123.45" -> mantissa 12345, scale 2; "0.1" -> mantissa 1, scale 1; "-0.050"
+; -> mantissa -50, scale 3; "42" -> mantissa 42, scale 0. A trailing or leading
+; '.', more than one '.', or a sign-only string is a protocol error (delegated
+; to bn_parse for non-digit characters). An empty fractional part after '.' (a
+; trailing dot) is rejected.
+;   s  : the decimal string
+;   -> : { "mantissa" bignum, "scale" int }
+(bind dec_parse
+  (lambda (s)
+    (bind ((neg? (string_starts_with s "-"))
+           (signless (if (or neg? (string_starts_with s "+"))
+                       (string_slice s 1 (size s)) s))
+           (sign_str (if neg? "-" ""))
+           (dot (string_find signless ".")))
+      (if (eq dot null)
+        ; no fractional part: a plain integer, scale 0
+        (dec_make (bn_parse s 10) 0)
+        (bind ((int_part (string_slice signless 0 dot))
+               (frac_part (string_slice signless (int_add dot 1) (size signless))))
+          (do
+            ; reject a second '.' and a trailing dot ("123.")
+            (if (not (eq (string_find frac_part ".") null))
+              (raise! "stdlib.numeric.decimal.parse"
+                (string_concat_many "more than one '.' in decimal `" s "`")
+                (assoc (map_of) "string" s))
+              null)
+            (if (eq (size frac_part) 0)
+              (raise! "stdlib.numeric.decimal.parse"
+                (string_concat_many "trailing '.' with no fractional digits in `" s "`")
+                (assoc (map_of) "string" s))
+              null)
+            ; the integer part may be empty (".5" / "-.5") — treat as 0
+            (bind ((digits (string_concat_many int_part frac_part))
+                   (mant_str (string_concat_many sign_str
+                               (if (eq (size digits) 0) "0" digits))))
+              (dec_make (bn_parse mant_str 10) (size frac_part)))))))))
+
+; ── format ───────────────────────────────────────────────────────────────────
+; dec_format — render a decimal as a base-10 string, inserting the decimal
+; point per the scale. Scale 0 prints the plain integer (no point). For scale
+; s > 0 the magnitude digits are left-padded with zeros to at least s+1 digits
+; so there is always a single leading "0" before the point and the fractional
+; part keeps every trailing zero (1.50 -> "1.50", 0.1 -> "0.1", -0.050 ->
+; "-0.050"). Zero prints as "0" at scale 0 and "0.0…0" otherwise.
+;   d  : a decimal
+;   -> : the decimal string
+(bind dec_format
+  (lambda (d)
+    (bind ((m (dec_mantissa d))
+           (scale (dec_scale d))
+           (neg? (lt (bn_sign m) 0))
+           (sign_str (if neg? "-" ""))
+           ; format the magnitude (no sign) so we control digit placement
+           (mag (bn_format (bn_abs m) 10)))
+      (if (eq scale 0)
+        ; integer-valued decimal: the sign + the plain digits
+        (string_concat_many sign_str mag)
+        ; left-pad to at least scale+1 digits: one int digit + `scale` frac
+        (bind ((need (int_add scale 1))
+               (pad (int_sub need (size mag)))
+               (full (if (gt pad 0)
+                       (string_concat_many (string_repeat "0" pad) mag)
+                       mag))
+               (cut (int_sub (size full) scale))
+               (int_part (string_slice full 0 cut))
+               (frac_part (string_slice full cut (size full))))
+          (string_concat_many sign_str int_part "." frac_part))))))
+
+; ── scale alignment ──────────────────────────────────────────────────────────
+; align_mantissas — bring two decimals to a common scale (the larger of the
+; two) and return { "a" a_mant, "b" b_mant, "scale" common } where a_mant and
+; b_mant are bignums comparable/addable directly. The smaller-scale mantissa is
+; multiplied by 10^(delta) so its value is unchanged.
+(bind align_mantissas
+  (lambda (a b)
+    (bind ((sa (dec_scale a)) (sb (dec_scale b))
+           (common (if (gt sa sb) sa sb)))
+      (assoc (map_of)
+        "a" (scale_up (dec_mantissa a) (int_sub common sa))
+        "b" (scale_up (dec_mantissa b) (int_sub common sb))
+        "scale" common))))
+
+; ── arithmetic ───────────────────────────────────────────────────────────────
+; dec_add — a + b, aligned to max(scale a, scale b) then bignum-added. The
+; result keeps the common (max) scale, so 1.50 + 2.50 = 4.00 (scale 2 kept).
+(bind dec_add
+  (lambda (a b)
+    (bind ((al (align_mantissas a b)))
+      (dec_make (bn_add (get al "a") (get al "b")) (get al "scale")))))
+
+; dec_sub — a - b, aligned to max(scale a, scale b) then bignum-subtracted.
+(bind dec_sub
+  (lambda (a b)
+    (bind ((al (align_mantissas a b)))
+      (dec_make (bn_sub (get al "a") (get al "b")) (get al "scale")))))
+
+; dec_mul — a * b: mantissas multiply, scales ADD (10^-sa * 10^-sb = 10^-(sa+sb)).
+; 1.5 * 1.5 = 2.25 (scale 1 + scale 1 = scale 2), exact, no rounding.
+(bind dec_mul
+  (lambda (a b)
+    (dec_make (bn_mul (dec_mantissa a) (dec_mantissa b))
+              (int_add (dec_scale a) (dec_scale b)))))
+
+; round_half_even_div — divide bignum `num` by NON-ZERO bignum `den`, returning
+; the quotient rounded to the nearest integer with ties going to the even
+; quotient (banker's rounding). Works for any signs: it rounds on the magnitude
+; and reapplies the sign of the exact quotient (sign(num)*sign(den)).
+;   Decision: let q,r = trunc(|num| / |den|), so |num| = q*|den| + r, 0 <= r < |den|.
+;   Compare 2*r to |den|: 2r<|den| round down; 2r>|den| round up; tie (2r=|den|)
+;   round to even q (up iff q is odd).
+(bind round_half_even_div
+  (lambda (num den)
+    (if (bn_is_zero? den)
+      (raise! "stdlib.numeric.decimal.divzero" "decimal division by zero" null)
+      (bind ((result_sign (int_mul (bn_sign num) (bn_sign den)))
+             (an (bn_abs num)) (ad (bn_abs den))
+             (dm (bn_divmod an ad))
+             (q (get dm "quot"))
+             (r (get dm "rem"))
+             (twice_r (bn_mul r (bn_from_int 2)))
+             (c (bn_cmp twice_r ad))           ; 2r vs |den|
+             (round_up?
+               (cond
+                 ((eq c 1) true)               ; past the midpoint -> up
+                 ((eq c -1) false)             ; below the midpoint -> down
+                 ; exactly on the midpoint -> to even: up iff q is odd
+                 (else (eq (bn_to_int (bn_mod q (bn_from_int 2))) 1))))
+             (mag (if round_up? (bn_add q (bn_from_int 1)) q)))
+        ; reapply the sign (result_sign is 0 only when num is 0 -> mag is 0)
+        (if (lt result_sign 0) (bn_neg mag) mag)))))
+
+; dec_div — a / b to a TARGET result scale, round-half-even. The exact quotient
+; a/b is value(a)/value(b) = (mant_a * 10^(scale-scale_a)) / (mant_b * 10^(-scale_b)),
+; i.e. we want round( mant_a * 10^(scale + scale_b - scale_a) / mant_b ) as the
+; result mantissa at `scale`. The single banker's-rounding division above does
+; the rounding exactly (no guard-digit dance needed — it inspects the true
+; remainder). b must be non-zero; `scale` must be >= 0.
+;   a, b  : decimals
+;   scale : the result scale (>= 0)
+;   ->    : a decimal approximating a/b at `scale`, round-half-even
+(bind dec_div
+  (lambda (a b scale)
+    (do
+      (if (lt scale 0)
+        (raise! "stdlib.numeric.decimal.scale"
+          "decimal division target scale must be non-negative"
+          (assoc (map_of) "scale" scale))
+        null)
+      (if (bn_is_zero? (dec_mantissa b))
+        (raise! "stdlib.numeric.decimal.divzero" "decimal division by zero" null)
+        null)
+      ; exponent e = scale + scale_b - scale_a may be negative; a negative e
+      ; means scale the DENOMINATOR up instead of the numerator.
+      (bind ((e (int_sub (int_add scale (dec_scale b)) (dec_scale a)))
+             (num (if (ge e 0)
+                    (bn_mul (dec_mantissa a) (pow10 e))
+                    (dec_mantissa a)))
+             (den (if (ge e 0)
+                    (dec_mantissa b)
+                    (bn_mul (dec_mantissa b) (pow10 (int_sub 0 e))))))
+        (dec_make (round_half_even_div num den) scale)))))
+
+; ── sign / magnitude ─────────────────────────────────────────────────────────
+; dec_neg — additive inverse: negate the mantissa (scale unchanged).
+(bind dec_neg
+  (lambda (d) (dec_make (bn_neg (dec_mantissa d)) (dec_scale d))))
+
+; dec_abs — magnitude: |mantissa| at the same scale.
+(bind dec_abs
+  (lambda (d) (dec_make (bn_abs (dec_mantissa d)) (dec_scale d))))
+
+; dec_sign — the sign of the value: -1, 0, or 1 (the mantissa's sign, since
+; 10^(-scale) is always positive).
+(bind dec_sign (lambda (d) (bn_sign (dec_mantissa d))))
+
+; dec_is_zero? — is the value exactly zero? (mantissa zero at any scale).
+(bind dec_is_zero? (lambda (d) (bn_is_zero? (dec_mantissa d))))
+
+; ── comparison ───────────────────────────────────────────────────────────────
+; dec_cmp — total order on VALUES: -1 if a<b, 0 if equal, 1 if a>b. Aligns both
+; mantissas to the common (max) scale, then compares the bignums. So
+; "1.0" vs "1.00" compares equal (0) despite the differing raw scales.
+(bind dec_cmp
+  (lambda (a b)
+    (bind ((al (align_mantissas a b)))
+      (bn_cmp (get al "a") (get al "b")))))
+
+; dec_eq? — value equality (scale-aligned), i.e. dec_cmp = 0. Note this is a
+; VALUE comparison, NOT struct identity: "1.0" and "1.00" are dec_eq?.
+(bind dec_eq? (lambda (a b) (eq (dec_cmp a b) 0)))
+
+; ── rounding / rescaling ─────────────────────────────────────────────────────
+; dec_rescale — return the value of `d` re-expressed at exactly `target` scale.
+; Increasing the scale is exact (multiply the mantissa by 10^delta). Decreasing
+; the scale drops digits with ROUND-HALF-EVEN. `target` must be >= 0.
+;   d      : a decimal
+;   target : the desired scale (>= 0)
+;   ->     : a decimal with scale = target and value = round(d) at that scale
+(bind dec_rescale
+  (lambda (d target)
+    (do
+      (if (lt target 0)
+        (raise! "stdlib.numeric.decimal.scale"
+          "decimal target scale must be non-negative"
+          (assoc (map_of) "scale" target))
+        null)
+      (bind ((scale (dec_scale d)) (m (dec_mantissa d)))
+        (cond
+          ((eq target scale) d)
+          ((gt target scale)
+            ; widen: exact, append zero fractional digits
+            (dec_make (scale_up m (int_sub target scale)) target))
+          (else
+            ; narrow: divide the mantissa by 10^(scale-target), banker's round
+            (dec_make (round_half_even_div m (pow10 (int_sub scale target)))
+                      target)))))))
+
+; dec_round — round `d` to `scale` fractional digits with round-half-even and
+; RETURN a decimal AT that scale. Equivalent to dec_rescale to `scale`; named
+; separately because "round to N places" is the intent at money-call sites
+; (dec_rescale also widens, which is not "rounding").
+;   d     : a decimal
+;   scale : the number of fractional digits to keep (>= 0)
+;   ->    : `d` rounded to `scale` digits (round-half-even), scale = `scale`
+(bind dec_round
+  (lambda (d scale) (dec_rescale d scale)))
+
+; ── structural validation ────────────────────────────────────────────────────
+; dec? — is `d` a structurally well-formed decimal? A pure predicate (never
+; throws): true exactly when `d` is a map whose "mantissa" is a valid bignum
+; (per `bn?`) and whose "scale" is a non-negative int. It is a shape/invariant
+; guard, not a value audit (it does not, e.g., re-derive the mantissa).
+(bind dec?
+  (lambda (d)
+    (and (eq (value_type d) "map")
+         (bn? (get d "mantissa" null))
+         (bind ((scale (get d "scale" -1)))
+           (and (eq (value_type scale) "int") (ge scale 0))))))
+
+; dec_validate — return `d` unchanged when `(dec? d)`, else throw. Use at trust
+; boundaries to reject malformed input before arithmetic relies on the invariant.
+(bind dec_validate
+  (lambda (d)
+    (if (dec? d) d (throw "dec_validate: not a decimal"))))
+
+(export
+  dec_mantissa dec_scale dec_make
+  dec? dec_validate
+  dec_from_int dec_zero dec_parse dec_format
+  dec_add dec_sub dec_mul dec_div
+  dec_neg dec_abs dec_sign dec_is_zero?
+  dec_cmp dec_eq?
+  dec_round dec_rescale)

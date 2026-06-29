@@ -1,0 +1,159 @@
+; stdlib/lib/text/buffer.caap — growable string/byte builders.
+; (module stdlib.lib.text.buffer)
+;
+; A buffer replaces the quadratic `string_concat_many`-in-a-loop pattern: you
+; push fragments onto a growable accumulator, then join ONCE at the end. Building
+; an n-piece string costs O(n) appends + one final join, not O(n²) re-copies.
+;
+; MUTABILITY: a buffer is a `ref` wrapping a kernel-mutable list (`list_of`). Push
+; operations `append` to that list IN PLACE and return the SAME buffer, so they
+; compose writer-style:  (push (push (buf_new) "a") "b").  This mirrors how the
+; stdlib uses ref+append elsewhere (see lib/random, lib/text/encoding). The cell
+; identity is stable; aliases of a buffer see each other's writes.
+;
+;   String:  buf_new -> push / push_str / push_char -> to_string   (single join)
+;   Bytes:   byte_buf_new -> push_byte / push_bytes -> to_bytes / to_byte_list
+;
+; A string buffer accumulates STRINGS; a byte buffer accumulates INTS (0..255).
+; The two share the ref+list shape but are joined differently at the end.
+(module stdlib.lib.text.buffer)
+
+(use stdlib.lib.diag.error raise!)
+
+; ── string buffer ───────────────────────────────────────────────────────────
+
+; buf_new — a fresh, empty string buffer.
+;   -> : a buffer (a ref over an empty mutable list of string fragments)
+(bind buf_new
+  (lambda () (ref (list_of))))
+
+; push — append a string fragment; returns the buffer (writer-style).
+;   buf : a string buffer
+;   s   : the string to append
+;   ->  : `buf`, for chaining
+(bind push
+  (lambda (buf s)
+    (do (append (deref buf) s) buf)))
+
+; push_str — alias of `push`, for call sites that prefer the longer name.
+(bind push_str push)
+
+; push_char — append a single character (a one-char string).
+;   buf : a string buffer
+;   c   : a one-character string
+;   ->  : `buf`
+(bind push_char push)
+
+; buf_len — how many fragments have been pushed (NOT the joined length).
+;   buf : a string buffer
+;   ->  : int — the number of pushed pieces
+(bind buf_len
+  (lambda (buf) (size (deref buf))))
+
+; buf_is_empty? — has nothing been pushed yet? (No fragments — note a buffer of
+; only empty-string fragments still joins to "" but is NOT empty by this test.)
+;   buf : a string buffer
+;   ->  : bool
+(bind buf_is_empty?
+  (lambda (buf) (eq (size (deref buf)) 0)))
+
+; buf_clear — reset the buffer to empty; returns the buffer (writer-style). The
+; cell identity is preserved (a fresh list replaces the contents in place), so
+; aliases keep pointing at the same — now empty — buffer.
+;   buf : a string buffer
+;   ->  : `buf`
+(bind buf_clear
+  (lambda (buf) (do (set_ref buf (list_of)) buf)))
+
+; to_string — join every pushed fragment into one string (the single join).
+;   buf : a string buffer
+;   ->  : the concatenation of all fragments, in push order
+(bind to_string
+  (lambda (buf) (sequence_join (deref buf) "")))
+
+; ── pretty-printer helpers ──────────────────────────────────────────────────
+
+; newline — append a line break; returns the buffer.
+;   buf : a string buffer
+;   ->  : `buf`
+(bind newline
+  (lambda (buf) (push buf "\n")))
+
+; push_line — append a string fragment followed by a line break; returns the
+; buffer. Equivalent to `(newline (push buf s))`.
+;   buf : a string buffer
+;   s   : the string to append before the newline
+;   ->  : `buf`
+(bind push_line
+  (lambda (buf s) (newline (push buf s))))
+
+; indent — append `n` levels of two-space indentation; returns the buffer.
+;   buf : a string buffer
+;   n   : indentation depth (each level is two spaces); n<=0 appends nothing
+;   ->  : `buf`
+(bind indent
+  (lambda (buf n)
+    (if (gt n 0)
+      (push buf (string_repeat "  " n))
+      buf)))
+
+; ── byte buffer ─────────────────────────────────────────────────────────────
+
+; each_byte — internal: apply `f` to each element of list `bs` left-to-right.
+; (A local loop so buffer.caap stays independent of lib/collections.sequence.)
+(bind each_byte
+  (lambda (bs f)
+    (bind ((i (ref 0)) (n (size bs)))
+      (do
+        (while (lt (deref i) n)
+          (do
+            (f (get bs (deref i)))
+            (set_ref i (int_add (deref i) 1))))
+        null))))
+
+; byte_buf_new — a fresh, empty byte buffer.
+;   -> : a byte buffer (a ref over an empty mutable list of ints 0..255)
+(bind byte_buf_new
+  (lambda () (ref (list_of))))
+
+; push_byte — append one byte (an int 0..255); returns the buffer.
+;   buf : a byte buffer
+;   n   : the byte value, validated to be an int in 0..255
+;   ->  : `buf`
+(bind push_byte
+  (lambda (buf n)
+    (do
+      (if (and (eq (value_type n) "int") (ge n 0) (le n 255))
+        null
+        (raise! "stdlib.buffer.byte"
+          (string_concat_many "push_byte expects an int in 0..255, got `"
+            (value_to_string n) "`")
+          (assoc (map_of) "value" n)))
+      (append (deref buf) n)
+      buf)))
+
+; push_bytes — append every byte from a list of ints (0..255); returns the buffer.
+;   buf : a byte buffer
+;   bs  : a list of byte ints (0..255)
+;   ->  : `buf`
+(bind push_bytes
+  (lambda (buf bs)
+    (do
+      (each_byte bs (lambda (b) (push_byte buf b)))
+      buf)))
+
+; to_byte_list — the accumulated bytes as a plain list of ints.
+;   buf : a byte buffer
+;   ->  : list of ints (0..255), in push order
+(bind to_byte_list
+  (lambda (buf) (deref buf)))
+
+; to_bytes — the accumulated bytes as a kernel `bytes` value.
+;   buf : a byte buffer
+;   ->  : a bytes value built from the pushed ints
+(bind to_bytes
+  (lambda (buf) (bytes_from_list (deref buf))))
+
+(export buf_new push push_str push_char buf_len buf_is_empty? buf_clear to_string
+        newline push_line indent
+        byte_buf_new push_byte push_bytes to_byte_list to_bytes)

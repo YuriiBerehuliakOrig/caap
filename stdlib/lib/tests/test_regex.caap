@@ -1,0 +1,139 @@
+; stdlib/lib/tests/test_regex.caap — in-language tests for lib/text/regex.
+; Covers the documented subset: quantifiers, classes, anchors, capture groups,
+; alternation, replace, and split. assert_eq uses identity equality, so every
+; assertion compares scalar fields (sizes / ints / strings), never whole maps.
+
+;; @area: text
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.text.regex
+     rx_compile rx_match? rx_search rx_find_all rx_replace rx_split)
+
+; ── a+b : '+' quantifier (1 or more) ────────────────────────────────────────
+(bind aplus (rx_compile "a+b"))
+(assert_true (get aplus "ok" false) "a+b compiles")
+(assert_eq (rx_match? aplus "aaab") true  "a+b matches aaab")
+(assert_eq (rx_match? aplus "ab")   true  "a+b matches ab")
+(assert_eq (rx_match? aplus "b")    false "a+b rejects b (needs >=1 a)")
+(assert_eq (rx_match? aplus "aaa")  false "a+b rejects aaa (no trailing b)")
+
+; ── [0-9]+ : char-class range, found inside a larger string ─────────────────
+(bind digits (rx_compile "[0-9]+"))
+(assert_true (get digits "ok" false) "[0-9]+ compiles")
+(bind d (rx_search digits "x123y"))
+(assert_eq (get d "found") true "[0-9]+ found in x123y")
+(assert_eq (get d "start") 1     "[0-9]+ starts at index 1")
+(assert_eq (get d "end")   4     "[0-9]+ ends at index 4")
+(assert_eq (get d "match") "123" "[0-9]+ match text is 123")
+(assert_eq (get (rx_search digits "abc") "found") false "[0-9]+ not found in abc")
+
+; ── (\w+)@(\w+) : two capture groups via \w and grouping ────────────────────
+(bind email (rx_compile "(\\w+)@(\\w+)"))
+(assert_true (get email "ok" false) "(\\w+)@(\\w+) compiles")
+(assert_eq (get email "ngroups") 2 "two capture groups")
+(bind em (rx_search email "a@b"))
+(assert_eq (get em "found") true "email pattern found in a@b")
+(assert_eq (get em "match") "a@b" "whole match is a@b")
+(bind groups (get em "groups"))
+(assert_eq (size groups) 3 "groups: whole + 2 captures")
+(assert_eq (get (get groups 0) "text") "a@b" "group 0 = whole match")
+(assert_eq (get (get groups 1) "text") "a"   "group 1 = local part")
+(assert_eq (get (get groups 2) "text") "b"   "group 2 = domain")
+; longer word run still captures correctly
+(bind em2 (rx_search email "  user@host  "))
+(assert_eq (get (get (get em2 "groups") 1) "text") "user" "group 1 = user")
+(assert_eq (get (get (get em2 "groups") 2) "text") "host" "group 2 = host")
+
+; ── ^\d{2,3}$ : anchors + bounded quantifier {2,3} ──────────────────────────
+(bind nn (rx_compile "^\\d{2,3}$"))
+(assert_true (get nn "ok" false) "^\\d{2,3}$ compiles")
+(assert_eq (rx_match? nn "12")   true  "{2,3} accepts 12")
+(assert_eq (rx_match? nn "123")  true  "{2,3} accepts 123")
+(assert_eq (rx_match? nn "1")    false "{2,3} rejects 1 (too short)")
+(assert_eq (rx_match? nn "1234") false "{2,3} rejects 1234 (too long)")
+
+; ── cat|dog : alternation ───────────────────────────────────────────────────
+(bind animal (rx_compile "cat|dog"))
+(assert_true (get animal "ok" false) "cat|dog compiles")
+(assert_eq (rx_match? animal "cat") true  "alt matches cat")
+(assert_eq (rx_match? animal "dog") true  "alt matches dog")
+(assert_eq (rx_match? animal "cow") false "alt rejects cow")
+(bind found_dog (rx_search animal "a dog here"))
+(assert_eq (get found_dog "match") "dog" "alt finds dog in a sentence")
+(assert_eq (get found_dog "start") 2 "dog starts at index 2")
+
+; ── negated class + dot + star ──────────────────────────────────────────────
+(bind notdigit (rx_compile "[^0-9]+"))
+(assert_eq (get (rx_search notdigit "12ab34") "match") "ab" "[^0-9]+ matches ab")
+(bind dotstar (rx_compile "a.*z"))
+(assert_eq (rx_match? dotstar "a___z") true ".* spans the middle")
+(assert_eq (rx_match? dotstar "az")    true ".* matches zero chars")
+
+; ── ? optional + escaped dot ────────────────────────────────────────────────
+(bind colour (rx_compile "colou?r"))
+(assert_eq (rx_match? colour "color")  true  "u? optional absent")
+(assert_eq (rx_match? colour "colour") true  "u? optional present")
+(bind dotlit (rx_compile "a\\.b"))
+(assert_eq (rx_match? dotlit "a.b") true  "\\. is a literal dot")
+(assert_eq (rx_match? dotlit "axb") false "\\. does NOT match arbitrary char")
+
+; ── rx_find_all : every non-overlapping match ───────────────────────────────
+(bind nums (rx_compile "\\d+"))
+(bind all (rx_find_all nums "a1bb22ccc333"))
+(assert_eq (size all) 3 "three number runs")
+(assert_eq (get (get all 0) "match") "1"   "find_all[0] = 1")
+(assert_eq (get (get all 1) "match") "22"  "find_all[1] = 22")
+(assert_eq (get (get all 2) "match") "333" "find_all[2] = 333")
+
+; ── rx_replace ──────────────────────────────────────────────────────────────
+(bind sp (rx_compile "\\s+"))
+(assert_eq (rx_replace sp "a  b   c" "_") "a_b_c" "replace whitespace runs")
+(assert_eq (rx_replace nums "a1b22c" "#") "a#b#c" "replace number runs")
+(assert_eq (rx_replace (rx_compile "x") "abc" "y") "abc" "replace no-match is identity")
+
+; ── rx_split ────────────────────────────────────────────────────────────────
+(bind comma (rx_compile ",+"))
+(bind parts (rx_split comma "a,b,,c"))
+(assert_eq (size parts) 3 "split on ,+ → 3 parts")
+(assert_eq (get parts 0) "a" "split[0]=a")
+(assert_eq (get parts 1) "b" "split[1]=b")
+(assert_eq (get parts 2) "c" "split[2]=c")
+; leading delimiter → empty first field; trailing delimiter → empty last field.
+(bind ws (rx_split sp "  one two   three "))
+(assert_eq (size ws) 5 "split on \\s+ keeps leading/trailing empties")
+(assert_eq (get ws 0) ""      "ws split[0]= (leading empty)")
+(assert_eq (get ws 1) "one"   "ws split[1]=one")
+(assert_eq (get ws 2) "two"   "ws split[2]=two")
+(assert_eq (get ws 3) "three" "ws split[3]=three")
+(assert_eq (get ws 4) ""      "ws split[4]= (trailing empty)")
+
+; ── error path: malformed pattern → {ok:false} (does not throw) ─────────────
+(bind bad (rx_compile "[a-z"))
+(assert_eq (get bad "ok" true) false "unterminated class → ok:false")
+(assert_true (string_contains (get bad "error" "") "class") "error mentions class")
+(assert_eq (rx_match? bad "x") false "rx_match? on bad regex is false")
+(assert_eq (get (rx_search bad "x") "found") false "rx_search on bad regex: not found")
+
+; ── zero-width quantifier bodies must still satisfy their minimum ────────────
+; (a*)+ and ()+ over "" must match: the mandatory iteration is allowed to be
+; zero-width while climbing to min, then stops (no infinite loop).
+(assert_eq (rx_match? (rx_compile "(a*)+") "")  true "(a*)+ matches empty")
+(assert_eq (rx_match? (rx_compile "(a*)+") "aa") true "(a*)+ matches aa")
+(assert_eq (rx_match? (rx_compile "()+")   "")  true "()+ matches empty")
+(assert_eq (rx_match? (rx_compile "^(a*)+b$") "b") true "^(a*)+b$ matches b")
+(assert_eq (rx_match? (rx_compile "(\\s*)+") "")   true "(\\s*)+ matches empty")
+; a finite zero-width-capable {m,n} still terminates and matches
+(assert_eq (rx_match? (rx_compile "(a*){1,3}") "") true "(a*){1,3} matches empty")
+
+; ── malformed bounds are rejected at compile time (→ ok:false), not silent ──
+(assert_eq (get (rx_compile "a{3,2}") "ok" true) false "{3,2} (max<min) rejected")
+(assert_eq (get (rx_compile "[z-a]")  "ok" true) false "inverted range [z-a] rejected")
+(assert_eq (get (rx_compile "[5-1]")  "ok" true) false "inverted range [5-1] rejected")
+(assert_eq (get (rx_compile "[a-\\d]") "ok" true) false "escape range endpoint [a-\\d] rejected")
+(assert_eq (get (rx_compile "a{999999999999}") "ok" true) false "over-large count rejected")
+; well-formed bounds still compile
+(assert_eq (get (rx_compile "a{2,3}") "ok" false) true "{2,3} compiles")
+(assert_eq (get (rx_compile "[a-z]")  "ok" false) true "[a-z] compiles")
+
+true

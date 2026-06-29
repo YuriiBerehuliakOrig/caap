@@ -1,0 +1,75 @@
+; stdlib/lib/tests/test_hash.caap — in-language tests for lib/hash.
+;
+; Known-answer vectors were cross-checked against a reference implementation
+; (Python: standard FNV-1a, djb2, zlib.crc32 — all masked to 32 bits):
+;   fnv1a("hello") = 1335831723 ; djb2("hello") = 261238937
+;   crc32("hello") = 907060870  (also the value storage/binary.caap's CRC-32 of
+;                                the same bytes yields — same poly 0xEDB88320).
+
+;; @area: crypto
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq)
+(use stdlib.lib.hash fnv1a fnv1a_64 djb2 crc32 content_hash structural_hash)
+
+; ── FNV-1a known answers ─────────────────────────────────────────────────────
+(assert_eq (fnv1a "hello") 1335831723 "fnv1a hello")
+(assert_eq (fnv1a "") 2166136261 "fnv1a empty = offset basis")
+(assert_eq (fnv1a "abc") 440920331 "fnv1a abc")
+; a byte list and the equivalent string hash the same (the string->bytes path)
+(assert_eq (fnv1a (list_of 104 101 108 108 111)) 1335831723 "fnv1a accepts byte list")
+
+; ── 64-bit FNV-1a known answers ──────────────────────────────────────────────
+; cross-checked against a reference u64 FNV-1a (offset 0xcbf29ce484222325, prime
+; 0x100000001b3), returned as the signed two's-complement i64 bit pattern (the
+; true u64 values exceed i64::MAX, so they read back negative):
+;   fnv1a_64("")     = 14695981039346656037 -> -3750763034362895579
+;   fnv1a_64("a")    = 12638187200555641996 -> -5808556873153909620
+;   fnv1a_64("hello")= 11831194018420276491 -> -6615550055289275125
+;   fnv1a_64("abc")  = 16654208175385433931 -> -1792535898324117685
+(assert_eq (fnv1a_64 "") -3750763034362895579 "fnv1a_64 empty = offset basis")
+(assert_eq (fnv1a_64 "a") -5808556873153909620 "fnv1a_64 a")
+(assert_eq (fnv1a_64 "hello") -6615550055289275125 "fnv1a_64 hello")
+(assert_eq (fnv1a_64 "abc") -1792535898324117685 "fnv1a_64 abc")
+; a byte list and the equivalent string hash the same (shared bytes_of path)
+(assert_eq (fnv1a_64 (list_of 104 101 108 108 111)) -6615550055289275125
+  "fnv1a_64 accepts byte list")
+; determinism
+(assert_eq (eq (fnv1a_64 "deterministic") (fnv1a_64 "deterministic")) true
+  "fnv1a_64 deterministic")
+; 64-bit FNV-1a separates inputs the 32-bit one might not (different digests)
+(assert_eq (eq (fnv1a_64 "a") (fnv1a_64 "b")) false "fnv1a_64 distinguishes inputs")
+
+; ── djb2 known answers ───────────────────────────────────────────────────────
+(assert_eq (djb2 "hello") 261238937 "djb2 hello")
+(assert_eq (djb2 "") 5381 "djb2 empty = seed")
+(assert_eq (djb2 "abc") 193485963 "djb2 abc")
+
+; ── crc32 known answers (poly 0xEDB88320, == storage/binary.caap) ────────────
+(assert_eq (crc32 "hello") 907060870 "crc32 hello")
+(assert_eq (crc32 "") 0 "crc32 empty")
+(assert_eq (crc32 "abc") 891568578 "crc32 abc")
+(assert_eq (crc32 (list_of 104 101 108 108 111)) 907060870 "crc32 accepts byte list")
+
+; ── determinism: same input always the same output ──────────────────────────
+(assert_eq (eq (fnv1a "deterministic") (fnv1a "deterministic")) true "fnv1a deterministic")
+(assert_eq (eq (djb2 "deterministic") (djb2 "deterministic")) true "djb2 deterministic")
+(assert_eq (eq (crc32 "deterministic") (crc32 "deterministic")) true "crc32 deterministic")
+
+; ── content_hash / structural_hash facade over the kernel content hash ───────
+; structurally-equal values (two distinct lists with equal entries) hash equal
+(assert_eq (eq (content_hash (list_of 1 2 3)) (content_hash (list_of 1 2 3))) true
+  "content_hash: structurally-equal values hash equal")
+; different values hash differently
+(assert_eq (eq (content_hash (list_of 1 2 3)) (content_hash (list_of 1 2 4))) false
+  "content_hash: different values differ")
+; the result is a (non-empty) string digest
+(assert_eq (value_type (content_hash "anything")) "string" "content_hash returns a string")
+; structural_hash is the same facade: value_eq-equal inputs agree
+(assert_eq (eq (structural_hash (list_of 1 2 3)) (structural_hash (list_of 1 2 3))) true
+  "structural_hash: value-equal inputs agree")
+; and it agrees with content_hash on the same input (same underlying kernel hash)
+(assert_eq (eq (structural_hash "x") (content_hash "x")) true
+  "structural_hash and content_hash are the same kernel hash")
+; same input -> same digest (determinism)
+(assert_eq (eq (content_hash "stable") (content_hash "stable")) true "content_hash deterministic")

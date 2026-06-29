@@ -1,0 +1,56 @@
+; stdlib/backend/emit/llvm/lowering/calls.caap - call lowering helpers.
+;
+; Internal leaf behind stdlib.backend.emit.llvm.lowering.
+(module stdlib.backend.emit.llvm.lowering.calls)
+
+(use stdlib.backend.codegen_common pointee_of)
+(use stdlib.backend.emit.llvm.types render_t ll_of)
+(use stdlib.backend.emit.llvm.instructions tmp! emit!)
+
+(bind lower_direct_call
+  (lambda (self head args st env fns)
+    (bind (
+      (f (get fns head))
+      (ptypes (get f "ptypes" (list_of)))
+      (rendered (list_of))
+    )
+      (do
+        (unless (eq (size args) (size ptypes))
+          (throw (string_concat_many
+            "native codegen: `" head "` expects "
+            (int_to_string (size ptypes)) " argument(s)")))
+        (for i (sequence_range 0 (size args))
+          (bind (
+            (a (self self (get args i) st env fns))
+            (want (get ptypes i))
+          )
+            (do
+              (when (and (not (eq (get a "type") null))
+                         (not (eq (get a "type") want)))
+                (throw (string_concat_many
+                  "native codegen: `" head "` argument "
+                  (int_to_string (int_add i 1)) " is "
+                  (get a "type" "?") ", expected " want)))
+              (append rendered
+                (string_concat_many (render_t want) " " (get a "repr" "?"))))))
+        (bind (
+          (r (tmp! st))
+          (cres (get f "cresult"))
+          (structs (get (get st "prog" (map_of)) "structs" (map_of)))
+        )
+          (do
+            (emit! st (string_concat_many
+              r " = call " (render_t (get f "result" "?")) " @" head
+              "(" (sequence_join rendered ", ") ")"))
+            (if (and (eq (get f "result") "ptr") (not (eq cres null)))
+              (bind ((pointee (pointee_of cres structs)))
+                (assoc (map_of)
+                  "repr" r "type" "ptr"
+                  "elem" (if (eq pointee null) null (ll_of pointee structs))
+                  "elemct" pointee "ct" pointee))
+              (assoc (map_of)
+                "repr" r
+                "type" (get f "result")
+                "ct" cres))))))))
+
+(export lower_direct_call)

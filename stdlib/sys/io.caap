@@ -1,0 +1,52 @@
+; stdlib/sys/io.caap — facade for the host "io" library.
+;
+; Two layers, one file (the boilerplate lives in stdlib.sys.wrap):
+;   1. The visible, TYPED surface (`ops`): each function with its parameters
+;      (name + type) and return type. verify_facade checks this against the live
+;      caap-sys catalog, so the declaration cannot drift.
+;   2. CALLABLE wrappers (println/print/…): partial applications of the RUNTIME
+;      callables boot/sys_grants.caap projected (io is a runtime-phase library —
+;      only runtime evaluation may invoke these; CTFE builds and passes them).
+;      Without the grant the module still loads — wrappers are
+;      self-describing throwing stubs that raise "requires a sys grant"
+;      when called (declaration-only mode).
+; `make_facade` files the typed surface AND builds the wrapper bundle in one
+; step; each export reads its wrapper from that bundle, so the wiring is in one
+; place and the bound names derive from the same op table verify_sys checks.
+(module stdlib.sys.io)
+
+(use stdlib.sys.verify op p)
+(use stdlib.sys.wrap make_facade)
+
+(bind ops
+  (list_of
+    ;    name           params                          returns        effect
+    (op "print"        (list_of (p "value" "any"))    "null"        "impure")
+    (op "println"      (list_of (p "value" "any"))    "null"        "impure")
+    (op "eprint"       (list_of (p "value" "any"))    "null"        "impure")
+    (op "eprintln"     (list_of (p "value" "any"))    "null"        "impure")
+    (op "write"        (list_of (p "value" "string")) "null"        "impure")
+    (op "write_bytes"  (list_of (p "bytes" "bytes"))  "null"        "impure")
+    (op "flush_stdout" (list_of)                      "null"        "impure")
+    (op "flush_stderr" (list_of)                      "null"        "impure")
+    (op "read_line"    (list_of)                      "string|null" "impure")
+    (op "read_all"     (list_of)                      "string"      "impure")))
+
+; one call: file the typed surface AND build the wrapper bundle. Each export
+; below reads its (capability-applied, or null) callable from this bundle.
+(bind sys (make_facade "io" ops))
+
+(bind print        (get sys "print"))
+(bind println      (get sys "println"))
+(bind eprint       (get sys "eprint"))
+(bind eprintln     (get sys "eprintln"))
+(bind write        (get sys "write"))
+(bind write_bytes  (get sys "write_bytes"))
+(bind flush_stdout (get sys "flush_stdout"))
+(bind flush_stderr (get sys "flush_stderr"))
+(bind read_line    (get sys "read_line"))
+(bind read_all     (get sys "read_all"))
+
+(export ops
+        print println eprint eprintln write write_bytes
+        flush_stdout flush_stderr read_line read_all)

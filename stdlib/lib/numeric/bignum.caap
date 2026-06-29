@@ -1,0 +1,631 @@
+; stdlib/lib/numeric/bignum.caap — arbitrary-precision integers in pure CAAP
+; (module stdlib.lib.numeric.bignum).
+;
+; The kernel int is a bounded i64 and its arithmetic builtins are CHECKED (they
+; RAISE on overflow, they do not wrap), so a bignum cannot lean on machine wrap.
+; A bignum is stored as a sign + a little-endian list of LIMBS in base 10^9:
+;
+;   { "sign"  -1 | 0 | 1            ; 0 only for the canonical zero
+;     "limbs" [l0 l1 …] }           ; little-endian, each 0 <= li < 10^9
+;
+; The base is chosen so EVERY intermediate stays inside i64 (max 9223372036854775807):
+;   limb < 10^9, so limb*limb < 10^18, and 10^18 + (carry < 10^9) < 9.2*10^18 < i64max.
+; Base 10^9 also makes base-10 formatting trivial — each limb is 9 decimal digits.
+;
+; A bignum is always NORMALIZED: trailing zero limbs are stripped and the value
+; zero is the single canonical {sign 0, limbs []}. Every operation here returns a
+; normalized bignum; all functions are PURE (they build fresh values, never
+; mutate an input). Magnitude helpers (mag_*) work on bare limb lists.
+(module stdlib.lib.numeric.bignum)
+
+(use stdlib.lib.diag.error raise!)
+
+; ── base constants ──────────────────────────────────────────────────────────
+; base — 10^9, the limb radix.
+(bind base 1000000000)
+; base_digits — decimal digits per limb (9, since base = 10^9).
+(bind base_digits 9)
+
+; ── limb-list (magnitude) helpers ───────────────────────────────────────────
+; A magnitude is a little-endian list of limbs with NO trailing zero limbs;
+; the empty list is magnitude zero. These ignore sign entirely.
+
+; mag_normalize — strip trailing (most-significant) zero limbs from `ls`.
+;   ls : a little-endian limb list
+;   -> : a fresh list with no trailing zeros ([] for zero)
+(bind mag_normalize
+  (lambda (ls)
+    (bind ((n (ref (size ls))))
+      (do
+        (while (and (gt (deref n) 0) (eq (get ls (int_sub (deref n) 1) 0) 0))
+          (set_ref n (int_sub (deref n) 1)))
+        (sequence_slice ls 0 (deref n))))))
+
+; mag_zero? — is the magnitude `ls` (assumed normalized) zero?
+(bind mag_zero? (lambda (ls) (eq (size ls) 0)))
+
+; mag_cmp — compare two NORMALIZED magnitudes: -1 if a<b, 0 if equal, 1 if a>b.
+(bind mag_cmp
+  (lambda (a b)
+    (bind ((na (size a)) (nb (size b)))
+      (cond
+        ((lt na nb) -1)
+        ((gt na nb) 1)
+        (else
+          (bind ((i (ref (int_sub na 1))) (res (ref 0)))
+            (do
+              (while (and (ge (deref i) 0) (eq (deref res) 0))
+                (bind ((ai (get a (deref i) 0)) (bi (get b (deref i) 0)))
+                  (do
+                    (cond
+                      ((lt ai bi) (set_ref res -1))
+                      ((gt ai bi) (set_ref res 1))
+                      (else null))
+                    (set_ref i (int_sub (deref i) 1)))))
+              (deref res))))))))
+
+; mag_add — sum of two magnitudes (little-endian add with carry, all in i64).
+(bind mag_add
+  (lambda (a b)
+    (bind ((na (size a)) (nb (size b))
+           (n (if (gt na nb) na nb))
+           (out (list_of)) (carry (ref 0)) (i (ref 0)))
+      (do
+        (while (lt (deref i) n)
+          (bind ((s (int_add (int_add (get a (deref i) 0) (get b (deref i) 0))
+                             (deref carry))))
+            (do
+              (append out (int_mod s base))
+              (set_ref carry (int_div s base))
+              (set_ref i (int_add (deref i) 1)))))
+        (if (gt (deref carry) 0) (append out (deref carry)) out)
+        (mag_normalize out)))))
+
+; mag_sub — `a` - `b`, REQUIRING a >= b (caller guarantees it via mag_cmp).
+; Borrow subtraction; the result is non-negative so no underflow.
+(bind mag_sub
+  (lambda (a b)
+    (bind ((na (size a)) (out (list_of)) (borrow (ref 0)) (i (ref 0)))
+      (do
+        (while (lt (deref i) na)
+          (bind ((d (int_sub (int_sub (get a (deref i) 0) (get b (deref i) 0))
+                             (deref borrow))))
+            (do
+              (if (lt d 0)
+                (do (append out (int_add d base)) (set_ref borrow 1))
+                (do (append out d) (set_ref borrow 0)))
+              (set_ref i (int_add (deref i) 1)))))
+        (mag_normalize out)))))
+
+; mag_mul — product of two magnitudes (schoolbook, base 10^9). Every partial
+; product limb*limb < 10^18 and the running cell stays < i64max (10^18 + carry).
+(bind mag_mul
+  (lambda (a b)
+    (bind ((na (size a)) (nb (size b)))
+      (if (or (eq na 0) (eq nb 0)) (list_of)
+        (bind ((out (list_of)) (k (ref 0)))
+          (do
+            ; seed the accumulator with zeros (length na+nb)
+            (while (lt (deref k) (int_add na nb))
+              (do (append out 0) (set_ref k (int_add (deref k) 1))))
+            (bind ((i (ref 0)))
+              (while (lt (deref i) na)
+                (bind ((carry (ref 0)) (ai (get a (deref i) 0)) (j (ref 0)))
+                  (do
+                    (while (lt (deref j) nb)
+                      (bind ((pos (int_add (deref i) (deref j)))
+                             (cur (int_add (int_add (get out pos 0)
+                                                    (int_mul ai (get b (deref j) 0)))
+                                          (deref carry))))
+                        (do
+                          (set out pos (int_mod cur base))
+                          (set_ref carry (int_div cur base))
+                          (set_ref j (int_add (deref j) 1)))))
+                    ; flush remaining carry into the next position
+                    (bind ((pos (int_add (deref i) nb)))
+                      (set out pos (int_add (get out pos 0) (deref carry))))
+                    (set_ref i (int_add (deref i) 1))))))
+            (mag_normalize out)))))))
+
+; mag_mul_small — magnitude `a` times a single limb `m` (0 <= m < base).
+; Used by long division to scale the divisor by a trial quotient digit.
+(bind mag_mul_small
+  (lambda (a m)
+    (if (eq m 0) (list_of)
+      (bind ((na (size a)) (out (list_of)) (carry (ref 0)) (i (ref 0)))
+        (do
+          (while (lt (deref i) na)
+            (bind ((cur (int_add (int_mul (get a (deref i) 0) m) (deref carry))))
+              (do
+                (append out (int_mod cur base))
+                (set_ref carry (int_div cur base))
+                (set_ref i (int_add (deref i) 1)))))
+          (while (gt (deref carry) 0)
+            (do (append out (int_mod (deref carry) base))
+                (set_ref carry (int_div (deref carry) base))))
+          (mag_normalize out))))))
+
+; mag_divmod — long division of NORMALIZED magnitudes: a = q*b + r (0 <= r < b).
+; Returns {"quot" qlimbs, "rem" rlimbs}. `b` must be non-zero. Builds the
+; remainder one MORE-significant limb at a time and BINARY-SEARCHES each quotient
+; limb in 0..base-1 (each probe is one mag_mul_small + mag_cmp).
+(bind mag_divmod
+  (lambda (a b)
+    (cond
+      ((mag_zero? b)
+        (raise! "stdlib.numeric.bignum.divzero" "bignum division by zero" null))
+      ((eq (mag_cmp a b) -1)
+        (assoc (map_of) "quot" (list_of) "rem" (mag_normalize a)))
+      (else
+        (bind ((na (size a))
+               (qrev (list_of))           ; quotient limbs, most-significant first
+               (rem (ref (list_of)))      ; running remainder magnitude
+               (i (ref (int_sub na 1))))
+          (do
+            (while (ge (deref i) 0)
+              (bind (; bring down the next limb: rem = rem*base + a[i]
+                     (shifted (append (list_of) (get a (deref i) 0)))
+                     (new_rem (mag_add (mag_mul_small (deref rem) base)
+                                       (mag_normalize shifted)))
+                     (lo (ref 0)) (hi (ref (int_sub base 1))) (qd (ref 0)))
+                (do
+                  (set_ref rem new_rem)
+                  ; binary search the largest d with b*d <= rem
+                  (while (le (deref lo) (deref hi))
+                    (bind ((mid (int_div (int_add (deref lo) (deref hi)) 2))
+                           (prod (mag_mul_small b mid)))
+                      (if (le (mag_cmp prod (deref rem)) 0)
+                        (do (set_ref qd mid) (set_ref lo (int_add mid 1)))
+                        (set_ref hi (int_sub mid 1)))))
+                  (set_ref rem (mag_sub (deref rem) (mag_mul_small b (deref qd))))
+                  (append qrev (deref qd))
+                  (set_ref i (int_sub (deref i) 1)))))
+            ; qrev is most-significant first; reverse to little-endian
+            (assoc (map_of)
+              "quot" (mag_normalize (sequence_reverse qrev))
+              "rem" (mag_normalize (deref rem)))))))))
+
+; ── bignum constructors / normalization ─────────────────────────────────────
+; bn_make — assemble a normalized bignum from a sign and a limb list. The sign
+; is forced to 0 (canonical zero) whenever the magnitude normalizes to empty.
+(bind bn_make
+  (lambda (sign limbs)
+    (bind ((ls (mag_normalize limbs)))
+      (if (mag_zero? ls)
+        (assoc (map_of) "sign" 0 "limbs" (list_of))
+        (assoc (map_of) "sign" (if (lt sign 0) -1 1) "limbs" ls)))))
+
+; bn_zero — the canonical zero bignum.
+(bind bn_zero (lambda () (assoc (map_of) "sign" 0 "limbs" (list_of))))
+
+; bn_sign — the sign field (-1, 0, 1).
+(bind bn_sign (lambda (bn) (get bn "sign" 0)))
+; bn_limbs — the limb list.
+(bind bn_limbs (lambda (bn) (get bn "limbs" (list_of))))
+
+; bn_is_zero? — is `bn` the zero bignum?
+(bind bn_is_zero? (lambda (bn) (eq (bn_sign bn) 0)))
+
+; ── from / to kernel int ─────────────────────────────────────────────────────
+; bn_from_int — a kernel int -> bignum. Works for the full i64 range; the
+; magnitude is split into base-10^9 limbs via repeated div/mod (checked, safe).
+(bind bn_from_int
+  (lambda (n)
+    (if (eq n 0) (bn_zero)
+      (bind ((sign (if (lt n 0) -1 1))
+             (m (ref (int_abs n)))
+             (limbs (list_of)))
+        (do
+          (while (gt (deref m) 0)
+            (do
+              (append limbs (int_mod (deref m) base))
+              (set_ref m (int_div (deref m) base))))
+          (bn_make sign limbs))))))
+
+; bn_to_int — a bignum -> kernel int, RAISING if it does not fit in i64.
+; Folds limbs most-significant first as ((acc*base)+limb); the checked builtins
+; raise on overflow, so we surface a clear diagnostic instead.
+(bind bn_to_int
+  (lambda (bn)
+    (if (bn_is_zero? bn) 0
+      (bind ((ls (bn_limbs bn)) (n (size ls)) (acc (ref 0)) (i (ref (int_sub n 1))))
+        (do
+          (try
+            (while (ge (deref i) 0)
+              (do
+                (set_ref acc (int_add (int_mul (deref acc) base) (get ls (deref i) 0)))
+                (set_ref i (int_sub (deref i) 1))))
+            (catch e
+              (raise! "stdlib.numeric.bignum.overflow"
+                "bignum does not fit in a kernel int" null)))
+          (int_mul (bn_sign bn) (deref acc)))))))
+
+; ── comparison ───────────────────────────────────────────────────────────────
+; bn_cmp — total order: -1 if a<b, 0 if equal, 1 if a>b. Signs first, then
+; magnitudes (with the sign-aware flip for two negatives).
+(bind bn_cmp
+  (lambda (a b)
+    (bind ((sa (bn_sign a)) (sb (bn_sign b)))
+      (cond
+        ((lt sa sb) -1)
+        ((gt sa sb) 1)
+        ((eq sa 0) 0)                       ; both zero
+        (else (int_mul sa (mag_cmp (bn_limbs a) (bn_limbs b))))))))
+
+; ── sign helpers ─────────────────────────────────────────────────────────────
+; bn_neg — additive inverse (zero stays zero).
+(bind bn_neg
+  (lambda (bn) (bn_make (int_sub 0 (bn_sign bn)) (bn_limbs bn))))
+
+; bn_abs — magnitude as a non-negative bignum.
+(bind bn_abs (lambda (bn) (bn_make (int_abs (bn_sign bn)) (bn_limbs bn))))
+
+; ── add / sub ────────────────────────────────────────────────────────────────
+; bn_add — signed addition. Same signs add magnitudes; opposite signs subtract
+; the smaller magnitude from the larger and take the larger's sign.
+(bind bn_add
+  (lambda (a b)
+    (cond
+      ((bn_is_zero? a) b)
+      ((bn_is_zero? b) a)
+      ((eq (bn_sign a) (bn_sign b))
+        (bn_make (bn_sign a) (mag_add (bn_limbs a) (bn_limbs b))))
+      (else
+        (bind ((c (mag_cmp (bn_limbs a) (bn_limbs b))))
+          (cond
+            ((eq c 0) (bn_zero))
+            ((gt c 0) (bn_make (bn_sign a) (mag_sub (bn_limbs a) (bn_limbs b))))
+            (else     (bn_make (bn_sign b) (mag_sub (bn_limbs b) (bn_limbs a))))))))))
+
+; bn_sub — signed subtraction, a - b = a + (-b).
+(bind bn_sub (lambda (a b) (bn_add a (bn_neg b))))
+
+; ── multiply ─────────────────────────────────────────────────────────────────
+; bn_mul — signed multiplication; sign is the product of the two signs.
+(bind bn_mul
+  (lambda (a b)
+    (if (or (bn_is_zero? a) (bn_is_zero? b)) (bn_zero)
+      (bn_make (int_mul (bn_sign a) (bn_sign b))
+               (mag_mul (bn_limbs a) (bn_limbs b))))))
+
+; ── divmod ───────────────────────────────────────────────────────────────────
+; bn_divmod — truncated division toward zero: returns {"quot" q, "rem" r} with
+; a = q*b + r and the remainder taking the DIVIDEND's sign (|r| < |b|). Raises
+; on division by zero.
+;   a : the dividend bignum
+;   b : the divisor bignum (non-zero)
+;   -> : {"quot" bignum, "rem" bignum}
+(bind bn_divmod
+  (lambda (a b)
+    (if (bn_is_zero? b)
+      (raise! "stdlib.numeric.bignum.divzero" "bignum division by zero" null)
+      (bind ((dm (mag_divmod (bn_limbs a) (bn_limbs b)))
+             (qsign (int_mul (bn_sign a) (bn_sign b)))
+             (q (bn_make qsign (get dm "quot" (list_of))))
+             (r (bn_make (bn_sign a) (get dm "rem" (list_of)))))
+        (assoc (map_of) "quot" q "rem" r)))))
+
+; bn_div — the quotient of bn_divmod (truncated toward zero).
+(bind bn_div (lambda (a b) (get (bn_divmod a b) "quot")))
+; bn_rem — the remainder of bn_divmod (takes the dividend's sign).
+(bind bn_rem (lambda (a b) (get (bn_divmod a b) "rem")))
+
+; bn_mod — non-negative modulo: result in [0, |b|). Differs from bn_rem when the
+; dividend is negative; this is the form modular arithmetic (bn_pow_mod) wants.
+(bind bn_mod
+  (lambda (a b)
+    (bind ((r (bn_rem a b)))
+      (if (lt (bn_sign r) 0)
+        (bn_add r (bn_abs b))
+        r))))
+
+; ── power ────────────────────────────────────────────────────────────────────
+; bn_pow — `base` raised to a NON-NEGATIVE int exponent by binary exponentiation
+; (square-and-multiply). exp must be a kernel int >= 0; a negative exp raises.
+;   base : a bignum
+;   exp  : a non-negative kernel int
+;   -> : base^exp (1 when exp = 0)
+(bind bn_pow
+  (lambda (base exp)
+    (if (lt exp 0)
+      (raise! "stdlib.numeric.bignum.pow"
+        "bignum exponent must be non-negative" null)
+      (bind ((result (ref (bn_from_int 1)))
+             (b (ref base))
+             (e (ref exp)))
+        (do
+          (while (gt (deref e) 0)
+            (do
+              (if (eq (int_mod (deref e) 2) 1)
+                (set_ref result (bn_mul (deref result) (deref b)))
+                null)
+              (set_ref e (int_div (deref e) 2))
+              (if (gt (deref e) 0)
+                (set_ref b (bn_mul (deref b) (deref b)))
+                null)))
+          (deref result))))))
+
+; bn_pow_mod — modular exponentiation base^exp mod m, the workhorse for crypto
+; and hashing. `exp` is a NON-NEGATIVE bignum (so exponents beyond i64 are fine);
+; `m` must be a non-zero bignum. Square-and-multiply, reducing mod m at every
+; step so the working values never grow past 2*len(m). Result is in [0, |m|).
+;   base : a bignum
+;   exp  : a non-negative bignum exponent
+;   m    : a non-zero bignum modulus
+;   -> : base^exp mod |m|, in [0, |m|)
+(bind bn_pow_mod
+  (lambda (base exp m)
+    (cond
+      ((bn_is_zero? m)
+        (raise! "stdlib.numeric.bignum.divzero" "bignum modulus is zero" null))
+      ((lt (bn_sign exp) 0)
+        (raise! "stdlib.numeric.bignum.pow"
+          "bignum exponent must be non-negative" null))
+      (else
+        (bind ((two (bn_from_int 2))
+               (result (ref (bn_mod (bn_from_int 1) m)))
+               (b (ref (bn_mod base m)))
+               (e (ref exp)))
+          (do
+            (while (not (bn_is_zero? (deref e)))
+              (bind ((dm (bn_divmod (deref e) two)))
+                (do
+                  (if (bn_is_zero? (get dm "rem"))
+                    null
+                    (set_ref result (bn_mod (bn_mul (deref result) (deref b)) m)))
+                  (set_ref e (get dm "quot"))
+                  (if (not (bn_is_zero? (deref e)))
+                    (set_ref b (bn_mod (bn_mul (deref b) (deref b)) m))
+                    null))))
+            (deref result)))))))
+
+; ── gcd ──────────────────────────────────────────────────────────────────────
+; bn_gcd — greatest common divisor of two bignums (Euclid on magnitudes),
+; always non-negative. gcd(0,0) = 0.
+(bind bn_gcd
+  (lambda (a b)
+    (bind ((x (ref (bn_abs a))) (y (ref (bn_abs b))))
+      (do
+        (while (not (bn_is_zero? (deref y)))
+          (bind ((r (bn_mod (deref x) (deref y))))
+            (do
+              (set_ref x (deref y))
+              (set_ref y r))))
+        (deref x)))))
+
+; ── lcm ──────────────────────────────────────────────────────────────────────
+; bn_lcm — least common multiple, always non-negative: |a*b| / gcd(a,b).
+; lcm(0, x) = lcm(x, 0) = 0 by definition (and this also dodges a divide-by-zero,
+; since gcd(0,0) = 0). Computed as (|a| / gcd) * |b| to keep the intermediate
+; smaller, which is exact because gcd divides a.
+;   a, b : bignums
+;   -> : the non-negative least common multiple
+(bind bn_lcm
+  (lambda (a b)
+    (if (or (bn_is_zero? a) (bn_is_zero? b))
+      (bn_zero)
+      ; (|a| / g) and |b| are both non-negative, so the product is already the
+      ; non-negative lcm — no outer bn_abs needed.
+      (bind ((g (bn_gcd a b)))
+        (bn_mul (bn_div (bn_abs a) g) (bn_abs b))))))
+
+; ── integer square root ──────────────────────────────────────────────────────
+; bn_isqrt — floor(sqrt(a)) for a >= 0; raises on a negative input. Integer
+; Newton's method: start from an overestimate x0 = a and iterate
+; x_{k+1} = (x_k + a/x_k) / 2 (truncating bignum division). The sequence is
+; monotonically non-increasing once it passes the root, so we stop as soon as the
+; next iterate would not strictly decrease and return the last value, which is
+; exactly the floor. Handles 0 and 1 directly.
+;   a : a non-negative bignum
+;   -> : floor(sqrt(a)) as a bignum
+(bind bn_isqrt
+  (lambda (a)
+    (cond
+      ((lt (bn_sign a) 0)
+        (raise! "stdlib.numeric.bignum.isqrt"
+          "bignum square root of a negative number" null))
+      ((bn_is_zero? a) (bn_zero))
+      ((eq (bn_cmp a (bn_from_int 1)) 0) (bn_from_int 1))
+      (else
+        (bind ((one (bn_from_int 1))
+               (two (bn_from_int 2))
+               (x (ref a))                          ; current estimate (overestimate)
+               (y (ref (bn_div (bn_add a one) two))) ; first Newton step from a
+               (continue (ref true)))
+          (do
+            ; iterate while the next estimate strictly decreases
+            (while (deref continue)
+              (if (eq (bn_cmp (deref y) (deref x)) -1)
+                (do
+                  (set_ref x (deref y))
+                  (set_ref y (bn_div (bn_add (deref x)
+                                             (bn_div a (deref x)))
+                                     two)))
+                (set_ref continue false)))
+            (deref x)))))))
+
+; ── extended gcd / modular inverse ───────────────────────────────────────────
+; bn_egcd — extended Euclidean algorithm. Returns {"g" g, "x" x, "y" y} with
+; a*x + b*y = g and g = gcd(|a|, |b|) >= 0. Iterative; carries the Bézout
+; coefficients alongside the remainders. egcd(0,0) = {g 0, x 0, y 0}.
+;   a, b : bignums
+;   -> : {"g" bignum, "x" bignum, "y" bignum}
+(bind bn_egcd
+  (lambda (a b)
+    (bind ((old_r (ref a)) (r (ref b))
+           (old_s (ref (bn_from_int 1))) (s (ref (bn_zero)))
+           (old_t (ref (bn_zero))) (t (ref (bn_from_int 1))))
+      (do
+        (while (not (bn_is_zero? (deref r)))
+          (bind ((dm (bn_divmod (deref old_r) (deref r)))
+                 (q (get dm "quot"))
+                 (next_r (get dm "rem"))
+                 (next_s (bn_sub (deref old_s) (bn_mul q (deref s))))
+                 (next_t (bn_sub (deref old_t) (bn_mul q (deref t)))))
+            (do
+              (set_ref old_r (deref r)) (set_ref r next_r)
+              (set_ref old_s (deref s)) (set_ref s next_s)
+              (set_ref old_t (deref t)) (set_ref t next_t))))
+        ; normalize so the returned gcd is non-negative, flipping the
+        ; coefficients in lockstep so a*x + b*y = g still holds.
+        (if (lt (bn_sign (deref old_r)) 0)
+          (assoc (map_of)
+            "g" (bn_neg (deref old_r))
+            "x" (bn_neg (deref old_s))
+            "y" (bn_neg (deref old_t)))
+          (assoc (map_of)
+            "g" (deref old_r)
+            "x" (deref old_s)
+            "y" (deref old_t)))))))
+
+; bn_modinv — modular inverse of `a` modulo `m`: the bignum k in [0, |m|) with
+; a*k ≡ 1 (mod m). Exists iff gcd(a, m) = 1; returns null when it does not (or
+; when m is zero). Built from bn_egcd: x is a Bézout coefficient for (a mod |m|),
+; so a*x ≡ g (mod m); when g = 1 the inverse is x reduced into [0, |m|).
+;   a : a bignum
+;   m : the modulus bignum (its sign is ignored; |m| is used)
+;   -> : the inverse in [0, |m|), or null if none exists
+(bind bn_modinv
+  (lambda (a m)
+    (if (bn_is_zero? m)
+      null
+      (bind ((mm (bn_abs m))
+             (e (bn_egcd (bn_mod a mm) mm))
+             (g (get e "g")))
+        (if (eq (bn_cmp g (bn_from_int 1)) 0)
+          (bn_mod (get e "x") mm)
+          null)))))
+
+; ── parse / format ───────────────────────────────────────────────────────────
+; digit_value — value 0..radix-1 of one digit char, or -1 if not a valid digit
+; in `radix` (handles 0-9, a-z, A-Z; radix up to 36).
+(bind digit_value
+  (lambda (c radix)
+    (if (not (eq (size c) 1)) -1
+      (bind ((v (cond
+                  ((string_contains "0123456789" c) (string_find "0123456789" c))
+                  ((string_contains "abcdefghijklmnopqrstuvwxyz" c)
+                    (int_add 10 (string_find "abcdefghijklmnopqrstuvwxyz" c)))
+                  ((string_contains "ABCDEFGHIJKLMNOPQRSTUVWXYZ" c)
+                    (int_add 10 (string_find "ABCDEFGHIJKLMNOPQRSTUVWXYZ" c)))
+                  (else -1))))
+        (if (and (ge v 0) (lt v radix)) v -1)))))
+
+; digit_char — the lowercase digit character for value 0..35.
+(bind digit_char
+  (lambda (v)
+    (string_slice "0123456789abcdefghijklmnopqrstuvwxyz" v (int_add v 1))))
+
+; bn_parse — parse `s` in `radix` (2..36) into a bignum. A leading "+"/"-" sets
+; the sign; the remaining characters must all be valid digits (a bad digit or an
+; empty/sign-only string is a protocol error). Horner accumulation:
+; value = value*radix + digit, on bignums.
+;   s     : the digit string (optional leading sign)
+;   radix : the base, 2..36
+;   -> : the bignum value of `s`
+(bind bn_parse
+  (lambda (s radix)
+    (do
+      (if (or (lt radix 2) (gt radix 36))
+        (raise! "stdlib.numeric.bignum.radix"
+          "radix must be in 2..36" (assoc (map_of) "radix" radix))
+        null)
+      (bind ((neg? (string_starts_with s "-"))
+             (body (if (or neg? (string_starts_with s "+"))
+                     (string_slice s 1 (size s)) s))
+             (chars (string_chars body))
+             (n (size chars))
+             (rbn (bn_from_int radix))
+             (acc (ref (bn_zero)))
+             (i (ref 0)))
+        (do
+          (if (eq n 0)
+            (raise! "stdlib.numeric.bignum.parse"
+              "empty number string" (assoc (map_of) "string" s))
+            null)
+          (while (lt (deref i) n)
+            (bind ((d (digit_value (get chars (deref i) "") radix)))
+              (do
+                (if (lt d 0)
+                  (raise! "stdlib.numeric.bignum.parse"
+                    (string_concat_many "invalid digit `" (get chars (deref i) "")
+                      "` for radix " (int_to_string radix))
+                    (assoc (map_of) "string" s "index" (deref i)))
+                  null)
+                (set_ref acc (bn_add (bn_mul (deref acc) rbn) (bn_from_int d)))
+                (set_ref i (int_add (deref i) 1)))))
+          (if neg? (bn_neg (deref acc)) (deref acc)))))))
+
+; bn_format — render `bn` in `radix` (2..36). Base 10 takes the fast path (each
+; limb is exactly 9 decimal digits, zero-padded except the most-significant);
+; other radices repeatedly divmod by the radix, collecting digits least-
+; significant first. Zero formats as "0"; negatives get a leading "-".
+;   bn    : a bignum
+;   radix : the base, 2..36
+;   -> : the digit string
+(bind bn_format
+  (lambda (bn radix)
+    (do
+      (if (or (lt radix 2) (gt radix 36))
+        (raise! "stdlib.numeric.bignum.radix"
+          "radix must be in 2..36" (assoc (map_of) "radix" radix))
+        null)
+      (cond
+        ((bn_is_zero? bn) "0")
+        ((eq radix 10)
+          ; little-endian limbs -> most-significant first, each 9-digit padded
+          (bind ((ls (bn_limbs bn)) (n (size ls))
+                 (out (ref (int_to_string (get ls (int_sub n 1) 0))))
+                 (i (ref (int_sub n 2))))
+            (do
+              (while (ge (deref i) 0)
+                (bind ((d (int_to_string (get ls (deref i) 0)))
+                       (pad (int_sub base_digits (size d))))
+                  (do
+                    (set_ref out
+                      (string_concat_many (deref out) (string_repeat "0" pad) d))
+                    (set_ref i (int_sub (deref i) 1)))))
+              (string_concat_many (if (lt (bn_sign bn) 0) "-" "") (deref out)))))
+        (else
+          (bind ((rbn (bn_from_int radix))
+                 (mag (ref (bn_abs bn)))
+                 (digits (list_of)))
+            (do
+              (while (not (bn_is_zero? (deref mag)))
+                (bind ((dm (bn_divmod (deref mag) rbn)))
+                  (do
+                    (append digits (digit_char (bn_to_int (get dm "rem"))))
+                    (set_ref mag (get dm "quot")))))
+              (string_concat_many
+                (if (lt (bn_sign bn) 0) "-" "")
+                (sequence_join (sequence_reverse digits) "")))))))))
+
+; ── structural validation ────────────────────────────────────────────────────
+; bn? — is `bn` a structurally well-formed bignum? A pure predicate (never
+; throws): true exactly when `bn` is a map whose "sign" is an int in {-1,0,1},
+; whose "limbs" is a list, and whose sign/limbs agree on zero (sign 0 iff the
+; limb list is empty). It does NOT check that each limb is in [0, base) or that
+; the magnitude is normalized — it is a shape/invariant guard, not a deep audit.
+(bind bn?
+  (lambda (bn)
+    (and (eq (value_type bn) "map")
+         (bind ((s (get bn "sign" 0)) (ls (get bn "limbs" null)))
+           (and (eq (value_type s) "int")
+                (or (eq s -1) (eq s 0) (eq s 1))
+                (eq (value_type ls) "list")
+                (eq (eq s 0) (eq (size ls) 0)))))))
+
+; bn_validate — return `bn` unchanged when `(bn? bn)`, else throw. Use at trust
+; boundaries to reject malformed input before arithmetic relies on the invariant.
+(bind bn_validate
+  (lambda (bn)
+    (if (bn? bn) bn (throw "bn_validate: not a bignum"))))
+
+(export
+  bn_zero bn_from_int bn_to_int bn_parse bn_format
+  bn? bn_validate
+  bn_sign bn_limbs bn_is_zero? bn_cmp
+  bn_neg bn_abs bn_add bn_sub bn_mul
+  bn_divmod bn_div bn_rem bn_mod
+  bn_pow bn_pow_mod bn_gcd
+  bn_lcm bn_isqrt bn_egcd bn_modinv)

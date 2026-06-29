@@ -1,0 +1,1 @@
+(assoc (map_of) "name" "dup_proj" "roots" (list_of) "deps" (list_of))

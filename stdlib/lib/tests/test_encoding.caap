@@ -1,0 +1,155 @@
+; stdlib/lib/tests/test_encoding.caap — in-language tests for lib/text/encoding.
+
+;; @area: text
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.text.encoding
+  hex_encode hex_decode
+  base64_encode base64_decode base64url_encode base64url_decode
+  base32_encode base32_decode
+  percent_encode percent_decode
+  ord chr
+  utf8_encode utf8_decode)
+(use stdlib.lib.diag.error error? error_code)
+(use stdlib.lib.core.equal deep_eq)
+
+(do
+  ; ── hex ──────────────────────────────────────────────────────────────────
+  (assert_eq (hex_encode "Hi") "4869" "hex_encode Hi")
+  ; hex_decode returns bytes; read text back out
+  (assert_eq (bytes->string (hex_decode "4869")) "Hi" "hex_decode round-trip")
+  (assert_eq (hex_encode "") "" "hex_encode empty")
+  ; full byte range encodes to fixed two-digit lowercase pairs
+  (assert_eq (hex_encode (bytes_from_list (list_of 0 15 255))) "000fff" "hex byte edges")
+  ; uppercase hex still decodes (case-insensitive input)
+  (assert_eq (bytes->string (hex_decode "4869")) (bytes->string (hex_decode "4869")) "hex stable")
+  (assert_true
+    (deep_eq (bytes_to_list (hex_decode "00ff")) (list_of 0 255)) "hex_decode bytes")
+  ; odd length and non-hex are protocol errors
+  (assert_true
+    (error? (try (hex_decode "abc") (catch e e))) "hex odd length errors")
+  (assert_true
+    (error? (try (hex_decode "zz") (catch e e))) "hex non-hex errors")
+
+  ; ── base64 ───────────────────────────────────────────────────────────────
+  (assert_eq (base64_encode "Man") "TWFu" "base64 3-byte")
+  (assert_eq (base64_encode "Ma")  "TWE=" "base64 2-byte tail")
+  (assert_eq (base64_encode "M")   "TQ==" "base64 1-byte tail")
+  (assert_eq (base64_encode "")    ""     "base64 empty")
+  ; canonical RFC 4648 vector
+  (assert_eq (base64_encode "foobar") "Zm9vYmFy" "base64 foobar")
+  (assert_eq (base64_encode "foo") "Zm9v" "base64 foo")
+  (assert_eq (base64_encode "fo")  "Zm8=" "base64 fo")
+  ; decode round-trips through the original text
+  (assert_eq (bytes->string (base64_decode "TWFu")) "Man" "base64_decode 3-byte")
+  (assert_eq (bytes->string (base64_decode "TWE=")) "Ma"  "base64_decode 2-byte tail")
+  (assert_eq (bytes->string (base64_decode "TQ==")) "M"   "base64_decode 1-byte tail")
+  (assert_eq (bytes->string (base64_decode "")) "" "base64_decode empty")
+  (assert_eq (bytes->string (base64_decode (base64_encode "hello, world!")))
+    "hello, world!" "base64 round-trip")
+  ; invalid alphabet char is a protocol error
+  (assert_true
+    (error? (try (base64_decode "****") (catch e e))) "base64 invalid char errors")
+
+  ; ── base64url ────────────────────────────────────────────────────────────
+  ; the "+/" bytes (0xFB 0xFF 0xBF) map to "-_" and there is no "=" padding
+  (bind ((raw (bytes_from_list (list_of 251 255 191))))
+    (do
+      (assert_eq (base64url_encode raw) "-_-_" "base64url uses -_ alphabet")
+      (assert_eq (base64_encode raw) "+/+/" "base64 std uses +/ alphabet")))
+  ; a 1-byte tail has NO "=" padding in the url variant
+  (assert_eq (base64url_encode "M") "TQ" "base64url no padding (1-byte)")
+  (assert_eq (base64url_encode "Ma") "TWE" "base64url no padding (2-byte)")
+  (assert_eq (bytes->string (base64url_decode "TQ")) "M" "base64url_decode unpadded")
+  (assert_eq (bytes->string (base64url_decode (base64url_encode "a/b+c?")))
+    "a/b+c?" "base64url round-trip")
+
+  ; ── base32 (RFC 4648) ──────────────────────────────────────────────────────
+  ; the canonical RFC 4648 §10 test vectors (uppercase, "=" padded)
+  (assert_eq (base32_encode "")       ""                 "base32 empty")
+  (assert_eq (base32_encode "f")      "MY======"         "base32 f")
+  (assert_eq (base32_encode "fo")     "MZXQ===="         "base32 fo")
+  (assert_eq (base32_encode "foo")    "MZXW6==="         "base32 foo")
+  (assert_eq (base32_encode "foob")   "MZXW6YQ="         "base32 foob")
+  (assert_eq (base32_encode "fooba")  "MZXW6YTB"         "base32 fooba")
+  (assert_eq (base32_encode "foobar") "MZXW6YTBOI======" "base32 foobar vector")
+  ; decode round-trips through the original text
+  (assert_eq (bytes->string (base32_decode "MY======"))         "f"      "base32_decode f")
+  (assert_eq (bytes->string (base32_decode "MZXQ===="))         "fo"     "base32_decode fo")
+  (assert_eq (bytes->string (base32_decode "MZXW6==="))         "foo"    "base32_decode foo")
+  (assert_eq (bytes->string (base32_decode "MZXW6YQ="))         "foob"   "base32_decode foob")
+  (assert_eq (bytes->string (base32_decode "MZXW6YTB"))         "fooba"  "base32_decode fooba")
+  (assert_eq (bytes->string (base32_decode "MZXW6YTBOI======")) "foobar" "base32_decode foobar")
+  (assert_eq (bytes->string (base32_decode "")) "" "base32_decode empty")
+  ; padding is optional on input (still decodes to the same bytes)
+  (assert_eq (bytes->string (base32_decode "MZXW6YTBOI")) "foobar" "base32_decode tolerates no padding")
+  (assert_eq (bytes->string (base32_decode (base32_encode "hello, world!")))
+    "hello, world!" "base32 round-trip")
+  ; full byte range survives a round-trip (bytes value input)
+  (assert_true
+    (deep_eq (bytes_to_list (base32_decode (base32_encode (bytes_from_list (list_of 0 1 127 128 255)))))
+             (list_of 0 1 127 128 255))
+    "base32 round-trip full byte range")
+  ; a bytes value encodes the same as the equivalent string
+  (assert_eq (base32_encode (bytes_from_list (list_of 102 111 111 98 97 114))) "MZXW6YTBOI======"
+    "base32_encode of bytes")
+  ; invalid alphabet char (lowercase / "1" / "8" / "0" are NOT in A-Z2-7) is an error
+  (assert_true
+    (error? (try (base32_decode "mzxw") (catch e e))) "base32 lowercase is invalid")
+  (assert_true
+    (error? (try (base32_decode "0189") (catch e e))) "base32 0189 invalid chars")
+  ; an impossible significant-length tail (1 value) is a protocol error
+  (assert_true
+    (error? (try (base32_decode "A") (catch e e))) "base32 invalid length errors")
+
+  ; ── percent (URL) ────────────────────────────────────────────────────────
+  (assert_eq (percent_encode "a b/c") "a%20b%2Fc" "percent_encode spaces and slash")
+  (assert_eq (percent_decode "a%20b%2Fc") "a b/c" "percent_decode round-trip")
+  ; unreserved characters pass through untouched
+  (assert_eq (percent_encode "Aa0-._~") "Aa0-._~" "percent unreserved untouched")
+  (assert_eq (percent_decode (percent_encode "x?y=z&w")) "x?y=z&w" "percent round-trip")
+  ; "+" is a reserved byte: encoded as %2B, and decoded back to "+" (NOT a space —
+  ; this is RFC 3986 URI decoding, not application/x-www-form-urlencoded)
+  (assert_eq (percent_encode "a+b") "a%2Bb" "percent encodes + as %2B")
+  (assert_eq (percent_decode "a+b") "a+b" "percent_decode leaves literal + untouched")
+  ; truncated escape is a protocol error
+  (assert_true
+    (error? (try (percent_decode "%2") (catch e e))) "percent truncated escape errors")
+
+  ; ── ord / chr ────────────────────────────────────────────────────────────
+  (assert_eq (ord "A") 65 "ord A")
+  (assert_eq (chr 65) "A" "chr 65")
+  (assert_eq (ord "0") 48 "ord 0")
+  (assert_eq (ord (chr 233)) 233 "ord/chr e-acute round-trip (2-byte)")
+  (assert_eq (ord (chr 9786)) 9786 "ord/chr smiley round-trip (3-byte)")
+  (assert_eq (ord (chr 128512)) 128512 "ord/chr grinning round-trip (4-byte)")
+  ; chr of e-acute is the same single character json.caap mints
+  (assert_eq (chr 233) (bytes->string (bytes_from_list (list_of 195 169))) "chr 2-byte bytes")
+  ; bad inputs are protocol errors
+  (assert_true (error? (try (ord "ab") (catch e e))) "ord multi-char errors")
+  (assert_true (error? (try (chr 55296) (catch e e))) "chr surrogate errors")
+  (assert_true (error? (try (chr -1) (catch e e))) "chr negative errors")
+
+  ; ── utf8 ─────────────────────────────────────────────────────────────────
+  (assert_true (deep_eq (utf8_encode "Hi") (list_of 72 105)) "utf8_encode ascii")
+  (assert_eq (utf8_decode (list_of 72 105)) "Hi" "utf8_decode ascii")
+  ; a multi-byte string round-trips through the byte-list view
+  (bind ((s (string_concat_many "caf" (chr 233))))   ; "café"
+    (do
+      (assert_true (deep_eq (utf8_encode s) (list_of 99 97 102 195 169)) "utf8_encode multibyte")
+      (assert_eq (utf8_decode (utf8_encode s)) s "utf8 round-trip multibyte")))
+
+  ; codecs accept a bytes value directly, not only strings
+  (assert_eq (hex_encode (bytes_from_list (list_of 72 105))) "4869" "hex_encode of bytes")
+  (assert_eq (base64_encode (bytes_from_list (list_of 77 97 110))) "TWFu" "base64_encode of bytes")
+
+  ; longer inputs exercise the list-accumulate-then-join encoders (the previous
+  ; per-byte concat was O(n^2)); output must be byte-identical
+  (bind ((long (string_repeat "abcdefghij" 40)))   ; 400 chars
+    (do
+      (assert_eq (bytes->string (hex_decode (hex_encode long))) long "hex round-trip long")
+      (assert_eq (bytes->string (base64_decode (base64_encode long))) long "base64 round-trip long")
+      (assert_eq (bytes->string (base32_decode (base32_encode long))) long "base32 round-trip long")
+      (assert_eq (percent_decode (percent_encode long)) long "percent round-trip long")))
+  true)

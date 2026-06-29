@@ -1,0 +1,240 @@
+; stdlib/frontend/surface.caap — opt-in custom-lowering surface grammars: the
+; FRAMEWORK other surface languages (stdlib.frontend.clike) are built on.
+;
+; Tier 5's textual reader-directives (extend_syntax/define_grammar, in the
+; loader) give SPELLING aliases. This kit gives full CUSTOM LOWERING: author a
+; grammar with `-> surface.*` lower hooks, parse arbitrary TEXT under it via
+; the kernel's one-call `ctfe_grammar_parse_forms`, and convert the resulting
+; ParsedForm trees into stdlib ExprSpecs that flow through the WHOLE pipeline
+; (expand → check → typecheck → eval, or prep → LLVM). Pure kernel, zero
+; stdlib-v1.
+;
+; THE PIPELINE (and which export drives each stage):
+;   1. AUTHOR a grammar as structured combinators — seq/choice/named/many over
+;      regex/literal/rule_ref/token, plus entry_rule/set_comment. `grammar`
+;      serializes them into the engine's authoring DSL (it reads as code, not
+;      one opaque EBNF string):
+;        add rule num  = integer -> surface.integer
+;        add rule word = /[A-Za-z]+/ -> surface.symbol
+;        replace rule form = num | word
+;   2. ATTACH it to a loaded host unit with `apply_grammar!` (a unit from
+;      ctfe_compiler_load_surface_file_template).
+;   3. PARSE text under the merged grammars with `parse_forms`/`parse_forms_at`
+;      — a parse failure is DATA ({ok:false,error}), never an exception, so a
+;      language builder branches on it. The lower hooks
+;      (surface.symbol/integer/string/boolean/null/list) build the ParsedForm
+;      leaves the next stage reads back.
+;   4. CONVERT each ParsedForm tree to a stdlib ExprSpec with `form_to_spec`
+;      (or `parse_to_specs` to do 3+4 at once) — now evaluable/compilable AST.
+;
+; Two ways to consume the result: a builder reads ParsedForm trees DIRECTLY for
+; full structural control (this is what stdlib.frontend.clike does — its own recursive
+; lowerer over the bracketed token stream); or it takes the form_to_spec
+; s-expression convention as-is. `parse_text`/`template` dogfood the kit: an
+; s-expr grammar authored through this very machinery turns kernel TEXT into
+; specs, the substrate for building big trees as text and filling `?holes`.
+(module stdlib.frontend.surface)
+
+(import stdlib.load loader_api)
+(use stdlib.lib.collections.sequence map)
+(use stdlib.syntax.ir subst)
+
+; ── grammar AS FORMS ────────────────────────────────────────────────────────
+; Rules are declared as structured combinators (the v1 syntax.caap shape —
+; seq/choice/named/many over regex/literal/rule_ref), and `grammar` serializes
+; the declarations into the engine's authoring DSL. The grammar reads as
+; code, not as one opaque EBNF string.
+;
+;   (grammar (list_of
+;     (set_comment "//")
+;     (syntax_rule "num" (token "integer") "integer")
+;     (syntax_rule "parens"
+;       (seq (list_of (literal "(") (named "items" (many (rule_ref "tok")))
+;                     (literal ")")))
+;       "list")
+;     (entry_rule (rule_ref "fndef"))))
+
+; ── the combinator vocabulary ───────────────────────────────────────────────
+; Each builder is a thin constructor of authoring-DSL TEXT, so a grammar reads
+; as nested calls instead of a hand-spelled EBNF string:
+;   (regex rx)     -> /rx/         a character-class / pattern token
+;   (literal s)    -> "s"          an exact keyword/punctuation match
+;   (rule_ref n)   -> n            a reference to rule `n`
+;   (token n)      -> n            a base token rule (integer/string/symbol)
+;   (named lbl x)  -> lbl:x        capture `x` under field `lbl` (read by hooks)
+;   (many x)       -> x*           zero or more
+;   (many1 x)      -> x+           one or more
+;   (opt x)        -> x?           optional
+;   (seq [a b …])  -> (a b …)      a sequence (a lone item stays bare)
+;   (choice [a b]) -> a | b        an ordered alternation
+(bind regex    (lambda (rx) (string_concat_many "/" rx "/")))
+(bind literal  (lambda (s)  (string_concat_many "\"" s "\"")))
+(bind rule_ref (lambda (n)  n))
+(bind token    (lambda (n)  n))
+(bind named    (lambda (label x) (string_concat_many label ":" x)))
+(bind many     (lambda (x) (string_concat_many x "*")))
+(bind many1    (lambda (x) (string_concat_many x "+")))
+(bind opt      (lambda (x) (string_concat_many x "?")))
+(bind seq
+  (lambda (xs)
+    (if (eq (size xs) 1)
+      (get xs 0)
+      (string_concat_many "(" (sequence_join xs " ") ")"))))
+(bind choice
+  (lambda (xs) (sequence_join xs " | ")))
+
+; syntax_rule — one rule declaration; `hook` names the surface.* lowering
+; (null = a structural rule with no form of its own).
+(bind syntax_rule
+  (lambda (name body hook)
+    (string_concat_many
+      "add rule " name " = " body
+      (if (eq hook null) "" (string_concat_many " -> surface." hook)))))
+
+; entry_rule / set_comment — the grammar's start rule and comment convention.
+(bind entry_rule
+  (lambda (body) (string_concat_many "replace rule form = " body)))
+(bind set_comment
+  (lambda (s)
+    (if (eq s null)
+      "set comment = none"
+      (string_concat_many "set comment = \"" s "\""))))
+
+; grammar — the declarations as ONE authoring-DSL source.
+(bind grammar
+  (lambda (decls) (string_concat_many (sequence_join decls "\n") "\n")))
+
+; apply_grammar! — attach an authoring-DSL grammar to a loaded host unit.
+;   unit          : a unit from ctfe_compiler_load_surface_file_template
+;   authoring_dsl : the textual grammar (add/replace rule … -> surface.hook)
+;   ->            : the same unit, grammar applied (for chaining)
+(bind apply_grammar!
+  (lambda (unit authoring_dsl)
+    (do
+      (ctfe_unit_syntax_authoring_source_apply! unit authoring_dsl)
+      unit)))
+
+; parse_forms — parse TEXT under the merged grammars, faithfully. A parse
+; failure is DATA, never an error, so language builders branch on it.
+;   units : a list of grammar unit handles
+;   text  : the source text
+;   start : optional start-rule name (null = the grammar's `form`)
+;   ->    : {ok: true, forms: [ParsedForm…]} | {ok: false, error: "…"}
+(bind parse_forms
+  (lambda (units text start)
+    (if (eq start null)
+      (ctfe_grammar_parse_forms compiler units text)
+      (ctfe_grammar_parse_forms compiler units text start))))
+
+; parse_forms_at — like parse_forms, with a REAL source path for the
+; returned form spans (C7: default stays "<ctfe_grammar_parse_forms>").
+(bind parse_forms_at
+  (lambda (units text start path)
+    (ctfe_grammar_parse_forms compiler units text start path)))
+
+; form_to_spec — convert ONE ParsedForm tree to a stdlib ExprSpec, so a
+; parsed surface form becomes evaluable/compilable kernel AST.
+;   self : itself (recursion idiom)
+;   form : a ParsedForm map ({kind, value, items, …})
+;   ->   : an ExprSpec (syntax_name / syntax_literal / syntax_call)
+; Leaves: a `symbol` is a name; integer/float/string/boolean/null literals
+; carry their value. A `list` becomes a call — its first item is the callee, the
+; rest the arguments (the surface convention for an s-expression-shaped node).
+(bind form_to_spec
+  (lambda (self form)
+    (bind ((kind (get form "kind")))
+      (cond
+        ((eq kind "symbol") (syntax_name (get form "value" "")))
+        ((eq kind "integer") (syntax_literal (get form "value" 0)))
+        ((eq kind "float") (syntax_literal (get form "value" 0.0)))
+        ((eq kind "string") (syntax_literal (get form "value" "")))
+        ((eq kind "boolean") (syntax_literal (get form "value" false)))
+        ((eq kind "null") (syntax_literal null))
+        ((eq kind "list")
+          (bind ((items (get form "items" (list_of))))
+            (if (eq (size items) 0)
+              (syntax_call (syntax_name "list_of") (list_of))
+              (syntax_call
+                (self self (get items 0))
+                (map (sequence_drop items 1)
+                  (lambda (it) (self self it)))))))
+        (else
+          (throw (string_concat_many
+            "surface: cannot lower form of kind `"
+            (value_to_string kind) "`")))))))
+
+; parse_to_specs — parse + convert in one step.
+;   units / text / start : as parse_forms
+;   ->                    : {ok: true, specs: [ExprSpec…]} | {ok: false, error}
+(bind parse_to_specs
+  (lambda (units text start)
+    (bind ((r (parse_forms units text start)))
+      (if (get r "ok" false)
+        (assoc (map_of) "ok" true
+          "specs" (map (get r "forms" (list_of))
+                    (lambda (f) (form_to_spec form_to_spec f))))
+        r))))
+
+; ── kernel s-expressions as TEXT: parse_text / template ─────────────────────
+; The kit dogfoods itself: an s-expression grammar authored through its own
+; machinery turns kernel text into specs at runtime — the substrate for
+; templates (build big trees as text, fill the holes with subst).
+
+; the s-expr grammar: ints/strings/symbols/lists with the standard lowering
+; hooks. `?x` parses as a symbol, so pattern variables survive the trip.
+(bind sexpr_grammar
+  (grammar (list_of
+    (syntax_rule "s_int" (token "integer") "integer")
+    (syntax_rule "s_str" (token "string") "string")
+    (syntax_rule "s_sym"
+      (regex "[A-Za-z_?!+*\\/<>=.\\-][A-Za-z0-9_?!+*\\/<>=.\\-]*") "symbol")
+    (syntax_rule "s_list"
+      (seq (list_of (literal "(")
+                    (named "items" (many (rule_ref "s_item")))
+                    (literal ")")))
+      "list")
+    (syntax_rule "s_item"
+      (choice (list_of (rule_ref "s_list") (rule_ref "s_int")
+                       (rule_ref "s_str") (rule_ref "s_sym")))
+      null)
+    (entry_rule (rule_ref "s_item")))))
+
+; the host unit carrying the s-expr grammar, created ON FIRST USE: the kit
+; loads its OWN file (resolved through the loader's registry) as a neutral
+; host and applies the grammar — no extra files, no kit-level load cost.
+(bind sexpr_host (ref null))
+(bind sexpr_units
+  (lambda ()
+    (do
+      (when (eq (deref sexpr_host) null)
+        (set_ref sexpr_host
+          (apply_grammar!
+            (ctfe_compiler_load_surface_file_template compiler
+              ((get loader_api "module_path") "stdlib.frontend.surface"))
+            sexpr_grammar)))
+      (list_of (deref sexpr_host)))))
+
+; parse_text — kernel s-expression TEXT -> specs (parse failure is data).
+;   text : e.g. "(int_add ?x (int_mul 2 3))"
+;   ->   : {ok: true, specs: […]} | {ok: false, error}
+(bind parse_text
+  (lambda (text) (parse_to_specs (sexpr_units) text null)))
+
+; template — build a tree from TEXT, filling `?hole` names from a map.
+;   text     : ONE s-expression with `?name` holes
+;   bindings : map of "?name" -> spec (same keying match_node produces, so a
+;              rule's captures instantiate a template directly)
+;   ->       : the spec (throws on parse failure — a template is source code,
+;              a typo in it is a bug, not data)
+(bind template
+  (lambda (text bindings)
+    (bind ((r (parse_text text)))
+      (if (get r "ok" false)
+        (subst (get (get r "specs" (list_of)) 0) bindings)
+        (throw (string_concat_many
+          "surface template: " (value_to_string (get r "error"))))))))
+
+(export apply_grammar! parse_forms parse_forms_at form_to_spec parse_to_specs
+        parse_text template
+        grammar syntax_rule entry_rule set_comment
+        regex literal token rule_ref named many many1 opt seq choice)

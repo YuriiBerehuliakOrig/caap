@@ -1,0 +1,128 @@
+; stdlib/lib/tests/test_escape.caap — escape analysis for borrowed references.
+
+;; @area: passes
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.escape check)
+(use stdlib.syntax.ast sym lit calln lam)
+(use stdlib.lib.collections.sequence any?)
+
+(do
+  (bind (
+    (has (lambda (findings needle)
+           (any? findings (lambda (f) (string_contains f needle)))))
+    ; (borrow x (lambda (r) body))
+    (bor (lambda (body) (calln "borrow" (list_of (sym "x") (lam (list_of "r") body)))))
+    (bormut (lambda (body) (calln "borrow_mut" (list_of (sym "x") (lam (list_of "r") body)))))
+  )
+    (do
+      ; ── direct return of the handle escapes ──
+      (assert_true (has (check (bor (sym "r"))) "`r` escapes")
+        "directly returned borrow escapes")
+
+      ; ── escape through an if-branch ──
+      (assert_true
+        (has (check (bor (calln "if" (list_of (sym "c") (sym "r") (lit 0)))))
+             "`r` escapes")
+        "borrow returned via if-branch escapes")
+
+      ; ── escape via a returned closure capturing r ──
+      (assert_true
+        (has (check (bor (lam (list_of) (sym "r")))) "`r` escapes")
+        "closure capturing the borrow escapes")
+
+      ; ── borrow_mut handle escaping too ──
+      (assert_true (has (check (bormut (sym "r"))) "`r` escapes")
+        "escaping &mut handle flagged")
+
+      ; ── alias through a bind, then returned: (bind ((y r)) y) ──
+      (assert_true
+        (has (check (bor (calln "bind" (list_of (lit "y") (sym "r") (sym "y")))))
+             "`r` escapes")
+        "borrow aliased through a bind and returned escapes")
+
+      ; ── clean: aliased but only read ──
+      (assert_eq
+        (size (check (bor (calln "bind"
+                 (list_of (lit "y") (sym "r")
+                          (calln "println" (list_of (sym "y"))))))))
+        0
+        "aliased borrow that is only read does not escape")
+
+      ; ── clean: read-only use, returns unit ──
+      (assert_eq (size (check (bor (calln "println" (list_of (sym "r")))))) 0
+        "read-borrow that returns a call result does not escape")
+
+      ; ── clean: uses r, returns a literal ──
+      (assert_eq
+        (size (check (bor (calln "do"
+                 (list_of (calln "use" (list_of (sym "r"))) (lit 0))))))
+        0
+        "borrow whose result is a literal does not escape")
+
+      ; ── clean: r as an if CONDITION (not the result) ──
+      (assert_eq
+        (size (check (bor (calln "if" (list_of (sym "r") (lit 1) (lit 2))))))
+        0
+        "borrow used only as a condition does not escape")
+
+      ; ── escape through a NESTED bind tail: (bind ((y r)) (bind ((z y)) z)) ──
+      (assert_true
+        (has (check (bor (calln "bind"
+                 (list_of (lit "y") (sym "r")
+                   (calln "bind" (list_of (lit "z") (sym "y") (sym "z")))))))
+             "`r` escapes")
+        "borrow aliased through chained binds and returned escapes")
+
+      ; ── a NESTED inner borrow's handle escaping is caught independently ──
+      ; the walk visits every borrow node, so the inner (borrow_mut y (lambda (s) s))
+      ; flags its own handle `s` (the outer `r` is opaque through that call).
+      (assert_true
+        (has (check (bor (calln "borrow_mut"
+                 (list_of (sym "y") (lam (list_of "s") (sym "s"))))))
+             "`s` escapes")
+        "an inner nested borrow handle that escapes is flagged")
+
+      ; ── clean: an inner borrow whose handle is only read ──
+      (assert_eq
+        (size (check (bor (calln "borrow"
+                 (list_of (sym "y")
+                   (lam (list_of "s") (calln "println" (list_of (sym "s")))))))))
+        0
+        "a nested read-only borrow does not escape")
+
+      ; ── data constructors: storing the handle in a returned structure escapes ──
+      ; (pair r s) — r is embedded in the returned pair
+      (assert_true
+        (has (check (bor (calln "pair" (list_of (sym "r") (sym "s"))))) "`r` escapes")
+        "borrow captured into a returned pair escapes")
+      ; (list_of r) — r is embedded in the returned list
+      (assert_true
+        (has (check (bor (calln "list_of" (list_of (sym "r"))))) "`r` escapes")
+        "borrow captured into a returned list escapes")
+      ; (ref r) — r outlives the borrow through the cell
+      (assert_true
+        (has (check (bor (calln "ref" (list_of (sym "r"))))) "`r` escapes")
+        "borrow stored into a ref escapes")
+      ; (assoc (map_of) "f" r) — r stored into a returned struct/map field
+      (assert_true
+        (has (check (bor (calln "assoc"
+               (list_of (calln "map_of" (list_of)) (lit "f") (sym "r")))))
+             "`r` escapes")
+        "borrow stored into a returned struct field escapes")
+      ; nested: (pair (pair r s) t) — composes through the constructor branch
+      (assert_true
+        (has (check (bor (calln "pair"
+               (list_of (calln "pair" (list_of (sym "r") (sym "s"))) (sym "t")))))
+             "`r` escapes")
+        "borrow captured in a NESTED constructor escapes")
+
+      ; ── clean: r used only to INDEX into a constructor arg, not stored ──
+      ; (list_of (get m r)) — r is read to index m; the constructor stores the
+      ; RESULT of the get, not r, so r does not escape.
+      (assert_eq
+        (size (check (bor (calln "list_of"
+                 (list_of (calln "get" (list_of (sym "m") (sym "r"))))))))
+        0
+        "a borrow read only to index into a constructor arg does not escape"))))

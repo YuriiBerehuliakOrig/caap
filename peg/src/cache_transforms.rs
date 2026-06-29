@@ -4,14 +4,17 @@
 //! `cache_seed.py`.  Transforms a persisted `PositionCache` across text edits so that
 //! surviving memo entries are carried forward into the next parse run.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::incremental_edits::{
-    compile_incremental_edit_steps, BoundaryTransplant, IncrementalEditError, IncrementalEditStep,
-    SpanShift,
+    compile_incremental_edit_steps, shift_offset_by_delta, BoundaryTransplant,
+    IncrementalEditError, IncrementalEditStep, SpanShift,
 };
 use crate::types::{IncrementalEdit, ParseValue, PositionCache, PositionMemoEntry};
 use crate::values::contains_spanned;
+
+type RuleMemoTable = HashMap<String, HashMap<usize, PositionMemoEntry>>;
 
 // ── PayloadProjection ──────────────────────────────────────────────────────
 
@@ -27,15 +30,7 @@ impl std::fmt::Display for UnmappablePayloadError {
 
 impl std::error::Error for UnmappablePayloadError {}
 
-/// An optional filename replacement applied during payload projection.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FilenameUpdate {
-    pub value: Option<String>,
-}
-
 /// Projects span offsets inside a cached `ParseValue` tree when text shifts.
-///
-/// Mirrors `peg/engine/payload_projection.py::PayloadProjection`.
 ///
 /// After an incremental edit the in-cache parse values contain stale byte
 /// offsets. `PayloadProjection` walks the value tree and applies the
@@ -45,10 +40,6 @@ pub struct PayloadProjection {
     /// Ordered list of (shift_from, delta) pairs. Each pair means: for every
     /// span endpoint `>= shift_from`, add `delta` to it.
     pub span_shifts: Vec<SpanShift>,
-    /// If set, replaces `source_id` in every span-bearing node.
-    pub source_id: Option<u64>,
-    /// If set, replaces the filename in every `RawBlock`-style leaf.
-    pub filename_update: Option<FilenameUpdate>,
 }
 
 impl PayloadProjection {
@@ -59,20 +50,6 @@ impl PayloadProjection {
     pub fn with_span_shifts(mut self, shifts: Vec<SpanShift>) -> Self {
         self.span_shifts = shifts;
         self
-    }
-
-    pub fn with_source_id(mut self, id: u64) -> Self {
-        self.source_id = Some(id);
-        self
-    }
-
-    pub fn with_filename_update(mut self, filename: Option<String>) -> Self {
-        self.filename_update = Some(FilenameUpdate { value: filename });
-        self
-    }
-
-    pub fn has_effect(&self) -> bool {
-        !self.span_shifts.is_empty() || self.source_id.is_some() || self.filename_update.is_some()
     }
 
     /// Apply span projection to a `ParseValue` tree.
@@ -90,38 +67,42 @@ impl PayloadProjection {
                 start,
                 end,
             } => {
-                let new_start = self.shift_pos(start);
-                let new_end = self.shift_pos(end);
-                let new_inner = self.project_value(*inner)?;
+                let new_start = self.shift_pos(start).ok_or_else(|| {
+                    UnmappablePayloadError("projected span start moved before byte 0".to_string())
+                })?;
+                let new_end = self.shift_pos(end).ok_or_else(|| {
+                    UnmappablePayloadError("projected span end moved before byte 0".to_string())
+                })?;
+                let new_inner = self.project_value(ParseValue::unwrap_arc(inner))?;
                 Ok(ParseValue::SpannedValue {
-                    value: Box::new(new_inner),
+                    value: Arc::new(new_inner),
                     start: new_start,
                     end: new_end,
                 })
             }
             ParseValue::Named(name, inner) => Ok(ParseValue::Named(
                 name,
-                Box::new(self.project_value(*inner)?),
+                Arc::new(self.project_value(ParseValue::unwrap_arc(inner))?),
             )),
             ParseValue::Node(tag, children) => {
                 let projected: Result<Vec<_>, _> = children
-                    .into_iter()
-                    .map(|c| self.project_value(c))
+                    .iter()
+                    .map(|c| self.project_value(c.clone()))
                     .collect();
-                Ok(ParseValue::Node(tag, projected?))
+                Ok(ParseValue::Node(tag, Arc::new(projected?)))
             }
             other => Ok(other),
         }
     }
 
-    fn shift_pos(&self, pos: usize) -> usize {
-        let mut p = pos as isize;
+    fn shift_pos(&self, pos: usize) -> Option<usize> {
+        let mut shifted = pos;
         for shift in &self.span_shifts {
             if pos >= shift.shift_from {
-                p += shift.delta;
+                shifted = shift_offset_by_delta(shifted, shift.delta)?;
             }
         }
-        p.max(0) as usize
+        Some(shifted)
     }
 }
 
@@ -132,16 +113,9 @@ impl PayloadProjection {
 pub struct CacheTables {
     /// Rule memo: rule_name → start_pos → entry.
     pub memo_data: HashMap<String, HashMap<usize, PositionMemoEntry>>,
-    /// Trivia-skip memo: start_pos → end_pos.
-    pub skip_memo_data: HashMap<usize, usize>,
-    /// `(rule, start)` pairs whose cached values contain embedded source spans.
-    /// These need special handling if the text shifts — without projection the
-    /// spans would be stale.  Conservative policy: spans in shifted entries are
-    /// stripped so they are re-captured on the next parse.
-    pub memo_provenance_keys: HashSet<(String, usize)>,
 }
 
-/// Error returned by [`ensure_cache_compatible`].
+/// Error returned by cache compatibility and metadata validation helpers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CacheCompatError {
     GrammarMismatch { cache_hash: u64, current_hash: u64 },
@@ -230,14 +204,12 @@ pub fn resolve_incremental_cache_tables(
     if pos_cache.text == text && invalidate_from.is_none() {
         return Ok(CacheTables {
             memo_data: pos_cache.memo.clone(),
-            skip_memo_data: HashMap::new(),
-            memo_provenance_keys: compute_provenance_keys(&pos_cache.memo),
         });
     }
 
     // Same text with forced invalidation — apply only the invalidation filter.
     if pos_cache.text == text {
-        let (memo_data, prov) = build_transformed_rule_cache_fast(
+        let memo_data = build_transformed_rule_cache_fast(
             &pos_cache.memo,
             &BoundaryTransplant {
                 prefix: 0,
@@ -246,11 +218,7 @@ pub fn resolve_incremental_cache_tables(
             },
             invalidate_from,
         );
-        return Ok(CacheTables {
-            memo_data,
-            skip_memo_data: HashMap::new(),
-            memo_provenance_keys: prov,
-        });
+        return Ok(CacheTables { memo_data });
     }
 
     // Determine the transplant plan.
@@ -310,7 +278,13 @@ fn boundary_plan_for_changed_text(old_text: &str, new_text: &str) -> Option<Boun
         .count();
 
     let old_edit_end = ob.len() - suffix;
-    let delta = (nb.len() as isize) - (ob.len() as isize);
+    let delta = if nb.len() >= ob.len() {
+        isize::try_from(nb.len() - ob.len()).ok()?
+    } else {
+        isize::try_from(ob.len() - nb.len())
+            .ok()
+            .and_then(isize::checked_neg)?
+    };
     Some(BoundaryTransplant {
         prefix,
         old_edit_end,
@@ -325,7 +299,7 @@ fn build_transformed_cache_tables(
     plan: &TransplantPlan,
     invalidate_from: Option<usize>,
 ) -> CacheTables {
-    let (memo_data, prov) = match plan {
+    let memo_data = match plan {
         TransplantPlan::Boundary(bp) => {
             build_transformed_rule_cache_fast(memo, bp, invalidate_from)
         }
@@ -336,11 +310,7 @@ fn build_transformed_cache_tables(
             build_transformed_rule_cache_general(memo, steps, invalidate_from)
         }
     };
-    CacheTables {
-        memo_data,
-        skip_memo_data: HashMap::new(), // skip memo not yet persisted across runs
-        memo_provenance_keys: prov,
-    }
+    CacheTables { memo_data }
 }
 
 // ── Rule memo fast path (BoundaryTransplant) ───────────────────────────────
@@ -351,91 +321,111 @@ fn build_transformed_cache_tables(
 /// Shifts positions of entries in the suffix zone by `delta`.
 /// Strips embedded spans from shifted entries to avoid stale provenance.
 fn build_transformed_rule_cache_fast(
-    memo: &HashMap<String, HashMap<usize, PositionMemoEntry>>,
+    memo: &RuleMemoTable,
     plan: &BoundaryTransplant,
     invalidate_from: Option<usize>,
-) -> (
-    HashMap<String, HashMap<usize, PositionMemoEntry>>,
-    HashSet<(String, usize)>,
-) {
+) -> RuleMemoTable {
     let prefix = plan.prefix;
     let old_edit_end = plan.old_edit_end;
     let delta = plan.delta;
     let mut out: HashMap<String, HashMap<usize, PositionMemoEntry>> = HashMap::new();
-    let mut prov: HashSet<(String, usize)> = HashSet::new();
 
     for (rule, by_pos) in memo {
         let mut new_by_pos: HashMap<usize, PositionMemoEntry> = HashMap::new();
         for (&start, entry) in by_pos {
             let end = entry.end;
-            let lo = start.min(end);
-            let hi = start.max(end);
-            if delta == 0 {
-                // No shift — only apply zone filter and invalidate_from.
-                if (hi < prefix || lo >= old_edit_end) && invalidate_from.is_none_or(|f| end <= f) {
-                    let has_prov = contains_spanned(&entry.value);
+            // Reuse is classified on the *examined* interval, not the matched
+            // span: an edit inside a lookahead/lookbehind region (read but not
+            // consumed) must still invalidate the entry.
+            let (read_lo, read_hi) = entry.examined(start);
+            match crate::incremental_edits::cache_interval_zone(
+                read_lo,
+                read_hi,
+                prefix,
+                old_edit_end,
+            ) {
+                // Before the edit — keep as-is (unless the invalidation filter
+                // drops it).
+                Some("prefix") if invalidate_from.is_none_or(|f| end <= f) => {
                     new_by_pos.insert(start, entry.clone());
-                    if has_prov {
-                        prov.insert((rule.clone(), start));
-                    }
                 }
-            } else if hi < prefix {
-                // Prefix zone: keep as-is.
-                if invalidate_from.is_none_or(|f| end <= f) {
-                    let has_prov = contains_spanned(&entry.value);
-                    new_by_pos.insert(start, entry.clone());
-                    if has_prov {
-                        prov.insert((rule.clone(), start));
-                    }
-                }
-            } else if lo >= old_edit_end {
-                // Suffix zone: shift positions.
-                let new_start = (start as isize + delta) as usize;
-                let new_end = (end as isize + delta) as usize;
-                if invalidate_from.is_none_or(|f| new_end <= f) {
-                    let has_prov = contains_spanned(&entry.value);
-                    let value = if has_prov && delta != 0 {
-                        // Project embedded spans to new positions.
-                        let proj = PayloadProjection::new().with_span_shifts(vec![SpanShift {
-                            shift_from: old_edit_end,
-                            delta,
-                        }]);
-                        proj.project_value(entry.value.clone())
-                            .unwrap_or_else(|_| crate::values::strip_spans(entry.value.clone()))
-                    } else {
-                        entry.value.clone()
+                Some("suffix") => {
+                    // After the edit — shift the matched span and examined interval.
+                    let Some(new_start) = shift_offset_by_delta(start, delta) else {
+                        continue;
                     };
-                    if has_prov {
-                        prov.insert((rule.clone(), new_start));
+                    let Some(new_end) = shift_offset_by_delta(end, delta) else {
+                        continue;
+                    };
+                    if invalidate_from.is_none_or(|f| new_end <= f) {
+                        let value = project_shifted_value(
+                            entry,
+                            delta,
+                            &[SpanShift {
+                                shift_from: old_edit_end,
+                                delta,
+                            }],
+                        );
+                        new_by_pos.insert(new_start, shifted_entry(entry, new_end, value, delta));
                     }
-                    new_by_pos.insert(
-                        new_start,
-                        PositionMemoEntry {
-                            end: new_end,
-                            value,
-                        },
-                    );
                 }
+                // Overlap (or unexpected) — drop.
+                _ => {}
             }
-            // Overlap zone: drop.
         }
         if !new_by_pos.is_empty() {
             out.insert(rule.clone(), new_by_pos);
         }
     }
-    (out, prov)
+    out
+}
+
+/// Shift an entry's value provenance spans by `delta` (only when it embeds spans
+/// and `delta != 0`); otherwise reuse the value as-is.
+fn project_shifted_value(
+    entry: &PositionMemoEntry,
+    delta: isize,
+    shifts: &[SpanShift],
+) -> Arc<ParseValue> {
+    if delta != 0 && !shifts.is_empty() && contains_spanned(&entry.value) {
+        let proj = PayloadProjection::new().with_span_shifts(shifts.to_vec());
+        Arc::new(
+            proj.project((*entry.value).clone())
+                .unwrap_or_else(|_| crate::values::strip_spans((*entry.value).clone())),
+        )
+    } else {
+        entry.value.clone()
+    }
+}
+
+/// Build a shifted entry: new matched end + value, with the examined interval
+/// shifted by `delta`. Entries that drop below 0 keep `None` (fall back to span).
+fn shifted_entry(
+    entry: &PositionMemoEntry,
+    new_end: usize,
+    value: Arc<ParseValue>,
+    delta: isize,
+) -> PositionMemoEntry {
+    PositionMemoEntry {
+        end: new_end,
+        value,
+        cut: entry.cut,
+        read_lo: entry
+            .read_lo
+            .and_then(|lo| shift_offset_by_delta(lo, delta)),
+        read_hi: entry
+            .read_hi
+            .and_then(|hi| shift_offset_by_delta(hi, delta)),
+    }
 }
 
 // ── Rule memo single-step path ─────────────────────────────────────────────
 
 fn build_transformed_rule_cache_single_step(
-    memo: &HashMap<String, HashMap<usize, PositionMemoEntry>>,
+    memo: &RuleMemoTable,
     step: &IncrementalEditStep,
     invalidate_from: Option<usize>,
-) -> (
-    HashMap<String, HashMap<usize, PositionMemoEntry>>,
-    HashSet<(String, usize)>,
-) {
+) -> RuleMemoTable {
     let s = step.start;
     let e = step.old_end;
     let d = step.delta;
@@ -450,50 +440,39 @@ fn build_transformed_rule_cache_single_step(
 // ── Rule memo general path (multi-step) ────────────────────────────────────
 
 fn build_transformed_rule_cache_general(
-    memo: &HashMap<String, HashMap<usize, PositionMemoEntry>>,
+    memo: &RuleMemoTable,
     steps: &[IncrementalEditStep],
     invalidate_from: Option<usize>,
-) -> (
-    HashMap<String, HashMap<usize, PositionMemoEntry>>,
-    HashSet<(String, usize)>,
-) {
-    use crate::incremental_edits::apply_incremental_steps_to_interval;
+) -> RuleMemoTable {
+    use crate::incremental_edits::apply_incremental_steps_to_entry;
     let mut out: HashMap<String, HashMap<usize, PositionMemoEntry>> = HashMap::new();
-    let mut prov: HashSet<(String, usize)> = HashSet::new();
 
+    use crate::incremental_edits::apply_incremental_steps_to_interval;
     for (rule, by_pos) in memo {
         let mut new_by_pos: HashMap<usize, PositionMemoEntry> = HashMap::new();
         for (&start, entry) in by_pos {
             let end = entry.end;
-            // Try to transform [start, end) through all steps.
-            if let Some((new_start, new_end)) =
-                apply_incremental_steps_to_interval(start, end, steps)
+            let (read_lo, read_hi) = entry.examined(start);
+            // Reuse is gated on the examined interval being edit-disjoint; the
+            // matched span (a subset) is then guaranteed transplantable too.
+            let Some((new_read_lo, new_read_hi)) =
+                apply_incremental_steps_to_interval(read_lo, read_hi, steps)
+            else {
+                continue;
+            };
+            if let Some((new_start, new_end, shifts)) =
+                apply_incremental_steps_to_entry(start, end, steps)
             {
                 if invalidate_from.is_none_or(|f| new_end <= f) {
-                    let has_prov = contains_spanned(&entry.value);
-                    let value = if has_prov && new_start != start {
-                        // Build span shifts from all steps that affected this entry.
-                        let shifts: Vec<SpanShift> = steps
-                            .iter()
-                            .map(|s| SpanShift {
-                                shift_from: s.start,
-                                delta: s.delta,
-                            })
-                            .collect();
-                        let proj = PayloadProjection::new().with_span_shifts(shifts);
-                        proj.project_value(entry.value.clone())
-                            .unwrap_or_else(|_| crate::values::strip_spans(entry.value.clone()))
-                    } else {
-                        entry.value.clone()
-                    };
-                    if has_prov {
-                        prov.insert((rule.clone(), new_start));
-                    }
+                    let value = project_shifted_value_with_shifts(entry, &shifts);
                     new_by_pos.insert(
                         new_start,
                         PositionMemoEntry {
                             end: new_end,
                             value,
+                            cut: entry.cut,
+                            read_lo: Some(new_read_lo),
+                            read_hi: Some(new_read_hi),
                         },
                     );
                 }
@@ -503,82 +482,24 @@ fn build_transformed_rule_cache_general(
             out.insert(rule.clone(), new_by_pos);
         }
     }
-    (out, prov)
+    out
 }
 
-// ── Provenance helpers ─────────────────────────────────────────────────────
-
-/// Collect `(rule, start)` keys whose values contain embedded source spans.
-fn compute_provenance_keys(
-    memo: &HashMap<String, HashMap<usize, PositionMemoEntry>>,
-) -> HashSet<(String, usize)> {
-    let mut keys = HashSet::new();
-    for (rule, by_pos) in memo {
-        for (&start, entry) in by_pos {
-            if contains_spanned(&entry.value) {
-                keys.insert((rule.clone(), start));
-            }
-        }
+/// Like [`project_shifted_value`] but driven by an explicit shift list (the
+/// multi-step path computes one shift per applied edit).
+fn project_shifted_value_with_shifts(
+    entry: &PositionMemoEntry,
+    shifts: &[SpanShift],
+) -> Arc<ParseValue> {
+    if !shifts.is_empty() && contains_spanned(&entry.value) {
+        let proj = PayloadProjection::new().with_span_shifts(shifts.to_vec());
+        Arc::new(
+            proj.project((*entry.value).clone())
+                .unwrap_or_else(|_| crate::values::strip_spans((*entry.value).clone())),
+        )
+    } else {
+        entry.value.clone()
     }
-    keys
-}
-
-/// Validate that `tables.memo_provenance_keys` exactly matches the set of
-/// cache entries that contain embedded spans.
-///
-/// Returns an error message if the keys are out of sync — which can happen if
-/// the cache was built without provenance tracking or was corrupted.
-pub fn validate_cache_provenance_metadata(tables: &CacheTables) -> Result<(), String> {
-    let actual_keys = compute_provenance_keys(&tables.memo_data);
-    if actual_keys != tables.memo_provenance_keys {
-        return Err(
-            "CacheTables memo_provenance_keys must exactly match span-bearing memo entries; \
-             rebuild the cache with the current parser"
-                .to_string(),
-        );
-    }
-    Ok(())
-}
-
-// ── Cache persistence helpers ──────────────────────────────────────────────
-
-/// Statistics collected when persisting a parse run's cache state.
-#[derive(Clone, Debug, Default)]
-pub struct CacheStats {
-    pub rule_cache_size: usize,
-    pub rule_cache_hits: usize,
-    pub rule_cache_misses: usize,
-}
-
-/// Persist a `PositionCache` snapshot suitable for serialization and later
-/// incremental reuse.
-///
-/// Strips failed entries (only successful outcomes are worth keeping) and
-/// records provenance keys for span-bearing entries.
-pub fn persist_position_cache(
-    pos_cache: &PositionCache,
-) -> (PositionCache, HashSet<(String, usize)>) {
-    let mut clean_memo: HashMap<String, HashMap<usize, PositionMemoEntry>> = HashMap::new();
-    let mut provenance: HashSet<(String, usize)> = HashSet::new();
-    for (rule, by_pos) in &pos_cache.memo {
-        let clean: HashMap<usize, PositionMemoEntry> =
-            by_pos.iter().map(|(&k, v)| (k, v.clone())).collect();
-        if !clean.is_empty() {
-            for (&start, entry) in &clean {
-                if contains_spanned(&entry.value) {
-                    provenance.insert((rule.clone(), start));
-                }
-            }
-            clean_memo.insert(rule.clone(), clean);
-        }
-    }
-    let persisted = PositionCache {
-        text: pos_cache.text.clone(),
-        grammar_hash: pos_cache.grammar_hash,
-        runtime_signature: pos_cache.runtime_signature,
-        memo: clean_memo,
-    };
-    (persisted, provenance)
 }
 
 // ── Cache seed helpers (from cache_seed.py) ────────────────────────────────
@@ -594,7 +515,7 @@ pub fn build_parse_cache_seed(
     incremental_cache: bool,
     grammar_hash: u64,
     runtime_signature: u64,
-) -> CacheTables {
+) -> Result<CacheTables, IncrementalEditError> {
     resolve_incremental_cache_tables(
         cache,
         text,
@@ -604,7 +525,6 @@ pub fn build_parse_cache_seed(
         grammar_hash,
         runtime_signature,
     )
-    .unwrap_or_default()
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -612,7 +532,11 @@ pub fn build_parse_cache_seed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ParseValue, PositionCache, PositionMemoEntry};
+    use crate::types::{IncrementalEdit, ParseValue, PositionCache, PositionMemoEntry};
+
+    fn edit(start: usize, old_end: usize, replacement: impl Into<String>) -> IncrementalEdit {
+        IncrementalEdit::new(start, old_end, replacement).expect("test edit must be valid")
+    }
 
     fn make_cache(text: &str, grammar_hash: u64, runtime_sig: u64) -> PositionCache {
         PositionCache {
@@ -628,7 +552,32 @@ mod tests {
             start,
             PositionMemoEntry {
                 end,
-                value: ParseValue::Nil,
+                value: Arc::new(ParseValue::Nil),
+                cut: false,
+                read_lo: Some(start),
+                read_hi: Some(end),
+            },
+        );
+    }
+
+    /// Like [`add_entry`] but with an explicit examined interval wider than the
+    /// matched span (e.g. a lookahead that read past `end`).
+    fn add_entry_examined(
+        cache: &mut PositionCache,
+        rule: &str,
+        start: usize,
+        end: usize,
+        read_lo: usize,
+        read_hi: usize,
+    ) {
+        cache.memo.entry(rule.to_string()).or_default().insert(
+            start,
+            PositionMemoEntry {
+                end,
+                value: Arc::new(ParseValue::Nil),
+                cut: false,
+                read_lo: Some(read_lo),
+                read_hi: Some(read_hi),
             },
         );
     }
@@ -729,6 +678,102 @@ mod tests {
     }
 
     #[test]
+    fn drops_entry_when_edit_hits_examined_but_unmatched_region() {
+        // Entry matched [0,1) but examined [0,4) (a lookahead read past `end`).
+        // An edit at byte 2 is outside the matched span but inside the examined
+        // interval — the transplant must drop it (soundness).
+        let mut cache = make_cache("abcd", 1, 1);
+        add_entry_examined(&mut cache, "rule", 0, 1, 0, 4);
+        // Insert 'X' at position 2: "abXcd".
+        let tables =
+            resolve_incremental_cache_tables(Some(&cache), "abXcd", &[], None, true, 1, 1).unwrap();
+        let rule_entries = tables.memo_data.get("rule");
+        assert!(
+            rule_entries.is_none_or(|m| m.is_empty()),
+            "entry whose examined interval overlaps the edit must be dropped: {rule_entries:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_single_edit_drops_examined_overlap() {
+        // One explicit edit routes through the single-step transplant; the entry
+        // matched [0,1) but examined [0,4), and the edit lands at byte 2.
+        let mut cache = make_cache("abcd", 1, 1);
+        add_entry_examined(&mut cache, "rule", 0, 1, 0, 4);
+        let edits = [edit(2, 3, "Z")]; // replace 'c' → 'Z' (delta 0) ⇒ "abZd"
+        let tables =
+            resolve_incremental_cache_tables(Some(&cache), "abZd", &edits, None, true, 1, 1)
+                .unwrap();
+        assert!(
+            tables.memo_data.get("rule").is_none_or(|m| m.is_empty()),
+            "single-step explicit edit must drop the examined-overlapping entry"
+        );
+    }
+
+    #[test]
+    fn multi_step_edits_drop_examined_overlap() {
+        // Two explicit edits force the general (multi-step) transplant path.
+        // The entry matched [0,1) but examined [0,4); the first edit lands inside
+        // that examined tail (byte 2) → it must be dropped.
+        let mut cache = make_cache("abcdefghij", 1, 1);
+        add_entry_examined(&mut cache, "rule", 0, 1, 0, 4);
+        // Sequential single-char replacements: "abcdefghij" → "abZdefghij" → "abZdefQhij".
+        let edits = [edit(2, 3, "Z"), edit(6, 7, "Q")];
+        let tables =
+            resolve_incremental_cache_tables(Some(&cache), "abZdefQhij", &edits, None, true, 1, 1)
+                .unwrap();
+        assert!(
+            tables.memo_data.get("rule").is_none_or(|m| m.is_empty()),
+            "general path must classify on the examined interval, not the match span"
+        );
+    }
+
+    #[test]
+    fn multi_step_edits_shift_examined_interval_of_suffix_entry() {
+        // Two insertions at the front shift a trailing entry's matched span AND
+        // its examined interval by the combined delta through the general path.
+        let mut cache = make_cache("abcdefghij", 1, 1);
+        add_entry_examined(&mut cache, "rule", 8, 9, 8, 10);
+        // Insert 'X' then 'Y' at the front: "abcdefghij" → "Xabcdefghij" → "YXabcdefghij".
+        let edits = [edit(0, 0, "X"), edit(0, 0, "Y")];
+        let tables = resolve_incremental_cache_tables(
+            Some(&cache),
+            "YXabcdefghij",
+            &edits,
+            None,
+            true,
+            1,
+            1,
+        )
+        .unwrap();
+        let entry = tables
+            .memo_data
+            .get("rule")
+            .and_then(|m| m.get(&10))
+            .expect("suffix entry shifted by +2");
+        assert_eq!(entry.end, 11);
+        assert_eq!((entry.read_lo, entry.read_hi), (Some(10), Some(12)));
+    }
+
+    #[test]
+    fn keeps_entry_when_edit_is_past_examined_region() {
+        // Entry matched [0,1), examined [0,2); appending past byte 2 leaves it
+        // untouched even though the matched span is tiny.
+        let mut cache = make_cache("abcd", 1, 1);
+        add_entry_examined(&mut cache, "rule", 0, 1, 0, 2);
+        let tables =
+            resolve_incremental_cache_tables(Some(&cache), "abcdX", &[], None, true, 1, 1).unwrap();
+        assert!(
+            tables
+                .memo_data
+                .get("rule")
+                .and_then(|m| m.get(&0))
+                .is_some(),
+            "entry examined only [0,2) should survive an append at byte 4"
+        );
+    }
+
+    #[test]
     fn keeps_prefix_entries_on_suffix_insertion() {
         let mut cache = make_cache("abcd", 1, 1);
         // Entry [0, 1) is purely in the prefix.
@@ -792,7 +837,7 @@ mod tests {
 
     #[test]
     fn seed_returns_empty_on_none_cache() {
-        let seed = build_parse_cache_seed(None, "text", &[], None, true, 1, 1);
+        let seed = build_parse_cache_seed(None, "text", &[], None, true, 1, 1).unwrap();
         assert!(seed.memo_data.is_empty());
     }
 
@@ -800,8 +845,17 @@ mod tests {
     fn seed_reuses_compatible_cache() {
         let mut cache = make_cache("hello", 10, 20);
         add_entry(&mut cache, "r", 0, 5);
-        let seed = build_parse_cache_seed(Some(&cache), "hello", &[], None, true, 10, 20);
+        let seed = build_parse_cache_seed(Some(&cache), "hello", &[], None, true, 10, 20).unwrap();
         assert!(seed.memo_data.contains_key("r"));
+    }
+
+    #[test]
+    fn seed_rejects_invalid_normalized_edit_range() {
+        let cache = make_cache("hello", 10, 20);
+        let edits = [edit(9, 9, "!")];
+        let err =
+            build_parse_cache_seed(Some(&cache), "hello!", &edits, None, true, 10, 20).unwrap_err();
+        assert!(matches!(err, IncrementalEditError::InvalidRange { .. }));
     }
 
     // ── PayloadProjection ─────────────────────────────────────────────────
@@ -809,7 +863,7 @@ mod tests {
     #[test]
     fn payload_projection_no_shifts_is_identity() {
         let proj = PayloadProjection::new();
-        let v = ParseValue::Text("hello".to_string());
+        let v = ParseValue::Text("hello".into());
         assert_eq!(proj.project(v.clone()).unwrap(), v);
     }
 
@@ -820,7 +874,7 @@ mod tests {
             delta: 3,
         }]);
         let v = ParseValue::SpannedValue {
-            value: Box::new(ParseValue::Text("x".to_string())),
+            value: Arc::new(ParseValue::Text("x".into())),
             start: 5,
             end: 8,
         };
@@ -841,7 +895,7 @@ mod tests {
             delta: 5,
         }]);
         let v = ParseValue::SpannedValue {
-            value: Box::new(ParseValue::Nil),
+            value: Arc::new(ParseValue::Nil),
             start: 3,
             end: 8,
         };
@@ -856,38 +910,16 @@ mod tests {
     }
 
     #[test]
-    fn payload_projection_negative_delta_clamps_to_zero() {
+    fn payload_projection_negative_delta_underflow_is_unmappable() {
         let proj = PayloadProjection::new().with_span_shifts(vec![SpanShift {
             shift_from: 0,
             delta: -100,
         }]);
         let v = ParseValue::SpannedValue {
-            value: Box::new(ParseValue::Nil),
+            value: Arc::new(ParseValue::Nil),
             start: 5,
             end: 10,
         };
-        let projected = proj.project(v).unwrap();
-        match projected {
-            ParseValue::SpannedValue { start, end, .. } => {
-                assert_eq!(start, 0);
-                assert_eq!(end, 0);
-            }
-            _ => panic!("expected SpannedValue"),
-        }
-    }
-
-    #[test]
-    fn payload_projection_has_effect_checks_correctly() {
-        assert!(!PayloadProjection::new().has_effect());
-        assert!(PayloadProjection::new()
-            .with_span_shifts(vec![SpanShift {
-                shift_from: 0,
-                delta: 1
-            }])
-            .has_effect());
-        assert!(PayloadProjection::new().with_source_id(1).has_effect());
-        assert!(PayloadProjection::new()
-            .with_filename_update(None)
-            .has_effect());
+        assert!(proj.project(v).is_err());
     }
 }

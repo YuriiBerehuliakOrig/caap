@@ -1,0 +1,72 @@
+; stdlib/lib/tests/test_checksum.caap — in-language tests for lib/crypto/checksum.
+;
+; Known-answer vectors are the canonical published values for each code:
+;   crc32("")          = 0
+;   crc32("123456789") = 0xCBF43926 = 3421780262  (the CRC-32 "check" value)
+;   crc32c("123456789")= 0xE3069283 = 3808858755  (the CRC-32C "check" value)
+;   adler32("Wikipedia")= 0x11E60398 = 300286872  (the Wikipedia Adler-32 example)
+;   adler32("")        = 1                          (a=1, b=0 -> (0<<16)|1)
+
+;; @area: crypto
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true assert_throws)
+(use stdlib.lib.crypto.checksum crc32 crc32c adler32 fnv1a fnv1a_64 checksum)
+(use stdlib.lib.diag.error error? error_code error_data)
+
+; ── crc32 (re-exported from lib/hash) ────────────────────────────────────────
+(assert_eq (crc32 "") 0 "crc32 empty = 0")
+(assert_eq (crc32 "123456789") 3421780262 "crc32 check vector = 0xCBF43926")
+; a byte list and the equivalent string agree (shared bytes_of path)
+(assert_eq (crc32 (list_of 49 50 51 52 53 54 55 56 57)) 3421780262
+  "crc32 accepts byte list")
+
+; ── crc32c (Castagnoli, poly 0x82F63B78) ─────────────────────────────────────
+(assert_eq (crc32c "") 0 "crc32c empty = 0")
+(assert_eq (crc32c "123456789") 3808858755 "crc32c check vector = 0xE3069283")
+(assert_eq (crc32c (list_of 49 50 51 52 53 54 55 56 57)) 3808858755
+  "crc32c accepts byte list")
+; crc32 and crc32c are genuinely different codes for the same input
+(assert_eq (eq (crc32 "123456789") (crc32c "123456789")) false
+  "crc32 and crc32c differ")
+
+; ── adler32 (zlib) ───────────────────────────────────────────────────────────
+(assert_eq (adler32 "") 1 "adler32 empty = 1")
+(assert_eq (adler32 "Wikipedia") 300286872 "adler32 Wikipedia = 0x11E60398")
+; "Wikipedia" as its ASCII byte list -> same value (shared bytes_of path)
+(assert_eq (adler32 (list_of 87 105 107 105 112 101 100 105 97)) 300286872
+  "adler32 accepts byte list")
+
+; ── fnv1a / fnv1a_64 (re-exported from lib/hash) ─────────────────────────────
+; cross-checked in test_hash.caap; here we confirm the re-export is wired through
+(assert_eq (fnv1a "hello") 1335831723 "fnv1a re-export hello")
+(assert_eq (fnv1a_64 "hello") -6615550055289275125 "fnv1a_64 re-export hello")
+
+; ── checksum dispatcher ──────────────────────────────────────────────────────
+(assert_eq (checksum "crc32" "123456789") 3421780262 "checksum dispatch crc32")
+(assert_eq (checksum "crc32c" "123456789") 3808858755 "checksum dispatch crc32c")
+(assert_eq (checksum "adler32" "Wikipedia") 300286872 "checksum dispatch adler32")
+(assert_eq (checksum "fnv1a" "hello") 1335831723 "checksum dispatch fnv1a")
+(assert_eq (checksum "fnv1a_64" "hello") -6615550055289275125
+  "checksum dispatch fnv1a_64")
+
+; ── unknown algorithm: a structured diag.error, no longer a bare string ──────
+; The dispatcher `raise!`s on an unknown name (a contract violation must
+; surface, never silently fall back). assert_throws catches ANY thrown value.
+(assert_throws (lambda () (checksum "nope" "123456789"))
+  "checksum unknown algorithm throws")
+; The caught value is now a protocol error MAP (code + offending name in data),
+; not the old plain string — catch it explicitly and inspect the shape.
+(bind ((err (try (do (checksum "nope" "123456789") null) (catch e e))))
+  (do
+    (assert_true (error? err) "checksum unknown algorithm raises a protocol error")
+    (assert_eq (error_code err) "stdlib.crypto.checksum.unknown_algorithm"
+      "checksum unknown algorithm error code")
+    (assert_eq (get (error_data err) "name") "nope"
+      "checksum unknown algorithm records the offending name")))
+
+; ── determinism: same input always the same output ──────────────────────────
+(assert_eq (eq (crc32c "deterministic") (crc32c "deterministic")) true
+  "crc32c deterministic")
+(assert_eq (eq (adler32 "deterministic") (adler32 "deterministic")) true
+  "adler32 deterministic")

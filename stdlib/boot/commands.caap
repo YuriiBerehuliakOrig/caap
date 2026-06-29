@@ -1,0 +1,103 @@
+; stdlib/boot/commands.caap — the SESSION COMMAND surface (module
+; stdlib.commands). The one file the bootstrap loads eagerly for tooling;
+; everything heavy is LAZY.
+; MODULE IDENTITY: intentionally the SHORT name `stdlib.commands`, not the
+; path-canonical `stdlib.boot.commands` — it self-locates via
+; `(module_path "stdlib.commands")` to find its lazy siblings, and is the
+; established session-command identity. Allowlisted in stdlib/CONVENTIONS.md +
+; stdlib_module_identity_check.
+;
+; Architecture:
+;   - the AUTHORITATIVE registration is ONE capability map,
+;     "caap.session.commands" -> {version, analyze_source,
+;     analyze_source_with_root, run_source, run_from_root} — one lookup,
+;     discoverable (map_keys is has_named_command for free), versionable,
+;     and no arity-based name dispatch. New clients should use it.
+;   - the v1-era names ("stdlib.module.analyze_source" …) stay as a COMPAT
+;     layer, guarded: in a composed v1+stdlib session the registry refuses
+;     overwrites and v1's commands keep those names — the capability map
+;     still points at the stdlib-aware commands, which is the escape from
+;     that trap.
+;   - every command is a THUNK: the real module (boot/analyze.caap,
+;     boot/run.caap) loads on FIRST CALL, resolved against THIS module's own
+;     registered path — sessions that never analyze or debug never pay.
+(module stdlib.commands)
+
+(import stdlib.load loader_api)
+
+; here_dir — the boot/ directory, derived from THIS module's own canonical
+; path (no embedder configuration): the loader knows where stdlib.commands
+; was loaded from, and the siblings analyze.caap / run.caap sit beside it.
+;   -> : the boot/ directory path, trailing-slash-inclusive (it had the
+;        "commands.caap" filename sliced off, so `<dir>file` concatenates)
+(bind here_dir
+  (bind ((mp ((get loader_api "module_path") "stdlib.commands")))
+    (string_slice mp 0 (int_sub (size mp) (size "commands.caap")))))
+
+; lazy — a 1-ary command THUNK: on first call, load sibling `file` (the loader
+; is idempotent, so repeat calls are a cached lookup) and apply its `fname`
+; export to the argument. The deferral is the whole point — a session that
+; never analyzes/debugs never loads analyze.caap/run.caap.
+;   file  : the sibling filename under here_dir (e.g. "analyze.caap")
+;   fname : the export to pull from that module's map
+;   ->    : (a) -> the export's result
+(bind lazy
+  (lambda (file fname)
+    (lambda (a)
+      ((get ((get loader_api "load")
+             (string_concat_many here_dir file)) fname) a))))
+
+; lazy2 — the 2-ary sibling of `lazy`, for commands that take two arguments
+; (…_with_root / run_from_root). Same deferral; same cached re-load.
+;   file  : the sibling filename under here_dir
+;   fname : the export to pull from that module's map
+;   ->    : (a b) -> the export's result
+(bind lazy2
+  (lambda (file fname)
+    (lambda (a b)
+      ((get ((get loader_api "load")
+             (string_concat_many here_dir file)) fname) a b))))
+
+(bind analyze_source            (lazy  "analyze.caap" "analyze_source"))
+(bind analyze_source_with_root  (lazy2 "analyze.caap" "analyze_source_with_root"))
+(bind run_source                (lazy  "run.caap" "run_source"))
+(bind run_from_root             (lazy2 "run.caap" "run_from_root"))
+(bind run_source_checked        (lazy  "run.caap" "run_source_checked"))
+
+; commands — the AUTHORITATIVE capability map. `version` lets a client
+; feature-detect; every other entry is a lazy command thunk. Discoverable
+; (map_keys is "what commands exist") and overwrite-free (a composed v1
+; session keeps the legacy NAMES while this map still points at the
+; stdlib-aware commands — the escape from the name-collision trap).
+(bind commands
+  (assoc (map_of)
+    "version" 1
+    "analyze_source" analyze_source
+    "analyze_source_with_root" analyze_source_with_root
+    "run_source" run_source
+    "run_from_root" run_from_root
+    "run_source_checked" run_source_checked))
+
+(when (eq (ctfe_compiler_lookup_value compiler "caap.session.commands" null) null)
+  (ctfe_compiler_register_value compiler "caap.session.commands" commands))
+
+; compat layer (first registration wins by registry rule)
+(when (eq (ctfe_compiler_lookup_value compiler
+            "stdlib.module.analyze_source" null) null)
+  (ctfe_compiler_register_value
+    compiler "stdlib.module.analyze_source" analyze_source))
+(when (eq (ctfe_compiler_lookup_value compiler
+            "stdlib.module.analyze_source_with_root" null) null)
+  (ctfe_compiler_register_value
+    compiler "stdlib.module.analyze_source_with_root" analyze_source_with_root))
+(when (eq (ctfe_compiler_lookup_value compiler
+            "stdlib.module.run_source" null) null)
+  (ctfe_compiler_register_value
+    compiler "stdlib.module.run_source" run_source))
+(when (eq (ctfe_compiler_lookup_value compiler
+            "stdlib.module.run_from_root" null) null)
+  (ctfe_compiler_register_value
+    compiler "stdlib.module.run_from_root" run_from_root))
+
+(export commands analyze_source analyze_source_with_root
+        run_source run_from_root run_source_checked)

@@ -1,0 +1,496 @@
+; stdlib/backend/emit/wasm/emit.caap — wasm function/module assembly + entry points
+; (module stdlib.backend.emit.wasm.emit).
+;
+; The ASSEMBLY seam of the wasm emitter (split out of emit/wasm.caap): one
+; function's WAT (emit_fn — params -> locals, body -> a folded expr, exported by
+; name; struct constructors heap-allocate + store fields; array_local users get a
+; $__sp frame), the best-effort external Source Map v3 debug channel (dbg_new /
+; b64_vlq / json_escape / count_lines / func_name_of / build_source_map — a
+; FUNCTION-level .wasm.map, since WAT carries no debug-metadata syntax), the
+; whole-module driver (emit_core — prep_units' flat program -> imports + table +
+; memory + data segments + bodies), and the four public entry points
+; (emit_program / emit_program_debug / emit_module / emit_module_debug). The
+; debug-info HONEST-SCOPE note lives inline before dbg_new.
+(module stdlib.backend.emit.wasm.emit)
+
+(use stdlib.backend.prep prep_units)
+; typed READERS over prep_units' flat program map — the strict accessors name
+; each codegen table (pairs/consts/externs/globals/global_arrays/…) so a forgotten
+; key fails LOUDLY at the read, not as a silent null mid-emit. Same backend tier,
+; imports nothing, so no cycle.
+(use stdlib.backend.program_accessors
+     program_pairs program_structs program_unions program_consts
+     program_externs program_globals program_global_arrays program_diagnostics)
+(use stdlib.semantics.types.registry pointer? ptr_elem)
+(use stdlib.lib.collections.map clone)
+(use stdlib.syntax.ast args_of arg)
+; growable string builder for b64_vlq's Base64-VLQ assembly.
+(use stdlib.lib.text.buffer buf_new push_str to_string)
+; the type / layout helpers + the one diagnostic shape.
+(use stdlib.backend.emit.wasm.types
+     diag w_type elem_bytes field_bytes field_store struct_size)
+; the value-materializer + body-sequence lowerer emit_fn composes.
+(use stdlib.backend.emit.wasm.instructions mat seq_value)
+; the lowering trampoline + the per-function signature + the runtime concat helper.
+(use stdlib.backend.emit.wasm.lowering lower w_entry strcat_wat)
+
+; emit_fn — one function: params become locals, the body lowers to a folded
+; expr leaving the result on the stack; the function is exported by name.
+(bind emit_fn
+  (lambda (pair entry fns genv pstate structs unions fn_slots)
+    (bind (
+      (st (assoc (map_of) "n" (ref 0) "locals" (list_of) "frame" (ref 0)
+            "structs" structs "unions" unions "pstate" pstate "fn_slots" fn_slots))
+      (env (clone genv))
+      (value (get pair "value"))
+      (pnames (get entry "pnames")) (ptypes (get entry "ptypes"))
+      (ctypes (get entry "ctypes"))
+      (header (list_of)) (forms (list_of))
+    )
+      (do
+        (for i (sequence_range 0 (size pnames))
+          (bind ((lid (string_concat_many "$a" (int_to_string i)))
+                 (ct (get ctypes i)))
+            (do
+              (append header (string_concat_many "(param " lid " " (get ptypes i) ")"))
+              (assoc env (get pnames i)
+                (assoc (map_of) "local" lid
+                  "text" (string_concat_many "(local.get " lid ")")
+                  "type" (get ptypes i) "ct" ct
+                  "elem" (if (pointer? ct) (ptr_elem ct) null))))))
+        (for k (sequence_range 1 (size (args_of value)))
+          (append forms (arg value k)))
+        (bind (
+          (rt (get entry "result"))
+          (btext
+            (if (not (eq (get entry "ctor") null))
+              ; a struct constructor: heap-allocate, store each field, return ptr
+              (bind ((sname (get entry "ctor")) (off (ref 0)) (stmts (list_of)))
+                (do
+                  (set_ref (get pstate "heap_used") true)
+                  (append (get st "locals") "(local $p i32)")
+                  (append stmts "(local.set $p (global.get $__heap))")
+                  (append stmts (string_concat_many
+                    "(global.set $__heap (i32.add (global.get $__heap) (i32.const "
+                    (int_to_string (struct_size structs sname)) ")))"))
+                  (for i (sequence_range 0 (size pnames))
+                    (bind ((ft (get ctypes i)))
+                      (do
+                        (append stmts (string_concat_many
+                          "(" (field_store ft structs)
+                          " (i32.add (local.get $p) (i32.const " (int_to_string (deref off)) ")) "
+                          "(local.get $a" (int_to_string i) "))"))
+                        (set_ref off (int_add (deref off) (field_bytes ft structs))))))
+                  (append stmts "(local.get $p)")
+                  (sequence_join stmts " ")))
+              ; an ordinary function: lower the body (with a $__sp frame if it
+              ; took array_local slots)
+              (bind (
+                (s (seq_value lower forms st env fns))
+                (fs (deref (get st "frame")))
+                (raw (string_concat_many (get s "pre")
+                       (if (eq (get s "pre") "") "" " ") (mat (get s "last") rt)))
+              )
+                (if (eq fs 0)
+                  raw
+                  (do
+                    (set_ref (get pstate "sp_used") true)
+                    (append (get st "locals") "(local $__frame i32)")
+                    (append (get st "locals") (string_concat_many "(local $__ret " rt ")"))
+                    (string_concat_many
+                      "(global.set $__sp (i32.sub (global.get $__sp) (i32.const "
+                      (int_to_string fs) "))) "
+                      "(local.set $__frame (global.get $__sp)) "
+                      "(local.set $__ret " raw ") "
+                      "(global.set $__sp (i32.add (global.get $__sp) (i32.const "
+                      (int_to_string fs) "))) "
+                      "(local.get $__ret)"))))))
+          (out (list_of))
+        )
+          (do
+            (append out (string_concat_many
+              "(func $" (get entry "name") " "
+              (sequence_join header " ") (if (eq (size header) 0) "" " ")
+              "(result " rt ")"))
+            (for l (get st "locals") (append out (string_concat_many "  " l)))
+            (append out (string_concat_many "  " btext))
+            (append out ")")
+            (append out (string_concat_many
+              "(export \"" (get entry "name") "\" (func $" (get entry "name") "))"))
+            (sequence_join out "\n")))))))
+
+; ── best-effort wasm debug info: an EXTERNAL Source Map v3 (.wasm.map) ─────────
+; HONEST SCOPE (read this before extending). WAT — the WebAssembly *text* format —
+; has NO debug-metadata syntax: there is no `!DI…`-style channel a textual emitter
+; can write the way the LLVM backend does (clang -x ir carries those into
+; .debug_info). The ONLY mechanism real wasm debuggers consume is an external
+; source map (or a DWARF `.debug_*` custom section, which only the BINARY assembler
+; — `wat2wasm`/LLVM — can write, NOT this textual layer).
+;
+; So a debug build here produces a Source Map v3 JSON ALONGSIDE the WAT, keyed on
+; the GENERATED WAT TEXT we control exactly. Its granularity is FUNCTION-LEVEL and
+; that is deliberate, not a stub:
+;   - We emit WAT text, not the final `.wasm` binary, so we do NOT know the binary
+;     byte offsets a wasm debugger's `sourceMappingURL` section keys on (those are
+;     assigned by wat2wasm). We therefore map GENERATED WAT LINES, which are real
+;     and which we own, back to `.caap` source lines.
+;   - The wasm `lower` does not thread per-node spans through its folded-expr
+;     emission (unlike the LLVM backend's `lower` trampoline), so the finest span
+;     we can attribute is each function's `(defn …)` value span. One mapping
+;     segment per generated `(func $name …)` line -> that function's source
+;     line/col. This is accurate at the function granularity and never fabricated.
+; This is exactly the "coarse function-level map + documented limitation" the
+; sibling-backend parity allows. The map is REAL Source Map v3 (a tool can load
+; it); it just describes WAT-text positions, not final-binary byte offsets, so it
+; is an inspection / WAT-level aid — for instruction-accurate source debugging of
+; a wasm program, use the LLVM backend (true DWARF). When debug is OFF the whole
+; mechanism is inert and the WAT text is byte-identical to before.
+
+; dbg_new — the debug context. level is "none" | "line-tables" | "full"; the wasm
+; map is function-level, so "line-tables" and "full" behave the same here (both
+; produce the function map) — the levels are accepted for parity with the LLVM
+; backend's signature, not because finer wasm granularity exists.
+(bind dbg_new
+  (lambda (level)
+    (assoc (map_of)
+      "level" level
+      "on?" (not (eq level "none"))
+      "fn_lines" (list_of))))      ; per-fn {name, src_line, src_col, path}
+
+; b64_vlq — a single signed integer as a Base64-VLQ string (the Source Map v3
+; `mappings` encoding): the sign goes in the low bit, then 5-bit groups, the
+; continuation bit (0x20) set on every group but the last. Each group indexes the
+; base64 alphabet. (Used for the four-field segment columns.)
+(bind b64_alphabet
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+(bind b64_vlq
+  (lambda (n)
+    (bind (
+      (vlq (if (lt n 0) (int_or (int_shl (int_sub 0 n) 1) 1) (int_shl n 1)))
+      (rest (ref vlq))
+      (out (buf_new))
+      (more (ref true))
+    )
+      (do
+        (while (deref more)
+          (bind ((digit (ref (int_and (deref rest) 31))))
+            (do
+              (set_ref rest (int_shr (deref rest) 5))
+              (when (gt (deref rest) 0) (set_ref digit (int_or (deref digit) 32)))
+              (push_str out
+                (string_slice b64_alphabet (deref digit) (int_add (deref digit) 1)))
+              (set_ref more (gt (deref rest) 0)))))
+        (to_string out)))))
+
+; json_escape — a string as a JSON string body (backslash, quote, newline, tab).
+(bind json_escape
+  (lambda (s)
+    (string_replace
+      (string_replace
+        (string_replace (string_replace s "\\" "\\\\") "\"" "\\\"")
+        "\n" "\\n")
+      "\t" "\\t")))
+
+; count_lines — how many text lines `s` spans (1 + the count of "\n" in it). A
+; generated WAT part is appended with a trailing "\n" join, so a part that is
+; itself multi-line advances the running output-line cursor by this much.
+(bind count_lines
+  (lambda (s)
+    (bind ((n (ref 1)) (i (ref 0)) (len (string_byte_length s)))
+      (do
+        (while (lt (deref i) len)
+          (do
+            (when (eq (string_slice s (deref i) (int_add (deref i) 1)) "\n")
+              (set_ref n (int_add (deref n) 1)))
+            (set_ref i (int_add (deref i) 1))))
+        (deref n)))))
+
+; func_name_of — the "$name" a generated single-line WAT fragment declares (for
+; `(func $name …`), or null. `line` is one line (no newline). Used only by
+; build_source_map to locate the generated line of each program function. The
+; `(func $` of an import / the $__strcat helper resolves to a name not in the
+; function map, so it is harmlessly ignored by the caller.
+(bind func_name_of
+  (lambda (line)
+    (bind ((p (string_find line "(func $")))
+      (if (eq p null) null
+        (bind (
+          (start (int_add p 6))                  ; the "$" position (after "(func ")
+          (rest (string_slice line start))
+          (sp (string_find rest " "))
+        )
+          (if (eq sp null) rest (string_slice rest 0 sp)))))))
+
+; build_source_map — assemble the Source Map v3 JSON from the generated `parts`
+; (the assembled WAT lines) and the per-function source spans collected during
+; lowering. Returns the JSON text, or null when there is nothing to map (no
+; source path / no spanned function) so the build degrades cleanly to no map.
+;   parts    : the ordered list of generated WAT text fragments (each joined by
+;              "\n"); we scan it for `(func $name` lines to find each function's
+;              GENERATED line number (0-based, as Source Map v3 counts lines).
+;   fn_lines : {name -> {src_line, src_col, path}} for functions that carry a span.
+; The `mappings` is one segment per generated function line: [genCol, srcIdx,
+; srcLine, srcCol] in the v3 VLQ form, deltas relative to the previous segment.
+; Lines with no segment are empty (just the ";" separators).
+(bind build_source_map
+  (lambda (parts fn_lines source_path)
+    (if (or (eq source_path null) (eq (size fn_lines) 0)) null
+      (bind (
+        (fmap (map_of))                ; "$name" -> {src_line, src_col}
+        (genline (ref 0))              ; running 0-based generated line
+        (group_lines (list_of))        ; one entry per generated line: its segment or ""
+        ; the previous-segment fields for VLQ delta encoding (all start at 0)
+        (prev_col (ref 0)) (prev_src (ref 0)) (prev_sl (ref 0)) (prev_sc (ref 0))
+        (any (ref false))
+      )
+        (do
+          (for fl fn_lines (assoc fmap (string_concat_many "$" (get fl "name")) fl))
+          (for part parts
+            (bind ((nlines (count_lines part)))
+              (do
+                ; only the FIRST line of a part can begin a `(func $name` decl;
+                ; check it and record a mapping segment at that generated line.
+                (bind (
+                  (nlpos (string_find part "\n"))
+                  (first (if (eq nlpos null) part (string_slice part 0 nlpos)))
+                  (fname (func_name_of first))
+                  (fl (if (eq fname null) null (get fmap fname)))
+                )
+                  (when (not (eq fl null))
+                    (do
+                      (set_ref any true)
+                      ; segment = [genCol(0), srcIdx(0), srcLine, srcCol], all as
+                      ; deltas from the previous segment; lines are 0-based in v3.
+                      (bind (
+                        (sl (int_sub (get fl "src_line" 1) 1))
+                        (sc (int_sub (get fl "src_col" 1) 1))
+                        (seg (string_concat_many
+                               (b64_vlq (int_sub 0 (deref prev_col)))
+                               (b64_vlq (int_sub 0 (deref prev_src)))
+                               (b64_vlq (int_sub sl (deref prev_sl)))
+                               (b64_vlq (int_sub sc (deref prev_sc)))))
+                      )
+                        (do
+                          ; pad `group_lines` up to this generated line with empties
+                          (while (lt (size group_lines) (deref genline))
+                            (append group_lines ""))
+                          (append group_lines seg)
+                          (set_ref prev_col 0) (set_ref prev_src 0)
+                          (set_ref prev_sl sl) (set_ref prev_sc sc))))))
+                ; advance the generated-line cursor past this part (+1 for the join)
+                (set_ref genline (int_add (deref genline) nlines)))))
+          (if (not (deref any)) null
+            (string_concat_many
+              "{\"version\":3,"
+              "\"file\":\"module.wasm\","
+              "\"sources\":[\"" (json_escape source_path) "\"],"
+              "\"names\":[],"
+              "\"mappings\":\"" (sequence_join group_lines ";") "\"}")))))))
+
+; emit_core — the wasm backend. A hosted program needs `main` (its value is the
+; module's result, read by the wasm host). debug_level is "none" | "line-tables"
+; | "full"; "none" (the default the non-debug callers pass) yields a WAT text
+; byte-identical to before. unit -> {text: WAT, diagnostics, source_map}; with
+; debug ON, `source_map` is the .wasm.map JSON (or null when nothing maps).
+(bind emit_core
+  (lambda (unit require_main debug_level)
+    (bind (
+      (dbg (dbg_new debug_level))
+      (prog (prep_units unit))
+      (diags (program_diagnostics prog))
+      (fns (map_of))
+      (bodies (list_of))
+      (genv (map_of))                         ; global_array names -> ptr values
+      (static_off (ref 16))                   ; static data base (addr 0 reserved)
+      (pstate (assoc (map_of) "sp_used" (ref false) "heap_used" (ref false)
+                "mem_used" (ref false) "table_used" (ref false)
+                "types" (map_of) "type_decls" (list_of) "type_n" (ref 0)
+                "static_off" static_off "data_segs" (list_of)
+                "string_used" (ref false) "print_used" (ref false)
+                "print_int_used" (ref false)
+                "strcat_used" (ref false)))
+      (fn_slots (map_of))
+      (structs (program_structs prog))
+      (unions (program_unions prog))
+      (imports (list_of))                     ; extern -> (import "env" …) decls
+      (global_decls (list_of))                ; scalar global -> (global …) decls
+      (source_path (ref null))                ; the program's .caap source (debug)
+    )
+      (do
+        (when (eq (size diags) 0)
+          (do
+            ; program constants (enum variants, top-level int binds) inline as
+            ; deferred literals in every function body
+            (for cn (map_keys (program_consts prog))
+              (assoc genv cn
+                (assoc (map_of) "lit" (get (program_consts prog) cn)
+                  "type" null "ct" null)))
+            ; extern declarations -> wasm imports + call-table entries
+            (for ext (program_externs prog)
+              (bind ((sym (get ext "symbol")) (rt (w_type (get ext "result")))
+                     (ptypes (list_of)) (ptxt (list_of)) (ok (ref true)))
+                (do
+                  (when (eq rt null)
+                    (do (set_ref ok false)
+                        (append diags (diag (string_concat_many "wasm codegen: extern `"
+                          sym "` result type `" (get ext "result" "?") "` is not in the subset")))))
+                  (for pr (get ext "params" (list_of))
+                    (bind ((wt (w_type (get pr "type"))))
+                      (if (eq wt null)
+                        (do (set_ref ok false)
+                            (append diags (diag (string_concat_many "wasm codegen: extern `"
+                              sym "` param type `" (get pr "type" "?") "` is not in the subset"))))
+                        (do (append ptypes wt) (append ptxt (string_concat_many "(param " wt ")"))))))
+                  (when (deref ok)
+                    (do
+                      (assoc fns sym
+                        (assoc (map_of) "name" sym "ptypes" ptypes "ctypes" (list_of)
+                          "result" rt "cresult" (get ext "result")))
+                      (append imports
+                        (string_concat_many "(import \"env\" \"" sym "\" (func $" sym " "
+                          (sequence_join ptxt " ") (if (eq (size ptxt) 0) "" " ")
+                          "(result " rt ")))")))))))
+            ; scalar globals -> wasm mutable globals; deref/set_ref reach them
+            (for g (program_globals prog)
+              (bind ((wt (w_type (get g "type"))) (gn (get g "name")) (iv (get g "init")))
+                (if (eq wt null)
+                  (append diags (diag (string_concat_many "wasm codegen: global `" gn
+                    "` type `" (get g "type" "?") "` is not in the subset")))
+                  (do
+                    (assoc genv gn
+                      (assoc (map_of) "gname" (string_concat_many "$" gn)
+                        "text" (string_concat_many "(global.get $" gn ")")
+                        "type" wt "ct" (get g "type")))
+                    (append global_decls
+                      (string_concat_many "(global $" gn " (mut " wt ") (" wt ".const "
+                        (cond ((eq (value_type iv) "bool") (if iv "1" "0"))
+                              ((eq (value_type iv) "float") (value_to_string iv))
+                              (else (int_to_string iv)))
+                        "))"))))))
+            ; lay global arrays out in linear memory (zero-initialized by wasm);
+            ; the name resolves to a constant base address
+            (for ga (program_global_arrays prog)
+              (bind ((elem (get ga "elem")) (eb (elem_bytes (get ga "elem")))
+                     (cnt (get ga "count")))
+                (if (or (eq eb null) (eq cnt null))
+                  (append diags (diag (string_concat_many "wasm codegen: global_array `"
+                    (get ga "name") "` element/length unsupported")))
+                  (do
+                    (assoc genv (get ga "name")
+                      (assoc (map_of)
+                        "text" (string_concat_many "(i32.const " (int_to_string (deref static_off)) ")")
+                        "type" "i32" "ct" (string_concat_many "ptr_" elem) "elem" elem))
+                    (set_ref static_off (int_add (deref static_off) (int_mul cnt eb)))))))
+            (when (eq (size diags) 0)
+              (do
+                ; typed signatures from the defn markers
+                (for pair (program_pairs prog)
+                  (try (assoc fns (get pair "name") (w_entry pair structs))
+                    (catch err (append diags (diag (value_to_string err))))))
+                (when (and require_main (eq (get fns "main") null))
+                  (append diags (diag "wasm codegen: no `main` function")))
+                ; assign every program function a funcref-table slot (for fn_ptr)
+                (bind ((si (ref 0)))
+                  (for pair (program_pairs prog)
+                    (do (assoc fn_slots (get pair "name") (deref si))
+                        (set_ref si (int_add (deref si) 1)))))
+                ; lower each function body
+                (when (eq (size diags) 0)
+                  (for pair (program_pairs prog)
+                    (try
+                      (do
+                        ; debug: record this function's source span (a function
+                        ; granularity map; spans come from the same ctfe_spec_span
+                        ; the LLVM backend uses). A spanless function is skipped.
+                        (when (get dbg "on?")
+                          (bind ((sp (ctfe_spec_span (get pair "value"))))
+                            (when (and (not (eq sp null))
+                                       (not (eq (get sp "start_line") null)))
+                              (do
+                                (when (and (eq (deref source_path) null)
+                                           (not (eq (get sp "path") null)))
+                                  (set_ref source_path (get sp "path")))
+                                (append (get dbg "fn_lines")
+                                  (assoc (map_of) "name" (get pair "name")
+                                    "src_line" (get sp "start_line" 1)
+                                    "src_col" (get sp "start_col" 1)
+                                    "path" (get sp "path")))))))
+                        (append bodies
+                           (emit_fn pair (get fns (get pair "name")) fns genv pstate
+                                    structs unions fn_slots)))
+                      (catch err (append diags (diag (value_to_string err)))))))))))
+        (if (gt (size diags) 0)
+          (assoc (map_of) "diagnostics" diags "text" "" "source_map" null)
+          (bind ((parts (list_of "(module ;; generated by stdlib.backend.emit.wasm")))
+            (do
+              ; call_indirect signature types (the type section is first)
+              (for td (get pstate "type_decls") (append parts td))
+              ; imports first (wasm orders the import section ahead of funcs)
+              (when (deref (get pstate "print_used"))
+                (append parts "(import \"env\" \"print\" (func $print (param i32 i32)))"))
+              (when (deref (get pstate "print_int_used"))
+                (append parts "(import \"env\" \"print_int\" (func $print_int (param i32)))"))
+              (for im imports (append parts im))
+              ; a funcref table + elem of every program function (for fn_ptr)
+              (when (deref (get pstate "table_used"))
+                (bind ((names (list_of)))
+                  (do
+                    (for pair (program_pairs prog)
+                      (append names (string_concat_many "$" (get pair "name"))))
+                    (append parts (string_concat_many
+                      "(table " (int_to_string (size names)) " funcref)"))
+                    (append parts (string_concat_many
+                      "(elem (i32.const 0) " (sequence_join names " ") ")")))))
+              ; a memory only when the program touches it; a $__sp stack for
+              ; array_local; a $__heap bump (above the static region) for
+              ; struct constructors
+              (when (or (gt (size (program_global_arrays prog)) 0)
+                        (or (deref (get pstate "sp_used"))
+                            (or (deref (get pstate "heap_used"))
+                                (deref (get pstate "mem_used")))))
+                (append parts "(memory (export \"memory\") 1)"))
+              (when (deref (get pstate "sp_used"))
+                (append parts "(global $__sp (mut i32) (i32.const 65536))"))
+              (when (deref (get pstate "heap_used"))
+                (append parts (string_concat_many
+                  "(global $__heap (mut i32) (i32.const "
+                  (int_to_string (deref static_off)) "))")))
+              (for gd global_decls (append parts gd))
+              ; string-literal data segments + the runtime concat helper
+              (for ds (get pstate "data_segs") (append parts ds))
+              (when (deref (get pstate "strcat_used")) (append parts strcat_wat))
+              (for b bodies (append parts b))
+              (assoc (map_of)
+                "diagnostics" diags
+                "text" (string_concat_many (sequence_join parts "\n") "\n)\n")
+                ; a debug build attaches an external Source Map v3 (.wasm.map),
+                ; keyed on the generated WAT lines we built `parts` from; OFF or
+                ; mapless -> null (and the WAT above is byte-identical to no-debug)
+                "source_map" (if (get dbg "on?")
+                               (build_source_map parts (get dbg "fn_lines")
+                                                 (deref source_path))
+                               null)))))))))
+
+; emit_program — hosted: requires `main`; its value is the module result.
+(bind emit_program (lambda (unit) (emit_core unit true "none")))
+
+; emit_program_debug — hosted, with an explicit debug level ("none" |
+; "line-tables" | "full"). "none" reproduces emit_program exactly (byte-identical
+; WAT, source_map null); any other level ALSO attaches a function-level Source Map
+; v3 (.wasm.map) under the "source_map" key (see the debug-info note above). The
+; signature mirrors the LLVM backend's emit_program_debug; the wasm map is
+; function-granularity, so the two non-"none" levels behave identically here.
+(bind emit_program_debug
+  (lambda (unit debug_level) (emit_core unit true debug_level)))
+
+; emit_module — a library module: no `main` contract, every function is lowered
+; and exported (the sibling of llvm's emit_freestanding).
+(bind emit_module (lambda (unit) (emit_core unit false "none")))
+
+; emit_module_debug — a library module with an explicit debug level (the .wasm.map
+; sibling of emit_program_debug, with no `main` contract).
+(bind emit_module_debug
+  (lambda (unit debug_level) (emit_core unit false debug_level)))
+
+
+(export emit_program emit_program_debug emit_module emit_module_debug)

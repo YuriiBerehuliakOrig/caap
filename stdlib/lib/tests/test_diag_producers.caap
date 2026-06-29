@@ -1,0 +1,53 @@
+; stdlib/lib/tests/test_diag_producers.caap — unified diagnostic normalizer (#16).
+;
+; The audit's #16 complaint: producers emit DIFFERENT diagnostic shapes (a pass
+; writes a finding STRING, the backend emitters an ad-hoc MAP, a checked failure a
+; diag.error), so it is hard to prove the eval and native paths report the "same"
+; diagnostics. normalize_diag / diagnostics_to_bag converge ALL of those on ONE
+; canonical bag shape at the consumer — WITHOUT touching what producers emit (the
+; byte-identical emitter contract is intact). This proves the convergence.
+;; @area: diag
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.diag.convert normalize_diag diagnostics_to_bag)
+(use stdlib.lib.diag.bag entries code_of message_of is_error?)
+(use stdlib.lib.diag.error make_error)
+
+(do
+  (bind (
+    ; one diagnostic from each producer shape
+    (pass_finding "tiers: foo.caap:3: upward import")
+    (backend_map (assoc (map_of)
+       "code" "stdlib.backend.llvm.unknown_type" "severity" "error"
+       "message" "no native type" "node_name" "x"))
+    (an_error (make_error "stdlib.crypto.checksum.unknown_algorithm" "bad algo" (map_of)))
+  )
+    (do
+      ; ── normalize_diag maps each producer shape to a canonical bag diag ──
+      (assert_true (eq (get (normalize_diag pass_finding) "diag" false) true)
+        "a pass-finding string normalizes to a canonical diag")
+      (assert_eq (code_of (normalize_diag pass_finding)) "tiers"
+        "string_to_diag splits the code off the finding")
+      (assert_eq (code_of (normalize_diag backend_map)) "stdlib.backend.llvm.unknown_type"
+        "a backend ad-hoc map keeps its code")
+      (assert_eq (message_of (normalize_diag backend_map)) "no native type (x)"
+        "backend_map_to_diag appends the node name to the message")
+      (assert_eq (code_of (normalize_diag an_error)) "stdlib.crypto.checksum.unknown_algorithm"
+        "a diag.error normalizes via error_to_diag")
+      ; an already-canonical diag passes through unchanged
+      (assert_eq (code_of (normalize_diag (normalize_diag pass_finding))) "tiers"
+        "an already-canonical diag passes through normalize_diag")
+      ; an unrecognised value degrades to a generic diag (never dropped)
+      (assert_eq (code_of (normalize_diag 42)) "stdlib.diag.unrecognized"
+        "an unrecognised producer value degrades to a generic error diag")
+
+      ; ── diagnostics_to_bag collects a MIXED producer list into ONE bag ──
+      (bind ((bag (diagnostics_to_bag (list_of pass_finding backend_map an_error))))
+        (do
+          (assert_eq (size (entries bag)) 3 "all three producers land in one bag")
+          (assert_true (is_error? (get (entries bag) 0)) "entry 0 is a real diag")
+          (assert_eq (code_of (get (entries bag) 1)) "stdlib.backend.llvm.unknown_type"
+            "insertion order is preserved (backend map at index 1)")
+          (assert_eq (code_of (get (entries bag) 2)) "stdlib.crypto.checksum.unknown_algorithm"
+            "the diag.error is at index 2"))))))

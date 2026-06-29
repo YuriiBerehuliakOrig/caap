@@ -1,0 +1,125 @@
+; stdlib/lib/tests/test_sys_finish.caap — the PURE half of the sys-finish unit:
+;   1. stdlib.lib.text.path.relpath/segments — lexical relative-path algebra.
+;   2. stdlib.sys.verify.verify_facade — ALL-errors drift report (was: throw on
+;      the first mismatch; now collects every mismatch and reports them once).
+;   3. stdlib.sys.wrap.make_facade/declare_ops! — the FINER per-library effect
+;      tag filed into the type layer ("fs"/"net"/… instead of one blanket
+;      "impure"), so distinct host surfaces stay distinguishable.
+; All three are pure (no host catalog, no grants), so this runs in the ordinary
+; in-language test corpus.
+
+;; @area: sys
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.text.path relpath segments normalize path_join)
+(use stdlib.sys.verify op p verify_facade)
+(use stdlib.sys.wrap make_facade)
+(use stdlib.semantics.types.infer sig_of)
+
+(do
+  ; ── 1. relpath / segments (pure path algebra) ─────────────────────────────
+  ; segments: non-empty components, slashes collapsed (lists need value_eq —
+  ; `eq` is identity equality, structural only on scalars)
+  (assert_true (value_eq (segments "/a//b/") (list_of "a" "b")) "segments collapses slashes")
+  (assert_true (value_eq (segments "") (list_of)) "segments of empty is empty")
+  (assert_true (value_eq (segments "/") (list_of)) "segments of root is empty")
+
+  ; descend: from a parent to a child
+  (assert_eq (relpath "/a" "/a/b/c") "b/c" "relpath descends")
+  ; ascend: from a child to an ancestor
+  (assert_eq (relpath "/a/b/c" "/a") "../.." "relpath ascends")
+  ; sibling: up then over
+  (assert_eq (relpath "/a/b" "/a/c") "../c" "relpath to a sibling")
+  ; identity: a path relative to itself is "."
+  (assert_eq (relpath "/a/b" "/a/b") "." "relpath to self is .")
+  ; relative (both): same algebra, no leading slash
+  (assert_eq (relpath "a/b" "a/c") "../c" "relpath on relative paths")
+  ; normalization happens first ("." / ".." in inputs)
+  (assert_eq (relpath "/a/./b" "/a/b/../c") "../c" "relpath normalizes inputs")
+  ; different kinds (absolute vs relative): no lexical relation -> normalized `to`
+  (assert_eq (relpath "a/b" "/x/y") "/x/y" "relpath mixed kinds -> normalized to")
+  ; ROUND-TRIP invariant: join(from, relpath(from,to)) normalizes to to
+  (assert_eq (normalize (path_join "/a/b" (relpath "/a/b" "/a/x/y")))
+             (normalize "/a/x/y") "relpath round-trips through path_join")
+
+  ; ── 2. verify_facade reports ALL drift, not just the first ─────────────────
+  ; a synthetic catalog: ops "a" (value:any -> null, impure) and "b" (-> null, impure)
+  (bind ((cat
+           (list_of
+             (assoc (map_of) "public" "a" "effect" "impure" "signature"
+               (assoc (map_of)
+                 "params" (list_of (assoc (map_of) "name" "value" "type" "any"))
+                 "result" "null"))
+             (assoc (map_of) "public" "b" "effect" "impure" "signature"
+               (assoc (map_of) "params" (list_of) "result" "null")))))
+    (do
+      ; a faithful facade verifies clean -> true
+      (assert_eq
+        (verify_facade cat
+          (list_of
+            (op "a" (list_of (p "value" "any")) "null" "impure")
+            (op "b" (list_of)                   "null" "impure"))
+          "demo")
+        true "verify_facade passes a faithful facade")
+
+      ; a SINGLE mismatch keeps the verbatim first-failure message (no count
+      ; prefix, no bullet list) — consumers matching a drift string still match
+      (assert_true
+        (try
+          (do
+            (verify_facade cat
+              (list_of
+                (op "a" (list_of (p "value" "int")) "null" "impure")  ; wrong param type
+                (op "b" (list_of)                   "null" "impure"))
+              "demo")
+            false)
+          (catch e
+            (bind ((m (if (eq (value_type e) "map") (get e "message" (value_to_string e))
+                        (value_to_string e))))
+              (and (string_contains m "type")
+                   (not (string_contains m "drift mismatches"))))))
+        "single drift keeps the verbatim message")
+
+      ; TWO independent mismatches: ONE throw naming BOTH (the whole point).
+      ; facade drops "b" (coverage gap) AND gives "a" the wrong return type.
+      (assert_true
+        (try
+          (do
+            (verify_facade cat
+              (list_of (op "a" (list_of (p "value" "any")) "int" "impure"))  ; wrong result + drops b
+              "demo")
+            false)
+          (catch e
+            (bind ((m (if (eq (value_type e) "map") (get e "message" (value_to_string e))
+                        (value_to_string e))))
+              (and (string_contains m "2 drift mismatches")
+                   (and (string_contains m "returns")
+                        (string_contains m "missing declaration"))))))
+        "two drifts are reported together in one throw")))
+
+  ; ── 3. make_facade files a FINER per-library effect tag ────────────────────
+  ; build a facade for a synthetic library "fx": one impure op, one pure op.
+  (bind ((ops
+           (list_of
+             (op "touch" (list_of (p "path" "string")) "null" "impure")
+             (op "kind"  (list_of)                     "string" "pure"))))
+    (do
+      (make_facade "fx" ops)
+      ; the impure op's declared signature carries the library tag, not "impure"
+      (bind ((touch_sig (sig_of "sys.fx" "touch")))
+        (do
+          (assert_true (not (eq touch_sig null)) "make_facade files the impure op's sig")
+          (assert_true (value_eq (get touch_sig "effects") (list_of "fx"))
+            "impure op carries the finer per-library tag, not a blanket impure")
+          ; coarse binary view is preserved for pure-vs-impure consumers
+          (assert_eq (get touch_sig "effect") "impure"
+            "the coarse effect view stays impure")))
+      ; the pure op stays pure with no tags
+      (bind ((kind_sig (sig_of "sys.fx" "kind")))
+        (do
+          (assert_true (value_eq (get kind_sig "effects") (list_of))
+            "pure op carries no effect tags")
+          (assert_eq (get kind_sig "effect") "pure"
+            "pure op stays pure")))))
+  null)

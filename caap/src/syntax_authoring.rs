@@ -1,12 +1,14 @@
 //! Syntax-authoring DSL support for CAAP surface grammars.
 //!
-//! This mirrors the supportable Python `caap.surface.syntax_authoring`
+//! This mirrors the supportable CAAP surface syntax-authoring
 //! behavior at the UnitSyntaxState boundary: grammar-authoring source is
 //! compiled into semantic grammar rule specs plus metadata, then applied to a
 //! unit syntax state.
 
+use crate::error::{CaapError, CaapResult};
 use crate::semantic::SemanticValue;
 use crate::unit::UnitSyntaxState;
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AuthoringRuleOp {
@@ -23,9 +25,18 @@ pub enum AuthoringOp {
         source: String,
         prefix: Option<String>,
     },
+    /// `set <key> = "<value>"` / `set <key> = none` — grammar-level metadata
+    /// directives. The canonical consumer is `set comment = "//"`: the
+    /// grammar's line-comment convention (trivia), with `none` disabling
+    /// comments entirely (whitespace-only trivia). The kernel default (`;`
+    /// comments) stays when the directive is absent.
+    SetMetadata {
+        key: String,
+        value: Option<String>,
+    },
 }
 
-pub fn compile_authoring_grammar_source(source: &str) -> Result<Vec<AuthoringOp>, String> {
+pub fn compile_authoring_grammar_source(source: &str) -> CaapResult<Vec<AuthoringOp>> {
     let mut ops = Vec::new();
     for (line_index, line) in source.lines().enumerate() {
         let trimmed = line.trim();
@@ -33,12 +44,12 @@ pub fn compile_authoring_grammar_source(source: &str) -> Result<Vec<AuthoringOp>
             continue;
         }
         let mut parser = Parser::new(trimmed);
-        let op = parser
-            .parse_statement()
-            .map_err(|error| format!("syntax authoring line {}: {error}", line_index + 1))?;
-        parser
-            .expect_end()
-            .map_err(|error| format!("syntax authoring line {}: {error}", line_index + 1))?;
+        let op = parser.parse_statement().map_err(|error| {
+            CaapError::parse(format!("syntax authoring line {}: {error}", line_index + 1))
+        })?;
+        parser.expect_end().map_err(|error| {
+            CaapError::parse(format!("syntax authoring line {}: {error}", line_index + 1))
+        })?;
         ops.push(op);
     }
     Ok(ops)
@@ -47,7 +58,7 @@ pub fn compile_authoring_grammar_source(source: &str) -> Result<Vec<AuthoringOp>
 pub fn apply_authoring_grammar_source(
     syntax: &mut UnitSyntaxState,
     source: &str,
-) -> Result<(), String> {
+) -> CaapResult<()> {
     for op in compile_authoring_grammar_source(source)? {
         apply_authoring_op(syntax, op)?;
     }
@@ -58,12 +69,16 @@ pub fn define_authoring_syntax_rule(
     syntax: &mut UnitSyntaxState,
     source: &str,
     function_name: &str,
-) -> Result<(), String> {
+) -> CaapResult<()> {
     if function_name.is_empty() {
-        return Err("syntax rule function name must be non-empty".to_string());
+        return Err(CaapError::parse(
+            "syntax rule function name must be non-empty",
+        ));
     }
     if source.contains("->") {
-        return Err("syntax rule source must not include an inline semantic hook".to_string());
+        return Err(CaapError::parse(
+            "syntax rule source must not include an inline semantic hook",
+        ));
     }
     let authoring_source = format!("{} -> {function_name}", source.trim_end());
     let mut hook_refs = Vec::new();
@@ -74,10 +89,9 @@ pub fn define_authoring_syntax_rule(
         apply_authoring_op(syntax, op)?;
     }
     if hook_refs.len() != 1 {
-        return Err(
-            "define-syntax-rule expects exactly one semantic hook in the authoring rule"
-                .to_string(),
-        );
+        return Err(CaapError::parse(
+            "define-syntax-rule expects exactly one semantic hook in the authoring rule",
+        ));
     }
     syntax_set_hook_function(syntax, &hook_refs[0], function_name)
 }
@@ -86,9 +100,11 @@ pub fn define_authoring_syntax_rule_inline_source(
     syntax: &mut UnitSyntaxState,
     source: &str,
     implementation_source: &str,
-) -> Result<String, String> {
+) -> CaapResult<String> {
     if source.contains("->") {
-        return Err("syntax rule source must not include an inline semantic hook".to_string());
+        return Err(CaapError::parse(
+            "syntax rule source must not include an inline semantic hook",
+        ));
     }
     let hook_ref = inline_hook_ref(source, implementation_source);
     let authoring_source = format!("{} -> {hook_ref}", source.trim_end());
@@ -100,33 +116,42 @@ pub fn define_authoring_syntax_rule_inline_source(
         apply_authoring_op(syntax, op)?;
     }
     if hook_refs != [hook_ref.as_str()] {
-        return Err(
-            "define-syntax-rule inline hook produced unexpected semantic hook metadata".to_string(),
-        );
+        return Err(CaapError::semantic(
+            "define-syntax-rule inline hook produced unexpected semantic hook metadata",
+        ));
     }
-    syntax_set_inline_hook_source(syntax, &hook_ref, implementation_source)?;
+    set_inline_syntax_hook_source(syntax, &hook_ref, implementation_source)?;
     Ok(hook_ref)
 }
 
-pub fn extract_inline_lambda_source(source: &str) -> Result<&str, String> {
+pub fn extract_inline_lambda_source(source: &str) -> CaapResult<&str> {
     let trimmed = source.trim();
     if trimmed.starts_with("(lambda") && trimmed.ends_with(')') {
         return Ok(trimmed);
     }
-    Err("inline syntax implementation node must be a lambda form".to_string())
+    Err(CaapError::parse(
+        "inline syntax implementation node must be a lambda form",
+    ))
 }
 
-fn apply_authoring_op(syntax: &mut UnitSyntaxState, op: AuthoringOp) -> Result<(), String> {
+fn apply_authoring_op(syntax: &mut UnitSyntaxState, op: AuthoringOp) -> CaapResult<()> {
     match op {
         AuthoringOp::AddRule(op) | AuthoringOp::ReplaceRule(op) => {
             let name = op.name;
             if let Some(metadata) = op.metadata {
                 syntax.set_grammar_metadata(name.clone(), metadata)?;
             }
-            syntax.set_grammar_rule(name, op.expr)
+            syntax.set_grammar_rule(name, op.expr)?;
+            Ok(())
         }
-        AuthoringOp::IncludeGrammar { .. } => {
-            Err("syntax authoring include-grammar operations are not applied at unit scope".into())
+        AuthoringOp::IncludeGrammar { .. } => Err(CaapError::parse(
+            "syntax authoring include-grammar operations are not applied at unit scope",
+        )),
+        AuthoringOp::SetMetadata { key, value } => {
+            // `none` is stored as the empty string: "directive present,
+            // feature disabled" must stay distinguishable from "no directive".
+            syntax.set_grammar_metadata(key, SemanticValue::Str(value.unwrap_or_default()))?;
+            Ok(())
         }
     }
 }
@@ -134,11 +159,11 @@ fn apply_authoring_op(syntax: &mut UnitSyntaxState, op: AuthoringOp) -> Result<(
 fn authoring_rule_metadata(op: &AuthoringOp) -> Option<&SemanticValue> {
     match op {
         AuthoringOp::AddRule(op) | AuthoringOp::ReplaceRule(op) => op.metadata.as_ref(),
-        AuthoringOp::IncludeGrammar { .. } => None,
+        AuthoringOp::IncludeGrammar { .. } | AuthoringOp::SetMetadata { .. } => None,
     }
 }
 
-fn semantic_hook_references(metadata: &SemanticValue) -> Result<Vec<String>, String> {
+fn semantic_hook_references(metadata: &SemanticValue) -> CaapResult<Vec<String>> {
     let SemanticValue::Map(entries) = metadata else {
         return Ok(Vec::new());
     };
@@ -146,15 +171,19 @@ fn semantic_hook_references(metadata: &SemanticValue) -> Result<Vec<String>, Str
         return Ok(Vec::new());
     };
     let SemanticValue::List(hooks) = hooks else {
-        return Err("semantic_hooks metadata must be a sequence".to_string());
+        return Err(CaapError::semantic(
+            "semantic_hooks metadata must be a sequence",
+        ));
     };
     let mut refs = Vec::with_capacity(hooks.len());
     for entry in hooks {
         let SemanticValue::List(pair) = entry else {
-            return Err("semantic_hooks entries must be pairs".to_string());
+            return Err(CaapError::semantic("semantic_hooks entries must be pairs"));
         };
         let [_, SemanticValue::Str(hook_ref)] = pair.as_slice() else {
-            return Err("semantic_hooks entries must contain a string hook reference".to_string());
+            return Err(CaapError::semantic(
+                "semantic_hooks entries must contain a string hook reference",
+            ));
         };
         refs.push(hook_ref.clone());
     }
@@ -165,7 +194,7 @@ fn syntax_set_hook_function(
     syntax: &mut UnitSyntaxState,
     hook_ref: &str,
     function_name: &str,
-) -> Result<(), String> {
+) -> CaapResult<()> {
     let hooks = syntax
         .grammar_metadata
         .get("semantic_hook_functions")
@@ -180,14 +209,18 @@ fn syntax_set_hook_function(
         hook_ref.to_string(),
         SemanticValue::Str(function_name.to_string()),
     ));
-    syntax.set_grammar_metadata("semantic_hook_functions", SemanticValue::Map(entries))
+    syntax.set_grammar_metadata("semantic_hook_functions", SemanticValue::Map(entries))?;
+    Ok(())
 }
 
-fn syntax_set_inline_hook_source(
+pub fn set_inline_syntax_hook_source(
     syntax: &mut UnitSyntaxState,
     hook_ref: &str,
     implementation_source: &str,
-) -> Result<(), String> {
+) -> CaapResult<()> {
+    if hook_ref.is_empty() {
+        return Err(CaapError::parse("inline syntax hook ref must be non-empty"));
+    }
     let hooks = syntax
         .grammar_metadata
         .get("semantic_hook_inline_sources")
@@ -202,7 +235,8 @@ fn syntax_set_inline_hook_source(
         hook_ref.to_string(),
         SemanticValue::Str(implementation_source.to_string()),
     ));
-    syntax.set_grammar_metadata("semantic_hook_inline_sources", SemanticValue::Map(entries))
+    syntax.set_grammar_metadata("semantic_hook_inline_sources", SemanticValue::Map(entries))?;
+    Ok(())
 }
 
 fn inline_hook_ref(source: &str, implementation_source: &str) -> String {
@@ -210,85 +244,14 @@ fn inline_hook_ref(source: &str, implementation_source: &str) -> String {
     bytes.extend_from_slice(source.as_bytes());
     bytes.push(0);
     bytes.extend_from_slice(implementation_source.as_bytes());
-    let suffix = sha1_hex_prefix_16(&bytes);
-    format!("inline.syntax.{suffix}")
+    let suffix = sha256_hex_prefix_32(&bytes);
+    format!("inline.syntax.sha256.{suffix}")
 }
 
-fn sha1_hex_prefix_16(bytes: &[u8]) -> String {
-    let mut h0: u32 = 0x6745_2301;
-    let mut h1: u32 = 0xefcd_ab89;
-    let mut h2: u32 = 0x98ba_dcfe;
-    let mut h3: u32 = 0x1032_5476;
-    let mut h4: u32 = 0xc3d2_e1f0;
-
-    let bit_len = (bytes.len() as u64) * 8;
-    let mut message = bytes.to_vec();
-    message.push(0x80);
-    while message.len() % 64 != 56 {
-        message.push(0);
-    }
-    message.extend_from_slice(&bit_len.to_be_bytes());
-
-    for chunk in message.chunks_exact(64) {
-        let mut words = [0u32; 80];
-        for (index, word) in words.iter_mut().take(16).enumerate() {
-            let offset = index * 4;
-            *word = u32::from_be_bytes([
-                chunk[offset],
-                chunk[offset + 1],
-                chunk[offset + 2],
-                chunk[offset + 3],
-            ]);
-        }
-        for index in 16..80 {
-            words[index] =
-                (words[index - 3] ^ words[index - 8] ^ words[index - 14] ^ words[index - 16])
-                    .rotate_left(1);
-        }
-
-        let mut a = h0;
-        let mut b = h1;
-        let mut c = h2;
-        let mut d = h3;
-        let mut e = h4;
-
-        for (index, word) in words.iter().enumerate() {
-            let (f, k) = match index {
-                0..=19 => ((b & c) | ((!b) & d), 0x5a82_7999),
-                20..=39 => (b ^ c ^ d, 0x6ed9_eba1),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdc),
-                _ => (b ^ c ^ d, 0xca62_c1d6),
-            };
-            let temp = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(*word);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = temp;
-        }
-
-        h0 = h0.wrapping_add(a);
-        h1 = h1.wrapping_add(b);
-        h2 = h2.wrapping_add(c);
-        h3 = h3.wrapping_add(d);
-        h4 = h4.wrapping_add(e);
-    }
-
-    let digest = [
-        h0.to_be_bytes(),
-        h1.to_be_bytes(),
-        h2.to_be_bytes(),
-        h3.to_be_bytes(),
-        h4.to_be_bytes(),
-    ]
-    .concat();
-    let mut out = String::with_capacity(16);
-    for byte in digest.iter().take(8) {
+fn sha256_hex_prefix_32(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
         out.push_str(&format!("{byte:02x}"));
     }
     out
@@ -305,21 +268,21 @@ fn sv_str(value: impl Into<String>) -> SemanticValue {
     SemanticValue::Str(value.into())
 }
 
-fn rule_metadata(hooks: &[(String, Vec<String>)]) -> Option<SemanticValue> {
+fn rule_metadata(hooks: &[(String, Vec<String>)]) -> Result<Option<SemanticValue>, String> {
     if hooks.is_empty() {
-        return None;
+        return Ok(None);
     }
     let hook_items = hooks
         .iter()
         .map(|(hook, _)| SemanticValue::List(vec![sv_str(hook), sv_str(hook)]))
         .collect();
-    Some(
+    Ok(Some(
         SemanticValue::map([(
             "semantic_hooks".to_string(),
             SemanticValue::List(hook_items),
         )])
-        .expect("static metadata keys are non-empty"),
-    )
+        .map_err(|error| error.to_string())?,
+    ))
 }
 
 struct Parser<'a> {
@@ -343,7 +306,7 @@ impl<'a> Parser<'a> {
             self.parse_rule_op(true)
         } else if self.consume_keyword("replace") {
             self.parse_rule_op(false)
-        } else if self.consume_keyword("include-grammar") {
+        } else if self.consume_keyword("include_grammar") {
             let source = self.parse_string_literal()?;
             let prefix = if self.peek_nonspace().is_some() {
                 Some(self.parse_string_literal()?)
@@ -351,8 +314,18 @@ impl<'a> Parser<'a> {
                 None
             };
             Ok(AuthoringOp::IncludeGrammar { source, prefix })
+        } else if self.consume_keyword("set") {
+            let key = self.parse_identifier()?;
+            self.expect_char('=')?;
+            self.skip_spaces();
+            let value = if self.consume_keyword("none") {
+                None
+            } else {
+                Some(self.parse_string_literal()?)
+            };
+            Ok(AuthoringOp::SetMetadata { key, value })
         } else {
-            Err("expected add, replace, or include-grammar".to_string())
+            Err("expected add, replace, set, or include-grammar".to_string())
         }
     }
 
@@ -361,7 +334,7 @@ impl<'a> Parser<'a> {
         let name = self.parse_identifier()?;
         self.expect_char('=')?;
         let expr = self.parse_choice()?;
-        let metadata = rule_metadata(&self.semantic_hooks);
+        let metadata = rule_metadata(&self.semantic_hooks)?;
         let op = AuthoringRuleOp {
             name,
             expr,
@@ -681,9 +654,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compiles_transform_rule_like_python_authoring() {
+    fn compiles_transform_rule_like_reference_authoring() {
         let ops = compile_authoring_grammar_source(
-            r#"add rule demo = "x" -> surface.keyword-string("X")"#,
+            r#"add rule demo = "x" -> surface.keyword_string("X")"#,
         )
         .unwrap();
         let AuthoringOp::AddRule(op) = &ops[0] else {
@@ -697,7 +670,7 @@ mod tests {
                 vec![
                     SemanticValue::List(vec![SemanticValue::List(vec![
                         sv_str("transform"),
-                        sv_str("surface.keyword-string"),
+                        sv_str("surface.keyword_string"),
                         sv_str("X")
                     ])]),
                     sv_tag("literal", vec![sv_str("x")])
@@ -710,8 +683,8 @@ mod tests {
                 SemanticValue::map([(
                     "semantic_hooks".to_string(),
                     SemanticValue::List(vec![SemanticValue::List(vec![
-                        sv_str("surface.keyword-string"),
-                        sv_str("surface.keyword-string")
+                        sv_str("surface.keyword_string"),
+                        sv_str("surface.keyword_string")
                     ])])
                 )])
                 .unwrap()
@@ -776,25 +749,28 @@ add rule args = ",".symbol+"#,
     }
 
     #[test]
-    fn inline_hook_ref_uses_python_sha1_prefix_shape() {
-        assert_eq!(sha1_hex_prefix_16(b"abc"), "a9993e364706816a");
+    fn inline_hook_ref_uses_sha256_namespace() {
+        assert_eq!(
+            sha256_hex_prefix_32(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223"
+        );
         assert!(inline_hook_ref("add rule demo = symbol", "(lambda (x) x)")
-            .starts_with("inline.syntax."));
+            .starts_with("inline.syntax.sha256."));
     }
 
     #[test]
     fn define_rule_trims_trailing_source_and_registers_metadata_hook_ref() {
         let mut syntax = UnitSyntaxState::new("caap").unwrap();
 
-        define_authoring_syntax_rule(&mut syntax, "add rule demo = symbol\n", "lower-demo")
+        define_authoring_syntax_rule(&mut syntax, "add rule demo = symbol\n", "lower_demo")
             .unwrap();
 
         assert!(syntax.grammar_rules.contains_key("demo"));
         assert_eq!(
             syntax.grammar_metadata.get("semantic_hook_functions"),
             Some(&SemanticValue::Map(vec![(
-                "lower-demo".to_string(),
-                SemanticValue::Str("lower-demo".to_string())
+                "lower_demo".to_string(),
+                SemanticValue::Str("lower_demo".to_string())
             )]))
         );
     }
@@ -803,12 +779,13 @@ add rule args = ",".symbol+"#,
     fn semantic_hook_references_rejects_malformed_metadata() {
         let metadata = SemanticValue::map([(
             "semantic_hooks".to_string(),
-            SemanticValue::List(vec![SemanticValue::Str("not-a-pair".to_string())]),
+            SemanticValue::List(vec![SemanticValue::Str("not_a_pair".to_string())]),
         )])
         .unwrap();
 
         assert!(semantic_hook_references(&metadata)
             .unwrap_err()
+            .message()
             .contains("entries must be pairs"));
     }
 }

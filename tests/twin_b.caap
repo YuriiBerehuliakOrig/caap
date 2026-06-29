@@ -1,0 +1,4 @@
+; tests/twin_b.caap — claims the SAME name from a different file.
+(module stdlib.fixtures.twin)
+(bind v (lambda () 2))
+(export v)

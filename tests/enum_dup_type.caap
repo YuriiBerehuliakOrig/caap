@@ -1,0 +1,7 @@
+; enum_dup_type — re-declaring a registered type name is a load error.
+(module stdlib.fixtures.enum_dup_type)
+
+(struct Dup (x i32))
+(enum Dup a b c)
+
+(export make_Dup)

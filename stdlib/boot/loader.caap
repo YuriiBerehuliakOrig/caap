@@ -1,0 +1,498 @@
+; stdlib/boot/loader.caap
+; MODULE IDENTITY: a RAW bootstrap script (run via ctfe_compiler_execute_bootstrap_file /
+; run_expanded BEFORE the `module` form is a bound name), so it carries NO `(module …)`
+; form — adding one would raise `unknown name: module`. Its registry identity is set
+; explicitly via ctfe_compiler_register_value. Allowlisted in stdlib/CONVENTIONS.md +
+; stdlib_module_identity_check (caap/tests/stdlib_governance_tests.rs).
+;
+; Tier 0/3 — the module loader. Core invariant:
+;   load = read -> expand -> check -> typecheck -> eval
+; All four pre-eval phases run PER TOP-LEVEL FORM, so every finding carries
+; the form's "path:line:col" source location.
+;
+; A module file is directives + body forms:
+;
+;   (module name)                 names the module; exports registered under it
+;   (import mod alias)            bind `alias` to mod's export map
+;   (use mod a b)                 bind a, b directly from mod (validated)
+;   (re_export mod a b)           like `use`, and re-export a, b from THIS module
+;   (export a b)                  explicit public contract; rest is private
+;   <body forms…>                 one shared scope; last form = exports (if no export)
+;
+; Directives take NAMES (read off the AST, never evaluated), not strings.
+;
+; Imports are injected WITHOUT embedding values in syntax: the loader wraps the
+; body in `(lambda (param…) (do body…))`, evaluates it to a closure, then
+; `apply`s it to the resolved import values.
+;
+; ── an ORCHESTRATOR of responsibilities ─────────────────────────────────────
+; The loader was once one monolith: its helpers shared a handful of MUTABLE
+; accumulators re-entered mid-cycle, so splitting them would "publish in-flux
+; state across module boundaries". That coupling is now made EXPLICIT — the
+; shared `state` record {fragments, roots, loaded_paths, dep_graph, load_log} is
+; threaded as a value — so each responsibility is its own reusable boot module
+; that this file merely WIRES together (each registered under its stdlib.* name,
+; resolved + bound here, looked up exactly like the type/passes phases):
+;   stdlib.namespace   directive/export-map readers + namespace-value ops
+;   stdlib.resolve     name -> path + the module index (over `state`)
+;   stdlib.reader      surface-kit vs kernel-parser read -> located forms
+;   stdlib.gate        the load-time pipeline (check -> typecheck -> passes), as data
+;   stdlib.unit_build  injections + body -> the export value (expand/check/eval)
+; The orchestrator keeps only what genuinely SPANS them: the `state`, the cache-
+; or-load step (load_module/resolve_import — they need `load`), the top-level
+; `load` (read -> build -> register, plus dep_graph/load_log/cycle bookkeeping),
+; and the published API. The pieces are reusable on their own — stdlib.lib.
+; namespace re-exports the namespace ops for any library — and the gate order
+; still matches the historical hardcoded sequence (eval=native parity rides on it).
+;
+; Published as `stdlib.load`:
+;   load          path  -> value
+;   load_module   name  -> value     (registry-cached; resolves via fragments/roots)
+;   declare       name path          map a module name to a file path
+;   declare_root  prefix base        derive `<base>/<suffix>.caap` for `prefix.*`
+;   module_path   name  -> path|null
+(do
+  (bind (
+    (ex             (ctfe_compiler_lookup_value compiler "stdlib.expand"))
+    (expand_collect (get ex "expand_collect"))
+    (check_forms
+      (get (ctfe_compiler_lookup_value compiler "stdlib.check") "check_forms"))
+    ; ── load-time GATE (stdlib.gate, extracted to boot/gate.caap) ───────────────
+    ; The pipeline-as-data sweep (check -> type pass -> user passes), bound over the
+    ; semantic checker just resolved; `checked` drives the phase registry per form.
+    (gate    ((get (ctfe_compiler_lookup_value compiler "stdlib.gate") "make") check_forms))
+    (checked (get gate "checked"))
+    ; ── the loader's shared, in-flux state — ONE explicit record ────────────────
+    ; Grouping fragments/roots/loaded_paths/dep_graph/load_log/missing into a single
+    ; `state` object is the enabling step for decomposition: each responsibility
+    ; below can be threaded this object as a parameter (and, once extracted into a
+    ; sibling boot module, operate on the SAME maps the orchestrator owns) instead
+    ; of closing over separate lexical bindings. The aliases keep every existing
+    ; helper unchanged — each name is the SAME object inside `state`, so the
+    ; in-place mutation (append/assoc/map_delete) the loader relies on is shared.
+    (state
+      (assoc (map_of)
+        "fragments"    (map_of)    ; explicit name -> path
+        "roots"        (list_of)   ; [{prefix, base}] for name -> path derivation (#2)
+        "loaded_paths" (map_of)    ; name -> path it was loaded from (#6 duplicate guard)
+        "dep_graph"    (map_of)    ; name|path -> [imported module names] (tooling)
+        "load_log"     (list_of)   ; [{name, path, deps}] in load order (tooling)
+        "missing"      (map_of)))  ; sentinel for "key absent" (a value may be null)
+    (fragments    (get state "fragments"))
+    (roots        (get state "roots"))
+    (loaded_paths (get state "loaded_paths"))
+    (dep_graph    (get state "dep_graph"))
+    (load_log     (get state "load_log"))
+
+    ; ── NAMESPACE toolkit (stdlib.namespace, extracted to boot/namespace.caap) ──
+    ; directive/export-map readers (the loader uses these for its unit assembly)
+    ; + reusable namespace-value ops (ns_of/merge/nest/resolve/… for any library).
+    (namespace       (ctfe_compiler_lookup_value compiler "stdlib.namespace"))
+    (form_head       (get namespace "form_head"))
+    (ident           (get namespace "ident"))
+    (ident_arg       (get namespace "ident_arg"))
+    (arg_idents      (get namespace "arg_idents"))
+    (export_map_spec (get namespace "export_map_spec"))
+    (check_directive (get namespace "check_directive"))
+    (get_export      (get namespace "get_export"))
+
+    ; ── module-name RESOLUTION (stdlib.resolve, extracted to boot/resolve.caap) ──
+    ; name->path + the module index, over the shared state + the namespace toolkit.
+    ; (resolve_import + load_module stay below — they need `load`.)
+    (resolve          ((get (ctfe_compiler_lookup_value compiler "stdlib.resolve") "make") state namespace))
+    (name_to_path     (get resolve "name_to_path"))
+    (module_path      (get resolve "module_path"))
+    (declare          (get resolve "declare"))
+    (declare_root     (get resolve "declare_root"))
+    (read_module_name (get resolve "read_module_name"))
+    (discover         (get resolve "discover"))
+
+    ; resolve_import — an imported module's export map (registry-cached).
+    ;   name : module being imported
+    ;   ->   : its export map (loads it if needed; cycle guard lives in `load`)
+    (resolve_import
+      (lambda (name)
+        (bind ((existing (ctfe_compiler_lookup_value compiler name null)))
+          (if (eq existing null) (load_module name) existing))))
+
+    ; ── UNIT assembly (stdlib.unit_build, extracted to boot/unit_build.caap) ────
+    ; injections + body -> the module export value (expand -> check -> typecheck
+    ; -> eval). Bound over the gate (`checked`) + the import/namespace helpers.
+    (unit_build  ((get (ctfe_compiler_lookup_value compiler "stdlib.unit_build") "make") checked resolve_import get_export export_map_spec expand_collect))
+    (build_value (get unit_build "build_value"))
+
+    ; ── the SURFACE protocol ────────────────────────────────────────────────
+    ; A file may open with a default-readable header naming its surface kit:
+    ;
+    ;   (surface stdlib.frontend.clike)
+    ;
+    ; (the first non-comment line). The loader then reads the file's TEXT,
+    ; loads the kit, and the kit's lower_program turns the text into stdlib
+    ; surface specs that ride the SAME pipeline as parsed forms (directives,
+    ; expand, check, type pass, eval). One language, many surfaces — the file
+    ; says which, and every consumer (load/run/analyze) honours it.
+
+    ; ── source READING (stdlib.reader, extracted to boot/reader.caap) ───────────
+    ; surface-kit lowering vs the kernel parser -> {path, located}. Bound over
+    ; resolve_import (used only to resolve a surface kit module).
+    (reader      ((get (ctfe_compiler_lookup_value compiler "stdlib.reader") "make") resolve_import))
+    (surface_of      (get reader "surface_of"))
+    (surface_of_diag (get reader "surface_of_diag"))
+    (surface_read    (get reader "surface_read"))
+    (default_read    (get reader "default_read"))
+
+    ; load — read a file, interpret directives, guard, build, register.
+    ;   path : the file path
+    ;   ->   : the module's export value
+    (load
+      (lambda (raw_path)
+        (bind (
+          ; best-effort wall clock (null without the time service): the load
+          ; log carries per-module durations, so cache decisions (ROADMAP
+          ; B1) are made on DATA, not guesses — the parse-cache lesson
+          (t0 (try ((host_service_export "time" "unix_millis" "compile_time"))
+                (catch e null)))
+          (skit (surface_of raw_path))
+          (rd (if (eq skit null)
+                (default_read raw_path)
+                (surface_read raw_path skit)))
+          (path (get rd "path" raw_path))
+          (state
+            (assoc (map_of)
+              "name" null "module_loc" "<unknown>" "injections" (list_of)
+              "exports" (list_of) "body" (list_of)))
+        )
+          (do
+            ; ── scan: split directives from body ──
+            (sequence_each (get rd "located" (list_of))
+              (lambda (lf)
+                ; with_map binds the (mutable) accumulator lists once; appending
+                ; to them mutates `state` in place. `case` dispatches on the head.
+                (with_map state (
+                  (injections "injections")
+                  (exports "exports")
+                  (body "body")
+                )
+                  (bind (
+                    (spec (get lf "spec"))
+                    (at (get lf "loc" "<unknown>"))
+                    (head (form_head spec))
+                  )
+                    (case head
+                      ("module"
+                        (do
+                          (check_directive at "module" spec 1 1 "(module name)")
+                          (assoc state "name" (ident_arg spec 0))
+                          (assoc state "module_loc" at)))
+                      ; the surface header was consumed by surface_of; in the
+                      ; DEFAULT path it would be an unknown name — drop it
+                      ("surface" null)
+                      ("import"
+                        (do
+                          (check_directive at "import" spec 2 2 "(import mod alias)")
+                          (append injections
+                            (assoc (map_of)
+                              "kind" "namespace"
+                              "module" (ident_arg spec 0)
+                              "alias" (ident_arg spec 1)
+                              "loc" at))))
+                      ("use"
+                        (do
+                          (check_directive at "use" spec 2 -1 "(use mod name…)")
+                          (append injections
+                            (assoc (map_of)
+                              "kind" "symbols"
+                              "module" (ident_arg spec 0)
+                              "names" (arg_idents spec 1)
+                              "loc" at))))
+                      ("re_export"
+                        (do
+                          (check_directive at "re_export" spec 2 -1 "(re_export mod name…)")
+                          (bind ((names (arg_idents spec 1)))
+                            (do
+                              (append injections
+                                (assoc (map_of)
+                                  "kind" "symbols"
+                                  "module" (ident_arg spec 0)
+                                  "names" names
+                                  "loc" at))
+                              (for nm names (append exports nm))))))
+                      ("export"
+                        (do
+                          (check_directive at "export" spec 1 -1 "(export name…)")
+                          (for arg (syntax_call_args spec)
+                            (append exports (ident arg)))))
+                      (else
+                        ; a body form: keep its source location alongside, so
+                        ; every later finding (expansion/check/type) names it
+                        (append body
+                          (assoc (map_of) "spec" spec "loc" at))))))))
+            ; ── bare-import gate (audit #26) — the DIRECTIVE-level default check ─
+            ; The scan above CONSUMES use/import/re_export into `injections`, so a
+            ; directive linter cannot ride the body gate (it never sees directives).
+            ; This is the loader's seat for one: look up the bare-import gate BY NAME
+            ; (optional — null in a session that never loaded it, the same late-bind
+            ; idiom the type/passes phases use), run its check_forms over the RAW
+            ; located specs (directives intact), and fail the load loudly — like the
+            ; check_directive guards above — if a plain eval load reaches a native-
+            ; only stdlib.bare.* wrapper. The native backend does NOT pass through
+            ; here (prep inlines its bare deps via the surface-template builtin, not
+            ; this loader path), so its legitimate bare imports are never seen; the
+            ; gate ALSO skips when prep's native_context cell is set (belt-and-
+            ; suspenders, in case it is ever reached on the native path).
+            (bind ((bg (ctfe_compiler_lookup_value compiler
+                         "stdlib.semantics.passes.bare_gate" null)))
+              (when_let (bg_check (if (eq bg null) null (get bg "check_forms")))
+                (bind ((raw_specs (list_of)))
+                  (do
+                    (sequence_each (get rd "located" (list_of))
+                      (lambda (lf) (append raw_specs (get lf "spec"))))
+                    (bind ((bare_findings (bg_check raw_specs)))
+                      (when (gt (size bare_findings) 0)
+                        (runtime_error (sequence_join bare_findings "; "))))))))
+            ; ── observability: the dependency graph + load log (DATA, not
+            ; callbacks — read them back via the api) ──
+            (bind (
+              (gkey (if (eq (get state "name") null)
+                      path (get state "name")))
+              (deps (list_of))
+            )
+              (do
+                (for inj (get state "injections" (list_of))
+                  (append deps (get inj "module")))
+                (assoc dep_graph gkey deps)
+                (append load_log
+                  (assoc (map_of) "name" gkey "path" path "deps" deps
+                    "ms" (if (eq t0 null) null
+                           (int_sub
+                             (try ((host_service_export "time" "unix_millis"
+                                                        "compile_time"))
+                               (catch e t0))
+                             t0))))))
+            ; ── LoadState lifecycle (audit #5 — the two-phase model, made explicit) ──
+            ; A module NAME moves through these states across the compiler registry
+            ; and `loaded_paths` (the index threaded on `state`). Reading the block
+            ; below against this glossary is the key to the "clever" cycle handling:
+            ;   UNSEEN       no registry entry, no loaded_paths[name].
+            ;   PLACEHOLDER  registry[name] = an EMPTY mutable map (phase 1) +
+            ;                loaded_paths[name] = path. A cyclic (import …) reached
+            ;                mid-build resolves to THIS map, so the cycle terminates.
+            ;   LOADED       the placeholder POPULATED in place (phase 2): every
+            ;                importer that captured it (even mid-cycle) now sees the
+            ;                exports. loaded_paths[name] == path is the "done" marker.
+            ;   FAILED       a build that threw UNREGISTERS both records, so a retry
+            ;                (fix + reload in the same session) restarts from UNSEEN,
+            ;                never stuck handing back an empty placeholder.
+            ;   STALE        an OLDER failed load left an empty placeholder (the
+            ;                registry refuses overwrites, and there is no loaded_paths
+            ;                entry) — it is ADOPTED as this attempt's placeholder and
+            ;                scrubbed clean (so references held across the failure heal).
+            ; ── two-phase load (cycles + #6 duplicate guard) ──
+            ; Phase 1: publish an EMPTY export map under the name BEFORE building,
+            ; so a cyclic `(import …)` resolves to this same (mutable) map. Phase 2:
+            ; build, then populate the published map IN PLACE — importers that
+            ; captured it (even mid-cycle) now see the exports at call time.
+            (bind (
+              (name (get state "name"))
+              ; a PREVIOUS FAILED load leaves its empty placeholder registered
+              ; (the registry refuses overwrites) with no loaded_paths entry —
+              ; ADOPT it as this attempt's placeholder: on success the same
+              ; map is populated, so even references held across cycles heal
+              (stale (if (eq name null) null
+                       (if (eq (get loaded_paths name) null)
+                         (ctfe_compiler_lookup_value compiler name null)
+                         null)))
+              (placeholder (if (eq stale null) (map_of) stale))
+              (prior (if (eq name null) null (get loaded_paths name)))
+            )
+              ; Reloading the SAME file is idempotent: hand back the already-
+              ; registered module without re-running its body. A DIFFERENT file
+              ; claiming the same name is a hard error.
+              (if (and (not (eq name null)) (eq prior path))
+                (ctfe_compiler_lookup_value compiler name null)
+              (do
+                (if (not (eq name null))
+                  (do
+                    (if (not (eq prior null))
+                      (runtime_error
+                        (string_concat_many
+                          (get state "module_loc" "<unknown>")
+                          ": duplicate module name \"" name
+                          "\" (already loaded from " prior ", now " path ")")))
+                    (if (eq stale null)
+                      (ctfe_compiler_register_value compiler name placeholder)
+                      ; adopted: scrub whatever a partial build left behind
+                      (for k (map_keys placeholder)
+                        (map_delete placeholder k)))
+                    (assoc loaded_paths name path)))
+                (bind (
+                  ; a FAILED build must not leave the module poisoned: the
+                  ; two-phase placeholder was already published (cycle
+                  ; support), so on error UNREGISTER both records — a later
+                  ; retry in the same session (try + fix + reload) starts
+                  ; clean instead of getting the empty placeholder back
+                  (value
+                    (try
+                      (build_value
+                        (get state "injections" (list_of))
+                        (get state "body" (list_of))
+                        (get state "exports" (list_of))
+                        (if (eq name null) path name)
+                        (get state "module_loc" "<unknown>"))
+                      (catch e
+                        (do
+                          ; drop the path record so a RETRY rebuilds (the
+                          ; placeholder stays registered — overwriting is
+                          ; impossible — and gets adopted+scrubbed then)
+                          (when (not (eq name null))
+                            (map_delete loaded_paths name))
+                          (runtime_error
+                            (if (eq (value_type e) "map")
+                              (get e "message" (value_to_string e))
+                              (value_to_string e)))))))
+                )
+                  (if (eq name null)
+                    value
+                    (if (eq (value_type value) "map")
+                      ; populate the published placeholder in place, return it
+                      (do
+                        (sequence_each (map_keys value)
+                          (lambda (k) (assoc placeholder k (get value k))))
+                        placeholder)
+                      ; a NAMED module must export a map — its name was already
+                      ; published as one (the two-phase cycle placeholder), and
+                      ; importers address it by key. Value-shaped programs are
+                      ; files WITHOUT a (module …) directive.
+                      (runtime_error
+                        (string_concat_many
+                          (get state "module_loc" "<unknown>")
+                          ": module \"" name
+                          "\" must evaluate to an export map, got "
+                          (value_type value)
+                          " (drop the (module …) directive for a value-shaped file)"))))))))))))
+
+    ; backfill_types — run the type pass over an ALREADY-LOADED module's
+    ; source purely for its signature harvest. The bootstrap uses it for the
+    ; modules the type layer itself depends on (they load before infer
+    ; exists, so their load ran without a type pass). Nothing is evaluated;
+    ; findings fail loudly — these are our own foundations.
+    ;   path / module_name : the source file and the name to file sigs under
+    (backfill_types
+      (lambda (path module_name)
+        (bind (
+          (ti (ctfe_compiler_lookup_value compiler "stdlib.semantics.types.infer" null))
+          (located (list_of))
+          (sink (list_of))
+        )
+          (when_let (cmt (if (eq ti null) null (get ti "check_module_types")))
+            (do
+              (for form (ctfe_unit_top_level_forms
+                          (ctfe_compiler_load_surface_file_template compiler path))
+                (bind ((spec (ctfe_node_to_spec form)))
+                  (case (form_head spec)
+                    ("module" null) ("export" null) ("use" null)
+                    ("import" null) ("re_export" null)
+                    (else
+                      (bind ((res (expand_collect spec null)))
+                        (do
+                          (for d (get res "diagnostics" (list_of))
+                            (when (eq (get d "severity" "error") "error")
+                              (append sink
+                                (string_concat_many
+                                  path ": " (get d "message" "expansion error")))))
+                          (append located
+                            (assoc (map_of)
+                              "node" (get res "node")
+                              "loc" path))))))))
+              (bind ((harvest (cmt located (map_of) sink)))
+                (if (gt (size sink) 0)
+                  (runtime_error
+                    (string_concat_many
+                      "stdlib backfill (" module_name "): "
+                      (sequence_join sink "; ")))
+                  ((get ti "register_sigs!") module_name harvest))))))))
+
+    ; load_module — load a declared module by name (registry-cached).
+    ;   name : the module name (via fragment or root)
+    ;   ->   : its export value; raises if the name cannot be resolved to a path
+    (load_module
+      (lambda (name)
+        (bind ((existing (ctfe_compiler_lookup_value compiler name null)))
+          (if (not (eq existing null))
+            existing
+            (bind ((path (module_path name)))
+              (if (eq path null)
+                (runtime_error
+                  (string_concat_many
+                    "stdlib: unknown module \"" name
+                    "\" (no fragment or root); declare it or set a root"))
+                (load path)))))))
+
+    ; detect_cycles — find import cycles by a gray/black DFS over `dep_graph`
+    ; (the relation the loader already maintains: name|path -> [imported module
+    ; names]). A back-edge to a GREY node (one still on the current DFS path) is
+    ; a cycle; the chain is reconstructed from the path and rendered "A -> B -> A".
+    ; Read-only observability — it inspects the SAME `dep_graph` the loader fills,
+    ; never the registry, so it cannot perturb a load. Module-level cycles stay
+    ; LEGAL (the two-phase placeholder supports them; see this file's doc block +
+    ; lib/project's "module-level cycles among a project's files stay legal");
+    ; this merely makes them DETECTABLE so tooling can warn. Returned as data,
+    ; not a throw — a throw here would break that documented invariant.
+    ;   -> : a list of cycle-chain strings (each "A -> B -> A"), [] when acyclic
+    (detect_cycles
+      (lambda ()
+        (bind (
+          (color (map_of))   ; node -> "grey" | "black"
+          (found (list_of))  ; the cycle-chain strings, in discovery order
+          ; dfs — visit `node`, threading `path` (the grey ancestors, in order).
+          ; A dep that is grey closes a cycle: slice the path from that dep on,
+          ; append the dep again, and join with " -> ".
+          (dfs
+            (lambda (self node path)
+              (do
+                (assoc color node "grey")
+                (bind ((next_path (list_of)))
+                  (do
+                    (for p path (append next_path p))
+                    (append next_path node)
+                    (for dep (get dep_graph node (list_of))
+                      (bind ((c (get color dep)))
+                        (if (eq c "grey")
+                          ; back-edge: render the cycle from `dep` round to `dep`
+                          (bind (
+                            (chain (list_of))
+                            (seen (ref false))
+                          )
+                            (do
+                              (for p next_path
+                                (when (or (deref seen) (eq p dep))
+                                  (do (set_ref seen true) (append chain p))))
+                              (append chain dep)
+                              (append found (sequence_join chain " -> "))))
+                          (when (not (eq c "black"))
+                            (self self dep next_path)))))
+                    (assoc color node "black")))))))
+          (do
+            ; start a DFS from every known node not yet finished
+            (for node (map_keys dep_graph)
+              (when (not (eq (get color node) "black"))
+                (dfs dfs node (list_of))))
+            found))))
+
+  )
+    (ctfe_compiler_register_value
+      compiler
+      "stdlib.load"
+      (assoc (map_of)
+        "load" load
+        "load_module" load_module
+        "declare" declare
+        "declare_root" declare_root
+        "discover" discover
+        "module_path" module_path
+        "surface_of" surface_of
+        "surface_of_diag" surface_of_diag
+        "dep_graph" (lambda () dep_graph)
+        "load_log" (lambda () load_log)
+        "cycles" detect_cycles
+        "backfill_types" backfill_types))))

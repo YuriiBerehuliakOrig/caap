@@ -1,0 +1,55 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "caap",
+      "request": "launch",
+      "name": "CAAP: Step stdlib bootstrap",
+      "bootstrap": "${workspaceFolder}/stdlib/bootstrap.caap",
+      "root": "${workspaceFolder}",
+      "stopOnEntry": true
+    },
+    {
+      // Debug the COMPILED URun ELF on QEMU (symbol/instruction level —
+      // the native backend emits no DWARF, so break on FUNC symbols and step
+      // ARM instructions / inspect registers + memory). Requires the
+      // Cortex-Debug extension (marus25.cortex-debug) and an ARM-capable gdb
+      // (gdb-multiarch or arm-none-eabi-gdb) on PATH.
+      //
+      // This config ATTACHES; the preLaunchTask builds the ELF and starts QEMU
+      // halted at reset (-S) on tcp::1234. When done, terminate the
+      // "urun: QEMU (debug)" task.
+      "name": "URun on QEMU (attach, cortex-debug)",
+      "type": "cortex-debug",
+      "request": "attach",
+      "servertype": "external",
+      "gdbTarget": "localhost:1234",
+      "cwd": "${workspaceFolder}",
+      "executable": "${workspaceFolder}/target/urun.elf",
+      "gdbPath": "gdb-multiarch",
+      "preLaunchTask": "urun: QEMU (debug)",
+      "postAttachCommands": [
+        "break _ur_thread_schedule",
+        "continue"
+      ],
+      "showDevDebugOutput": "none"
+    },
+    {
+      // One-click alternative: let Cortex-Debug spawn and own QEMU itself
+      // (no task, no lingering process). Same requirements as above. If your
+      // qemu-system-arm is elsewhere, set "serverpath" to its absolute path.
+      "name": "URun on QEMU (launch, cortex-debug manages QEMU)",
+      "type": "cortex-debug",
+      "request": "launch",
+      "servertype": "qemu",
+      "serverpath": "qemu-system-arm",
+      "cpu": "cortex-m3",
+      "machine": "mps2-an385",
+      "cwd": "${workspaceFolder}",
+      "executable": "${workspaceFolder}/target/urun.elf",
+      "gdbPath": "gdb-multiarch",
+      "preLaunchTask": "urun: build ELF",
+      "showDevDebugOutput": "none"
+    }
+  ]
+}

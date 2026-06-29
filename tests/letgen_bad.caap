@@ -1,0 +1,10 @@
+; letgen_bad — a genuine type error that let-generalization must STILL catch.
+; `id` is a single-param generic local; `(id "hi")` instantiates its variable to
+; string, so its result is string. Feeding that string to `want_int` (declared
+; (n int)) is a CERTAIN mismatch — generalization sharpens the result from the
+; old `null` (silently accepted) to `string`, so this error is now reported.
+(module stdlib.fixtures.letgen_bad)
+(defn want_int ((n int)) int n)
+(bind id (lambda (x) x))
+(bind broken (lambda () (want_int (id "hi"))))
+(export broken)

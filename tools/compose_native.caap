@@ -1,0 +1,19 @@
+; compose_native.caap
+;
+; A composed bootstrap that brings up stdlib AND the native emitter, so a build
+; tool / program run after it can emit native (hosted) binaries and freestanding
+; cross ELFs (Cortex-M, …). This is the entry the book and examples refer to as
+; "compose_native = bootstrap.caap + boot/native_emit.caap".
+;
+; Used as the FIRST argument to the flagless CLI, with a build tool + its args:
+;
+;   caap compose_native.caap examples/urun/ur_build.caap \
+;        examples/urun /tmp/urun.elf cortex-m3
+;
+; Paths below are relative to THIS file's directory (../ reaches the repo root).
+(do
+  ; 1. stdlib itself (expander, forms, loader, type layer, command surface).
+  (ctfe_compiler_execute_bootstrap_file compiler "../stdlib/bootstrap.caap")
+  ; 2. The native emitter (backend/emit/llvm + backend/driver): emit_program, the clang
+  ;    toolchain plumbing and the freestanding cross-build path (link_bare!).
+  (ctfe_compiler_execute_bootstrap_file compiler "../stdlib/boot/native_emit.caap"))

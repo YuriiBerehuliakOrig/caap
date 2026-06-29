@@ -1,0 +1,9 @@
+; borrow_bad — loaded AFTER borrow_demo registers the pass: `held` is moved,
+; then used — the borrow pass fails the load (use after move).
+(module stdlib.fixtures.borrow_bad)
+(use stdlib.semantics.passes.borrow move)
+(defn leak ((held int)) int
+  (do
+    (move held)
+    (int_add held 1)))
+(export leak)

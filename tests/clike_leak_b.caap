@@ -1,0 +1,11 @@
+(surface stdlib.frontend.clike)
+
+// Fixture B for the cross-file state-leak test. It NEVER declares `Leaky`, so a
+// bare use of that name must classify as a plain `variable` — proof that file
+// A's struct type did not leak across the per-file reset. (The use is otherwise
+// undefined; analyze only cares about the token's category, not a clean lower.)
+g (p u32) u32 export = { 0 }
+
+f () u32 export = {
+  g(Leaky)
+}

@@ -1,0 +1,115 @@
+; stdlib/lib/test_map.caap — in-language tests for lib/map.
+
+;; @area: collections
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq)
+(use stdlib.lib.collections.map
+  keys values merge clone delete! update! of_entries has?
+  map_size empty? entries pick map_vals get_in assoc_in keys_where
+  fold_entries map_entries omit invert filter_entries
+  merge_with update_in from_keys map_keys_fn)
+
+(bind m (assoc (map_of) "a" 1 "b" 2 "c" 3))
+
+(do
+  (assert_eq (size (keys m)) 3 "keys count")
+  (assert_eq (size (values m)) 3 "values count")
+  (assert_eq (get (merge m (assoc (map_of) "b" 9)) "b") 9 "merge: later wins")
+  (assert_eq (has? m "a") true "has? present")
+  (assert_eq (has? m "z") false "has? absent")
+  (assert_eq
+    (bind ((d (assoc (map_of) "x" 1)))
+      (do (delete! d "x") (has? d "x")))
+    false "delete! removes in place")
+  (assert_eq
+    (bind ((u (assoc (map_of) "a" 1)))
+      (do (update! u "a" (lambda (v) (int_add v 10))) (get u "a")))
+    11 "update! in place")
+  (assert_eq (get (of_entries (list_of (list_of "k" 7))) "k") 7 "of_entries")
+  (assert_eq (map_size m) 3 "map_size")
+  (assert_eq (empty? (map_of)) true "empty? yes")
+  (assert_eq (empty? m) false "empty? no")
+  (assert_eq (size (entries m)) 3 "entries count")
+  (assert_eq (map_size (pick m (list_of "a" "z"))) 1 "pick keeps only present")
+  (assert_eq (get (map_vals m (lambda (v) (int_mul v 2))) "c") 6 "map_vals")
+  (assert_eq
+    (bind ((c (clone m)))
+      (do (assoc c "d" 4) (has? m "d")))
+    false "clone: source untouched by edits")
+  (assert_eq (get (clone m) "b") 2 "clone carries entries")
+  ; enrichment
+  (assert_eq (get_in (assoc (map_of) "a" (assoc (map_of) "b" 7)) (list_of "a" "b") 0) 7 "get_in nested")
+  (assert_eq (get_in (assoc (map_of) "a" 1) (list_of "x" "y") -1) -1 "get_in missing -> default")
+  (assert_eq (get_in (assoc_in (map_of) (list_of "p" "q") 9) (list_of "p" "q") 0) 9 "assoc_in builds path")
+  (assert_eq (size (keys_where (assoc (map_of) "a" 1 "b" 5 "c" 2) (lambda (v) (lt v 3)))) 2 "keys_where")
+  ; fold_entries — reduce over (acc key value); here sum the values
+  (assert_eq (fold_entries m 0 (lambda (acc k v) (int_add acc v))) 6 "fold_entries sums values")
+  ; map_entries — rebuild each entry; uppercase-ish: append "!" to key, double value
+  (bind ((me (map_entries m (lambda (k v) (list_of (string_concat_many k "!") (int_mul v 2))))))
+    (do
+      (assert_eq (get me "a!") 2 "map_entries transforms key and value")
+      (assert_eq (map_size me) 3 "map_entries keeps every entry")))
+  ; omit — drop keys; complement of pick
+  (bind ((o (omit m (list_of "a" "z"))))
+    (do
+      (assert_eq (has? o "a") false "omit drops requested key")
+      (assert_eq (has? o "b") true  "omit keeps the rest")
+      (assert_eq (has? m "a") true  "omit does not mutate the input")))
+  ; invert — swap keys/values
+  (bind ((iv (invert (assoc (map_of) "x" 1 "y" 2))))
+    (do
+      (assert_eq (get iv 1) "x" "invert maps value 1 back to key x")
+      (assert_eq (get iv 2) "y" "invert maps value 2 back to key y")))
+  ; filter_entries — keep entries satisfying (key value) -> bool
+  (bind ((fe (filter_entries m (lambda (k v) (gt v 1)))))
+    (do
+      (assert_eq (map_size fe) 2 "filter_entries keeps values > 1")
+      (assert_eq (has? fe "a") false "filter_entries drops value 1")
+      (assert_eq (has? m "a") true "filter_entries does not mutate the input")))
+  ; merge_with — combine clashing keys via (f a b); disjoint keys pass through
+  (bind ((mw (merge_with (assoc (map_of) "a" 1 "b" 2)
+                         (assoc (map_of) "b" 10 "c" 3)
+                         (lambda (a b) (int_add a b)))))
+    (do
+      (assert_eq (get mw "a") 1 "merge_with: a-only key kept")
+      (assert_eq (get mw "c") 3 "merge_with: b-only key kept")
+      (assert_eq (get mw "b") 12 "merge_with: clash combined via f")
+      (assert_eq (map_size mw) 3 "merge_with: union of keys")))
+  (assert_eq
+    (bind ((a (assoc (map_of) "x" 1)))
+      (do (merge_with a (assoc (map_of) "x" 9) (lambda (p q) (int_add p q))) (get a "x")))
+    1 "merge_with does not mutate input a")
+  ; update_in — functional nested transform via (f old); deep path
+  (assert_eq
+    (get_in (update_in (assoc (map_of) "a" (assoc (map_of) "b" 7))
+                       (list_of "a" "b") (lambda (old) (int_add old 100)))
+            (list_of "a" "b") 0)
+    107 "update_in deep path transforms old")
+  (assert_eq
+    (get_in (update_in (map_of) (list_of "p" "q")
+                       (lambda (old) (if (eq old null) 1 (int_add old 1))))
+            (list_of "p" "q") -1)
+    1 "update_in builds missing path, old is null")
+  (assert_eq
+    (bind ((src (assoc (map_of) "a" (assoc (map_of) "b" 7))))
+      (do
+        (update_in src (list_of "a" "b") (lambda (old) (int_add old 1)))
+        (get_in src (list_of "a" "b") 0)))
+    7 "update_in does not mutate the input")
+  ; from_keys — every key maps to the common value
+  (bind ((fk (from_keys (list_of "a" "b" "c") 0)))
+    (do
+      (assert_eq (map_size fk) 3 "from_keys entry count")
+      (assert_eq (get fk "b") 0 "from_keys common value")
+      (assert_eq (has? fk "z") false "from_keys only listed keys")))
+  (assert_eq (map_size (from_keys (list_of) 1)) 0 "from_keys empty key list")
+  (assert_eq (map_size (from_keys (list_of "a" "a" "b") 1)) 2 "from_keys dedups duplicate keys")
+  ; map_keys_fn — transform every key, keep values
+  (bind ((mk (map_keys_fn m (lambda (k) (string_concat_many k "!")))))
+    (do
+      (assert_eq (get mk "a!") 1 "map_keys_fn transforms key, keeps value")
+      (assert_eq (map_size mk) 3 "map_keys_fn keeps every entry")
+      (assert_eq (has? mk "a") false "map_keys_fn old key is gone")
+      (assert_eq (has? m "a") true "map_keys_fn does not mutate the input")))
+  true)

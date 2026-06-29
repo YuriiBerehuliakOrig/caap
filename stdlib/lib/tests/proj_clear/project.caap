@@ -1,0 +1,5 @@
+; stdlib/lib/tests/proj_clear/project.caap — a minimal, dependency-free
+; project manifest used ONLY by test_project_clear.caap to exercise the
+; clear_projects! reset (it never declares roots, so it touches no loader
+; state beyond the project registries themselves).
+(assoc (map_of) "name" "proj_clear_fixture" "roots" (list_of) "deps" (list_of))

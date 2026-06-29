@@ -1,0 +1,43 @@
+; stdlib/lib/tests/test_sys_path.caap — the PURE, grant-free corner of the
+; OS-path facade: stdlib.sys.path.relpath. `relpath` is NOT a host op (caap-sys
+; has no `relpath`); it is in-language lexical path algebra, so it runs in the
+; ordinary corpus without a sys grant. It mirrors the host's lexical `normalize`
+; (`.` drops, `..` pops a real prior component, a leading `..` on a relative path
+; is preserved, `..` is a no-op at root) before diffing the components.
+;
+; This is the OS-path twin of test_sys_finish.caap's lib.text.path.relpath
+; cases — kept separate because it imports the sys facade (which loads in
+; declaration-only mode here), whereas test_sys_finish stays facade-free.
+
+;; @area: sys
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq)
+(use stdlib.sys.path relpath)
+
+(do
+  ; descend: from a parent to a child
+  (assert_eq (relpath "/a" "/a/b/c") "b/c" "relpath descends")
+  ; ascend: from a child to an ancestor
+  (assert_eq (relpath "/a/b/c" "/a") "../.." "relpath ascends")
+  ; sibling: up then over
+  (assert_eq (relpath "/a/b" "/a/c") "../c" "relpath to a sibling")
+  ; identity: a path relative to itself is "."
+  (assert_eq (relpath "/a/b" "/a/b") "." "relpath to self is .")
+  ; relative inputs (both): same algebra, no leading slash
+  (assert_eq (relpath "a/b" "a/c") "../c" "relpath on relative paths")
+  ; cousin: ascend two then descend two
+  (assert_eq (relpath "/a/b/c" "/a/x/y") "../../x/y" "relpath to a cousin")
+  ; normalization happens first ("." / ".." collapse before the diff)
+  (assert_eq (relpath "/a/./b" "/a/b/../c") "../c" "relpath normalizes inputs")
+  ; redundant + trailing slashes collapse like the host's components view
+  (assert_eq (relpath "/a/b/" "/a/b/c/") "c" "relpath collapses extra slashes")
+  ; the filesystem root as `from`: every component of `to` is fresh
+  (assert_eq (relpath "/" "/a/b") "a/b" "relpath from root")
+  ; ascend to the root
+  (assert_eq (relpath "/a/b" "/") "../.." "relpath to root")
+  ; different kinds (absolute vs relative): no lexical relation -> normalized `to`
+  (assert_eq (relpath "a/b" "/x/y") "/x/y" "relpath mixed kinds -> normalized to")
+  ; identity on relative paths is also "."
+  (assert_eq (relpath "x" "x") "." "relpath self (relative) is .")
+  true)

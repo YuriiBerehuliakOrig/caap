@@ -1,0 +1,158 @@
+; stdlib/boot/opt.caap — the OPTIMIZATION-LEVEL registry (module stdlib.boot.opt).
+;
+; CAAP has no built-in -O flag: optimization passes are ordinary load-time
+; transforms (stdlib/semantics/passes/*.caap) that a composed bootstrap OPTS IN
+; by loading the pass module and calling its `register!` (the boot/peval.caap
+; pattern). This module turns that opt-in into NAMED LEVELS — O0..O3 — each a
+; CUMULATIVE set of transforms, so a program can be compiled at a chosen level
+; instead of wiring individual passes by hand.
+;
+; Use it from a composed bootstrap (see boot/opt_O1.caap / opt_O2.caap /
+; opt_O3.caap):
+;
+;   ; opt_O2.caap: run the base bootstrap, then enable the O2 level
+;   (ctfe_compiler_execute_bootstrap_file compiler "stdlib/bootstrap.caap")
+;   ((get (load "boot/opt.caap") "enable_opt!") "O2")
+;
+;   caap stdlib/boot/opt_O2.caap program.caap     ; compile program at O2
+;
+; Each level's transforms are BEHAVIOUR-PRESERVING (constant folding, dead-code
+; elimination, algebraic simplification, CSE, inlining, LICM, partial
+; evaluation, …): a program's RESULT is identical at every level — only the
+; emitted IR changes. The level just trades load-time cost for IR quality.
+;
+; ── the level table ──────────────────────────────────────────────────────────
+; LEVELS lists the levels low→high. opt_adds maps a level to the transforms it
+; ADDS on top of the previous level; each entry is {module, name}:
+;   module : the pass module path RELATIVE to boot/ (the load idiom below)
+;   name   : the transform name that module's `register!` installs (its
+;            install_transform! key) — the public id reported by opt_transforms
+; Level assignment (per the soundness audit):
+;   O0 — none.
+;   O1 — cheap, local, sound:   constfold, dce, simplify, algebra.
+;   O2 — sound, broader:        O1 + cse, inline, licm, peval (cse/licm SSA-backed: the
+;                               ssa_gvn / ssa_licm modules register under these names,
+;                               composing the SSA pass with the conservative one).
+;   O3 — aggressive:            O2 + dead_store, ccp (both SSA-backed: the ssa_dce /
+;                               ssa_ccp modules register under these names, composing
+;                               the SSA across-control pass with the conservative one).
+; (pe — polyvariant specialization — is deliberately NOT in any level: it is not
+;  behaviour-preserving on general code, e.g. it corrupts json's bindings on load.
+;  It remains a separate explicit opt-in via boot/pe.caap, not a level.)
+; The cumulativity (O1 ⊆ O2 ⊆ O3) is computed from this table, not duplicated:
+; opt_transforms / enable_opt! fold the ADDS of every level ≤ the target.
+(module stdlib.boot.opt)
+
+; pass — one {module, name} entry of the level table.
+(bind pass
+  (lambda (module name)
+    (assoc (map_of) "module" module "name" name)))
+
+; LEVELS — the level names, low → high. The cumulative order.
+(bind LEVELS (list_of "O0" "O1" "O2" "O3"))
+
+; opt_adds — level -> the transforms ADDED at that level (not the cumulative
+; set; see opt_transforms for the cumulative fold). Paths are relative to boot/
+; — the same "../semantics/passes/<name>.caap" the load idiom below resolves.
+(bind opt_adds
+  (assoc (map_of)
+    "O0" (list_of)
+    "O1" (list_of
+           (pass "../semantics/passes/constfold.caap" "constfold")
+           (pass "../semantics/passes/dce.caap"       "dce")
+           (pass "../semantics/passes/simplify.caap"  "simplify")
+           (pass "../semantics/passes/algebra.caap"   "algebra"))
+    "O2" (list_of
+           ; cse / licm are SSA-BACKED (Phase-2 unification): the ssa_gvn / ssa_licm
+           ; modules COMPOSE the SSA cross-control value-numbering / invariant-deref
+           ; hoist with the conservative pass and register under "cse" / "licm" — ONE
+           ; transform each, not two. cse.caap / licm.caap stay the conservative core.
+           (pass "../semantics/passes/ssa_gvn.caap"  "cse")
+           (pass "../semantics/passes/inline.caap"   "inline")
+           (pass "../semantics/passes/ssa_licm.caap" "licm")
+           (pass "../semantics/passes/peval.caap"    "peval"))
+    "O3" (list_of
+           ; dead_store / ccp are SSA-BACKED (Phase-2 unification): the ssa_dce /
+           ; ssa_ccp modules COMPOSE the SSA across-control elimination with the
+           ; conservative pass and register under "dead_store" / "ccp" — ONE transform
+           ; each, not two. The conservative ccp.caap / dead_store.caap stay the core
+           ; (the SSA modules wrap them); to_ssa self-validates, so still strictly
+           ; behaviour-preserving like the rest of the level.
+           (pass "../semantics/passes/ssa_dce.caap" "dead_store")
+           (pass "../semantics/passes/ssa_ccp.caap" "ccp"))))
+
+; opt_levels — the whole table (the level→adds map), exposed for tooling/tests
+; that want to introspect the registry WITHOUT enabling anything (pure data).
+(bind opt_levels opt_adds)
+
+; level_index — a level's position in LEVELS, or -1 if unknown. The cumulative
+; fold runs over LEVELS up to and including this index.
+(bind level_index
+  (lambda (level)
+    (bind ((idx (ref -1)) (i (ref 0)))
+      (do
+        (for l LEVELS
+          (do
+            (when (eq l level) (set_ref idx (deref i)))
+            (set_ref i (int_add (deref i) 1))))
+        (deref idx)))))
+
+; valid_level? — is `level` one of the known LEVELS?
+(bind valid_level?
+  (lambda (level) (gt (level_index level) -1)))
+
+; opt_passes — the CUMULATIVE list of {module, name} entries for `level`: the
+; ADDS of every level from O0 up to and including `level`, in order. Throws on
+; an unknown level (a misconfiguration, not a silent default).
+(bind opt_passes
+  (lambda (level)
+    (bind ((top (level_index level)) (out (list_of)) (i (ref 0)))
+      (do
+        (when (lt top 0)
+          (throw (string_concat_many "opt: unknown level `" level "`")))
+        (for l LEVELS
+          (do
+            (when (le (deref i) top)
+              (for p (get opt_adds l (list_of)) (append out p)))
+            (set_ref i (int_add (deref i) 1))))
+        out))))
+
+; opt_transforms — the CUMULATIVE transform NAMES for `level` (the public ids:
+; what enable_opt! installs and what opt_transforms callers assert on). The
+; names of opt_passes, in cumulative order. O0 -> empty.
+(bind opt_transforms
+  (lambda (level)
+    (bind ((out (list_of)))
+      (do (for p (opt_passes level) (append out (get p "name"))) out))))
+
+; active_opt_level — the level most recently enabled in THIS session (default
+; "O0", since the base bootstrap installs none of these transforms). A ref so
+; enable_opt! can update it; read it with active_opt_level itself (it returns
+; the level string).
+(bind active_level_ref (ref "O0"))
+(bind active_opt_level (lambda () (deref active_level_ref)))
+
+; enable_opt! — install every transform of `level` into the live session
+; registry, CUMULATIVELY (O0 ⊆ O1 ⊆ O2 ⊆ O3). For each {module, name} of
+; opt_passes, load the pass module (which registers its name under stdlib.*)
+; and call its `register!` — the same idiom boot/peval.caap uses, just driven
+; by the table. Installation is idempotent (each `register!` calls
+; install_transform!, which replaces any same-named entry), so re-enabling a
+; level — or enabling a higher one after a lower one — never double-registers.
+; Returns the cumulative transform-name list it installed, and records the
+; level as active_opt_level. Throws on an unknown level.
+(bind enable_opt!
+  (lambda (level)
+    (bind ((load (get (ctfe_compiler_lookup_value compiler "stdlib.load") "load")))
+      (do
+        (when (not (valid_level? level))
+          (throw (string_concat_many "opt: unknown level `" level "`")))
+        (for p (opt_passes level)
+          ((get (load (get p "module")) "register!")))
+        (set_ref active_level_ref level)
+        (opt_transforms level)))))
+
+(export LEVELS opt_levels opt_adds
+        opt_passes opt_transforms
+        valid_level? level_index
+        active_opt_level enable_opt!)

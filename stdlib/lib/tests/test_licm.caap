@@ -1,0 +1,634 @@
+; stdlib/lib/tests/test_licm.caap — loop-invariant code motion, proven
+; behavior-preserving on a REAL counted loop, plus the conservative non-hoist
+; guards (variant ref reads, PARTIAL ops, nested lambdas, capture/shadowing).
+;
+; NOTE ON THE HOISTED INVARIANT: in this UNTYPED, overflow-CHECKED kernel almost
+; nothing is total — `int_mul`/`int_add` throw on overflow, `size`/`lt` throw on
+; wrong types — so they are NOT safe to hoist (hoisting a partial op before a
+; possibly-zero-trip loop can move a throw = miscompile). The only heads total
+; for ALL inputs are the structural/truthiness ones (eq/ne/not/value_type), so
+; the invariant we expect to hoist is `(not (eq k 0))`. The accumulator still
+; uses `int_add`/`int_mul` to make a real, numerically-checkable loop — and the
+; fact that those do NOT hoist is itself one of the conservative guarantees the
+; test asserts.
+
+;; @area: passes
+;; @kind: regression
+;; @slow: true
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.semantics.passes.licm licm_node)
+(use stdlib.syntax.ast sym lit calln call call? head_is? args_of arg head_of name_of walk eval_ir)
+(use stdlib.syntax.ir node_eq)
+
+; The hoistable invariant: total, pure, invariant (k is never mutated).
+(bind invariant_expr (calln "not" (list_of (calln "eq" (list_of (sym "k") (lit 0))))))
+
+; counted_loop_prog — build, over a parameter `k`, a 3-trip counted loop whose
+; body recomputes `inner_invariant` each iteration and accumulates k into acc
+; only when the invariant holds:
+;
+;   (lambda (k)
+;     (bind "i" (ref 0)
+;       (bind "acc" (ref 0)
+;         (do
+;           (while (lt (deref i) 3)
+;             (do
+;               (set_ref acc (int_add (deref acc) (if <inv> (sym "k") (lit 0))))
+;               (set_ref i (int_add (deref i) 1))))
+;           (deref acc)))))
+;
+; With k=5 the loop runs 3 times; <inv> = (not (eq k 0)) = true → adds 5 each
+; iteration → acc = 15.
+(bind counted_loop_prog
+  (lambda (inner_invariant)
+    (calln "lambda"
+      (list_of (lit (list_of "k"))
+        (calln "bind"
+          (list_of (lit "i") (calln "ref" (list_of (lit 0)))
+            (lit "acc") (calln "ref" (list_of (lit 0)))
+            (calln "do"
+              (list_of
+                (calln "while"
+                  (list_of
+                    (calln "lt" (list_of (calln "deref" (list_of (sym "i"))) (lit 3)))
+                    (calln "do"
+                      (list_of
+                        (calln "set_ref"
+                          (list_of (sym "acc")
+                            (calln "int_add"
+                              (list_of (calln "deref" (list_of (sym "acc")))
+                                (calln "if"
+                                  (list_of inner_invariant (sym "k") (lit 0)))))))
+                        (calln "set_ref"
+                          (list_of (sym "i")
+                            (calln "int_add"
+                              (list_of (calln "deref" (list_of (sym "i"))) (lit 1)))))))))
+                (calln "deref" (list_of (sym "acc")))))))))))
+
+; contains_node? — does `tree` structurally contain `target` anywhere?
+(bind contains_node?
+  (lambda (tree target)
+    (bind ((hit (ref false)))
+      (do (walk tree (lambda (n) (when (node_eq n target) (set_ref hit true))))
+          (deref hit)))))
+
+; find_while — the first `(while …)` node anywhere in `tree`, or null.
+(bind find_while
+  (lambda (tree)
+    (bind ((found (ref null)))
+      (do (walk tree
+            (lambda (n)
+              (when (and (eq (deref found) null) (head_is? n "while"))
+                (set_ref found n))))
+          (deref found)))))
+
+; hoisted_out? — the transform must wrap the while in `(bind name <invariant>
+; (… while …))`: the invariant appears OUTSIDE the while (in the hoisted bind)
+; and NO LONGER occurs INSIDE the while (each occurrence replaced by the name).
+(bind hoisted_out?
+  (lambda (transformed invariant)
+    (bind ((w (find_while transformed)))
+      (and (not (eq w null))
+           (and (contains_node? transformed invariant)        ; still in the bind
+                (not (contains_node? w invariant)))))))        ; gone from the loop
+
+(do
+  ; ── 1. BEHAVIOR PRESERVATION on a real terminating loop ──
+  (bind ((prog (counted_loop_prog invariant_expr))
+         (transformed (licm_node prog))
+         (fn_before (eval_ir prog))
+         (fn_after (eval_ir transformed)))
+    (do
+      (assert_eq (apply fn_before (list_of 5)) 15
+        "baseline: 3-trip loop adding k when (not (eq k 0)), k=5 → 15")
+      (assert_eq (apply fn_after (list_of 5)) (apply fn_before (list_of 5))
+        "LICM preserves behavior: after == before (k=5)")
+      (assert_eq (apply fn_after (list_of 5)) 15
+        "LICM preserves behavior: result is still 15 (k=5)")
+      ; a different k must also agree (guards against baking a wrong constant)
+      (assert_eq (apply fn_after (list_of 7)) (apply fn_before (list_of 7))
+        "LICM preserves behavior: after == before (k=7 → 21)")
+      (assert_eq (apply fn_after (list_of 7)) 21
+        "LICM preserves behavior: k=7 → 21")
+      ; zero case: with k=0 the invariant is false, adds nothing → 0 either way
+      (assert_eq (apply fn_after (list_of 0)) (apply fn_before (list_of 0))
+        "LICM preserves behavior: after == before (k=0 → 0)")
+      ; STRUCTURAL: the invariant (not (eq k 0)) is hoisted ABOVE the while.
+      (assert_true (hoisted_out? transformed invariant_expr)
+        "(not (eq k 0)) is hoisted before the while (gone from the loop body)")))
+
+  ; ── 2. NEGATIVE: an expression reading a loop-MUTATED ref is NOT hoisted ──
+  ; `i` is set_ref'd in the loop, so `(not (eq (deref i) 0))` is VARIANT.
+  (bind ((variant_expr
+           (calln "not"
+             (list_of (calln "eq"
+               (list_of (calln "deref" (list_of (sym "i"))) (lit 0))))))
+         (prog2 (counted_loop_prog variant_expr))
+         (transformed2 (licm_node prog2))
+         (w2 (find_while transformed2)))
+    (do
+      ; the variant expression must STILL be inside the loop (not hoisted)
+      (assert_true (contains_node? w2 variant_expr)
+        "(not (eq (deref i) 0)) stays inside — i is mutated, so variant")
+      ; behavior still preserved regardless
+      (assert_eq (apply (eval_ir transformed2) (list_of 5))
+                 (apply (eval_ir prog2) (list_of 5))
+        "behavior preserved with a variant body (deref of mutated i)")))
+
+  ; ── 3. NEGATIVE: a PARTIAL op (int_div by zero) is NOT hoisted ──
+  ; `(int_div k 0)` is invariant (k not mutated) but NOT total — hoisting it
+  ; before a possibly-zero-trip loop could move its throw. It must stay put.
+  ; We park it in a never-taken branch so the program is runnable.
+  (bind ((partial_expr (calln "int_div" (list_of (sym "k") (lit 0))))
+         (guarded_invariant
+           (calln "if"
+             (list_of (calln "lt" (list_of (lit 1) (lit 0)))   ; always false
+                      partial_expr
+                      (calln "not" (list_of (calln "eq" (list_of (sym "k") (lit -1))))))))
+         (prog3 (counted_loop_prog guarded_invariant))
+         (transformed3 (licm_node prog3))
+         (w3 (find_while transformed3)))
+    (do
+      (assert_true (contains_node? w3 partial_expr)
+        "(int_div k 0) is NOT hoisted — partial op, would move a possible throw")
+      (assert_eq (apply (eval_ir transformed3) (list_of 5))
+                 (apply (eval_ir prog3) (list_of 5))
+        "behavior preserved with a guarded partial op (k=5)")))
+
+  ; ── 3b. NEGATIVE: a PARTIAL arithmetic op (int_mul, can overflow) is NOT
+  ; hoisted, even though the kernel vocabulary calls it pure. ──
+  (bind ((mul_expr (calln "int_mul" (list_of (sym "k") (lit 2))))
+         (prog3b (counted_loop_prog mul_expr))
+         (w3b (find_while (licm_node prog3b))))
+    (assert_true (contains_node? w3b mul_expr)
+      "(int_mul k 2) is NOT hoisted — checked arithmetic can overflow (partial)"))
+
+  ; ── 4. a pure invariant in a NESTED LAMBDA is NOT hoisted out of the loop ──
+  ; The lambda body runs when CALLED, not per iteration; hoisting out would
+  ; change evaluation order.
+  (bind ((lam_body (calln "not" (list_of (calln "eq" (list_of (sym "k") (lit 9))))))
+         (nested
+           (calln "do"
+             (list_of
+               (calln "bind"
+                 (list_of (lit "_f")
+                   (calln "lambda" (list_of (lit (list_of)) lam_body))
+                   (lit 0))))))
+         (prog4 (counted_loop_prog nested))
+         (w4 (find_while (licm_node prog4))))
+    (assert_true (contains_node? w4 lam_body)
+      "(not (eq k 9)) inside a nested lambda is NOT hoisted out of the loop"))
+
+  ; ── 5. CAPTURE / SHADOWING: an invariant reading a name that an inner (bind …)
+  ; RE-BINDS inside the loop is NOT hoisted (hoisting it above the loop would
+  ; re-resolve the name to the OUTER binding — a silent miscompile). ──
+  (bind ((shadowed (calln "not" (list_of (calln "eq" (list_of (sym "k") (lit 0))))))
+         ; body re-binds `k` to 0 in an inner scope around the invariant use
+         (shadow_body
+           (calln "do"
+             (list_of
+               (calln "bind"
+                 (list_of (lit "k") (lit 0)
+                   (calln "set_ref"
+                     (list_of (sym "acc")
+                       (calln "int_add"
+                         (list_of (calln "deref" (list_of (sym "acc")))
+                           (calln "if" (list_of shadowed (lit 1) (lit 0)))))))))
+               (calln "set_ref"
+                 (list_of (sym "i")
+                   (calln "int_add"
+                     (list_of (calln "deref" (list_of (sym "i"))) (lit 1))))))))
+         (prog5 (counted_loop_prog shadow_body))
+         (transformed5 (licm_node prog5))
+         (w5 (find_while transformed5)))
+    (do
+      ; the shadowed invariant must NOT be hoisted (k is rebound inside)
+      (assert_true (contains_node? w5 shadowed)
+        "(not (eq k 0)) is NOT hoisted past an inner (bind \"k\" 0 …) — capture guard")
+      ; and behavior is preserved: inner k=0 makes the invariant false → adds 0
+      (assert_eq (apply (eval_ir transformed5) (list_of 5))
+                 (apply (eval_ir prog5) (list_of 5))
+        "behavior preserved across a shadowing inner bind (k=5)"))))
+
+; ── 6. ADVERSARIAL REGRESSIONS: six binary-reproduced miscompiles ────────────
+; Each was a WRONG hoist out of a (while …) where licm's scope analysis was
+; incomplete on kernel binders. They split into two root causes:
+;   (A) `catch` is a binder — `(try X (catch e HANDLER))` binds `e` over the
+;       handler. licm only knew `lambda`/`bind`, so a candidate inside a catch
+;       handler reading `e` was judged scope-stable and hoisted ABOVE the loop,
+;       where `e` is unbound (crash) or re-resolves to an OUTER `e` (silent
+;       wrong value). Cases L1–L4.
+;   (B) the callee NODE was never traversed — every tree scan recursed via
+;       `args_of`, excluding the callee. A `(lambda (k) …)` in CALLEE position
+;       `((lambda (k) …) 7)` was never visited, so its param `k` never entered
+;       the inner-bound set; a candidate using the OUTER `k` was hoisted then
+;       wrongly substituted into the inner shadowed occurrence. Cases L5–L6.
+; Each asserts eval(after-licm) == eval(before-licm). THROW cases map any throw
+; to the sentinel "THREW" on BOTH sides; lambda cases eval_ir + apply to a
+; concrete arg.
+(do
+  (bind ((safe_eval
+           (lambda (node) (try (eval_ir node) (catch err "THREW"))))
+         (safe_apply1
+           (lambda (node a)
+             (try (apply (eval_ir node) (list_of a)) (catch err "THREW")))))
+    (do
+      ; ── L1: candidate (eq e 99) inside a catch handler; no outer e — hoisting
+      ; it above the loop reads an unbound name (crash). before=0, after WAS THROW.
+      (bind ((L1
+               (calln "bind" (list_of
+                 (lit "r") (calln "ref" (list_of (lit 0)))
+                 (lit "out") (calln "ref" (list_of (lit 0)))
+                 (calln "do" (list_of
+                   (calln "while" (list_of
+                     (calln "lt" (list_of (calln "deref" (list_of (sym "r"))) (lit 2)))
+                     (calln "do" (list_of
+                       (calln "try" (list_of
+                         (calln "int_div" (list_of (lit 1) (lit 0)))
+                         (calln "catch" (list_of (sym "e")
+                           (calln "set_ref" (list_of (sym "out")
+                             (calln "if" (list_of
+                               (calln "eq" (list_of (sym "e") (lit 99))) (lit 1) (lit 0)))))))))
+                       (calln "set_ref" (list_of (sym "r")
+                         (calln "int_add" (list_of (calln "deref" (list_of (sym "r"))) (lit 1)))))))))
+                   (calln "deref" (list_of (sym "out")))))))))
+        (do
+          (assert_eq (safe_eval L1) 0 "L1 baseline: catch handler never sets out, before=0")
+          (assert_eq (safe_eval (licm_node L1)) (safe_eval L1)
+            "L1: candidate in catch handler not hoisted above loop (was THROW)")))
+
+      ; ── L2 (SILENT): an OUTER e=99 shadowed by the catch-bound e. Inside the
+      ; loop (eq e 99) reads the error map → false → out=0. Hoisting it re-resolves
+      ; to the outer e=99 → true → out=1. before=0, after WAS 1 (no crash).
+      (bind ((L2
+               (calln "bind" (list_of
+                 (lit "e") (lit 99)
+                 (lit "r") (calln "ref" (list_of (lit 0)))
+                 (lit "out") (calln "ref" (list_of (lit 0)))
+                 (calln "do" (list_of
+                   (calln "while" (list_of
+                     (calln "lt" (list_of (calln "deref" (list_of (sym "r"))) (lit 1)))
+                     (calln "do" (list_of
+                       (calln "try" (list_of
+                         (calln "int_div" (list_of (lit 1) (lit 0)))
+                         (calln "catch" (list_of (sym "e")
+                           (calln "set_ref" (list_of (sym "out")
+                             (calln "if" (list_of
+                               (calln "eq" (list_of (sym "e") (lit 99))) (lit 1) (lit 0)))))))))
+                       (calln "set_ref" (list_of (sym "r")
+                         (calln "int_add" (list_of (calln "deref" (list_of (sym "r"))) (lit 1)))))))))
+                   (calln "deref" (list_of (sym "out")))))))))
+        (do
+          (assert_eq (safe_eval L2) 0 "L2 baseline: shadowed catch e, before=0")
+          (assert_eq (safe_eval (licm_node L2)) (safe_eval L2)
+            "L2: no capture across the catch binder (was silently 1)")))
+
+      ; ── L3 (zero-trip): cond (lt 0 0) false, loop never runs, handler never
+      ; evaluated → before=0. Hoisting (eq e 7) eagerly onto the never-taken path
+      ; reads unbound e. before=0, after WAS THROW.
+      (bind ((L3
+               (calln "bind" (list_of
+                 (lit "r") (calln "ref" (list_of (lit 0)))
+                 (lit "out") (calln "ref" (list_of (lit 0)))
+                 (calln "do" (list_of
+                   (calln "while" (list_of
+                     (calln "lt" (list_of (calln "deref" (list_of (sym "r"))) (lit 0)))
+                     (calln "do" (list_of
+                       (calln "try" (list_of
+                         (calln "int_div" (list_of (lit 1) (lit 0)))
+                         (calln "catch" (list_of (sym "e")
+                           (calln "set_ref" (list_of (sym "out")
+                             (calln "if" (list_of
+                               (calln "eq" (list_of (sym "e") (lit 7))) (lit 1) (lit 0)))))))))
+                       (calln "set_ref" (list_of (sym "r")
+                         (calln "int_add" (list_of (calln "deref" (list_of (sym "r"))) (lit 1)))))))))
+                   (calln "deref" (list_of (sym "out")))))))))
+        (do
+          (assert_eq (safe_eval L3) 0 "L3 baseline: zero-trip loop, before=0")
+          (assert_eq (safe_eval (licm_node L3)) (safe_eval L3)
+            "L3: no eager hoist of catch candidate onto zero-trip path (was THROW)")))
+
+      ; ── L4: catch handler in the WHILE CONDITION. find_invariant scans cond as
+      ; well as body, so it hoisted (eq e 5) from the cond's handler → unbound e.
+      ; before=2 (cond throws→handler→(lt (deref r) 2)→2 iters), after WAS THROW.
+      (bind ((L4
+               (calln "bind" (list_of
+                 (lit "r") (calln "ref" (list_of (lit 0)))
+                 (lit "out") (calln "ref" (list_of (lit 0)))
+                 (calln "do" (list_of
+                   (calln "while" (list_of
+                     (calln "try" (list_of
+                       (calln "int_div" (list_of (lit 1) (lit 0)))
+                       (calln "catch" (list_of (sym "e")
+                         (calln "if" (list_of
+                           (calln "eq" (list_of (sym "e") (lit 5)))
+                           (calln "lt" (list_of (lit 0) (lit 1)))
+                           (calln "lt" (list_of (calln "deref" (list_of (sym "r"))) (lit 2)))))))))
+                     (calln "do" (list_of
+                       (calln "set_ref" (list_of (sym "out")
+                         (calln "int_add" (list_of (calln "deref" (list_of (sym "out"))) (lit 1)))))
+                       (calln "set_ref" (list_of (sym "r")
+                         (calln "int_add" (list_of (calln "deref" (list_of (sym "r"))) (lit 1)))))))))
+                   (calln "deref" (list_of (sym "out")))))))))
+        (do
+          (assert_eq (safe_eval L4) 2 "L4 baseline: catch in while-cond, before=2")
+          (assert_eq (safe_eval (licm_node L4)) (safe_eval L4)
+            "L4: no hoist of catch candidate from the while condition (was THROW)")))
+
+      ; ── L5: (not (eq k 7)) at the loop's top scope (outer k) AND inside a
+      ; CALLEE-position lambda `((lambda (k) …) 7)` (its own k=7). The callee was
+      ; never scanned, so the inner k never entered inner_bound; the candidate was
+      ; hoisted with the outer k and substituted into the inner shadowed use.
+      ; Applied to k=3: before=2, after WAS 202.
+      (bind ((L5
+               (calln "lambda" (list_of (lit (list_of "k"))
+                 (calln "bind" (list_of
+                   (lit "i") (calln "ref" (list_of (lit 0)))
+                   (lit "out") (calln "ref" (list_of (lit 0)))
+                   (calln "do" (list_of
+                     (calln "while" (list_of
+                       (calln "lt" (list_of (calln "deref" (list_of (sym "i"))) (lit 2)))
+                       (calln "do" (list_of
+                         (calln "set_ref" (list_of (sym "out")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "out")))
+                             (calln "if" (list_of
+                               (calln "not" (list_of (calln "eq" (list_of (sym "k") (lit 7)))))
+                               (lit 1) (lit 0)))))))
+                         (calln "set_ref" (list_of (sym "out")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "out")))
+                             (call
+                               (calln "lambda" (list_of (lit (list_of "k"))
+                                 (calln "if" (list_of
+                                   (calln "not" (list_of (calln "eq" (list_of (sym "k") (lit 7)))))
+                                   (lit 100) (lit 0)))))
+                               (list_of (lit 7)))))))
+                         (calln "set_ref" (list_of (sym "i")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "i"))) (lit 1)))))))))
+                     (calln "deref" (list_of (sym "out")))))))))))
+        (do
+          (assert_eq (safe_apply1 L5 3) 2 "L5 baseline: callee-lambda shadow, k=3, before=2")
+          (assert_eq (safe_apply1 (licm_node L5) 3) (safe_apply1 L5 3)
+            "L5: callee-position lambda param shadows k — not hoisted (was 202)")))
+
+      ; ── L6: same callee-blindness with (eq x 10). Top scope outer x=4 → false;
+      ; inner callee lambda applied to 10 → true → 1000. Hoisting (eq x 10)=false
+      ; rewrote the inner lambda body, dropping its 1000. Applied to x=4:
+      ; before=1000, after WAS 0.
+      (bind ((L6
+               (calln "lambda" (list_of (lit (list_of "x"))
+                 (calln "bind" (list_of
+                   (lit "i") (calln "ref" (list_of (lit 0)))
+                   (lit "out") (calln "ref" (list_of (lit 0)))
+                   (calln "do" (list_of
+                     (calln "while" (list_of
+                       (calln "lt" (list_of (calln "deref" (list_of (sym "i"))) (lit 1)))
+                       (calln "do" (list_of
+                         (calln "set_ref" (list_of (sym "out")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "out")))
+                             (calln "if" (list_of
+                               (calln "eq" (list_of (sym "x") (lit 10))) (lit 1) (lit 0)))))))
+                         (calln "set_ref" (list_of (sym "out")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "out")))
+                             (call
+                               (calln "lambda" (list_of (lit (list_of "x"))
+                                 (calln "if" (list_of
+                                   (calln "eq" (list_of (sym "x") (lit 10))) (lit 1000) (lit 0)))))
+                               (list_of (lit 10)))))))
+                         (calln "set_ref" (list_of (sym "i")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "i"))) (lit 1)))))))))
+                     (calln "deref" (list_of (sym "out")))))))))))
+        (do
+          (assert_eq (safe_apply1 L6 4) 1000 "L6 baseline: callee-lambda shadow, x=4, before=1000")
+          (assert_eq (safe_apply1 (licm_node L6) 4) (safe_apply1 L6 4)
+            "L6: callee-position lambda param shadows x — not hoisted (was 0)")))
+
+      ; ── L7: the `match` binder. `(match 5 (x …))` binds the name-pattern x to
+      ; the scrutinee 5 over the arm body, shadowing the outer x. The candidate
+      ; (eq x 99) is used at the loop's top scope (outer x=99 → true → +1) AND
+      ; inside the arm `(x (if (eq x 99) 1000 0))` (inner x=5 → false → +0). LICM
+      ; does not MODEL `match`, so it must BAIL the loop (hoist nothing) — without
+      ; the bail it would hoist (eq x 99)=true and substitute it into the arm,
+      ; yielding +1000. Applied to x=99: before=1, after WAS 1001.
+      (bind ((L7
+               (calln "lambda" (list_of (lit (list_of "x"))
+                 (calln "bind" (list_of
+                   (lit "i") (calln "ref" (list_of (lit 0)))
+                   (lit "out") (calln "ref" (list_of (lit 0)))
+                   (calln "do" (list_of
+                     (calln "while" (list_of
+                       (calln "lt" (list_of (calln "deref" (list_of (sym "i"))) (lit 1)))
+                       (calln "do" (list_of
+                         (calln "set_ref" (list_of (sym "out")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "out")))
+                             (calln "if" (list_of
+                               (calln "eq" (list_of (sym "x") (lit 99))) (lit 1) (lit 0)))))))
+                         (calln "set_ref" (list_of (sym "out")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "out")))
+                             (calln "match" (list_of (lit 5)
+                               (call (sym "x") (list_of
+                                 (calln "if" (list_of
+                                   (calln "eq" (list_of (sym "x") (lit 99))) (lit 1000) (lit 0)))))))))))
+                         (calln "set_ref" (list_of (sym "i")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "i"))) (lit 1)))))))))
+                     (calln "deref" (list_of (sym "out")))))))))))
+        (do
+          (assert_eq (safe_apply1 L7 99) 1 "L7 baseline: match-pattern shadows x, x=99, before=1")
+          (assert_eq (safe_apply1 (licm_node L7) 99) (safe_apply1 L7 99)
+            "L7: loop with a match binder bails — no capture across match (was 1001)"))))))
+
+; ── 7. PROVABLY-SOUND HARDENING: gensym-name capture (RULE B) + the binder
+; shapes the per-shape scope model missed (RULE A). Two prior rounds modeled
+; binder shapes precisely and still left binary-reproduced miscompiles:
+;   (B) INJECTED-NAME capture: licm named the hoisted binder via `(gensym "licm")`
+;       = a PREDICTABLE "licm__gN", never checking it was free in the loop. When
+;       the program already used that name, the injected `(bind licm__gN …)`
+;       CAPTURED it — shadowing the user's value inside the loop. RULE B re-gensyms
+;       until the name is absent from the whole while node. Cases G1 (silent) / G2
+;       (moved throw). Here the hoist STILL fires (no nested binder), with a fresh
+;       NON-colliding name, so after==before.
+;   (A) UNMODELED binder shapes: `bound_names_in` missed the kernel MULTI-binding
+;       `(bind ((k v) …) body)` (arg0 a CallNode of pairs) and a `(lambda (k) …)`
+;       whose PARAM LIST is a CallNode — so an inner `(bind ((k …)) …)` / callee
+;       `((lambda (k) …) …)` shadow was invisible and an outer-`k` candidate was
+;       hoisted+rewritten into the shadowed occurrence. RULE A removes the whole
+;       class: a loop containing ANY nested binder (lambda/bind/catch/match/macro)
+;       BAILS — no inner scope can shadow a hoisted name. Cases M1 / M2 (multi-
+;       bind), P1 (callnode-param lambda). Each asserts eval(after)==eval(before).
+(do
+  (bind ((safe_apply1
+           (lambda (node a)
+             (try (apply (eval_ir node) (list_of a)) (catch err "THREW"))))
+         ; kernel MULTI-binding constructors: ((nm v)) is a call whose callee is
+         ; the pair (nm v) and whose arg list is empty.
+         (mk_pairlist
+           (lambda (nm v) (call (call (sym nm) (list_of v)) (list_of)))))
+    (do
+      ; ── G1 (RULE B, SILENT): the program already binds the name licm__g1 (the
+      ; deterministic first `(gensym "licm")`) to `false`, read via (if licm__g1
+      ; 100 7) → 7. With (not (eq k 0))=true contributing 1, before = (1+7)*2 = 16.
+      ; The OLD code hoisted (not (eq k 0)) and named the binder licm__g1 — COLLIDING
+      ; — so the injected (bind licm__g1 true …) shadowed `false` and (if licm__g1
+      ; 100 7) → 100, giving 202. RULE B picks a fresh non-colliding name → 16.
+      (bind ((G1
+               (calln "lambda" (list_of (lit (list_of "k"))
+                 (calln "bind" (list_of
+                   (lit "licm__g1") (lit false)
+                   (lit "i") (calln "ref" (list_of (lit 0)))
+                   (lit "out") (calln "ref" (list_of (lit 0)))
+                   (calln "do" (list_of
+                     (calln "while" (list_of
+                       (calln "lt" (list_of (calln "deref" (list_of (sym "i"))) (lit 2)))
+                       (calln "do" (list_of
+                         (calln "set_ref" (list_of (sym "out")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "out")))
+                             (calln "if" (list_of
+                               (calln "not" (list_of (calln "eq" (list_of (sym "k") (lit 0)))))
+                               (lit 1) (lit 0)))))))
+                         (calln "set_ref" (list_of (sym "out")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "out")))
+                             (calln "if" (list_of (sym "licm__g1") (lit 100) (lit 7)))))))
+                         (calln "set_ref" (list_of (sym "i")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "i"))) (lit 1)))))))))
+                     (calln "deref" (list_of (sym "out")))))))))))
+        (do
+          (assert_eq (safe_apply1 G1 5) 16 "G1 baseline: user-bound licm__g1=false, before=16")
+          (assert_eq (safe_apply1 (licm_node G1) 5) (safe_apply1 G1 5)
+            "G1: hygienic hoist name avoids capturing user's licm__g1 (was 202)")))
+
+      ; ── G2 (RULE B, MOVED THROW): same collision but the user binds licm__g1 =
+      ; 1000 and accumulates (int_add (deref out) licm__g1) → +1000/iter, +1 from
+      ; the invariant; before = (1+1000)*2 = 2002. The OLD code shadowed 1000 with a
+      ; BOOLEAN (the hoisted (not (eq k 0))), so (int_add … licm__g1) added a bool
+      ; and THREW. RULE B's fresh name leaves the user's 1000 intact → 2002.
+      (bind ((G2
+               (calln "lambda" (list_of (lit (list_of "k"))
+                 (calln "bind" (list_of
+                   (lit "licm__g1") (lit 1000)
+                   (lit "i") (calln "ref" (list_of (lit 0)))
+                   (lit "out") (calln "ref" (list_of (lit 0)))
+                   (calln "do" (list_of
+                     (calln "while" (list_of
+                       (calln "lt" (list_of (calln "deref" (list_of (sym "i"))) (lit 2)))
+                       (calln "do" (list_of
+                         (calln "set_ref" (list_of (sym "out")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "out")))
+                             (calln "if" (list_of
+                               (calln "not" (list_of (calln "eq" (list_of (sym "k") (lit 0)))))
+                               (lit 1) (lit 0)))))))
+                         (calln "set_ref" (list_of (sym "out")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "out")))
+                             (sym "licm__g1")))))
+                         (calln "set_ref" (list_of (sym "i")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "i"))) (lit 1)))))))))
+                     (calln "deref" (list_of (sym "out")))))))))))
+        (do
+          (assert_eq (safe_apply1 G2 5) 2002 "G2 baseline: user-bound licm__g1=1000, before=2002")
+          (assert_eq (safe_apply1 (licm_node G2) 5) (safe_apply1 G2 5)
+            "G2: hygienic name avoids shadowing user's int with a bool (was THROW)")))
+
+      ; ── M1 (RULE A, multi-bind): outer candidate (not (eq k 0)) at the loop's
+      ; top scope (+1), AND inside a kernel MULTI-binding (bind ((k 0)) …) that
+      ; RE-BINDS k to 0 in the body. `bound_names_in` did not parse the `((k 0))`
+      ; CallNode-of-pairs shape, so the inner k was invisible: the outer candidate
+      ; was hoisted+substituted into the inner shadowed (not (eq k 0)) too, turning
+      ; its 7 into 100. before = (1+7)*2 = 16, OLD after WAS 202. RULE A bails on
+      ; the nested bind → unchanged → 16.
+      (bind ((M1
+               (calln "lambda" (list_of (lit (list_of "k"))
+                 (calln "bind" (list_of
+                   (lit "i") (calln "ref" (list_of (lit 0)))
+                   (lit "out") (calln "ref" (list_of (lit 0)))
+                   (calln "do" (list_of
+                     (calln "while" (list_of
+                       (calln "lt" (list_of (calln "deref" (list_of (sym "i"))) (lit 2)))
+                       (calln "do" (list_of
+                         (calln "set_ref" (list_of (sym "out")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "out")))
+                             (calln "if" (list_of
+                               (calln "not" (list_of (calln "eq" (list_of (sym "k") (lit 0)))))
+                               (lit 1) (lit 0)))))))
+                         (calln "set_ref" (list_of (sym "out")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "out")))
+                             (calln "bind" (list_of
+                               (mk_pairlist "k" (lit 0))
+                               (calln "if" (list_of
+                                 (calln "not" (list_of (calln "eq" (list_of (sym "k") (lit 0)))))
+                                 (lit 100) (lit 7)))))))))
+                         (calln "set_ref" (list_of (sym "i")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "i"))) (lit 1)))))))))
+                     (calln "deref" (list_of (sym "out")))))))))))
+        (do
+          (assert_eq (safe_apply1 M1 5) 16 "M1 baseline: multi-bind ((k 0)) shadow, before=16")
+          (assert_eq (safe_apply1 (licm_node M1) 5) (safe_apply1 M1 5)
+            "M1: nested multi-bind ((k 0)) makes the loop bail — no capture (was 202)")))
+
+      ; ── M2 (RULE A, multi-bind, k=30 input): a single-trip loop, outer x=30.
+      ; (not (eq x 0))=true → +30; inner (bind ((x 0)) (if (not (eq x 0)) x 30))
+      ; with inner x=0 → false → +30. before = 60. The OLD code hoisted (not (eq x
+      ; 0))=true into BOTH the outer use and the inner shadowed one, turning the
+      ; inner branch from 30 into x — but inner x=0 — collapsing it. RULE A bails.
+      (bind ((M2
+               (calln "lambda" (list_of (lit (list_of "x"))
+                 (calln "bind" (list_of
+                   (lit "i") (calln "ref" (list_of (lit 0)))
+                   (lit "out") (calln "ref" (list_of (lit 0)))
+                   (calln "do" (list_of
+                     (calln "while" (list_of
+                       (calln "lt" (list_of (calln "deref" (list_of (sym "i"))) (lit 1)))
+                       (calln "do" (list_of
+                         (calln "set_ref" (list_of (sym "out")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "out")))
+                             (calln "if" (list_of
+                               (calln "not" (list_of (calln "eq" (list_of (sym "x") (lit 0)))))
+                               (sym "x") (lit 0)))))))
+                         (calln "set_ref" (list_of (sym "out")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "out")))
+                             (calln "bind" (list_of
+                               (mk_pairlist "x" (lit 0))
+                               (calln "if" (list_of
+                                 (calln "not" (list_of (calln "eq" (list_of (sym "x") (lit 0)))))
+                                 (sym "x") (lit 30)))))))))
+                         (calln "set_ref" (list_of (sym "i")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "i"))) (lit 1)))))))))
+                     (calln "deref" (list_of (sym "out")))))))))))
+        (do
+          (assert_eq (safe_apply1 M2 30) 60 "M2 baseline: multi-bind ((x 0)) shadow, x=30, before=60")
+          (assert_eq (safe_apply1 (licm_node M2) 30) (safe_apply1 M2 30)
+            "M2: nested multi-bind shadow makes the loop bail — no capture (was 30)")))
+
+      ; ── P1 (RULE A, lambda with a CALLNODE param list): inner lambda's param list
+      ; is the CallNode (k), applied to 999 so inner k=999 shadows the outer k.
+      ; `bound_names_in` only read a LITERAL-tuple param list, so this inner k was
+      ; invisible; the outer candidate (not (eq k 0)) was hoisted+substituted into
+      ; the inner body too. With outer k=0 → outer-if +0, inner (k=999) → +100, x2
+      ; = 200; OLD after WAS 14 (hoisted false collapsed the inner 100 to 7). RULE A
+      ; bails on the nested lambda → 200.
+      (bind ((inner_lam
+               (calln "lambda" (list_of (call (sym "k") (list_of))  ; param list is a CallNode (k)
+                 (calln "if" (list_of
+                   (calln "not" (list_of (calln "eq" (list_of (sym "k") (lit 0)))))
+                   (lit 100) (lit 7))))))
+             (P1
+               (calln "lambda" (list_of (lit (list_of "k"))
+                 (calln "bind" (list_of
+                   (lit "i") (calln "ref" (list_of (lit 0)))
+                   (lit "out") (calln "ref" (list_of (lit 0)))
+                   (calln "do" (list_of
+                     (calln "while" (list_of
+                       (calln "lt" (list_of (calln "deref" (list_of (sym "i"))) (lit 2)))
+                       (calln "do" (list_of
+                         (calln "set_ref" (list_of (sym "out")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "out")))
+                             (calln "if" (list_of
+                               (calln "not" (list_of (calln "eq" (list_of (sym "k") (lit 0)))))
+                               (lit 1) (lit 0)))))))
+                         (calln "set_ref" (list_of (sym "out")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "out")))
+                             (call inner_lam (list_of (lit 999)))))))
+                         (calln "set_ref" (list_of (sym "i")
+                           (calln "int_add" (list_of (calln "deref" (list_of (sym "i"))) (lit 1)))))))))
+                     (calln "deref" (list_of (sym "out")))))))))))
+        (do
+          (assert_eq (safe_apply1 P1 0) 200 "P1 baseline: callnode-param lambda shadow, k=0, before=200")
+          (assert_eq (safe_apply1 (licm_node P1) 0) (safe_apply1 P1 0)
+            "P1: callee lambda with a CallNode param list makes the loop bail (was 14)"))))))

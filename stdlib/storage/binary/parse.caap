@@ -1,0 +1,137 @@
+; stdlib/storage/binary/parse.caap — spec node -> spec data
+; (module stdlib.storage.binary.parse).
+;
+; Walks a `(storage Name …)` AST node into the plain map/list spec data the rest
+; of the pipeline (validate + both codegen backends) reads: a {name, endian,
+; block_size, crc, records, migrations} map whose records carry {name, version,
+; fields:[{name, type, default, where, crc, loc}], loc} and whose field types are
+; {kind, size, …}. The on-disk int widths and int/uint predicates come from the
+; byte runtime so the scalar table is single-sourced. The endian policy (the
+; recognized spellings + the big-endian predicate both backends read) lives here
+; too, so the LE/BE choice is defined in ONE place.
+(module stdlib.storage.binary.parse)
+
+(use stdlib.syntax.ast
+  name? name_of literal_of head_of head_is? args_of arg loc)
+(use stdlib.lib.collections.sequence each drop)
+(use stdlib.storage.binary.runtime int_sizes int_type? sint_type?)
+
+; type node -> {kind, size, …}. Supported field types:
+;   - unsigned ints  u8 u16 u32 u64   -> {kind:"int",  signed:false, size}
+;   - signed ints    i8 i16 i32 i64   -> {kind:"int",  signed:true,  size}
+;       (two's-complement; eval decode sign-extends via read_le_signed, native
+;        lowers to the same width and the LLVM kit picks ashr/sext by the type)
+;   - bool                            -> {kind:"bool", size:1}  (one byte, 0/1)
+;   - float / f64 / f32               -> {kind:"float", size:8/4}  (IEEE-754)
+;   - fixed bytes    (bytes N)        -> {kind:"bytes", size:N}
+;   - tagged union   (enum uN …)      -> {kind:"enum",  base, size}  (base UNSIGNED)
+; Anything else -> {kind:"unsupported"} and validation reports it (located).
+; `float`/`f64` (8-byte) and `f32` (4-byte) round-trip on the integer-only eval
+; byte runtime via float_to_bits/bits_to_float (the kernel's exact inverse
+; bit-casts), so the eval = native parity invariant holds.
+(bind parse_type
+  (lambda (t)
+    (cond
+      ((name? t)
+        (cond
+          ((int_type? (name_of t))
+            (assoc (map_of) "kind" "int" "size" (get int_sizes (name_of t) 0)
+              "signed" (sint_type? (name_of t)) "spelling" (name_of t)))
+          ((eq (name_of t) "bool")
+            (assoc (map_of) "kind" "bool" "size" 1 "spelling" "bool"))
+          ; float / f64 -> 8-byte IEEE-754; f32 -> 4-byte. Round-trips on the
+          ; eval byte runtime via float_to_bits/bits_to_float (size picks the width).
+          ((or (eq (name_of t) "float") (eq (name_of t) "f64"))
+            (assoc (map_of) "kind" "float" "size" 8 "spelling" (name_of t)))
+          ((eq (name_of t) "f32")
+            (assoc (map_of) "kind" "float" "size" 4 "spelling" "f32"))
+          (else (assoc (map_of) "kind" "unsupported" "spelling" (name_of t)))))
+      ; (bytes N) — N must be a positive int literal; an absent/non-int/non-positive
+      ; N is kept verbatim in "size" (the spelling stays crash-safe) and validate
+      ; reports it as a located finding rather than crashing here on int_to_string.
+      ((head_is? t "bytes")
+        (bind ((n (literal_of (arg t 0))))
+          (assoc (map_of) "kind" "bytes" "size" n
+            "spelling" (string_concat_many "bytes["
+              (if (eq (value_type n) "int") (int_to_string n) "?") "]"))))
+      ((head_is? t "enum")
+        (bind ((base (name_of (arg t 0))) (variants (list_of)))
+          (do
+            (each (drop (args_of t) 1)
+              (lambda (vc)
+                (append variants
+                  (assoc (map_of) "name" (head_of vc)
+                    "value" (literal_of (arg vc 0))))))
+            (assoc (map_of) "kind" "enum" "base" base
+              "size" (get int_sizes base 0) "variants" variants
+              "spelling" (string_concat_many "enum " base)))))
+      (else (assoc (map_of) "kind" "unsupported" "spelling" "<expr>")))))
+
+(bind parse_field
+  (lambda (fc)
+    (bind ((default (ref null)) (wherec (ref null)) (is_crc (ref false)))
+      (do
+        (each (drop (args_of fc) 2)
+          (lambda (o)
+            (cond
+              ((head_is? o "default") (set_ref default (arg o 0)))
+              ((head_is? o "where") (set_ref wherec (arg o 0)))
+              ((head_is? o "crc_of") (set_ref is_crc true))
+              (else null))))
+        (assoc (map_of) "name" (name_of (arg fc 0)) "type" (parse_type (arg fc 1))
+          "default" (deref default) "where" (deref wherec) "crc" (deref is_crc)
+          "loc" (loc fc))))))
+
+(bind parse_record
+  (lambda (c)
+    (bind ((fields (list_of)))
+      (do
+        (each (drop (args_of c) 2) (lambda (fc) (append fields (parse_field fc))))
+        (assoc (map_of) "name" (name_of (arg c 0)) "version" (literal_of (arg c 1))
+          "fields" fields "loc" (loc c))))))
+
+; a migration mapping is `(fieldname expr)` — head is the target field, arg the
+; value (`(old X)` reads the old record, a literal is a constant).
+(bind parse_migrate
+  (lambda (c)
+    (bind ((sets (list_of)))
+      (do
+        (each (drop (args_of c) 3)
+          (lambda (s)
+            (append sets (assoc (map_of) "field" (head_of s)
+              "expr" (arg s 0)))))
+        (assoc (map_of) "record" (name_of (arg c 0)) "from" (literal_of (arg c 1))
+          "to" (literal_of (arg c 2)) "sets" sets "loc" (loc c))))))
+
+(bind parse_storage
+  (lambda (node)
+    (bind (
+      (endian (ref "little")) (block_size (ref 0)) (crc_kind (ref null))
+      (records (list_of)) (migrations (list_of))
+    )
+      (do
+        (each (drop (args_of node) 1)
+          (lambda (c)
+            (cond
+              ((head_is? c "endian") (set_ref endian (name_of (arg c 0))))
+              ((head_is? c "block_size") (set_ref block_size (literal_of (arg c 0))))
+              ((head_is? c "crc") (set_ref crc_kind (name_of (arg c 0))))
+              ((head_is? c "record") (append records (parse_record c)))
+              ((head_is? c "migrate") (append migrations (parse_migrate c)))
+              (else null))))
+        (assoc (map_of) "name" (name_of (arg node 0)) "endian" (deref endian)
+          "block_size" (deref block_size) "crc" (deref crc_kind)
+          "records" records "migrations" migrations)))))
+
+; endian policy — the recognized spellings and the single big-endian predicate
+; both backends read (so the LE/BE choice is defined in ONE place, not duplicated
+; in generate + render_native). `little`/`le` -> LE, `big`/`be` -> BE. An ABSENT
+; endian (null — parse_storage always supplies "little", but a hand-built spec
+; passed to the exported `validate` may omit it) is the LE default, so accepted.
+(bind endian_known?
+  (lambda (e) (or (eq e null) (eq e "little") (eq e "le") (eq e "big") (eq e "be"))))
+(bind endian_be?
+  (lambda (spec) (or (eq (get spec "endian") "big") (eq (get spec "endian") "be"))))
+
+(export parse_storage parse_type parse_field parse_record parse_migrate
+        endian_known? endian_be?)

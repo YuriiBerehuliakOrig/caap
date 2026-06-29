@@ -1,0 +1,101 @@
+; stdlib/sys/grant_for.caap — SCOPED takes over the umbrella sys grant.
+;
+; THE PROBLEM THIS NARROWS. boot/sys_grants.caap mints ONE umbrella `sys`
+; capability and, inside that granted frame, projects every op of every sys
+; library into the compiler registry as
+;   stdlib.sys.grant.<lib> = { capability: <umbrella handle>, raw: { op -> fn } }
+; That is the trusted-session model: the embedder decides whether sys_grants
+; runs at all, but ONCE it has, anyone who can read the registry can take ANY
+; library's whole grant (capability handle included). For a CLI/dev session that
+; is fine. For a restricted embedding that wants to hand one component only the
+; ops it needs, the umbrella is too coarse.
+;
+; This module is PURELY ADDITIVE: it does not mint, alter, or re-register any
+; grant — sys_grants.caap and wrap.caap are untouched. It only offers NARROWER
+; READS of what sys_grants already published, so a caller takes the minimum it
+; needs instead of the umbrella:
+;   - grant_for_operation lib op  -> the ONE callable for that op, or null.
+;       A taker that needs a single op (e.g. `fs.read_text`) holds exactly that
+;       callable and never sees the capability handle or its sibling ops — the
+;       handle is partially applied away (same as a facade wrapper in wrap.caap),
+;       so the taker calls `(op args…)`, not `(op <handle> args…)`.
+;   - grant_for_module module_name lib -> a SINGLE-library grant view
+;       { capability, raw, for_module } — a fresh, independent copy of one
+;       library's grant, tagged with the module it is intended for. It is still
+;       one library (not all eight), and the fresh `raw` map decouples the taker
+;       from the live registry value (assoc on it cannot mutate the registry).
+;
+; Neither call can manufacture authority: with no grant registered (sys_grants
+; never ran), grant_for_operation returns null and grant_for_module returns null
+; — there is no ambient capability to fabricate, exactly as for an untrusted
+; module. grant_for_operation hands back ONLY the handle-applied op callable, not
+; the handle itself, so a single-op taker holds one op and cannot re-project new
+; ones; grant_for_module DOES carry the handle (it is a library-scoped grant a
+; facade can build from), so it is the wider of the two takes.
+;
+; (Infrastructure module, like wrap/verify: it reads the registry via `compiler`
+;  and depends on no other sys module — so it cannot widen any facade.)
+(module stdlib.sys.grant_for)
+
+; grant_of — fetch one library's registered umbrella grant, or null.
+;   lib : the library name ("io", "fs", "os", …) — the grant key suffix
+;   ->  : the registered { capability, raw } map, or null if sys_grants never
+;         ran for `lib` (no ambient authority exists to invent one)
+(bind grant_of
+  (lambda (lib)
+    (ctfe_compiler_lookup_value compiler
+      (string_concat_many "stdlib.sys.grant." lib) null)))
+
+; grant_for_operation — the NARROWEST take: ONE op as a ready-to-call callable.
+;   lib : the library name ("fs", …)
+;   op  : the op name ("read_text", …)
+;   ->  : a callable for that op with the capability handle ALREADY partially
+;         applied — call it `(op args…)`, never `(op <handle> args…)` (same
+;         shape as a facade wrapper from wrap.caap). null if the library is
+;         ungranted OR the op is absent from its raw table. Returning null on an
+;         unknown/ungranted op is the documented shape — no silent fabrication,
+;         and the handle is never handed back, so a single-op taker holds exactly
+;         one op and cannot re-project new ones.
+(bind grant_for_operation
+  (lambda (lib op)
+    (bind ((grant (grant_of lib)))
+      (if (eq grant null)
+        null
+        (bind (
+          (raw (get (get grant "raw" (map_of)) op null))
+        )
+          (if (eq raw null)
+            null
+            ; partially apply the handle, exactly as make_fn does — the taker
+            ; calls the op without ever seeing the capability handle
+            (bind ((capability (get grant "capability")))
+              (lambda args (apply raw capability args)))))))))
+
+; grant_for_module — a SINGLE-library grant view, scoped (by intent) to one
+; module. Narrower than the umbrella in two ways: it is ONE library, not all
+; eight, and its `raw` is a FRESH copy, so the taker's map is decoupled from the
+; live registry value (mutating it cannot reach back into the registry).
+;   module_name : the module this view is minted for (recorded as "for_module",
+;                 so a taker/audit can see who the scoped grant was handed to)
+;   lib         : the single library the view exposes ("fs", "net", …)
+;   ->  : { capability, raw, for_module } — a fresh view of just `lib`'s grant,
+;         or null if `lib` is ungranted (no ambient authority to invent one)
+(bind grant_for_module
+  (lambda (module_name lib)
+    (bind ((grant (grant_of lib)))
+      (if (eq grant null)
+        null
+        (bind (
+          (src (get grant "raw" (map_of)))
+          ; a FRESH raw map so the view is decoupled from the registry value
+          (raw (map_of))
+        )
+          (do
+            (for name (map_keys src)
+              (assoc raw name (get src name)))
+            (assoc (map_of)
+              "capability" (get grant "capability")
+              "raw" raw
+              "for_module" module_name)))))))
+
+(export grant_of grant_for_operation grant_for_module)

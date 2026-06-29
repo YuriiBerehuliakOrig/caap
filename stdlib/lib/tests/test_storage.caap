@@ -1,0 +1,372 @@
+; stdlib/lib/tests/test_storage.caap — in-language tests for storage/binary.
+;
+; Two halves:
+;   1. POSITIVE — the field types the `(storage …)` form lowers on the EVAL
+;      backend, each via an encode→decode round-trip through the generated,
+;      specialized functions: unsigned ints, the NEWLY supported signed ints
+;      (i8…i64, two's-complement — decode must sign-extend) and bool (one byte),
+;      plus the existing bytes[N]/enum.
+;   2. NEGATIVE — the exported `validate` rejects a genuinely unsupported field
+;      type (float is the documented eval-backend boundary) and a signed enum
+;      base, while ACCEPTING a clean spec built from the new types.
+;
+; The native backend is pinned separately in caap/tests/tinylogfs_tests.rs (it
+; needs LLVM); both backends lower the same spec, so a green eval round-trip here
+; plus the native LLVM emit there is the eval=native parity gate for these types.
+
+;; @area: storage
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.storage.binary
+  le_bytes read_le read_le_signed validate
+  be_bytes read_be read_be_signed
+  crc32 emit! pad_bytes slice_bytes)
+(use stdlib.lib.text.string contains?)
+(use stdlib.lib.collections.sequence any?)
+
+; ── the spec under test: one record covering every scalar field kind ─────────
+; (no crc/where — the demo already pins those; this file is type coverage).
+(bind store
+  (storage Scalars
+    (endian little)
+    (record Mix 1
+      (field u_8   u8)
+      (field u_16  u16)
+      (field u_32  u32)
+      (field u_64  u64)
+      (field i_8   i8)
+      (field i_16  i16)
+      (field i_32  i32)
+      (field i_64  i64)
+      (field flag  bool)
+      (field tag   (enum u8 (a 1) (b 2)))
+      (field label (bytes 4)))))
+
+(bind enc (get store "encode_Mix_v1"))
+(bind dec (get store "decode_Mix_v1"))
+(bind round_trip (lambda (rec) (dec (enc rec))))  ; encode then decode back
+
+; some_finding? — does any validate finding mention `needle`?
+(bind some_finding? (lambda (findings needle)
+  (any? findings (lambda (msg) (contains? msg needle)))))
+
+; ── 1. byte runtime: signed two's-complement via read_le_signed ──────────────
+(do
+  (assert_eq (read_le_signed (le_bytes -1 1) 0 1) -1     "read_le_signed i8 -1")
+  (assert_eq (read_le_signed (le_bytes -128 1) 0 1) -128 "read_le_signed i8 min")
+  (assert_eq (read_le_signed (le_bytes 127 1) 0 1) 127   "read_le_signed i8 max")
+  (assert_eq (read_le_signed (le_bytes -1 2) 0 2) -1     "read_le_signed i16 -1")
+  (assert_eq (read_le_signed (le_bytes -32768 2) 0 2) -32768 "read_le_signed i16 min")
+  (assert_eq (read_le_signed (le_bytes 200 1) 0 1) -56   "read_le_signed reads 0xC8 as -56")
+  ; read_le itself stays unsigned: the same 0xFF byte is 255, not -1
+  (assert_eq (read_le (le_bytes 255 1) 0 1) 255          "read_le u8 255 unsigned")
+  true)
+
+; ── 2. generated encode/decode: each field kind round-trips ──────────────────
+(do
+  (assert_eq (get store "MIX_V1_SIZE" 0)
+    ; 1+2+4+8 (u) + 1+2+4+8 (i) + 1 (bool) + 1 (enum u8) + 4 (bytes) = 36
+    36 "MIX_V1_SIZE constant")
+  (assert_eq (size (enc (assoc (map_of)
+        "u_8" 0 "u_16" 0 "u_32" 0 "u_64" 0 "i_8" 0 "i_16" 0 "i_32" 0 "i_64" 0
+        "flag" false "tag" 1 "label" (list_of 0 0 0 0))))
+    36 "encoded Mix v1 size matches the constant")
+
+  (bind back (round_trip (assoc (map_of)
+        "u_8" 200 "u_16" 60000 "u_32" 4000000000 "u_64" 42
+        "i_8" -5 "i_16" -1000 "i_32" -123456 "i_64" -9000000000
+        "flag" true "tag" 2 "label" (list_of 99 97 97 112)))
+  (do
+    ; unsigned fields
+    (assert_eq (get back "u_8" 0) 200          "u8 round-trip")
+    (assert_eq (get back "u_16" 0) 60000       "u16 round-trip")
+    (assert_eq (get back "u_32" 0) 4000000000  "u32 round-trip")
+    (assert_eq (get back "u_64" 0) 42          "u64 round-trip")
+    ; signed fields (the new support: negatives must sign-extend on decode)
+    (assert_eq (get back "i_8" 0) -5           "i8 round-trip negative")
+    (assert_eq (get back "i_16" 0) -1000       "i16 round-trip negative")
+    (assert_eq (get back "i_32" 0) -123456     "i32 round-trip negative")
+    (assert_eq (get back "i_64" 0) -9000000000 "i64 round-trip negative")
+    ; bool decodes back to a boolean, not the raw byte
+    (assert_eq (get back "flag" false) true    "bool round-trip true")
+    (assert_true (eq (value_type (get back "flag" false)) "bool") "bool decodes to a bool")
+    ; enum + fixed bytes still work alongside the new scalars (compare the bytes
+    ; element-wise: `eq` on two distinct lists is identity, `assert_eq` wraps it)
+    (assert_eq (get back "tag" 0) 2            "enum round-trip")
+    (assert_eq (size (get back "label" (list_of))) 4 "bytes[4] round-trip length")
+    (assert_eq (get (get back "label" (list_of)) 0 0) 99  "bytes[4] byte 0")
+    (assert_eq (get (get back "label" (list_of)) 3 0) 112 "bytes[4] byte 3")
+
+    ; positive signed + zero + false must round-trip too (no spurious negation)
+    (bind pos (round_trip (assoc (map_of)
+          "u_8" 0 "u_16" 0 "u_32" 0 "u_64" 0
+          "i_8" 5 "i_16" 1000 "i_32" 123456 "i_64" 9000000000
+          "flag" false "tag" 1 "label" (list_of 0 0 0 0)))
+    (do
+      (assert_eq (get pos "i_8" 0) 5             "i8 round-trip positive")
+      (assert_eq (get pos "i_16" 0) 1000         "i16 round-trip positive")
+      (assert_eq (get pos "i_64" 0) 9000000000   "i64 round-trip positive")
+      (assert_eq (get pos "flag" true) false     "bool round-trip false")
+      ; docs table names the new scalar types
+      (assert_true (contains? (get store "docs" "") "i_64 : i64") "docs lists a signed field")
+      (assert_true (contains? (get store "docs" "") "flag : bool") "docs lists the bool field")
+      true)))))
+
+; ── 2b. float fields round-trip on the eval byte runtime via the kernel's
+; float_to_bits/bits_to_float inverse bit-casts. `float`/`f64` are 8-byte
+; IEEE-754, `f32` 4-byte. The native backend lowers float fields too (the same
+; bit-casts ride an LLVM `bitcast`); caap/tests/tinylogfs_tests.rs pins the
+; native leg + byte-level eval=native parity. ───────────────────────────────
+(bind fstore
+  (storage Floats
+    (endian little)
+    (record F 1
+      (field d float)
+      (field s f32))))
+(bind fenc (get fstore "encode_F_v1"))
+(bind fdec (get fstore "decode_F_v1"))
+(do
+  (assert_eq (get fstore "F_V1_SIZE" 0) 12 "float record size = 8 (f64) + 4 (f32)")
+  (bind back (fdec (fenc (assoc (map_of) "d" 3.14159 "s" 2.5)))
+    (do
+      (assert_eq (get back "d" 0.0) 3.14159 "f64 field round-trips exactly")
+      (assert_eq (get back "s" 0.0) 2.5     "f32 field round-trips (2.5 exact in f32)")
+      ; the sign bit must survive the round-trip (float_to_bits is negative here)
+      (bind neg (fdec (fenc (assoc (map_of) "d" -0.5 "s" -1.0)))
+        (do
+          (assert_eq (get neg "d" 0.0) -0.5 "negative f64 round-trips")
+          (assert_eq (get neg "s" 0.0) -1.0 "negative f32 round-trips")
+          true)))))
+
+; ── 2c. native-skip report: a record the native backend can't lower (here `Mix`,
+; whose `(bytes 4)` field has no native struct-field type) is REPORTED, not
+; silently dropped from the native output. The eval round-trip above is unchanged
+; — this only ADDS a report line. The all-native `Floats` record gets no such
+; line, so the report fires only for genuinely non-native records. ───────────
+(do
+  (bind rep (get store "report" (list_of))
+  (do
+    ; the Mix record's report mentions the native skip and names the bytes[4] field
+    (assert_true (some_finding? rep "native: record Mix skipped")
+      "report flags Mix as skipped by the native backend")
+    (assert_true (some_finding? rep "label : bytes[4]")
+      "native-skip line names the offending field and its spelling")
+    ; the eval encode/decode for Mix is still generated (the silent-drop is only
+    ; on the native path); the round-trips in block 2 above already exercised it
+    (assert_true (some_finding? rep "generated Mix v1 encode/decode")
+      "eval generate still emits Mix encode/decode (report, not removal)")
+    true))
+  ; the all-native Floats record produces NO native-skip line (no false positive)
+  (bind frep (get fstore "report" (list_of))
+  (do
+    (assert_true (not (some_finding? frep "native: record"))
+      "an all-native record gets no native-skip line")
+    true)))
+
+; ── 3. negatives: validate rejects what is genuinely unsupported ─────────────
+; validate reads a parsed spec map (loc node is null here -> "" location). A
+; field type the form can't lower is marked {kind:"unsupported"}; an enum needs
+; an UNSIGNED base. A clean spec built from the new scalar types passes.
+(bind mk_type  (lambda (kind extra) (assoc extra "kind" kind)))
+(bind mk_field (lambda (nm ty) (assoc (map_of) "name" nm "type" ty "crc" false "where" null)))
+(bind mk_spec  (lambda (fields) (assoc (map_of) "records"
+  (list_of (assoc (map_of) "name" "R" "version" 1 "fields" fields))
+  "migrations" (list_of))))
+
+(do
+  ; f128 is wider than the byte runtime handles -> unsupported, located
+  ; (float/f64/f32 are supported on both backends — eval + native; see 2b above)
+  (bind bad_float (validate (mk_spec (list_of
+        (mk_field "x" (mk_type "unsupported" (assoc (map_of) "spelling" "f128"))))) null)
+  (do
+    (assert_true (gt (size bad_float) 0) "unsupported wide-float field is rejected")
+    (assert_true (some_finding? bad_float "unsupported field type for `x`: f128")
+      "unsupported finding names the field and spelling")
+
+    ; a signed enum base is rejected (variant values are bit patterns -> uN only)
+    (bind bad_enum (validate (mk_spec (list_of
+          (mk_field "e" (assoc (map_of) "kind" "enum" "base" "i8" "size" 1
+            "variants" (list_of (assoc (map_of) "name" "z" "value" 1)))))) null)
+    (do
+      (assert_true (some_finding? bad_enum "must have an unsigned int base")
+        "signed enum base is rejected")
+
+      ; the new scalar types validate cleanly (no findings)
+      (bind ok_spec (validate (mk_spec (list_of
+            (mk_field "a" (mk_type "int" (assoc (map_of) "size" 4 "signed" true "spelling" "i32")))
+            (mk_field "b" (mk_type "bool" (assoc (map_of) "size" 1 "spelling" "bool"))))) null)
+      (do
+        (assert_eq (size ok_spec) 0 "a clean signed+bool record has no findings")
+        true)))))))
+
+; ── 3b. negatives: enum lower bound + (bytes N) length ───────────────────────
+; An unsigned-base enum's variant values are bit patterns, so a NEGATIVE variant
+; value is rejected (>= 0 required). A (bytes N) slice width must be a positive
+; int literal, so (bytes 0) / (bytes -1) (size <= 0) and an absent/non-int size
+; are rejected. A clean (bytes N>0) field still validates with zero findings.
+(do
+  ; an unsigned-base enum with a NEGATIVE variant value -> rejected (>= 0)
+  (bind neg_enum (validate (mk_spec (list_of
+        (mk_field "e" (assoc (map_of) "kind" "enum" "base" "u8" "size" 1
+          "variants" (list_of (assoc (map_of) "name" "z" "value" -1)))))) null)
+  (do
+    (assert_true (some_finding? neg_enum "must be >= 0")
+      "negative enum variant value is rejected")
+
+    ; a non-int variant value (a non-literal arg parses to a null value) is
+    ; reported, not crashed on by the polymorphic lt/ge range checks
+    (bind nonint_enum (validate (mk_spec (list_of
+          (mk_field "e" (assoc (map_of) "kind" "enum" "base" "u8" "size" 1
+            "variants" (list_of (assoc (map_of) "name" "z" "value" null)))))) null)
+    (do
+      (assert_true (some_finding? nonint_enum "must be an int literal")
+        "a non-int enum variant value is rejected (no crash)")
+
+    ; (bytes 0) -> rejected (a zero-width slice is meaningless)
+    (bind bytes0 (validate (mk_spec (list_of
+          (mk_field "b" (mk_type "bytes" (assoc (map_of) "size" 0 "spelling" "bytes[0]"))))) null)
+    (do
+      (assert_true (some_finding? bytes0 "bytes length must be a positive integer")
+        "(bytes 0) is rejected")
+
+      ; (bytes -1) -> rejected (a negative slice width is meaningless)
+      (bind bytesneg (validate (mk_spec (list_of
+            (mk_field "b" (mk_type "bytes" (assoc (map_of) "size" -1 "spelling" "bytes[-1]"))))) null)
+      (do
+        (assert_true (some_finding? bytesneg "bytes length must be a positive integer")
+          "(bytes -1) is rejected")
+
+        ; an absent (non-int) size is rejected too
+        (bind bytesnull (validate (mk_spec (list_of
+              (mk_field "b" (mk_type "bytes" (assoc (map_of) "size" null "spelling" "bytes[?]"))))) null)
+        (do
+          (assert_true (some_finding? bytesnull "bytes length must be a positive integer")
+            "(bytes) with a non-int size is rejected")
+
+          ; a clean (bytes 4) field still validates with no findings
+          (bind ok_bytes (validate (mk_spec (list_of
+                (mk_field "b" (mk_type "bytes" (assoc (map_of) "size" 4 "spelling" "bytes[4]"))))) null)
+          (do
+            (assert_eq (size ok_bytes) 0 "a clean (bytes 4) field has no findings")
+            true)))))))))))))
+
+; ── 4. byte runtime: big-endian twins (be_bytes / read_be / read_be_signed) ───
+; Same on-disk VALUES as the LE helpers, reversed byte ORDER (MSB first). Signed
+; reads sign-extend exactly like read_le_signed.
+(do
+  ; 0x0102 as 2 BE bytes is [0x01, 0x02] (MSB first) — the reverse of LE's [02,01]
+  (assert_eq (get (be_bytes 258 2) 0 0) 1   "be_bytes MSB first (high byte at 0)")
+  (assert_eq (get (be_bytes 258 2) 1 0) 2   "be_bytes LSB last")
+  (assert_eq (read_be (be_bytes 258 2) 0 2) 258 "read_be inverts be_bytes")
+  (assert_eq (read_be (le_bytes 258 2) 0 2) 513 "read_be over LE bytes reads the swapped value")
+  ; signed BE: 0xFFFF big-endian is -1 as i16
+  (assert_eq (read_be_signed (be_bytes -1 2) 0 2) -1     "read_be_signed i16 -1")
+  (assert_eq (read_be_signed (be_bytes -32768 2) 0 2) -32768 "read_be_signed i16 min")
+  (assert_eq (read_be (be_bytes 255 1) 0 1) 255          "read_be u8 255 unsigned")
+  true)
+
+; ── 4b. generated big-endian encode/decode: a (endian big) spec lowers its
+; scalar reads/writes to the BE helpers; bytes[N] stay byte-order agnostic. ───
+(bind bstore
+  (storage BeRec
+    (endian big)
+    (record B 1
+      (field a u16)
+      (field b u32)
+      (field tag (bytes 3)))))
+(bind benc (get bstore "encode_B_v1"))
+(bind bdec (get bstore "decode_B_v1"))
+(do
+  (assert_eq (get bstore "B_V1_SIZE" 0) 9 "BE record size = 2+4+3")
+  (bind buf (benc (assoc (map_of) "a" 258 "b" 16909060 "tag" (list_of 7 8 9)))
+    (do
+      ; a (u16=0x0102) lands MSB-first: byte 0 = 0x01, byte 1 = 0x02
+      (assert_eq (get buf 0 0) 1 "BE a high byte at offset 0")
+      (assert_eq (get buf 1 0) 2 "BE a low byte at offset 1")
+      ; b (u32=0x01020304) is [01,02,03,04] big-endian
+      (assert_eq (get buf 2 0) 1 "BE b byte 0 (MSB)")
+      (assert_eq (get buf 5 0) 4 "BE b byte 3 (LSB)")
+      ; bytes[3] copied verbatim (order-agnostic)
+      (assert_eq (get buf 6 0) 7 "bytes[3] verbatim byte 0")
+      (assert_eq (get buf 8 0) 9 "bytes[3] verbatim byte 2")
+      ; round-trip is lossless on the BE path
+      (bind back (bdec buf)
+        (do
+          (assert_eq (get back "a" 0) 258      "BE a round-trips")
+          (assert_eq (get back "b" 0) 16909060 "BE b round-trips")
+          (assert_eq (size (get back "tag" (list_of))) 3 "BE bytes[3] round-trips")
+          (assert_eq (get (get back "tag" (list_of)) 2 0) 9 "BE bytes[3] last byte")
+          true)))))
+
+; ── 5. CRC: encode appends a crc32 over the region before it; decode RECOMPUTES
+; and VERIFIES it (a corrupt buffer raises). Layout: a u32 payload + a u32 crc. ─
+(bind cstore
+  (storage Crc
+    (endian little)
+    (record C 1
+      (field payload u32)
+      (field check   u32 (crc_of (before check))))))
+(bind cenc (get cstore "encode_C_v1"))
+(bind cdec (get cstore "decode_C_v1"))
+(do
+  (assert_eq (get cstore "C_V1_SIZE" 0) 8 "crc record size = 4 (payload) + 4 (crc)")
+  (bind buf (cenc (assoc (map_of) "payload" 305419896))  ; 0x12345678
+    (do
+      (assert_eq (size buf) 8 "crc record encodes to 8 bytes")
+      ; the stored crc equals crc32 over the 4 payload bytes
+      (assert_eq (read_le buf 4 4) (crc32 buf 0 4) "stored crc matches crc32 of the payload region")
+      ; decode verifies the crc and returns the payload (no throw on a good buffer)
+      (bind back (cdec buf)
+        (do
+          (assert_eq (get back "payload" 0) 305419896 "crc decode round-trips the payload")
+          ; CORRUPT the payload (byte 0 -> 99) while leaving the stored crc intact:
+          ; decode recomputes crc32 over the (now different) payload region and the
+          ; mismatch RAISES — a corrupt buffer is rejected, not silently accepted.
+          (assert_eq
+            (try (do (cdec (list_of 99 (get buf 1 0) (get buf 2 0) (get buf 3 0)
+                                    (get buf 4 0) (get buf 5 0) (get buf 6 0) (get buf 7 0)))
+                     "NO_THROW")
+              (catch e (if (contains? (value_to_string e) "crc mismatch") "threw" "wrong")))
+            "threw"
+            "a corrupt buffer raises a crc mismatch on decode")
+          true)))))
+
+; ── 6. decode bounds check: a buffer shorter than the record raises instead of
+; silently reading off-the-end zeros. ────────────────────────────────────────
+(do
+  ; the Crc record needs 8 bytes; a 3-byte buffer must raise
+  (assert_eq
+    (try (do (cdec (list_of 1 2 3)) "NO_THROW")
+      (catch e (if (contains? (value_to_string e) "buffer too short") "threw" "wrong")))
+    "threw"
+    "decoding a short buffer raises (no off-the-end zero reads)")
+  ; the Mix record (from block 1) likewise guards its 36-byte length
+  (assert_eq
+    (try (do (dec (list_of 0 0 0)) "NO_THROW")
+      (catch e (if (contains? (value_to_string e) "buffer too short") "threw" "wrong")))
+    "threw"
+    "a short buffer raises for the multi-field record too")
+  true)
+
+; ── 7. validate rejects an unknown endian (no silent fall-through to LE) ──────
+; Now that the endian directive actually changes the emitted byte order, an
+; unrecognized spelling must be a located finding, not a silent LE default.
+(do
+  (bind bad_endian (validate (assoc (mk_spec (list_of
+        (mk_field "a" (mk_type "int" (assoc (map_of) "size" 2 "signed" false "spelling" "u16")))))
+        "endian" "middle") null)
+  (do
+    (assert_true (some_finding? bad_endian "unknown endian")
+      "an unrecognized (endian X) is rejected")
+    ; little/le and big/be all validate cleanly
+    (bind ok_le (validate (assoc (mk_spec (list_of
+          (mk_field "a" (mk_type "int" (assoc (map_of) "size" 2 "signed" false "spelling" "u16")))))
+          "endian" "little") null)
+    (bind ok_be (validate (assoc (mk_spec (list_of
+          (mk_field "a" (mk_type "int" (assoc (map_of) "size" 2 "signed" false "spelling" "u16")))))
+          "endian" "be") null)
+    (do
+      (assert_true (not (some_finding? ok_le "unknown endian")) "little endian is accepted")
+      (assert_true (not (some_finding? ok_be "unknown endian")) "be endian is accepted")
+      true))))))

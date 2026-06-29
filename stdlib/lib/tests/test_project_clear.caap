@@ -1,0 +1,102 @@
+; stdlib/lib/tests/test_project_clear.caap — clear_projects! resets the three
+; project session registries so a long-lived (LSP/test) session can isolate
+; or reload between projects.
+;
+; We need an ABSOLUTE manifest path but have no fs builtins in-language, so we
+; recover this test's own absolute path from the loader's `load_log` (same
+; trick as test_graph.caap) and derive the sibling fixture manifest from it
+; with the pure `path` helpers. The fixture (proj_clear/project.caap) declares
+; no roots and no deps, so loading it touches ONLY the project registries.
+
+;; @area: core
+;; @kind: unit
+;; @slow: false
+(use stdlib.lib.test assert_eq assert_true)
+(use stdlib.lib.text.path dirname path_join normalize)
+(use stdlib.lib.collections.sequence find contains?)
+(use stdlib.lib.project load_project projects clear_projects!
+     schema_version known_keys validate_manifest!)
+
+(do
+  (bind (
+    (loadapi (ctfe_compiler_lookup_value compiler "stdlib.load"))
+  )
+    (bind (
+      (log ((get loadapi "load_log")))
+      ; this test's own load_log entry carries its canonical absolute path
+      (me  (find log
+             (lambda (e2) (string_ends_with (get e2 "path" "")
+                                            "test_project_clear.caap"))))
+    )
+      (do
+        ; guard FIRST — the path derivation below dereferences `me`, so a
+        ; missing entry must fail here, not as an opaque null-get later
+        (assert_true (not (eq me null)) "found own load_log entry")
+        (bind ((manifest
+                 (normalize
+                   (path_join (dirname (get me "path"))
+                              "proj_clear/project.caap"))))
+          (do
+            ; clean baseline: this fixture is not loaded yet (fresh session)
+            (assert_eq (size (map_keys (projects))) 0
+              "no projects registered at start")
+            ; load the fixture -> the path registry now has exactly one entry
+            (bind ((rec (load_project manifest)))
+              (do
+                (assert_eq (get rec "name") "proj_clear_fixture"
+                  "fixture project loaded by name")
+                (assert_eq (size (map_keys (projects))) 1
+                  "one project registered after load")
+                (assert_true (contains (map_keys (projects)) manifest)
+                  "by_path keyed on the normalized manifest path")))
+            ; reset — every registry empties (same live map, now size 0)
+            (clear_projects!)
+            (assert_eq (size (map_keys (projects))) 0
+              "clear_projects! empties the path registry")
+            ; a re-load after the reset works cleanly (no fake cycle, the name
+            ; is free again) and re-registers the project
+            (bind ((rec2 (load_project manifest)))
+              (do
+                (assert_eq (get rec2 "name") "proj_clear_fixture"
+                  "fixture reloads cleanly after clear_projects!")
+                (assert_eq (size (map_keys (projects))) 1
+                  "re-load re-registers exactly one project")))
+            ; ── manifest schema validation (pure; no fs needed) ──────────────
+            ; a manifest using only known keys + the right version validates
+            (assert_eq
+              (validate_manifest! "p"
+                (assoc (map_of) "version" schema_version
+                  "name" "ok" "roots" (list_of) "deps" (list_of) "entry" "ok.main"))
+              null "a well-formed manifest validates (returns null)")
+            ; an unknown top-level key is rejected with a located error
+            (assert_true
+              (try (do (validate_manifest! "p"
+                         (assoc (map_of) "name" "x" "dep" (list_of))) false)
+                   (catch e (string_contains
+                              (if (eq (value_type e) "map") (get e "message" "") (value_to_string e))
+                              "unknown manifest key")))
+              "unknown manifest key rejected")
+            ; the located error names the manifest path
+            (assert_true
+              (try (do (validate_manifest! "myproj"
+                         (assoc (map_of) "name" "x" "bogus" 1)) false)
+                   (catch e (string_contains
+                              (if (eq (value_type e) "map") (get e "message" "") (value_to_string e))
+                              "myproj")))
+              "schema error is located (names the manifest path)")
+            ; a future schema version is refused
+            (assert_true
+              (try (do (validate_manifest! "p"
+                         (assoc (map_of) "version" 999 "name" "x")) false)
+                   (catch e (string_contains
+                              (if (eq (value_type e) "map") (get e "message" "") (value_to_string e))
+                              "version")))
+              "a wrong schema version is rejected")
+            ; the loaded fixture (only known keys) round-trips through validation
+            (assert_true (contains? known_keys "entry") "entry is a known key")
+
+            ; leave the session clean for any later test in the corpus
+            (clear_projects!)
+            (assert_eq (size (map_keys (projects))) 0
+              "registries left empty after the test")
+            true))))))
